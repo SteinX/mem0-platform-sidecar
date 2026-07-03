@@ -41,12 +41,13 @@ def _memory_delete_request(
     project_id: str,
     memory_id: str,
     memory: MemoryIndex | None,
+    request_app_id: str | None = None,
 ) -> dict[str, Any]:
     if memory is None:
         scope = normalize_scope(
             project_id=project_id,
             user_id=None,
-            app_id=None,
+            app_id=request_app_id,
             agent_id=None,
             run_id=None,
         )
@@ -157,6 +158,7 @@ class MemoryService:
         *,
         project_id: str,
         memory_id: str,
+        request_app_id: str | None = None,
     ) -> dict[str, Any]:
         memory_repo = MemoryIndexRepository(self.session)
         memory = memory_repo.get_memory(project_id=project_id, mem0_memory_id=memory_id)
@@ -169,6 +171,7 @@ class MemoryService:
                     project_id=project_id,
                     memory_id=memory_id,
                     memory=None,
+                    request_app_id=request_app_id,
                 ),
                 subject_type="memory",
                 subject_id=memory_id,

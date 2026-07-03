@@ -171,6 +171,27 @@ Results:
 - `8 passed`
 - `39 passed`
 
+## Task 4 Delete Scope Follow-up
+
+The earlier note that conflicting `project_id` / `app_id` requests were rejected or returned `400` is stale. Current intended semantics allow differing values, preserve the explicit `app_id`, and use sidecar `project_id` for local project scope.
+
+### Fix note
+
+Added regression coverage for `DELETE /v1/memories/mem-1?project_id=repo-a&app_id=app-x` to verify:
+
+- the response is `404`
+- no remote delete call is made
+- `repo-a` is bootstrapped with `default_app_id == app-x`
+- the failed `memory.delete` event is recorded under `project_id == repo-a`
+- `event.request_json` keeps `memory_id == mem-1` and `app_id == app-x`
+
+Verification commands:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/http_adapter/test_memory_routes.py -q -p no:cacheprovider
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider
+```
+
 ## Task 4 Final Review Fixes
 
 This pass addressed the final review findings around event read boundaries and failed-event durability.

@@ -89,13 +89,20 @@ async def delete_memory(
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
-    ensure_project(session, request.app.state.settings, project_id)
+    request_app_id = resolve_app_id(request)
+    ensure_project(
+        session,
+        request.app.state.settings,
+        project_id,
+        default_app_id=request_app_id,
+    )
     session.commit()
     service = MemoryService(session=session, mem0=mem0)
     try:
         result = await service.delete_memory(
             project_id=project_id,
             memory_id=memory_id,
+            request_app_id=request_app_id,
         )
         session.commit()
         return result

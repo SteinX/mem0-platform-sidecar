@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import pytest
@@ -435,6 +436,45 @@ def test_get_memory_does_not_bootstrap_unknown_project_on_read(tmp_path) -> None
         project_z = session.scalar(select(Project).where(Project.id == "repo-z"))
 
     assert project_z is None
+
+
+def test_delete_memory_missing_index_uses_query_app_id_for_failed_event(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    response = client.delete(
+        "/v1/memories/mem-1?project_id=repo-a&app_id=app-x"
+    )
+
+    assert response.status_code == 404
+    assert mem0.deleted_ids == []
+
+    with app.state.session_factory() as session:
+        project_a = session.scalar(select(Project).where(Project.id == "repo-a"))
+        event = session.scalar(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.delete",
+                Event.status == EventStatus.FAILED,
+                Event.subject_id == "mem-1",
+            )
+        )
+
+    assert project_a is not None
+    assert project_a.default_app_id == "app-x"
+    assert event is not None
+    assert json.loads(event.request_json)["memory_id"] == "mem-1"
+    assert json.loads(event.request_json)["app_id"] == "app-x"
 
 
 def test_route_scoped_requests_reject_conflicting_project_scope(tmp_path) -> None:
