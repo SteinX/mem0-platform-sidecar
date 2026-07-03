@@ -20,19 +20,50 @@ class Mem0RestClient:
             return {}
         return {"Authorization": f"Bearer {self.api_key}"}
 
-    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         async with httpx.AsyncClient(
             base_url=self.base_url,
             headers=self._headers(),
             transport=self.transport,
             timeout=30.0,
         ) as client:
-            response = await client.post(path, json=payload)
+            response = await client.request(
+                method,
+                path,
+                json=payload,
+                params=params,
+            )
             response.raise_for_status()
-            return dict(response.json())
+            data = response.json()
+            if isinstance(data, dict):
+                return data
+            return {"results": data}
 
     async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._post("/v1/memories/", payload)
+        return await self._request("POST", "/v1/memories/", payload=payload)
 
     async def search_memories(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._post("/v1/memories/search/", payload)
+        return await self._request("POST", "/v1/memories/search/", payload=payload)
+
+    async def get_memory(self, memory_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v1/memories/{memory_id}/")
+
+    async def update_memory(
+        self,
+        memory_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._request("PUT", f"/v1/memories/{memory_id}/", payload=payload)
+
+    async def delete_memory(self, memory_id: str) -> dict[str, Any]:
+        return await self._request("DELETE", f"/v1/memories/{memory_id}/")
+
+    async def delete_all_memories(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("DELETE", "/v1/memories/", params=params)
