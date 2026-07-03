@@ -139,3 +139,34 @@ Results:
 
 - `8 passed`
 - `39 passed`
+
+## Task 4 Payload Normalization Follow-up (project_id stripping)
+
+### RED (requested verification step)
+
+Ran baseline verification before introducing the strip behavior:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py -v
+```
+
+Observed: `5 passed` (baseline did not include the `project_id` stripping assertion, so existing suite remained green).
+
+### GREEN (post-fix)
+
+Updated `test_route_scoped_requests_bootstrap_non_default_project_and_normalize_app_id` to send payload-level `project_id` for add/search and assert it is not forwarded:
+
+- `mem0.add_payloads[0]` has no `project_id`, `app_id == resolved project`
+- `mem0.search_payloads[0]` has no `project_id`, `app_id == resolved project`
+
+Validation command:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py tests/http_adapter/test_health.py -v
+python -m pytest -v
+```
+
+Results:
+
+- `8 passed`
+- `39 passed`

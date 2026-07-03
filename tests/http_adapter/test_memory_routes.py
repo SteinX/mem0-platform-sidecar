@@ -196,18 +196,20 @@ def test_route_scoped_requests_bootstrap_non_default_project_and_normalize_app_i
     client = TestClient(app)
 
     add_response = client.post(
-        "/v3/memories/add/?project_id=repo-b",
-        json={"text": "hello", "user_id": "root"},
+        "/v3/memories/add/",
+        json={"text": "hello", "user_id": "root", "project_id": "repo-b"},
     )
     assert add_response.status_code == 200
     assert mem0.add_payloads[0]["app_id"] == "repo-b"
+    assert "project_id" not in mem0.add_payloads[0]
 
     search_response = client.post(
-        "/v3/memories/search/?app_id=repo-c",
-        json={"query": "hello", "user_id": "root"},
+        "/v3/memories/search/",
+        json={"query": "hello", "user_id": "root", "project_id": "repo-c"},
     )
     assert search_response.status_code == 200
     assert mem0.search_payloads[0]["app_id"] == "repo-c"
+    assert "project_id" not in mem0.search_payloads[0]
 
     events_response = client.get("/v1/events?project_id=repo-b")
     assert events_response.status_code == 200

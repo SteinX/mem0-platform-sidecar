@@ -38,6 +38,7 @@ def normalized_payload_for_project(
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request, payload)
     normalized_payload = dict(payload)
+    normalized_payload.pop("project_id", None)
     normalized_payload["app_id"] = project_id
     return normalized_payload
 
