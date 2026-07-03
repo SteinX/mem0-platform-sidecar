@@ -1,11 +1,12 @@
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.http_adapter.app import create_app
-from mem0_sidecar.store.models import Event, EventStatus
+from mem0_sidecar.store.models import Event, EventStatus, Project
 from mem0_sidecar.store.repositories import EventRepository, ProjectRepository
 
 
@@ -178,3 +179,72 @@ def test_event_routes_do_not_leak_other_project_events(tmp_path) -> None:
 
     hidden_detail = client.get(f"/v1/event/{hidden_event.id}?project_id=repo-a")
     assert hidden_detail.status_code == 404
+
+
+def test_route_scoped_requests_bootstrap_non_default_project_and_normalize_app_id(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    add_response = client.post(
+        "/v3/memories/add/?project_id=repo-b",
+        json={"text": "hello", "user_id": "root"},
+    )
+    assert add_response.status_code == 200
+    assert mem0.add_payloads[0]["app_id"] == "repo-b"
+
+    search_response = client.post(
+        "/v3/memories/search/?app_id=repo-c",
+        json={"query": "hello", "user_id": "root"},
+    )
+    assert search_response.status_code == 200
+    assert mem0.search_payloads[0]["app_id"] == "repo-c"
+
+    events_response = client.get("/v1/events?project_id=repo-b")
+    assert events_response.status_code == 200
+
+    with app.state.session_factory() as session:
+        project_b = session.scalar(select(Project).where(Project.id == "repo-b"))
+        project_c = session.scalar(select(Project).where(Project.id == "repo-c"))
+
+    assert project_b is not None
+    assert project_c is not None
+    assert project_b.mem0_base_url == "http://mem0.local"
+    assert project_c.mem0_base_url == "http://mem0.local"
+
+
+def test_route_scoped_requests_reject_conflicting_project_scope(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=FakeMem0Client(),
+    )
+    client = TestClient(app)
+
+    add_response = client.post(
+        "/v3/memories/add/",
+        json={
+            "text": "hello",
+            "project_id": "repo-a",
+            "app_id": "repo-b",
+        },
+    )
+    assert add_response.status_code == 400
+
+    events_response = client.get("/v1/events?project_id=repo-a&app_id=repo-b")
+    assert events_response.status_code == 400
+
+    event_response = client.get("/v1/event/does-not-matter?project_id=repo-a&app_id=repo-b")
+    assert event_response.status_code == 400

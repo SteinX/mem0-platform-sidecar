@@ -5,7 +5,11 @@ from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.memory_ops import MemoryService
 from mem0_sidecar.http_adapter.dependencies import get_mem0_client, get_session
-from mem0_sidecar.http_adapter.project_scope import resolve_project_id
+from mem0_sidecar.http_adapter.project_scope import (
+    ensure_project,
+    normalized_payload_for_project,
+    resolve_project_id,
+)
 
 memory_router = APIRouter()
 
@@ -18,11 +22,14 @@ async def add_memory(
     session: Session = Depends(get_session),
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
-    service = MemoryService(session=session, mem0=mem0)
     try:
+        project_id = resolve_project_id(request, payload)
+        ensure_project(session, request.app.state.settings, project_id)
+        session.commit()
+        service = MemoryService(session=session, mem0=mem0)
         result = await service.add_memory(
-            project_id=resolve_project_id(request, payload),
-            payload=payload,
+            project_id=project_id,
+            payload=normalized_payload_for_project(request, payload),
         )
         session.commit()
         return result
@@ -39,10 +46,13 @@ async def search_memories(
     session: Session = Depends(get_session),
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
+    project_id = resolve_project_id(request, payload)
+    ensure_project(session, request.app.state.settings, project_id)
+    session.commit()
     service = MemoryService(session=session, mem0=mem0)
     return await service.search_memories(
-        project_id=resolve_project_id(request, payload),
-        payload=payload,
+        project_id=project_id,
+        payload=normalized_payload_for_project(request, payload),
     )
 
 
@@ -54,10 +64,13 @@ async def get_memory(
     session: Session = Depends(get_session),
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
-    service = MemoryService(session=session, mem0=mem0)
     try:
+        project_id = resolve_project_id(request)
+        ensure_project(session, request.app.state.settings, project_id)
+        session.commit()
+        service = MemoryService(session=session, mem0=mem0)
         return await service.get_memory(
-            project_id=resolve_project_id(request),
+            project_id=project_id,
             memory_id=memory_id,
         )
     except KeyError as exc:
@@ -72,10 +85,13 @@ async def delete_memory(
     session: Session = Depends(get_session),
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
-    service = MemoryService(session=session, mem0=mem0)
     try:
+        project_id = resolve_project_id(request)
+        ensure_project(session, request.app.state.settings, project_id)
+        session.commit()
+        service = MemoryService(session=session, mem0=mem0)
         result = await service.delete_memory(
-            project_id=resolve_project_id(request),
+            project_id=project_id,
             memory_id=memory_id,
         )
         session.commit()

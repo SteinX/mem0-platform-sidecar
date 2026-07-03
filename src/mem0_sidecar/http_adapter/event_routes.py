@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.http_adapter.dependencies import get_session
-from mem0_sidecar.http_adapter.project_scope import resolve_project_id
+from mem0_sidecar.http_adapter.project_scope import ensure_project, resolve_project_id
 from mem0_sidecar.store.models import Event
 
 event_router = APIRouter()
@@ -33,6 +33,8 @@ def list_events(
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
+    ensure_project(session, request.app.state.settings, project_id)
+    session.commit()
     events = session.scalars(
         select(Event)
         .where(Event.project_id == project_id)
@@ -49,6 +51,8 @@ def get_event(
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
+    ensure_project(session, request.app.state.settings, project_id)
+    session.commit()
     event = session.scalar(
         select(Event).where(Event.project_id == project_id, Event.id == event_id)
     )

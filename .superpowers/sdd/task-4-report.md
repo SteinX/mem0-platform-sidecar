@@ -104,3 +104,38 @@ Result:
 ## Concerns
 
 - Test output includes an existing `StarletteDeprecationWarning` from `fastapi.testclient` / `httpx`; this did not affect correctness and was not changed in this task.
+
+## Re-review Follow-up
+
+This pass addressed the scope/bootstrap issues raised in re-review:
+
+- non-default projects are now materialized through route traffic with `ProjectRepository.upsert_default_project(...)`
+- payload/query conflicts between `project_id` and `app_id` now return `400`
+- add/search payloads normalize `app_id` to the resolved project before reaching `MemoryService`
+
+### RED
+
+Added new coverage in `tests/http_adapter/test_memory_routes.py` and ran:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py -v
+```
+
+Observed expected failures before the fix:
+
+- non-default project bootstrap assertions failed because the project row was never created by route traffic
+- conflicting `project_id` / `app_id` requests were still accepted
+
+### GREEN
+
+After implementing the route helpers and project bootstrap, reran:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py tests/http_adapter/test_health.py -v
+python -m pytest -v
+```
+
+Results:
+
+- `8 passed`
+- `39 passed`
