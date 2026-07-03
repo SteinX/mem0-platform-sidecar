@@ -14,6 +14,10 @@ python -m pip install -e ".[dev]"
 python -m pytest -v
 ```
 
+## E2E
+
+See [E2E Testing](e2e.md).
+
 ## Run HTTP Health Route
 
 ```bash
