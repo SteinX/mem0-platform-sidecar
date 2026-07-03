@@ -7,7 +7,10 @@ from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.store.repositories import ProjectRepository
 
 
-def resolve_app_id(request: Request, payload: dict[str, Any] | None = None) -> str | None:
+def resolve_app_id(
+    request: Request,
+    payload: dict[str, Any] | None = None,
+) -> str | None:
     if payload:
         app_id = payload.get("app_id")
         if isinstance(app_id, str) and app_id:

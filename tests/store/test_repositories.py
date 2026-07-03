@@ -171,7 +171,9 @@ def test_memory_index_repository_get_memory_scopes_by_project(db_session) -> Non
     assert memory.app_id == "repo-b"
 
 
-def test_memory_index_repository_get_memory_ignores_deleted_by_default(db_session) -> None:
+def test_memory_index_repository_get_memory_ignores_deleted_by_default(
+    db_session,
+) -> None:
     project_repo = ProjectRepository(db_session)
     memory_repo = MemoryIndexRepository(db_session)
 

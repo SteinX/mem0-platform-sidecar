@@ -115,17 +115,27 @@ async def test_mem0_client_updates_memory_by_id() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "PUT"
         assert request.url.path == "/memories/mem-1"
-        assert request.read() == b'{"memory":"updated"}'
-        return httpx.Response(200, json={"id": "mem-1", "memory": "updated"})
+        assert request.read() == b'{"text":"updated","metadata":{"source":"route"}}'
+        return httpx.Response(
+            200,
+            json={"id": "mem-1", "memory": "updated", "metadata": {"source": "route"}},
+        )
 
     client = Mem0RestClient(
         base_url="http://mem0.local",
         transport=httpx.MockTransport(handler),
     )
 
-    result = await client.update_memory("mem-1", {"memory": "updated"})
+    result = await client.update_memory(
+        "mem-1",
+        {"text": "updated", "metadata": {"source": "route"}},
+    )
 
-    assert result == {"id": "mem-1", "memory": "updated"}
+    assert result == {
+        "id": "mem-1",
+        "memory": "updated",
+        "metadata": {"source": "route"},
+    }
 
 
 @pytest.mark.asyncio

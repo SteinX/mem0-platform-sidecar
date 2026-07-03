@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
@@ -9,13 +9,14 @@ from mem0_sidecar.http_adapter.project_scope import resolve_project_id
 from mem0_sidecar.store.repositories import EventRepository
 
 event_router = APIRouter()
+SessionDependency = Annotated[Session, Depends(get_session)]
 
 
 @event_router.get("/v1/events")
 @event_router.get("/v1/events/", include_in_schema=False)
 def list_events(
     request: Request,
-    session: Session = Depends(get_session),
+    session: SessionDependency,
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
     service = EventService(EventRepository(session))
@@ -27,11 +28,11 @@ def list_events(
 def get_event(
     event_id: str,
     request: Request,
-    session: Session = Depends(get_session),
+    session: SessionDependency,
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
     service = EventService(EventRepository(session))
     try:
         return service.get_project_event(project_id, event_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Event not found")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Event not found") from exc

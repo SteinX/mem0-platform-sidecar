@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
@@ -7,12 +7,14 @@ from mem0_sidecar.core.memory_ops import MemoryService
 from mem0_sidecar.http_adapter.dependencies import get_mem0_client, get_session
 from mem0_sidecar.http_adapter.project_scope import (
     ensure_project,
-    resolve_app_id,
     normalized_payload_for_project,
+    resolve_app_id,
     resolve_project_id,
 )
 
 memory_router = APIRouter()
+SessionDependency = Annotated[Session, Depends(get_session)]
+Mem0Dependency = Annotated[Any, Depends(get_mem0_client)]
 
 
 @memory_router.post("/v3/memories/add/")
@@ -20,8 +22,8 @@ memory_router = APIRouter()
 async def add_memory(
     payload: dict[str, Any],
     request: Request,
-    session: Session = Depends(get_session),
-    mem0: Any = Depends(get_mem0_client),
+    session: SessionDependency,
+    mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request, payload)
     ensure_project(
@@ -49,8 +51,8 @@ async def add_memory(
 async def search_memories(
     payload: dict[str, Any],
     request: Request,
-    session: Session = Depends(get_session),
-    mem0: Any = Depends(get_mem0_client),
+    session: SessionDependency,
+    mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request, payload)
     service = MemoryService(session=session, mem0=mem0)
@@ -65,8 +67,8 @@ async def search_memories(
 async def get_memory(
     memory_id: str,
     request: Request,
-    session: Session = Depends(get_session),
-    mem0: Any = Depends(get_mem0_client),
+    session: SessionDependency,
+    mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
     service = MemoryService(session=session, mem0=mem0)
@@ -85,8 +87,8 @@ async def get_memory(
 async def delete_memory(
     memory_id: str,
     request: Request,
-    session: Session = Depends(get_session),
-    mem0: Any = Depends(get_mem0_client),
+    session: SessionDependency,
+    mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
     request_app_id = resolve_app_id(request)

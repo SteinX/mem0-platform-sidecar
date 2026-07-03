@@ -184,6 +184,35 @@ class MemoryIndexRepository:
             statement = statement.where(MemoryIndex.deleted_at.is_(None))
         return self.session.scalar(statement)
 
+    def list_scoped_memory_ids(
+        self,
+        *,
+        project_id: str,
+        mem0_memory_ids: list[str],
+        user_id: str | None,
+        app_id: str | None,
+        agent_id: str | None,
+        run_id: str | None,
+    ) -> set[str]:
+        if not mem0_memory_ids:
+            return set()
+
+        statement = select(MemoryIndex.mem0_memory_id).where(
+            MemoryIndex.project_id == project_id,
+            MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.mem0_memory_id.in_(mem0_memory_ids),
+        )
+        if user_id is not None:
+            statement = statement.where(MemoryIndex.user_id == user_id)
+        if app_id is not None:
+            statement = statement.where(MemoryIndex.app_id == app_id)
+        if agent_id is not None:
+            statement = statement.where(MemoryIndex.agent_id == agent_id)
+        if run_id is not None:
+            statement = statement.where(MemoryIndex.run_id == run_id)
+
+        return set(self.session.scalars(statement))
+
     def upsert_memory(
         self,
         *,

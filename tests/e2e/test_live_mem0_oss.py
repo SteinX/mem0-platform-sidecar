@@ -7,7 +7,6 @@ from fastapi.testclient import TestClient
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.http_adapter.app import create_app
 
-
 pytestmark = pytest.mark.e2e
 
 
@@ -34,28 +33,48 @@ def _record_contains(record, needle: str) -> bool:
     return record == needle
 
 
+def _extract_memory_ids(payload: dict[str, object]) -> list[str]:
+    ids: list[str] = []
+
+    def add(candidate: object) -> None:
+        if isinstance(candidate, str) and candidate not in ids:
+            ids.append(candidate)
+
+    add(payload.get("id"))
+    add(payload.get("memory_id"))
+    results = payload.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            add(item.get("id"))
+            add(item.get("memory_id"))
+    return ids
+
+
 def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
     settings = _live_settings(tmp_path)
     client = TestClient(create_app(settings=settings))
     marker = f"sidecar-e2e-{uuid4()}"
+    add_body: dict[str, object] | None = None
+    memory_ids: list[str] = []
 
-    add_response = client.post(
-        "/v3/memories/add/",
-        json={
-            "text": f"Remember {marker}",
-            "user_id": "sidecar-e2e-user",
-            "app_id": settings.default_project_id,
-            "metadata": {"type": "e2e", "marker": marker},
-        },
-    )
-    assert add_response.status_code == 200, add_response.text
-    add_body = add_response.json()
-    memory_id = add_body["memory"].get("id") or add_body["memory"].get("memory_id")
-    assert memory_id
-    assert add_body["event"]["status"] == "SUCCEEDED"
-
-    deleted = False
     try:
+        add_response = client.post(
+            "/v3/memories/add/",
+            json={
+                "text": f"Remember {marker}",
+                "user_id": "sidecar-e2e-user",
+                "app_id": settings.default_project_id,
+                "metadata": {"type": "e2e", "marker": marker},
+            },
+        )
+        assert add_response.status_code == 200, add_response.text
+        add_body = add_response.json()
+        memory_ids = _extract_memory_ids(add_body["memory"])
+        assert memory_ids, add_body
+        assert add_body["event"]["status"] == "SUCCEEDED"
+
         search_response = client.post(
             "/v3/memories/search/",
             json={
@@ -68,24 +87,26 @@ def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
         search_body = search_response.json()
         results = search_body["results"]
         assert any(
-            _record_contains(result, memory_id) or _record_contains(result, marker)
+            any(_record_contains(result, memory_id) for memory_id in memory_ids)
+            or _record_contains(result, marker)
             for result in results
         ), search_body
 
-        get_response = client.get(f"/v1/memories/{memory_id}/")
+        get_response = client.get(f"/v1/memories/{memory_ids[0]}/")
         assert get_response.status_code == 200, get_response.text
-        assert get_response.json().get("id") == memory_id
+        assert get_response.json().get("id") == memory_ids[0]
 
-        delete_response = client.delete(f"/v1/memories/{memory_id}/")
-        assert delete_response.status_code == 200, delete_response.text
-        assert delete_response.json()["event"]["status"] == "SUCCEEDED"
-        deleted = True
+        for memory_id in memory_ids:
+            delete_response = client.delete(f"/v1/memories/{memory_id}/")
+            assert delete_response.status_code == 200, delete_response.text
+            assert delete_response.json()["event"]["status"] == "SUCCEEDED"
     finally:
-        if not deleted:
-            try:
-                client.delete(f"/v1/memories/{memory_id}/")
-            except Exception:
-                pass
+        if add_body is not None:
+            for memory_id in memory_ids:
+                try:
+                    client.delete(f"/v1/memories/{memory_id}/")
+                except Exception:
+                    pass
 
     events_response = client.get("/v1/events")
     assert events_response.status_code == 200, events_response.text

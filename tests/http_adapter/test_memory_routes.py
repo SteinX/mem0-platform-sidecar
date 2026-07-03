@@ -1,13 +1,16 @@
 import json
 from typing import Any
 
-import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from mem0_sidecar.config import SidecarSettings
+from mem0_sidecar.core.memory_ops import (
+    SIDECAR_APP_ID_METADATA_KEY,
+    SIDECAR_PROJECT_ID_METADATA_KEY,
+)
 from mem0_sidecar.http_adapter.app import create_app
-from mem0_sidecar.store.models import Event, EventStatus, Project
+from mem0_sidecar.store.models import Event, EventStatus, MemoryIndex, Project
 from mem0_sidecar.store.repositories import EventRepository, ProjectRepository
 
 
@@ -65,7 +68,12 @@ def test_memory_routes_round_trip_with_fake_upstream(tmp_path) -> None:
     add_body = add_response.json()
     assert add_body["memory"]["id"] == "mem-1"
     assert add_body["event"]["status"] == "SUCCEEDED"
-    assert mem0.add_payloads[0]["app_id"] == "repo-a"
+    assert "app_id" not in mem0.add_payloads[0]
+    assert mem0.add_payloads[0]["metadata"] == {
+        "type": "decision",
+        SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+        SIDECAR_APP_ID_METADATA_KEY: "repo-a",
+    }
 
     search_response = client.post(
         "/v3/memories/search/",
@@ -201,7 +209,9 @@ def test_route_scoped_requests_bootstrap_non_default_project_and_normalize_app_i
         json={"text": "hello", "user_id": "root", "project_id": "repo-b"},
     )
     assert add_response.status_code == 200
-    assert mem0.add_payloads[0]["app_id"] == "repo-b"
+    assert "app_id" not in mem0.add_payloads[0]
+    assert mem0.add_payloads[0]["metadata"][SIDECAR_PROJECT_ID_METADATA_KEY] == "repo-b"
+    assert mem0.add_payloads[0]["metadata"][SIDECAR_APP_ID_METADATA_KEY] == "repo-b"
     assert "project_id" not in mem0.add_payloads[0]
 
     search_response = client.post(
@@ -209,7 +219,11 @@ def test_route_scoped_requests_bootstrap_non_default_project_and_normalize_app_i
         json={"query": "hello", "user_id": "root", "project_id": "repo-c"},
     )
     assert search_response.status_code == 200
-    assert mem0.search_payloads[0]["app_id"] == "repo-c"
+    assert "app_id" not in mem0.search_payloads[0]
+    assert mem0.search_payloads[0]["filters"] == {
+        SIDECAR_PROJECT_ID_METADATA_KEY: "repo-c",
+        SIDECAR_APP_ID_METADATA_KEY: "repo-c",
+    }
     assert "project_id" not in mem0.search_payloads[0]
 
     events_response = client.get("/v1/events?project_id=repo-b")
@@ -249,11 +263,19 @@ def test_route_scoped_add_preserves_explicit_app_id_and_uses_project_scope(
     )
 
     assert response.status_code == 200
-    assert mem0.add_payloads[0]["app_id"] == "app-x"
+    assert "app_id" not in mem0.add_payloads[0]
+    assert mem0.add_payloads[0]["metadata"][SIDECAR_PROJECT_ID_METADATA_KEY] == "repo-a"
+    assert mem0.add_payloads[0]["metadata"][SIDECAR_APP_ID_METADATA_KEY] == "app-x"
     assert "project_id" not in mem0.add_payloads[0]
 
     with app.state.session_factory() as session:
         project_a = session.scalar(select(Project).where(Project.id == "repo-a"))
+        indexed_memory = session.scalar(
+            select(MemoryIndex).where(
+                MemoryIndex.project_id == "repo-a",
+                MemoryIndex.mem0_memory_id == "mem-1",
+            )
+        )
         event = session.scalar(
             select(Event).where(
                 Event.project_id == "repo-a",
@@ -262,7 +284,13 @@ def test_route_scoped_add_preserves_explicit_app_id_and_uses_project_scope(
         )
 
     assert project_a is not None
+    assert indexed_memory is not None
+    assert indexed_memory.app_id == "app-x"
     assert event is not None
+    assert json.loads(event.request_json)["metadata"] == {
+        SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+        SIDECAR_APP_ID_METADATA_KEY: "app-x",
+    }
 
 
 def test_route_scoped_add_preserves_query_app_id_and_bootstraps_default_app_id(
@@ -288,7 +316,9 @@ def test_route_scoped_add_preserves_query_app_id_and_bootstraps_default_app_id(
     )
 
     assert response.status_code == 200
-    assert mem0.add_payloads[0]["app_id"] == "app-x"
+    assert "app_id" not in mem0.add_payloads[0]
+    assert mem0.add_payloads[0]["metadata"][SIDECAR_PROJECT_ID_METADATA_KEY] == "repo-a"
+    assert mem0.add_payloads[0]["metadata"][SIDECAR_APP_ID_METADATA_KEY] == "app-x"
     assert "project_id" not in mem0.add_payloads[0]
 
     with app.state.session_factory() as session:
@@ -323,7 +353,11 @@ def test_route_scoped_search_preserves_explicit_app_id_without_bootstrapping_pro
     )
 
     assert response.status_code == 200
-    assert mem0.search_payloads[0]["app_id"] == "app-x"
+    assert "app_id" not in mem0.search_payloads[0]
+    assert mem0.search_payloads[0]["filters"] == {
+        SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+        SIDECAR_APP_ID_METADATA_KEY: "app-x",
+    }
     assert "project_id" not in mem0.search_payloads[0]
 
     with app.state.session_factory() as session:
@@ -352,7 +386,11 @@ def test_route_scoped_search_preserves_query_app_id_without_bootstrapping_projec
     )
 
     assert response.status_code == 200
-    assert mem0.search_payloads[0]["app_id"] == "app-x"
+    assert "app_id" not in mem0.search_payloads[0]
+    assert mem0.search_payloads[0]["filters"] == {
+        SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+        SIDECAR_APP_ID_METADATA_KEY: "app-x",
+    }
     assert "project_id" not in mem0.search_payloads[0]
 
     with app.state.session_factory() as session:
@@ -361,7 +399,7 @@ def test_route_scoped_search_preserves_query_app_id_without_bootstrapping_projec
     assert project_a is None
 
 
-def test_route_scoped_search_uses_app_id_as_local_project_fallback_without_bootstrapping(
+def test_route_scoped_add_uses_app_id_as_local_project_fallback(
     tmp_path,
 ) -> None:
     mem0 = FakeMem0Client()
@@ -385,7 +423,9 @@ def test_route_scoped_search_uses_app_id_as_local_project_fallback_without_boots
     )
 
     assert response.status_code == 200
-    assert mem0.add_payloads[0]["app_id"] == "app-x"
+    assert "app_id" not in mem0.add_payloads[0]
+    assert mem0.add_payloads[0]["metadata"][SIDECAR_PROJECT_ID_METADATA_KEY] == "app-x"
+    assert mem0.add_payloads[0]["metadata"][SIDECAR_APP_ID_METADATA_KEY] == "app-x"
     assert "project_id" not in mem0.add_payloads[0]
 
     with app.state.session_factory() as session:
@@ -502,5 +542,7 @@ def test_route_scoped_requests_reject_conflicting_project_scope(tmp_path) -> Non
     events_response = client.get("/v1/events?project_id=repo-a&app_id=repo-b")
     assert events_response.status_code == 200
 
-    event_response = client.get("/v1/event/does-not-matter?project_id=repo-a&app_id=repo-b")
+    event_response = client.get(
+        "/v1/event/does-not-matter?project_id=repo-a&app_id=repo-b"
+    )
     assert event_response.status_code == 404

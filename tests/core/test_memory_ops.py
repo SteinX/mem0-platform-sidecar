@@ -4,7 +4,13 @@ from typing import Any
 import pytest
 from sqlalchemy.orm import Session
 
-from mem0_sidecar.core.memory_ops import MemoryService, extract_memory_id
+from mem0_sidecar.core.memory_ops import (
+    SIDECAR_APP_ID_METADATA_KEY,
+    SIDECAR_PROJECT_ID_METADATA_KEY,
+    MemoryService,
+    extract_memory_id,
+    extract_memory_ids,
+)
 from mem0_sidecar.store.models import EventStatus, MemoryIndex
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
@@ -56,6 +62,21 @@ def test_extract_memory_id_accepts_common_shapes() -> None:
     assert extract_memory_id({"results": [{"id": "mem-3"}]}) == "mem-3"
 
 
+def test_extract_memory_ids_collects_top_level_and_results_ids() -> None:
+    assert extract_memory_ids(
+        {
+            "id": "mem-1",
+            "memory_id": "mem-2",
+            "results": [
+                {"id": "mem-3"},
+                {"memory_id": "mem-4"},
+                {"id": "mem-3"},
+                {"memory": "missing-id"},
+            ],
+        }
+    ) == ["mem-1", "mem-2", "mem-3", "mem-4"]
+
+
 @pytest.mark.asyncio
 async def test_memory_service_adds_memory_indexes_projection_and_event(
     db_session,
@@ -94,9 +115,55 @@ async def test_memory_service_adds_memory_indexes_projection_and_event(
     assert indexed.app_id == "repo-a"
     assert indexed.category == "decision"
     assert mem0.add_payloads[0]["user_id"] == "root"
-    assert mem0.add_payloads[0]["app_id"] == "repo-a"
+    assert "app_id" not in mem0.add_payloads[0]
+    assert mem0.add_payloads[0]["metadata"] == {
+        "type": "decision",
+        SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+        SIDECAR_APP_ID_METADATA_KEY: "repo-a",
+    }
     event = EventRepository(db_session).get(result["event"]["id"])
-    assert json.loads(event.request_json)["app_id"] == "repo-a"
+    assert json.loads(event.request_json)["metadata"] == {
+        "type": "decision",
+        SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+        SIDECAR_APP_ID_METADATA_KEY: "repo-a",
+    }
+
+
+class ResultsOnlyAddMem0Client(FakeMem0Client):
+    async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.add_payloads.append(payload)
+        return {
+            "results": [
+                {"id": "mem-1", "memory": payload["text"]},
+                {"memory_id": "mem-2", "memory": payload["text"]},
+            ]
+        }
+
+
+@pytest.mark.asyncio
+async def test_memory_service_add_indexes_all_ids_from_results_response(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    service = MemoryService(session=db_session, mem0=ResultsOnlyAddMem0Client())
+
+    result = await service.add_memory(
+        project_id="repo-a",
+        payload={"text": "hello", "user_id": "root", "app_id": "app-a"},
+    )
+    db_session.commit()
+
+    indexed_ids = {
+        memory.mem0_memory_id
+        for memory in db_session.query(MemoryIndex).filter_by(project_id="repo-a").all()
+    }
+
+    assert indexed_ids == {"mem-1", "mem-2"}
+    assert result["event"]["subject_id"] == "mem-1"
 
 
 @pytest.mark.asyncio
@@ -108,6 +175,16 @@ async def test_memory_service_search_memories_preserves_normalized_scope(
         name="Repo A",
         mem0_base_url="http://mem0:8000",
     )
+    MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        user_id="root",
+        agent_id=None,
+        app_id="repo-a",
+        run_id=None,
+        category=None,
+        metadata={},
+    )
     mem0 = FakeMem0Client()
     service = MemoryService(session=db_session, mem0=mem0)
 
@@ -118,11 +195,95 @@ async def test_memory_service_search_memories_preserves_normalized_scope(
 
     assert result["results"][0]["id"] == "mem-1"
     assert mem0.search_payloads[0]["user_id"] == "root"
-    assert mem0.search_payloads[0]["app_id"] == "repo-a"
+    assert "app_id" not in mem0.search_payloads[0]
+    assert mem0.search_payloads[0]["filters"] == {
+        SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+        SIDECAR_APP_ID_METADATA_KEY: "repo-a",
+    }
+
+
+class ScopedSearchMem0Client(FakeMem0Client):
+    async def search_memories(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.search_payloads.append(payload)
+        return {
+            "results": [
+                {"id": "mem-app-a", "memory": "hello app a"},
+                {"memory_id": "mem-app-b", "memory": "hello app b"},
+                {"id": "mem-repo-b", "memory": "hello repo b"},
+                {"memory": "missing-id"},
+            ]
+        }
 
 
 @pytest.mark.asyncio
-async def test_memory_service_get_memory_scopes_by_project_projection(db_session) -> None:
+async def test_memory_service_search_filters_upstream_results_by_indexed_scope(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-b",
+        name="Repo B",
+        mem0_base_url="http://mem0:8000",
+    )
+    MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-app-a",
+        user_id="root",
+        agent_id=None,
+        app_id="app-a",
+        run_id=None,
+        category=None,
+        metadata={},
+    )
+    MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-app-b",
+        user_id="root",
+        agent_id=None,
+        app_id="app-b",
+        run_id=None,
+        category=None,
+        metadata={},
+    )
+    MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-b",
+        mem0_memory_id="mem-repo-b",
+        user_id="root",
+        agent_id=None,
+        app_id="app-a",
+        run_id=None,
+        category=None,
+        metadata={},
+    )
+
+    service = MemoryService(session=db_session, mem0=ScopedSearchMem0Client())
+
+    result = await service.search_memories(
+        project_id="repo-a",
+        payload={
+            "query": "hello",
+            "user_id": "root",
+            "app_id": "app-a",
+            "filters": {"topic": "scope-test"},
+        },
+    )
+
+    assert result["results"] == [{"id": "mem-app-a", "memory": "hello app a"}]
+    assert service.mem0.search_payloads[0]["filters"] == {
+        "topic": "scope-test",
+        SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+        SIDECAR_APP_ID_METADATA_KEY: "app-a",
+    }
+
+
+@pytest.mark.asyncio
+async def test_memory_service_get_memory_uses_project_index(
+    db_session,
+) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",
         name="Repo A",
@@ -219,7 +380,7 @@ async def test_memory_service_delete_uses_projection_scope_for_event_request(
 
 
 @pytest.mark.asyncio
-async def test_memory_service_delete_rejects_unknown_project_projection_without_remote_delete(
+async def test_memory_service_delete_rejects_unknown_project_without_remote_delete(
     db_session,
 ) -> None:
     ProjectRepository(db_session).upsert_default_project(
@@ -251,7 +412,7 @@ async def test_memory_service_delete_rejects_unknown_project_projection_without_
 
 
 @pytest.mark.asyncio
-async def test_memory_service_delete_rejects_tombstoned_projection_without_remote_delete(
+async def test_memory_service_delete_rejects_tombstoned_memory_without_remote_delete(
     db_session,
 ) -> None:
     ProjectRepository(db_session).upsert_default_project(
@@ -282,7 +443,9 @@ async def test_memory_service_delete_rejects_tombstoned_projection_without_remot
 
 
 @pytest.mark.asyncio
-async def test_memory_service_add_commits_failed_event_before_reraising(db_session) -> None:
+async def test_memory_service_add_persists_failed_event_before_reraising(
+    db_session,
+) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",
         name="Repo A",
@@ -304,7 +467,9 @@ async def test_memory_service_add_commits_failed_event_before_reraising(db_sessi
             project_id="repo-a",
             mem0_memory_id="mem-1",
         ).one_or_none()
-        failed_event = EventRepository(verification_session).list_project_events("repo-a")
+        failed_event = EventRepository(
+            verification_session
+        ).list_project_events("repo-a")
 
     assert event is None
     assert len(failed_event) == 1
@@ -312,7 +477,9 @@ async def test_memory_service_add_commits_failed_event_before_reraising(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_memory_service_delete_commits_failed_event_before_reraising(db_session) -> None:
+async def test_memory_service_delete_persists_failed_event_before_reraising(
+    db_session,
+) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",
         name="Repo A",
@@ -341,7 +508,9 @@ async def test_memory_service_delete_commits_failed_event_before_reraising(db_se
             project_id="repo-a",
             mem0_memory_id="mem-1",
         )
-        failed_event = EventRepository(verification_session).list_project_events("repo-a")
+        failed_event = EventRepository(
+            verification_session
+        ).list_project_events("repo-a")
 
     assert memory is not None
     assert len(failed_event) == 1
