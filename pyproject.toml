@@ -32,6 +32,9 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+markers = [
+  "e2e: tests that require a live Mem0 OSS-compatible REST service",
+]
 
 [tool.ruff]
 line-length = 88
