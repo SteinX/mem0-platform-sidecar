@@ -153,13 +153,15 @@ class MemoryIndexRepository:
         *,
         project_id: str,
         mem0_memory_id: str,
+        include_deleted: bool = False,
     ) -> MemoryIndex | None:
-        return self.session.scalar(
-            select(MemoryIndex).where(
+        statement = select(MemoryIndex).where(
                 MemoryIndex.project_id == project_id,
                 MemoryIndex.mem0_memory_id == mem0_memory_id,
             )
-        )
+        if not include_deleted:
+            statement = statement.where(MemoryIndex.deleted_at.is_(None))
+        return self.session.scalar(statement)
 
     def upsert_memory(
         self,

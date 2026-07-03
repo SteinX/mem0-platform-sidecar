@@ -143,7 +143,12 @@ class MemoryService:
         oss_payload.update(scope.as_filter_dict())
         return await self.mem0.search_memories(oss_payload)
 
-    async def get_memory(self, *, memory_id: str) -> dict[str, Any]:
+    async def get_memory(self, *, project_id: str, memory_id: str) -> dict[str, Any]:
+        memory_repo = MemoryIndexRepository(self.session)
+        memory = memory_repo.get_memory(project_id=project_id, mem0_memory_id=memory_id)
+        if memory is None:
+            raise KeyError(memory_id)
+
         return await self.mem0.get_memory(memory_id)
 
     async def delete_memory(

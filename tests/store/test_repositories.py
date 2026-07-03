@@ -167,3 +167,65 @@ def test_memory_index_repository_get_memory_scopes_by_project(db_session) -> Non
     assert memory is not None
     assert memory.user_id == "bob"
     assert memory.app_id == "repo-b"
+
+
+def test_memory_index_repository_get_memory_ignores_deleted_by_default(db_session) -> None:
+    project_repo = ProjectRepository(db_session)
+    memory_repo = MemoryIndexRepository(db_session)
+
+    project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    memory_repo.upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        user_id="alice",
+        app_id="repo-a",
+        category="decision",
+        metadata={"project": "repo-a"},
+    )
+    memory_repo.delete_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+    )
+
+    assert (
+        memory_repo.get_memory(project_id="repo-a", mem0_memory_id="mem-1")
+        is None
+    )
+
+
+def test_memory_index_repository_get_memory_can_include_deleted_rows(
+    db_session,
+) -> None:
+    project_repo = ProjectRepository(db_session)
+    memory_repo = MemoryIndexRepository(db_session)
+
+    project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    memory_repo.upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        user_id="alice",
+        app_id="repo-a",
+        category="decision",
+        metadata={"project": "repo-a"},
+    )
+    memory_repo.delete_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+    )
+
+    memory = memory_repo.get_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        include_deleted=True,
+    )
+
+    assert memory is not None
+    assert memory.deleted_at is not None
