@@ -170,3 +170,76 @@ Results:
 
 - `8 passed`
 - `39 passed`
+
+## Task 4 Final Review Fixes
+
+This pass addressed the final review findings around event read boundaries and failed-event durability.
+
+### RED
+
+Added coverage first in:
+
+- `tests/store/test_repositories.py`
+- `tests/core/test_events.py`
+- `tests/core/test_memory_ops.py`
+- `tests/http_adapter/test_memory_routes.py`
+
+Red command:
+
+```bash
+python -m pytest tests/core/test_events.py tests/core/test_memory_ops.py tests/store/test_repositories.py tests/http_adapter/test_memory_routes.py -v
+```
+
+Observed expected failures before the fix:
+
+- `EventRepository` had no project-scoped event list/get methods
+- `EventService` had no project-scoped serialized list/get methods
+- `GET /v1/events?project_id=repo-z` bootstrapped `repo-z` as a side effect
+
+### GREEN
+
+Implemented the fix by:
+
+- adding `EventRepository.list_project_events(...)` and `get_project_event(...)`
+- moving event JSON decoding into `EventService`
+- making `MemoryService.add_memory()` and `delete_memory()` commit after `mark_failed(...)` before re-raising
+- changing `memory_routes.py` failure handling to `rollback()` instead of broad `commit()` paths
+- routing event read endpoints through `EventService` without auto-creating projects
+
+Green command:
+
+```bash
+python -m pytest tests/core/test_events.py tests/core/test_memory_ops.py tests/store/test_repositories.py tests/http_adapter/test_memory_routes.py -v
+```
+
+Result:
+
+- `25 passed`
+
+### Required Verification
+
+Commands run:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py tests/http_adapter/test_health.py -v
+python -m pytest tests/core/test_events.py tests/core/test_memory_ops.py tests/store/test_repositories.py -v
+python -m pytest -v
+```
+
+Results:
+
+- `9 passed`
+- `19 passed`
+- `44 passed`
+
+## Files Changed In Final Review Pass
+
+- `src/mem0_sidecar/core/events.py`
+- `src/mem0_sidecar/core/memory_ops.py`
+- `src/mem0_sidecar/store/repositories.py`
+- `src/mem0_sidecar/http_adapter/memory_routes.py`
+- `src/mem0_sidecar/http_adapter/event_routes.py`
+- `tests/core/test_events.py`
+- `tests/core/test_memory_ops.py`
+- `tests/store/test_repositories.py`
+- `tests/http_adapter/test_memory_routes.py`

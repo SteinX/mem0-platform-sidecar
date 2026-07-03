@@ -124,6 +124,7 @@ class MemoryService:
             return {"memory": memory_response, "event": _event_payload(event)}
         except Exception as exc:
             event_repo.mark_failed(event.id, error={"message": str(exc)})
+            self.session.commit()
             raise
 
     async def search_memories(
@@ -176,6 +177,7 @@ class MemoryService:
                 event.id,
                 error={"message": f"Memory {memory_id!r} not found for project {project_id!r}"},
             )
+            self.session.commit()
             raise KeyError(memory_id)
 
         event_repo = EventRepository(self.session)
@@ -200,4 +202,5 @@ class MemoryService:
             return {"memory": response, "event": _event_payload(event)}
         except Exception as exc:
             event_repo.mark_failed(event.id, error={"message": str(exc)})
+            self.session.commit()
             raise

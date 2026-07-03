@@ -22,11 +22,11 @@ async def add_memory(
     session: Session = Depends(get_session),
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
+    project_id = resolve_project_id(request, payload)
+    ensure_project(session, request.app.state.settings, project_id)
+    session.commit()
+    service = MemoryService(session=session, mem0=mem0)
     try:
-        project_id = resolve_project_id(request, payload)
-        ensure_project(session, request.app.state.settings, project_id)
-        session.commit()
-        service = MemoryService(session=session, mem0=mem0)
         result = await service.add_memory(
             project_id=project_id,
             payload=normalized_payload_for_project(request, payload),
@@ -34,7 +34,7 @@ async def add_memory(
         session.commit()
         return result
     except Exception:
-        session.commit()
+        session.rollback()
         raise
 
 
@@ -64,16 +64,17 @@ async def get_memory(
     session: Session = Depends(get_session),
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
+    project_id = resolve_project_id(request)
+    ensure_project(session, request.app.state.settings, project_id)
+    session.commit()
+    service = MemoryService(session=session, mem0=mem0)
     try:
-        project_id = resolve_project_id(request)
-        ensure_project(session, request.app.state.settings, project_id)
-        session.commit()
-        service = MemoryService(session=session, mem0=mem0)
         return await service.get_memory(
             project_id=project_id,
             memory_id=memory_id,
         )
     except KeyError as exc:
+        session.rollback()
         raise HTTPException(status_code=404, detail="Memory not found") from exc
 
 
@@ -85,11 +86,11 @@ async def delete_memory(
     session: Session = Depends(get_session),
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
+    project_id = resolve_project_id(request)
+    ensure_project(session, request.app.state.settings, project_id)
+    session.commit()
+    service = MemoryService(session=session, mem0=mem0)
     try:
-        project_id = resolve_project_id(request)
-        ensure_project(session, request.app.state.settings, project_id)
-        session.commit()
-        service = MemoryService(session=session, mem0=mem0)
         result = await service.delete_memory(
             project_id=project_id,
             memory_id=memory_id,
@@ -97,8 +98,8 @@ async def delete_memory(
         session.commit()
         return result
     except KeyError as exc:
-        session.commit()
+        session.rollback()
         raise HTTPException(status_code=404, detail="Memory not found") from exc
     except Exception:
-        session.commit()
+        session.rollback()
         raise

@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 import pytest
+from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.memory_ops import MemoryService, extract_memory_id
 from mem0_sidecar.store.models import EventStatus, MemoryIndex
@@ -35,6 +36,18 @@ class FakeMem0Client:
     async def delete_memory(self, memory_id: str) -> dict[str, Any]:
         self.deleted_ids.append(memory_id)
         return {"message": "Deleted"}
+
+
+class FailingAddMem0Client(FakeMem0Client):
+    async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.add_payloads.append(payload)
+        raise RuntimeError("boom")
+
+
+class FailingDeleteMem0Client(FakeMem0Client):
+    async def delete_memory(self, memory_id: str) -> dict[str, Any]:
+        self.deleted_ids.append(memory_id)
+        raise RuntimeError("boom")
 
 
 def test_extract_memory_id_accepts_common_shapes() -> None:
@@ -266,3 +279,70 @@ async def test_memory_service_delete_rejects_tombstoned_projection_without_remot
         await service.delete_memory(project_id="repo-a", memory_id="mem-1")
 
     assert mem0.deleted_ids == []
+
+
+@pytest.mark.asyncio
+async def test_memory_service_add_commits_failed_event_before_reraising(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+
+    service = MemoryService(session=db_session, mem0=FailingAddMem0Client())
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await service.add_memory(
+            project_id="repo-a",
+            payload={"text": "hello", "user_id": "root"},
+        )
+
+    db_session.rollback()
+
+    with Session(db_session.get_bind()) as verification_session:
+        event = verification_session.query(MemoryIndex).filter_by(
+            project_id="repo-a",
+            mem0_memory_id="mem-1",
+        ).one_or_none()
+        failed_event = EventRepository(verification_session).list_project_events("repo-a")
+
+    assert event is None
+    assert len(failed_event) == 1
+    assert failed_event[0].status is EventStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_memory_service_delete_commits_failed_event_before_reraising(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        user_id="alice",
+        agent_id="codex",
+        app_id="repo-a",
+        run_id=None,
+        category=None,
+        metadata={},
+    )
+
+    service = MemoryService(session=db_session, mem0=FailingDeleteMem0Client())
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await service.delete_memory(project_id="repo-a", memory_id="mem-1")
+
+    db_session.rollback()
+
+    with Session(db_session.get_bind()) as verification_session:
+        memory = MemoryIndexRepository(verification_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="mem-1",
+        )
+        failed_event = EventRepository(verification_session).list_project_events("repo-a")
+
+    assert memory is not None
+    assert len(failed_event) == 1
+    assert failed_event[0].status is EventStatus.FAILED

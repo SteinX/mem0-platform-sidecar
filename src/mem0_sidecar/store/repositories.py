@@ -127,6 +127,23 @@ class EventRepository:
             raise KeyError(event_id)
         return event
 
+    def list_project_events(self, project_id: str) -> list[Event]:
+        return list(
+            self.session.scalars(
+                select(Event)
+                .where(Event.project_id == project_id)
+                .order_by(Event.created_at, Event.id)
+            )
+        )
+
+    def get_project_event(self, project_id: str, event_id: str) -> Event:
+        event = self.session.scalar(
+            select(Event).where(Event.project_id == project_id, Event.id == event_id)
+        )
+        if event is None:
+            raise KeyError(event_id)
+        return event
+
     def mark_succeeded(self, event_id: str, *, response: dict[str, Any]) -> Event:
         event = self.get(event_id)
         event.status = EventStatus.SUCCEEDED

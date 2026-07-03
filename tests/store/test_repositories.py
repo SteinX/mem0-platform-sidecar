@@ -1,3 +1,5 @@
+import pytest
+
 from mem0_sidecar.store.models import EventStatus, JobStatus
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
@@ -229,3 +231,48 @@ def test_memory_index_repository_get_memory_can_include_deleted_rows(
 
     assert memory is not None
     assert memory.deleted_at is not None
+
+
+def test_event_repository_lists_and_gets_events_scoped_to_project(db_session) -> None:
+    project_repo = ProjectRepository(db_session)
+    event_repo = EventRepository(db_session)
+
+    project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    project_repo.upsert_default_project(
+        project_id="repo-b",
+        name="Repo B",
+        mem0_base_url="http://mem0:8000",
+    )
+
+    visible = event_repo.create_event(
+        project_id="repo-a",
+        operation="memory.add",
+        request={"text": "visible"},
+        subject_type="memory",
+        subject_id="mem-a",
+    )
+    event_repo.mark_succeeded(visible.id, response={"id": "mem-a"})
+
+    hidden = event_repo.create_event(
+        project_id="repo-b",
+        operation="memory.add",
+        request={"text": "hidden"},
+        subject_type="memory",
+        subject_id="mem-b",
+    )
+    event_repo.mark_succeeded(hidden.id, response={"id": "mem-b"})
+    db_session.commit()
+
+    listed = event_repo.list_project_events("repo-a")
+    fetched = event_repo.get_project_event("repo-a", visible.id)
+
+    assert [event.id for event in listed] == [visible.id]
+    assert fetched.id == visible.id
+    assert fetched.project_id == "repo-a"
+
+    with pytest.raises(KeyError):
+        event_repo.get_project_event("repo-a", hidden.id)

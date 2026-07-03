@@ -224,6 +224,28 @@ def test_route_scoped_requests_bootstrap_non_default_project_and_normalize_app_i
     assert project_c.mem0_base_url == "http://mem0.local"
 
 
+def test_event_list_does_not_bootstrap_non_default_project_on_read(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=FakeMem0Client(),
+    )
+    client = TestClient(app)
+
+    response = client.get("/v1/events?project_id=repo-z")
+
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+
+    with app.state.session_factory() as session:
+        project_z = session.scalar(select(Project).where(Project.id == "repo-z"))
+
+    assert project_z is None
+
+
 def test_route_scoped_requests_reject_conflicting_project_scope(tmp_path) -> None:
     app = create_app(
         settings=SidecarSettings(
