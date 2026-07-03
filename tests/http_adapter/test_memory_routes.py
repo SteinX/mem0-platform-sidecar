@@ -264,6 +264,39 @@ def test_route_scoped_add_preserves_explicit_app_id_and_uses_project_scope(
     assert event is not None
 
 
+def test_route_scoped_add_preserves_query_app_id_and_bootstraps_default_app_id(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/v3/memories/add/?project_id=repo-a&app_id=app-x",
+        json={
+            "text": "hello",
+            "user_id": "root",
+        },
+    )
+
+    assert response.status_code == 200
+    assert mem0.add_payloads[0]["app_id"] == "app-x"
+    assert "project_id" not in mem0.add_payloads[0]
+
+    with app.state.session_factory() as session:
+        project_a = session.scalar(select(Project).where(Project.id == "repo-a"))
+
+    assert project_a is not None
+    assert project_a.default_app_id == "app-x"
+
+
 def test_route_scoped_search_preserves_explicit_app_id_without_bootstrapping_project(
     tmp_path,
 ) -> None:
@@ -286,6 +319,35 @@ def test_route_scoped_search_preserves_explicit_app_id_without_bootstrapping_pro
             "project_id": "repo-a",
             "app_id": "app-x",
         },
+    )
+
+    assert response.status_code == 200
+    assert mem0.search_payloads[0]["app_id"] == "app-x"
+    assert "project_id" not in mem0.search_payloads[0]
+
+    with app.state.session_factory() as session:
+        project_a = session.scalar(select(Project).where(Project.id == "repo-a"))
+
+    assert project_a is None
+
+
+def test_route_scoped_search_preserves_query_app_id_without_bootstrapping_project(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/v3/memories/search/?project_id=repo-a&app_id=app-x",
+        json={"query": "hello", "user_id": "root"},
     )
 
     assert response.status_code == 200

@@ -7,6 +7,7 @@ from mem0_sidecar.core.memory_ops import MemoryService
 from mem0_sidecar.http_adapter.dependencies import get_mem0_client, get_session
 from mem0_sidecar.http_adapter.project_scope import (
     ensure_project,
+    resolve_app_id,
     normalized_payload_for_project,
     resolve_project_id,
 )
@@ -23,7 +24,12 @@ async def add_memory(
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request, payload)
-    ensure_project(session, request.app.state.settings, project_id)
+    ensure_project(
+        session,
+        request.app.state.settings,
+        project_id,
+        default_app_id=resolve_app_id(request, payload),
+    )
     session.commit()
     service = MemoryService(session=session, mem0=mem0)
     try:

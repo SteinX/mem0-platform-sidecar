@@ -218,6 +218,49 @@ Result:
 
 ### Required Verification
 
+## Re-review Follow-up: Query App Scope Preservation
+
+This pass fixed the final re-review findings around query-supplied `app_id` and project bootstrap defaults.
+
+### RED
+
+Added regression coverage first in `tests/http_adapter/test_memory_routes.py` and ran:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py -v
+```
+
+Observed expected failures before the fix:
+
+- `POST /v3/memories/add/?project_id=repo-a&app_id=app-x` forwarded `app_id=repo-a` instead of preserving `app-x`
+- `POST /v3/memories/search/?project_id=repo-a&app_id=app-x` forwarded `app_id=repo-a` instead of preserving `app-x`
+
+### GREEN
+
+Implemented the route-scope fix by:
+
+- preserving query-supplied `app_id` in the payload forwarded to `MemoryService`
+- passing resolved `default_app_id` into `ensure_project(...)` for mutating routes
+- leaving search read-only and without project bootstrap side effects
+
+### Verification
+
+Ran:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py -v
+python -m pytest tests/http_adapter/test_memory_routes.py tests/store/test_repositories.py -v
+python -m pytest tests/http_adapter/test_memory_routes.py tests/http_adapter/test_health.py -v
+python -m pytest -v
+```
+
+Results:
+
+- `12 passed`
+- `22 passed`
+- `15 passed`
+- `53 passed`
+
 See the scope semantics fix below.
 
 ## Task 4 Scope Semantics Review Fix
