@@ -2,25 +2,28 @@
 
 ### What you implemented
 
-- Updated `src/mem0_sidecar/core/memory_ops.py` so `MemoryService.add_memory(...)` records the normalized outbound payload in the durable event request, `search_memories(...)` preserves the normalized scope, `get_memory(...)` stays a passthrough, and `delete_memory(...)` now marks projection deletion through `MemoryIndexRepository`.
-- Added `MemoryIndexRepository.delete_memory(...)` in `src/mem0_sidecar/store/repositories.py` to keep the core service behind the repository boundary.
-- Expanded `tests/core/test_memory_ops.py` to cover normalized event payloads, normalized search scope, `get_memory(...)` passthrough, and repository-bound delete behavior.
-- Added `tests/store/test_repositories.py` coverage for the new repository delete method.
+- Updated `src/mem0_sidecar/store/repositories.py` with `MemoryIndexRepository.get_memory(...)` so the core service can prove local ownership before delete.
+- Updated `src/mem0_sidecar/core/memory_ops.py` so `MemoryService.delete_memory(...)` now:
+  - loads the local projection first,
+  - builds the durable `memory.delete` request from the projection scope when it exists,
+  - creates a failed durable event and raises before any remote delete when the projection is missing for the project,
+  - calls the remote Mem0 delete only after ownership is established,
+  - then marks the local projection deleted.
+- Expanded core and repository tests to cover the projection lookup, scope-preserving delete request, and wrong-project rejection without remote delete.
 
 ### Test commands and results
 
 - Focused RED:
   - `python -m pytest tests/core/test_memory_ops.py -v`
-  - Result: failed on the new assertions for `event.request_json["app_id"]` and the repository-bound delete call.
+  - `python -m pytest tests/store/test_repositories.py -v`
+  - Result: the new delete-scope assertions failed and `MemoryIndexRepository.get_memory(...)` was missing.
 - Focused GREEN:
   - `python -m pytest tests/core/test_memory_ops.py -v`
-  - Result: `5 passed in 0.08s`
-- Repository focused:
   - `python -m pytest tests/store/test_repositories.py -v`
-  - Result: `3 passed in 0.07s`
+  - Result: `6 passed` and `4 passed`
 - Full suite:
   - `python -m pytest -v`
-  - Result: `26 passed, 1 warning in 3.25s`
+  - Result: `28 passed, 1 warning in 2.89s`
 
 ### TDD Evidence
 
@@ -31,29 +34,27 @@
 - Relevant output:
 
 ```text
-FAILED tests/core/test_memory_ops.py::test_memory_service_adds_memory_indexes_projection_and_event
-E       KeyError: 'app_id'
-FAILED tests/core/test_memory_ops.py::test_memory_service_delete_uses_memory_index_repository
-E       AssertionError: assert [] == [('repo-a', 'mem-1')]
+FAILED tests/core/test_memory_ops.py::test_memory_service_delete_uses_projection_scope_for_event_request
+E       AssertionError: assert {'memory_id': 'mem-1'} == {'agent_id': 'codex', ...}
+FAILED tests/core/test_memory_ops.py::test_memory_service_delete_rejects_unknown_project_projection_without_remote_delete
+E       Failed: DID NOT RAISE any of (<class 'KeyError'>, <class 'ValueError'>)
 ```
 
 - Why expected:
-  - The first failure showed the durable event still stored the raw caller payload.
-  - The second failure showed delete still bypassed the repository boundary.
+  - Delete was still building the event request from only `memory_id`.
+  - Delete still called the remote Mem0 client even when the memory belonged to a different project.
 
 #### GREEN command + passing output
 
 - Command:
   - `python -m pytest tests/core/test_memory_ops.py -v`
+  - `python -m pytest tests/store/test_repositories.py -v`
 - Passing output:
 
 ```text
-tests/core/test_memory_ops.py::test_extract_memory_id_accepts_common_shapes PASSED
-tests/core/test_memory_ops.py::test_memory_service_adds_memory_indexes_projection_and_event PASSED
-tests/core/test_memory_ops.py::test_memory_service_search_memories_preserves_normalized_scope PASSED
-tests/core/test_memory_ops.py::test_memory_service_get_memory_passthrough PASSED
-tests/core/test_memory_ops.py::test_memory_service_delete_uses_memory_index_repository PASSED
-============================== 5 passed in 0.08s ===============================
+tests/core/test_memory_ops.py::test_memory_service_delete_uses_projection_scope_for_event_request PASSED
+tests/core/test_memory_ops.py::test_memory_service_delete_rejects_unknown_project_projection_without_remote_delete PASSED
+tests/store/test_repositories.py::test_memory_index_repository_get_memory_scopes_by_project PASSED
 ```
 
 ### Files changed
@@ -66,11 +67,10 @@ tests/core/test_memory_ops.py::test_memory_service_delete_uses_memory_index_repo
 
 ### Self-review findings
 
-- Kept implementation within the task-owned production file.
-- Used existing repositories and helpers instead of adding new persistence paths.
-- Confirmed mutating operations persist durable events and keep `app_id` set to the project when absent.
-- Confirmed the service talks to the Mem0 client only and does not patch OSS internals or write to the OSS DB.
+- The service now stays inside the repository boundary for ownership checks.
+- The remote delete path is no longer reachable for a wrong-project memory id.
+- The durable delete request carries the projection scope fields that are available locally.
 
 ### Concerns, if any
 
-- Full suite passes, but it still reports one pre-existing deprecation warning from `fastapi.testclient`/`starlette` using legacy `httpx` integration.
+- One existing deprecation warning remains from `fastapi.testclient` / `starlette` using legacy `httpx` integration.

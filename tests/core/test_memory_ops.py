@@ -116,36 +116,68 @@ async def test_memory_service_get_memory_passthrough(db_session) -> None:
 
 
 @pytest.mark.asyncio
-async def test_memory_service_delete_uses_memory_index_repository(db_session, monkeypatch) -> None:
+async def test_memory_service_delete_uses_projection_scope_for_event_request(
+    db_session,
+) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",
         name="Repo A",
         mem0_base_url="http://mem0:8000",
+        default_user_id="root",
+        default_agent_id="codex",
     )
     MemoryIndexRepository(db_session).upsert_memory(
         project_id="repo-a",
         mem0_memory_id="mem-1",
         user_id="root",
+        agent_id="codex",
         app_id="repo-a",
+        run_id="session-1",
         category=None,
         metadata={},
     )
-
-    delete_calls: list[tuple[str, str]] = []
-
-    class RecordingMemoryIndexRepository:
-        def __init__(self, session) -> None:
-            self.session = session
-
-        def delete_memory(self, *, project_id: str, mem0_memory_id: str) -> None:
-            delete_calls.append((project_id, mem0_memory_id))
-
-    from mem0_sidecar.core import memory_ops
-
-    monkeypatch.setattr(memory_ops, "MemoryIndexRepository", RecordingMemoryIndexRepository)
 
     service = MemoryService(session=db_session, mem0=FakeMem0Client())
     result = await service.delete_memory(project_id="repo-a", memory_id="mem-1")
 
     assert result["memory"]["message"] == "Deleted"
-    assert delete_calls == [("repo-a", "mem-1")]
+    event = EventRepository(db_session).get(result["event"]["id"])
+    assert json.loads(event.request_json) == {
+        "memory_id": "mem-1",
+        "user_id": "root",
+        "agent_id": "codex",
+        "app_id": "repo-a",
+        "run_id": "session-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_memory_service_delete_rejects_unknown_project_projection_without_remote_delete(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-b",
+        name="Repo B",
+        mem0_base_url="http://mem0:8000",
+    )
+    MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-b",
+        mem0_memory_id="mem-1",
+        user_id="alice",
+        app_id="repo-b",
+        category=None,
+        metadata={},
+    )
+
+    mem0 = FakeMem0Client()
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    with pytest.raises((KeyError, ValueError)):
+        await service.delete_memory(project_id="repo-a", memory_id="mem-1")
+
+    assert mem0.deleted_ids == []

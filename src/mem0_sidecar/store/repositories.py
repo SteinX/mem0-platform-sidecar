@@ -148,6 +148,19 @@ class MemoryIndexRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
+    def get_memory(
+        self,
+        *,
+        project_id: str,
+        mem0_memory_id: str,
+    ) -> MemoryIndex | None:
+        return self.session.scalar(
+            select(MemoryIndex).where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.mem0_memory_id == mem0_memory_id,
+            )
+        )
+
     def upsert_memory(
         self,
         *,
@@ -186,12 +199,7 @@ class MemoryIndexRepository:
         project_id: str,
         mem0_memory_id: str,
     ) -> MemoryIndex | None:
-        memory = self.session.scalar(
-            select(MemoryIndex).where(
-                MemoryIndex.project_id == project_id,
-                MemoryIndex.mem0_memory_id == mem0_memory_id,
-            )
-        )
+        memory = self.get_memory(project_id=project_id, mem0_memory_id=mem0_memory_id)
         if memory is None:
             return None
 

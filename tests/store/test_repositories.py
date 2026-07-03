@@ -130,3 +130,40 @@ def test_memory_index_repository_marks_memory_deleted(db_session) -> None:
 
     assert deleted is not None
     assert deleted.deleted_at is not None
+
+
+def test_memory_index_repository_get_memory_scopes_by_project(db_session) -> None:
+    project_repo = ProjectRepository(db_session)
+    memory_repo = MemoryIndexRepository(db_session)
+
+    project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    project_repo.upsert_default_project(
+        project_id="repo-b",
+        name="Repo B",
+        mem0_base_url="http://mem0:8000",
+    )
+    memory_repo.upsert_memory(
+        project_id="repo-b",
+        mem0_memory_id="mem-shared",
+        user_id="bob",
+        app_id="repo-b",
+        category="incident",
+        metadata={"project": "repo-b"},
+    )
+
+    assert memory_repo.get_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-shared",
+    ) is None
+    memory = memory_repo.get_memory(
+        project_id="repo-b",
+        mem0_memory_id="mem-shared",
+    )
+
+    assert memory is not None
+    assert memory.user_id == "bob"
+    assert memory.app_id == "repo-b"

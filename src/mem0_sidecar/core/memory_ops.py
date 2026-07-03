@@ -36,6 +36,34 @@ def _event_payload(event: Any) -> dict[str, Any]:
     }
 
 
+def _memory_delete_request(
+    *,
+    project_id: str,
+    memory_id: str,
+    memory: MemoryIndex | None,
+) -> dict[str, Any]:
+    if memory is None:
+        scope = normalize_scope(
+            project_id=project_id,
+            user_id=None,
+            app_id=None,
+            agent_id=None,
+            run_id=None,
+        )
+        request = {"memory_id": memory_id}
+        request.update(scope.as_filter_dict())
+        return request
+
+    request = {
+        "memory_id": memory.mem0_memory_id,
+        "user_id": memory.user_id,
+        "agent_id": memory.agent_id,
+        "app_id": memory.app_id,
+        "run_id": memory.run_id,
+    }
+    return {key: value for key, value in request.items() if value}
+
+
 class MemoryService:
     def __init__(self, *, session: Session, mem0: Any) -> None:
         self.session = session
@@ -124,17 +152,42 @@ class MemoryService:
         project_id: str,
         memory_id: str,
     ) -> dict[str, Any]:
+        memory_repo = MemoryIndexRepository(self.session)
+        memory = memory_repo.get_memory(project_id=project_id, mem0_memory_id=memory_id)
+        if memory is None:
+            event_repo = EventRepository(self.session)
+            event = event_repo.create_event(
+                project_id=project_id,
+                operation="memory.delete",
+                request=_memory_delete_request(
+                    project_id=project_id,
+                    memory_id=memory_id,
+                    memory=None,
+                ),
+                subject_type="memory",
+                subject_id=memory_id,
+            )
+            event_repo.mark_failed(
+                event.id,
+                error={"message": f"Memory {memory_id!r} not found for project {project_id!r}"},
+            )
+            raise KeyError(memory_id)
+
         event_repo = EventRepository(self.session)
         event = event_repo.create_event(
             project_id=project_id,
             operation="memory.delete",
-            request={"memory_id": memory_id},
+            request=_memory_delete_request(
+                project_id=project_id,
+                memory_id=memory_id,
+                memory=memory,
+            ),
             subject_type="memory",
             subject_id=memory_id,
         )
         try:
             response = await self.mem0.delete_memory(memory_id)
-            MemoryIndexRepository(self.session).delete_memory(
+            memory_repo.delete_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,
             )
