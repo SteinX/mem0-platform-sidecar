@@ -5,11 +5,14 @@ from mem0_sidecar.mem0_client.client import Mem0RestClient
 
 
 @pytest.mark.asyncio
-async def test_mem0_client_posts_add_memory_payload() -> None:
+async def test_mem0_client_posts_add_memory_payload_with_text_translation() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/memories/"
-        assert request.headers["authorization"] == "Bearer local-key"
-        assert request.read() == b'{"text":"hello"}'
+        assert request.url.path == "/memories"
+        assert request.headers["x-api-key"] == "local-key"
+        assert request.read() == (
+            b'{"text":"hello","user_id":"root","metadata":{"source":"route"},'
+            b'"messages":[{"role":"user","content":"hello"}]}'
+        )
         return httpx.Response(200, json={"id": "mem-1"})
 
     transport = httpx.MockTransport(handler)
@@ -19,16 +22,45 @@ async def test_mem0_client_posts_add_memory_payload() -> None:
         transport=transport,
     )
 
-    result = await client.add_memory({"text": "hello"})
+    result = await client.add_memory(
+        {
+            "text": "hello",
+            "user_id": "root",
+            "metadata": {"source": "route"},
+        }
+    )
 
     assert result == {"id": "mem-1"}
 
 
 @pytest.mark.asyncio
+async def test_mem0_client_posts_add_memory_payload_with_memory_fallback() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/memories"
+        assert request.headers["x-api-key"] == "local-key"
+        assert request.read() == (
+            b'{"memory":"remember this","scope":"project",'
+            b'"messages":[{"role":"user","content":"remember this"}]}'
+        )
+        return httpx.Response(200, json={"id": "mem-2"})
+
+    transport = httpx.MockTransport(handler)
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        api_key="local-key",
+        transport=transport,
+    )
+
+    result = await client.add_memory({"memory": "remember this", "scope": "project"})
+
+    assert result == {"id": "mem-2"}
+
+
+@pytest.mark.asyncio
 async def test_mem0_client_posts_search_memory_payload() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/memories/search/"
-        assert request.headers["authorization"] == "Bearer local-key"
+        assert request.url.path == "/search"
+        assert request.headers["x-api-key"] == "local-key"
         assert request.read() == b'{"query":"hello","user_id":"root"}'
         return httpx.Response(200, json={"results": [{"id": "mem-1"}]})
 
@@ -48,7 +80,7 @@ async def test_mem0_client_posts_search_memory_payload() -> None:
 async def test_mem0_client_gets_memory_by_id() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
-        assert request.url.path == "/v1/memories/mem-1/"
+        assert request.url.path == "/memories/mem-1"
         return httpx.Response(200, json={"id": "mem-1", "memory": "hello"})
 
     client = Mem0RestClient(
@@ -65,7 +97,7 @@ async def test_mem0_client_gets_memory_by_id() -> None:
 async def test_mem0_client_deletes_memory_by_id() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "DELETE"
-        assert request.url.path == "/v1/memories/mem-1/"
+        assert request.url.path == "/memories/mem-1"
         return httpx.Response(200, json={"message": "Deleted"})
 
     client = Mem0RestClient(
@@ -74,5 +106,41 @@ async def test_mem0_client_deletes_memory_by_id() -> None:
     )
 
     result = await client.delete_memory("mem-1")
+
+    assert result == {"message": "Deleted"}
+
+
+@pytest.mark.asyncio
+async def test_mem0_client_updates_memory_by_id() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        assert request.url.path == "/memories/mem-1"
+        assert request.read() == b'{"memory":"updated"}'
+        return httpx.Response(200, json={"id": "mem-1", "memory": "updated"})
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.update_memory("mem-1", {"memory": "updated"})
+
+    assert result == {"id": "mem-1", "memory": "updated"}
+
+
+@pytest.mark.asyncio
+async def test_mem0_client_deletes_all_memories() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert request.url.path == "/memories"
+        assert request.url.params == httpx.QueryParams({"user_id": "root"})
+        return httpx.Response(200, json={"message": "Deleted"})
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.delete_all_memories({"user_id": "root"})
 
     assert result == {"message": "Deleted"}

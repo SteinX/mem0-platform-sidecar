@@ -18,7 +18,7 @@ class Mem0RestClient:
     def _headers(self) -> dict[str, str]:
         if not self.api_key:
             return {}
-        return {"Authorization": f"Bearer {self.api_key}"}
+        return {"X-API-Key": self.api_key}
 
     async def _request(
         self,
@@ -47,23 +47,32 @@ class Mem0RestClient:
             return {"results": data}
 
     async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/v1/memories/", payload=payload)
+        request_payload = dict(payload)
+        if "messages" not in request_payload:
+            content = request_payload.get("text")
+            if content is None and "memory" in request_payload:
+                content = request_payload["memory"]
+            if content is not None:
+                request_payload["messages"] = [
+                    {"role": "user", "content": content},
+                ]
+        return await self._request("POST", "/memories", payload=request_payload)
 
     async def search_memories(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/v1/memories/search/", payload=payload)
+        return await self._request("POST", "/search", payload=payload)
 
     async def get_memory(self, memory_id: str) -> dict[str, Any]:
-        return await self._request("GET", f"/v1/memories/{memory_id}/")
+        return await self._request("GET", f"/memories/{memory_id}")
 
     async def update_memory(
         self,
         memory_id: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        return await self._request("PUT", f"/v1/memories/{memory_id}/", payload=payload)
+        return await self._request("PUT", f"/memories/{memory_id}", payload=payload)
 
     async def delete_memory(self, memory_id: str) -> dict[str, Any]:
-        return await self._request("DELETE", f"/v1/memories/{memory_id}/")
+        return await self._request("DELETE", f"/memories/{memory_id}")
 
     async def delete_all_memories(self, params: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("DELETE", "/v1/memories/", params=params)
+        return await self._request("DELETE", "/memories", params=params)
