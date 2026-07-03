@@ -2,31 +2,25 @@
 
 ### What you implemented
 
-- Added `src/mem0_sidecar/core/memory_ops.py` with:
-  - `extract_memory_id(...)` handling `id`, `memory_id`, and first-result shapes
-  - `MemoryService.add_memory(...)` that:
-    - normalizes `user_id`, `agent_id`, `app_id`, and `run_id`
-    - preserves `app_id` project isolation by defaulting to `project_id`
-    - calls the Mem0 client only
-    - records a durable `memory.add` event
-    - writes a memory index projection
-    - projects the app entity
-  - `MemoryService.search_memories(...)` that forwards normalized scope filters
-  - `MemoryService.get_memory(...)` passthrough
-  - `MemoryService.delete_memory(...)` that records a durable `memory.delete` event and marks the projection deleted
-- Added `tests/core/test_memory_ops.py` covering memory-id extraction, add flow projection/event behavior, and delete tombstoning.
+- Updated `src/mem0_sidecar/core/memory_ops.py` so `MemoryService.add_memory(...)` records the normalized outbound payload in the durable event request, `search_memories(...)` preserves the normalized scope, `get_memory(...)` stays a passthrough, and `delete_memory(...)` now marks projection deletion through `MemoryIndexRepository`.
+- Added `MemoryIndexRepository.delete_memory(...)` in `src/mem0_sidecar/store/repositories.py` to keep the core service behind the repository boundary.
+- Expanded `tests/core/test_memory_ops.py` to cover normalized event payloads, normalized search scope, `get_memory(...)` passthrough, and repository-bound delete behavior.
+- Added `tests/store/test_repositories.py` coverage for the new repository delete method.
 
 ### Test commands and results
 
 - Focused RED:
   - `python -m pytest tests/core/test_memory_ops.py -v`
-  - Result: failed during collection with `ModuleNotFoundError: No module named 'mem0_sidecar.core.memory_ops'`
+  - Result: failed on the new assertions for `event.request_json["app_id"]` and the repository-bound delete call.
 - Focused GREEN:
   - `python -m pytest tests/core/test_memory_ops.py -v`
-  - Result: `3 passed in 0.25s`
+  - Result: `5 passed in 0.08s`
+- Repository focused:
+  - `python -m pytest tests/store/test_repositories.py -v`
+  - Result: `3 passed in 0.07s`
 - Full suite:
-  - `python -m pytest`
-  - Result: `23 passed, 1 warning in 1.26s`
+  - `python -m pytest -v`
+  - Result: `26 passed, 1 warning in 3.25s`
 
 ### TDD Evidence
 
@@ -37,12 +31,15 @@
 - Relevant output:
 
 ```text
-collecting ... collected 0 items / 1 error
-E   ModuleNotFoundError: No module named 'mem0_sidecar.core.memory_ops'
+FAILED tests/core/test_memory_ops.py::test_memory_service_adds_memory_indexes_projection_and_event
+E       KeyError: 'app_id'
+FAILED tests/core/test_memory_ops.py::test_memory_service_delete_uses_memory_index_repository
+E       AssertionError: assert [] == [('repo-a', 'mem-1')]
 ```
 
 - Why expected:
-  - The task required creating a new `memory_ops` module, so the test-first run should fail before implementation exists.
+  - The first failure showed the durable event still stored the raw caller payload.
+  - The second failure showed delete still bypassed the repository boundary.
 
 #### GREEN command + passing output
 
@@ -53,14 +50,18 @@ E   ModuleNotFoundError: No module named 'mem0_sidecar.core.memory_ops'
 ```text
 tests/core/test_memory_ops.py::test_extract_memory_id_accepts_common_shapes PASSED
 tests/core/test_memory_ops.py::test_memory_service_adds_memory_indexes_projection_and_event PASSED
-tests/core/test_memory_ops.py::test_memory_service_delete_marks_projection_deleted PASSED
-============================== 3 passed in 0.25s ===============================
+tests/core/test_memory_ops.py::test_memory_service_search_memories_preserves_normalized_scope PASSED
+tests/core/test_memory_ops.py::test_memory_service_get_memory_passthrough PASSED
+tests/core/test_memory_ops.py::test_memory_service_delete_uses_memory_index_repository PASSED
+============================== 5 passed in 0.08s ===============================
 ```
 
 ### Files changed
 
 - `src/mem0_sidecar/core/memory_ops.py`
+- `src/mem0_sidecar/store/repositories.py`
 - `tests/core/test_memory_ops.py`
+- `tests/store/test_repositories.py`
 - `.superpowers/sdd/task-2-report.md`
 
 ### Self-review findings

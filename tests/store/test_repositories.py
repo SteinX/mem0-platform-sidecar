@@ -102,3 +102,31 @@ def test_memory_index_repository_isolates_same_mem0_id_per_project(db_session) -
     assert memory_b.user_id == "bob"
     assert memory_b.category == "incident"
     assert memory_b.metadata_projection_json == '{"project": "repo-b"}'
+
+
+def test_memory_index_repository_marks_memory_deleted(db_session) -> None:
+    project_repo = ProjectRepository(db_session)
+    memory_repo = MemoryIndexRepository(db_session)
+
+    project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    memory_repo.upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        user_id="alice",
+        app_id="repo-a",
+        category="decision",
+        metadata={},
+    )
+
+    deleted = memory_repo.delete_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+    )
+    db_session.commit()
+
+    assert deleted is not None
+    assert deleted.deleted_at is not None

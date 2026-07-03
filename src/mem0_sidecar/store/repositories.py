@@ -180,6 +180,25 @@ class MemoryIndexRepository:
         self.session.flush()
         return memory
 
+    def delete_memory(
+        self,
+        *,
+        project_id: str,
+        mem0_memory_id: str,
+    ) -> MemoryIndex | None:
+        memory = self.session.scalar(
+            select(MemoryIndex).where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.mem0_memory_id == mem0_memory_id,
+            )
+        )
+        if memory is None:
+            return None
+
+        memory.deleted_at = _utc_now()
+        self.session.flush()
+        return memory
+
 
 class EntityRepository:
     def __init__(self, session: Session) -> None:

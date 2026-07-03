@@ -1,10 +1,16 @@
+import json
 from typing import Any
 
 import pytest
 
 from mem0_sidecar.core.memory_ops import MemoryService, extract_memory_id
 from mem0_sidecar.store.models import EventStatus, MemoryIndex
-from mem0_sidecar.store.repositories import CategoryRepository, ProjectRepository
+from mem0_sidecar.store.repositories import (
+    CategoryRepository,
+    EventRepository,
+    MemoryIndexRepository,
+    ProjectRepository,
+)
 
 
 class FakeMem0Client:
@@ -74,23 +80,72 @@ async def test_memory_service_adds_memory_indexes_projection_and_event(
     assert indexed.category == "decision"
     assert mem0.add_payloads[0]["user_id"] == "root"
     assert mem0.add_payloads[0]["app_id"] == "repo-a"
+    event = EventRepository(db_session).get(result["event"]["id"])
+    assert json.loads(event.request_json)["app_id"] == "repo-a"
 
 
 @pytest.mark.asyncio
-async def test_memory_service_delete_marks_projection_deleted(db_session) -> None:
+async def test_memory_service_search_memories_preserves_normalized_scope(
+    db_session,
+) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",
         name="Repo A",
         mem0_base_url="http://mem0:8000",
     )
-    service = MemoryService(session=db_session, mem0=FakeMem0Client())
-    await service.add_memory(project_id="repo-a", payload={"text": "delete me"})
-    result = await service.delete_memory(project_id="repo-a", memory_id="mem-1")
-    db_session.commit()
+    mem0 = FakeMem0Client()
+    service = MemoryService(session=db_session, mem0=mem0)
 
-    indexed = db_session.query(MemoryIndex).filter_by(
+    result = await service.search_memories(
+        project_id="repo-a",
+        payload={"text": "hello", "user_id": "root"},
+    )
+
+    assert result["results"][0]["id"] == "mem-1"
+    assert mem0.search_payloads[0]["user_id"] == "root"
+    assert mem0.search_payloads[0]["app_id"] == "repo-a"
+
+
+@pytest.mark.asyncio
+async def test_memory_service_get_memory_passthrough(db_session) -> None:
+    service = MemoryService(session=db_session, mem0=FakeMem0Client())
+
+    result = await service.get_memory(memory_id="mem-1")
+
+    assert result == {"id": "mem-1", "memory": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_memory_service_delete_uses_memory_index_repository(db_session, monkeypatch) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    MemoryIndexRepository(db_session).upsert_memory(
         project_id="repo-a",
         mem0_memory_id="mem-1",
-    ).one()
+        user_id="root",
+        app_id="repo-a",
+        category=None,
+        metadata={},
+    )
+
+    delete_calls: list[tuple[str, str]] = []
+
+    class RecordingMemoryIndexRepository:
+        def __init__(self, session) -> None:
+            self.session = session
+
+        def delete_memory(self, *, project_id: str, mem0_memory_id: str) -> None:
+            delete_calls.append((project_id, mem0_memory_id))
+
+    from mem0_sidecar.core import memory_ops
+
+    monkeypatch.setattr(memory_ops, "MemoryIndexRepository", RecordingMemoryIndexRepository)
+
+    service = MemoryService(session=db_session, mem0=FakeMem0Client())
+    result = await service.delete_memory(project_id="repo-a", memory_id="mem-1")
+
     assert result["memory"]["message"] == "Deleted"
-    assert indexed.deleted_at is not None
+    assert delete_calls == [("repo-a", "mem-1")]

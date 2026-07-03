@@ -1,4 +1,3 @@
-from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -70,7 +69,7 @@ class MemoryService:
         event = event_repo.create_event(
             project_id=project_id,
             operation="memory.add",
-            request=payload,
+            request=oss_payload,
             subject_type="memory",
         )
         try:
@@ -135,12 +134,10 @@ class MemoryService:
         )
         try:
             response = await self.mem0.delete_memory(memory_id)
-            indexed = self.session.query(MemoryIndex).filter_by(
+            MemoryIndexRepository(self.session).delete_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,
-            ).one_or_none()
-            if indexed is not None:
-                indexed.deleted_at = datetime.now(UTC)
+            )
             event_repo.mark_succeeded(event.id, response=response)
             return {"memory": response, "event": _event_payload(event)}
         except Exception as exc:
