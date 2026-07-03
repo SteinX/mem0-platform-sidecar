@@ -24,6 +24,16 @@ def _live_settings(tmp_path) -> SidecarSettings:
     )
 
 
+def _record_contains(record, needle: str) -> bool:
+    if isinstance(record, dict):
+        return any(_record_contains(value, needle) for value in record.values())
+    if isinstance(record, (list, tuple)):
+        return any(_record_contains(value, needle) for value in record)
+    if isinstance(record, str):
+        return needle in record
+    return record == needle
+
+
 def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
     settings = _live_settings(tmp_path)
     client = TestClient(create_app(settings=settings))
@@ -44,25 +54,38 @@ def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
     assert memory_id
     assert add_body["event"]["status"] == "SUCCEEDED"
 
-    search_response = client.post(
-        "/v3/memories/search/",
-        json={
-            "query": marker,
-            "user_id": "sidecar-e2e-user",
-            "app_id": settings.default_project_id,
-        },
-    )
-    assert search_response.status_code == 200, search_response.text
-    search_body = search_response.json()
-    assert memory_id in str(search_body) or marker in str(search_body)
+    deleted = False
+    try:
+        search_response = client.post(
+            "/v3/memories/search/",
+            json={
+                "query": marker,
+                "user_id": "sidecar-e2e-user",
+                "app_id": settings.default_project_id,
+            },
+        )
+        assert search_response.status_code == 200, search_response.text
+        search_body = search_response.json()
+        results = search_body["results"]
+        assert any(
+            _record_contains(result, memory_id) or _record_contains(result, marker)
+            for result in results
+        ), search_body
 
-    get_response = client.get(f"/v1/memories/{memory_id}/")
-    assert get_response.status_code == 200, get_response.text
-    assert get_response.json().get("id") == memory_id
+        get_response = client.get(f"/v1/memories/{memory_id}/")
+        assert get_response.status_code == 200, get_response.text
+        assert get_response.json().get("id") == memory_id
 
-    delete_response = client.delete(f"/v1/memories/{memory_id}/")
-    assert delete_response.status_code == 200, delete_response.text
-    assert delete_response.json()["event"]["status"] == "SUCCEEDED"
+        delete_response = client.delete(f"/v1/memories/{memory_id}/")
+        assert delete_response.status_code == 200, delete_response.text
+        assert delete_response.json()["event"]["status"] == "SUCCEEDED"
+        deleted = True
+    finally:
+        if not deleted:
+            try:
+                client.delete(f"/v1/memories/{memory_id}/")
+            except Exception:
+                pass
 
     events_response = client.get("/v1/events")
     assert events_response.status_code == 200, events_response.text

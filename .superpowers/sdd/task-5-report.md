@@ -46,3 +46,27 @@ Observed result:
 - `pyproject.toml`
 - `tests/e2e/test_live_mem0_oss.py`
 - `.superpowers/sdd/task-5-report.md`
+
+## Fix Note
+
+- Tightened `tests/e2e/test_live_mem0_oss.py` so the post-add flow deletes in a `finally` block if later assertions fail, while still asserting delete success on the normal path.
+- Narrowed the search assertion to inspect `search_body["results"]` records directly for the created memory id or unique marker.
+
+## Post-Fix Verification
+
+```bash
+unset MEM0_E2E_BASE_URL MEM0_E2E_API_KEY MEM0_E2E_PROJECT_ID && PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/e2e/test_live_mem0_oss.py -v -rs -p no:cacheprovider
+```
+
+Observed result:
+
+- `tests/e2e/test_live_mem0_oss.py::test_live_sidecar_add_search_get_delete_against_mem0_oss SKIPPED`
+- Skip reason: `MEM0_E2E_BASE_URL is not set`
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider
+```
+
+Observed result:
+
+- `54 passed, 1 skipped, 1 warning in 1.91s`
