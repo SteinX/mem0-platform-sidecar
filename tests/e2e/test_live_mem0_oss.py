@@ -58,6 +58,7 @@ def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
     marker = f"sidecar-e2e-{uuid4()}"
     add_body: dict[str, object] | None = None
     memory_ids: list[str] = []
+    cleanup_memory_ids: set[str] = set()
 
     try:
         add_response = client.post(
@@ -74,6 +75,7 @@ def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
         memory_ids = _extract_memory_ids(add_body["memory"])
         assert memory_ids, add_body
         assert add_body["event"]["status"] == "SUCCEEDED"
+        cleanup_memory_ids = set(memory_ids)
 
         search_response = client.post(
             "/v3/memories/search/",
@@ -100,9 +102,10 @@ def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
             delete_response = client.delete(f"/v1/memories/{memory_id}/")
             assert delete_response.status_code == 200, delete_response.text
             assert delete_response.json()["event"]["status"] == "SUCCEEDED"
+            cleanup_memory_ids.discard(memory_id)
     finally:
         if add_body is not None:
-            for memory_id in memory_ids:
+            for memory_id in cleanup_memory_ids:
                 try:
                     client.delete(f"/v1/memories/{memory_id}/")
                 except Exception:

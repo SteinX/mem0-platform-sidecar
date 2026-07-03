@@ -27,3 +27,8 @@
    - Result: `57 passed, 1 skipped, 1 warning in 1.74s`
 3. `python -m ruff check . --no-cache`
    - Result: `All checks passed!`
+
+### Follow-up note
+
+- Updated `tests/e2e/test_live_mem0_oss.py` so the live E2E only retries deletes
+  for memory IDs that were not already deleted during the success path.
