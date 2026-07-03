@@ -1,9 +1,12 @@
 from typing import Any
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.http_adapter.app import create_app
+from mem0_sidecar.store.models import Event, EventStatus
+from mem0_sidecar.store.repositories import EventRepository, ProjectRepository
 
 
 class FakeMem0Client:
@@ -28,6 +31,12 @@ class FakeMem0Client:
     async def delete_memory(self, memory_id: str) -> dict[str, Any]:
         self.deleted_ids.append(memory_id)
         return {"message": f"Deleted {memory_id}"}
+
+
+class FailingAddMem0Client(FakeMem0Client):
+    async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.add_payloads.append(payload)
+        raise RuntimeError("boom")
 
 
 def test_memory_routes_round_trip_with_fake_upstream(tmp_path) -> None:
@@ -81,3 +90,91 @@ def test_memory_routes_round_trip_with_fake_upstream(tmp_path) -> None:
     event_response = client.get(f"/v1/event/{event_id}")
     assert event_response.status_code == 200
     assert event_response.json()["id"] == event_id
+
+
+def test_failed_mutation_leaves_failed_event_queryable(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=FailingAddMem0Client(),
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/v3/memories/add/",
+        json={
+            "text": "hello",
+            "user_id": "root",
+            "metadata": {"type": "decision"},
+        },
+    )
+
+    assert response.status_code == 500
+
+    events_response = client.get("/v1/events")
+    assert events_response.status_code == 200
+    events = events_response.json()["results"]
+    assert len(events) == 1
+    assert events[0]["status"] == EventStatus.FAILED.value
+    assert events[0]["operation"] == "memory.add"
+
+    with app.state.session_factory() as session:
+        persisted = session.scalars(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.add",
+                Event.status == EventStatus.FAILED,
+            )
+        ).all()
+
+    assert len(persisted) == 1
+
+
+def test_event_routes_do_not_leak_other_project_events(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=FakeMem0Client(),
+    )
+
+    with app.state.session_factory() as session:
+        ProjectRepository(session).upsert_default_project(
+            project_id="repo-b",
+            name="repo-b",
+            mem0_base_url="http://mem0.local",
+        )
+        event_repo = EventRepository(session)
+        visible_event = event_repo.create_event(
+            project_id="repo-a",
+            operation="memory.add",
+            request={"text": "visible"},
+            subject_type="memory",
+            subject_id="mem-a",
+        )
+        event_repo.mark_succeeded(visible_event.id, response={"id": "mem-a"})
+        hidden_event = event_repo.create_event(
+            project_id="repo-b",
+            operation="memory.add",
+            request={"text": "hidden"},
+            subject_type="memory",
+            subject_id="mem-b",
+        )
+        event_repo.mark_succeeded(hidden_event.id, response={"id": "mem-b"})
+        session.commit()
+
+    client = TestClient(app)
+
+    events_response = client.get("/v1/events?app_id=repo-a")
+    assert events_response.status_code == 200
+    event_ids = {event["id"] for event in events_response.json()["results"]}
+    assert visible_event.id in event_ids
+    assert hidden_event.id not in event_ids
+
+    hidden_detail = client.get(f"/v1/event/{hidden_event.id}?project_id=repo-a")
+    assert hidden_detail.status_code == 404
