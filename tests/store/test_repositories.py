@@ -233,6 +233,32 @@ def test_memory_index_repository_get_memory_can_include_deleted_rows(
     assert memory.deleted_at is not None
 
 
+def test_project_repository_preserves_existing_defaults_on_routed_upsert(
+    db_session,
+) -> None:
+    project_repo = ProjectRepository(db_session)
+
+    original = project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+        default_user_id="root",
+        default_agent_id="codex",
+    )
+    project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A v2",
+        mem0_base_url="http://mem0:8000",
+    )
+    db_session.commit()
+
+    project = db_session.get(type(original), "repo-a")
+
+    assert project is not None
+    assert project.default_user_id == "root"
+    assert project.default_agent_id == "codex"
+
+
 def test_event_repository_lists_and_gets_events_scoped_to_project(db_session) -> None:
     project_repo = ProjectRepository(db_session)
     event_repo = EventRepository(db_session)

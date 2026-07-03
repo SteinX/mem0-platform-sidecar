@@ -246,6 +246,28 @@ def test_event_list_does_not_bootstrap_non_default_project_on_read(tmp_path) -> 
     assert project_z is None
 
 
+def test_get_memory_does_not_bootstrap_unknown_project_on_read(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=FakeMem0Client(),
+    )
+    client = TestClient(app)
+
+    response = client.get("/v1/memories/mem-1?project_id=repo-z")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Memory not found"}
+
+    with app.state.session_factory() as session:
+        project_z = session.scalar(select(Project).where(Project.id == "repo-z"))
+
+    assert project_z is None
+
+
 def test_route_scoped_requests_reject_conflicting_project_scope(tmp_path) -> None:
     app = create_app(
         settings=SidecarSettings(

@@ -65,8 +65,6 @@ async def get_memory(
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
-    ensure_project(session, request.app.state.settings, project_id)
-    session.commit()
     service = MemoryService(session=session, mem0=mem0)
     try:
         return await service.get_memory(

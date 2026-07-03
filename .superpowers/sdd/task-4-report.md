@@ -218,6 +218,41 @@ Result:
 
 ### Required Verification
 
+## Task 4 Latest Review Fixes
+
+This pass addressed the last two review findings:
+
+- `ProjectRepository.upsert_default_project(...)` now preserves existing `default_user_id` and `default_agent_id` when routed upserts omit them
+- `GET /v1/memories/{memory_id}` no longer bootstraps a project row on read
+
+### RED
+
+Added the new regressions first in:
+
+- `tests/store/test_repositories.py`
+- `tests/http_adapter/test_memory_routes.py`
+
+Observed expected failures before the fix:
+
+- routed project upserts cleared persisted project defaults
+- unknown-project memory reads created a `projects` row as a side effect
+
+### GREEN
+
+Implemented the fix and reran the requested checks:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py tests/store/test_repositories.py -v
+python -m pytest tests/http_adapter/test_memory_routes.py tests/http_adapter/test_health.py -v
+python -m pytest
+```
+
+Results:
+
+- `15 passed`
+- `10 passed`
+- `46 passed`
+
 Commands run:
 
 ```bash

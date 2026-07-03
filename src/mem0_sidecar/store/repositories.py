@@ -52,8 +52,10 @@ class ProjectRepository:
         else:
             project.name = name
             project.mem0_base_url = mem0_base_url
-            project.default_user_id = default_user_id
-            project.default_agent_id = default_agent_id
+            if default_user_id is not None:
+                project.default_user_id = default_user_id
+            if default_agent_id is not None:
+                project.default_agent_id = default_agent_id
             project.default_app_id = project_id
         self.session.flush()
         return project
