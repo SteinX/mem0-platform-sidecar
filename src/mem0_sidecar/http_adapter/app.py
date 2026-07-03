@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 
 from mem0_sidecar.config import SidecarSettings, load_settings
+from mem0_sidecar.http_adapter.event_routes import event_router
+from mem0_sidecar.http_adapter.memory_routes import memory_router
 from mem0_sidecar.mem0_client.client import Mem0RestClient
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base
@@ -38,6 +40,8 @@ def create_app(
     app.state.settings = settings
     app.state.session_factory = session_factory
     app.state.mem0_client = mem0_client
+    app.include_router(memory_router)
+    app.include_router(event_router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
