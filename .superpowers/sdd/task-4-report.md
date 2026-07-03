@@ -218,6 +218,51 @@ Result:
 
 ### Required Verification
 
+See the scope semantics fix below.
+
+## Task 4 Scope Semantics Review Fix
+
+This pass corrected the project/app scope split requested in the review:
+
+- `project_id` now controls the local sidecar project scope
+- `app_id` is preserved as the Mem0 data-plane scope when present
+- search no longer writes project rows as a read-side effect
+- `ProjectRepository.upsert_default_project(...)` preserves `default_app_id` unless explicitly changed
+
+### RED
+
+Added the requested coverage first in:
+
+- `tests/http_adapter/test_memory_routes.py`
+- `tests/store/test_repositories.py`
+
+Red command:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py tests/store/test_repositories.py -v
+```
+
+Observed expected failures before the fix:
+
+- add/search requests with differing `project_id` and `app_id` were rejected
+- `ProjectRepository.upsert_default_project(...)` did not accept `default_app_id`
+
+### GREEN
+
+Implemented the routing and repository changes, then reran:
+
+```bash
+python -m pytest tests/http_adapter/test_memory_routes.py tests/store/test_repositories.py -v
+python -m pytest tests/http_adapter/test_memory_routes.py tests/http_adapter/test_health.py -v
+python -m pytest -q
+```
+
+Results:
+
+- `20 passed`
+- `13 passed`
+- `51 passed`
+
 ## Task 4 Latest Review Fixes
 
 This pass addressed the last two review findings:

@@ -1,6 +1,6 @@
 import pytest
 
-from mem0_sidecar.store.models import EventStatus, JobStatus
+from mem0_sidecar.store.models import EventStatus, JobStatus, Project
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EntityRepository,
@@ -257,6 +257,51 @@ def test_project_repository_preserves_existing_defaults_on_routed_upsert(
     assert project is not None
     assert project.default_user_id == "root"
     assert project.default_agent_id == "codex"
+
+
+def test_project_repository_can_preserve_existing_default_app_id(db_session) -> None:
+    project_repo = ProjectRepository(db_session)
+
+    original = project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+        default_app_id="app-x",
+    )
+    project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A v2",
+        mem0_base_url="http://mem0:8000",
+    )
+    db_session.commit()
+
+    project = db_session.get(type(original), "repo-a")
+
+    assert project is not None
+    assert project.default_app_id == "app-x"
+
+
+def test_project_repository_can_update_default_app_id_explicitly(db_session) -> None:
+    project_repo = ProjectRepository(db_session)
+
+    project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+        default_app_id="app-x",
+    )
+    project_repo.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A v2",
+        mem0_base_url="http://mem0:8000",
+        default_app_id="app-y",
+    )
+    db_session.commit()
+
+    project = db_session.get(Project, "repo-a")
+
+    assert project is not None
+    assert project.default_app_id == "app-y"
 
 
 def test_event_repository_lists_and_gets_events_scoped_to_project(db_session) -> None:

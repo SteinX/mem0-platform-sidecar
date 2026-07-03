@@ -219,9 +219,116 @@ def test_route_scoped_requests_bootstrap_non_default_project_and_normalize_app_i
         project_c = session.scalar(select(Project).where(Project.id == "repo-c"))
 
     assert project_b is not None
-    assert project_c is not None
+    assert project_c is None
     assert project_b.mem0_base_url == "http://mem0.local"
-    assert project_c.mem0_base_url == "http://mem0.local"
+
+
+def test_route_scoped_add_preserves_explicit_app_id_and_uses_project_scope(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/v3/memories/add/",
+        json={
+            "text": "hello",
+            "user_id": "root",
+            "project_id": "repo-a",
+            "app_id": "app-x",
+        },
+    )
+
+    assert response.status_code == 200
+    assert mem0.add_payloads[0]["app_id"] == "app-x"
+    assert "project_id" not in mem0.add_payloads[0]
+
+    with app.state.session_factory() as session:
+        project_a = session.scalar(select(Project).where(Project.id == "repo-a"))
+        event = session.scalar(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.add",
+            )
+        )
+
+    assert project_a is not None
+    assert event is not None
+
+
+def test_route_scoped_search_preserves_explicit_app_id_without_bootstrapping_project(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/v3/memories/search/",
+        json={
+            "query": "hello",
+            "user_id": "root",
+            "project_id": "repo-a",
+            "app_id": "app-x",
+        },
+    )
+
+    assert response.status_code == 200
+    assert mem0.search_payloads[0]["app_id"] == "app-x"
+    assert "project_id" not in mem0.search_payloads[0]
+
+    with app.state.session_factory() as session:
+        project_a = session.scalar(select(Project).where(Project.id == "repo-a"))
+
+    assert project_a is None
+
+
+def test_route_scoped_search_uses_app_id_as_local_project_fallback_without_bootstrapping(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/v3/memories/add/",
+        json={
+            "text": "hello",
+            "user_id": "root",
+            "app_id": "app-x",
+        },
+    )
+
+    assert response.status_code == 200
+    assert mem0.add_payloads[0]["app_id"] == "app-x"
+    assert "project_id" not in mem0.add_payloads[0]
+
+    with app.state.session_factory() as session:
+        project_x = session.scalar(select(Project).where(Project.id == "app-x"))
+
+    assert project_x is not None
 
 
 def test_event_list_does_not_bootstrap_non_default_project_on_read(tmp_path) -> None:
@@ -287,10 +394,11 @@ def test_route_scoped_requests_reject_conflicting_project_scope(tmp_path) -> Non
             "app_id": "repo-b",
         },
     )
-    assert add_response.status_code == 400
+    assert add_response.status_code == 200
+    assert "project_id" not in add_response.json()["memory"]
 
     events_response = client.get("/v1/events?project_id=repo-a&app_id=repo-b")
-    assert events_response.status_code == 400
+    assert events_response.status_code == 200
 
     event_response = client.get("/v1/event/does-not-matter?project_id=repo-a&app_id=repo-b")
-    assert event_response.status_code == 400
+    assert event_response.status_code == 404

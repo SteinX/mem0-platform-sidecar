@@ -37,6 +37,7 @@ class ProjectRepository:
         mem0_base_url: str,
         default_user_id: str | None = None,
         default_agent_id: str | None = None,
+        default_app_id: str | None = None,
     ) -> Project:
         project = self.session.get(Project, project_id)
         if project is None:
@@ -44,7 +45,7 @@ class ProjectRepository:
                 id=project_id,
                 name=name,
                 default_user_id=default_user_id,
-                default_app_id=project_id,
+                default_app_id=default_app_id or project_id,
                 default_agent_id=default_agent_id,
                 mem0_base_url=mem0_base_url,
             )
@@ -56,7 +57,8 @@ class ProjectRepository:
                 project.default_user_id = default_user_id
             if default_agent_id is not None:
                 project.default_agent_id = default_agent_id
-            project.default_app_id = project_id
+            if default_app_id is not None:
+                project.default_app_id = default_app_id
         self.session.flush()
         return project
 

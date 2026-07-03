@@ -47,8 +47,6 @@ async def search_memories(
     mem0: Any = Depends(get_mem0_client),
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request, payload)
-    ensure_project(session, request.app.state.settings, project_id)
-    session.commit()
     service = MemoryService(session=session, mem0=mem0)
     return await service.search_memories(
         project_id=project_id,
