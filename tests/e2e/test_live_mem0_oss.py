@@ -67,6 +67,7 @@ def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
                 "text": f"Remember {marker}",
                 "user_id": "sidecar-e2e-user",
                 "app_id": settings.default_project_id,
+                "infer": False,
                 "metadata": {"type": "e2e", "marker": marker},
             },
         )

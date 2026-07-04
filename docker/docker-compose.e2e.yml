@@ -1,0 +1,81 @@
+services:
+  openai-stub:
+    build:
+      context: ../tests/e2e
+      dockerfile: openai_stub.Dockerfile
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/models', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  postgres:
+    build:
+      context: ../tests/e2e
+      dockerfile: postgres.Dockerfile
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: e2e-postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -d postgres -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mem0:
+    build:
+      context: ../../upstream
+      dockerfile: server/dev.Dockerfile
+    depends_on:
+      openai-stub:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_DB_NAME: mem0_app
+      AUTH_DISABLED: "true"
+      DASHBOARD_URL: http://localhost:3000
+      JWT_SECRET: e2e-jwt-secret
+      MEM0_TELEMETRY: "false"
+      OPENAI_API_KEY: e2e-openai-key
+      OPENAI_BASE_URL: http://openai-stub:8000/v1
+      POSTGRES_HOST: postgres
+      POSTGRES_PASSWORD: e2e-postgres
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    command:
+      - sh
+      - -c
+      - "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 90
+
+  e2e-runner:
+    build:
+      context: ..
+      dockerfile: tests/e2e/sidecar_e2e_runner.Dockerfile
+    depends_on:
+      mem0:
+        condition: service_healthy
+    environment:
+      MEM0_E2E_BASE_URL: http://mem0:8000
+      MEM0_E2E_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+
+volumes:
+  postgres-data:
