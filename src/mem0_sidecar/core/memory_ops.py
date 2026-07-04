@@ -166,6 +166,10 @@ def _validate_get_response(memory_id: str, response: Any) -> dict[str, Any]:
     return response
 
 
+def _is_upstream_not_found(exc: Exception) -> bool:
+    return isinstance(exc, Mem0UpstreamError) and exc.status_code == 404
+
+
 def _effective_request_app_id(
     session: Session,
     *,
@@ -343,7 +347,13 @@ class MemoryService:
         if memory is None:
             raise KeyError(memory_id)
 
-        return _validate_get_response(memory_id, await self.mem0.get_memory(memory_id))
+        try:
+            response = await self.mem0.get_memory(memory_id)
+        except Exception as exc:
+            if _is_upstream_not_found(exc):
+                raise KeyError(memory_id) from exc
+            raise
+        return _validate_get_response(memory_id, response)
 
     async def delete_memory(
         self,
@@ -411,4 +421,6 @@ class MemoryService:
         except Exception as exc:
             event_repo.mark_failed(event.id, error=_error_payload(exc))
             self.session.commit()
+            if _is_upstream_not_found(exc):
+                raise KeyError(memory_id) from exc
             raise

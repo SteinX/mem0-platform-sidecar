@@ -10,6 +10,7 @@ from mem0_sidecar.core.memory_ops import (
     SIDECAR_PROJECT_ID_METADATA_KEY,
 )
 from mem0_sidecar.http_adapter.app import create_app
+from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.store.models import Event, EventStatus, MemoryIndex, Project
 from mem0_sidecar.store.repositories import EventRepository, ProjectRepository
 
@@ -48,6 +49,28 @@ class MissingGetMem0Client(FakeMem0Client):
     async def get_memory(self, memory_id: str) -> dict[str, Any]:
         self.get_memory_ids.append(memory_id)
         return {"results": None}
+
+
+class UpstreamNotFoundMem0Client(FakeMem0Client):
+    async def get_memory(self, memory_id: str) -> dict[str, Any]:
+        self.get_memory_ids.append(memory_id)
+        raise Mem0UpstreamError(
+            method="GET",
+            path=f"/memories/{memory_id}",
+            status_code=404,
+            response_text="not found",
+            message="not found",
+        )
+
+    async def delete_memory(self, memory_id: str) -> dict[str, Any]:
+        self.deleted_ids.append(memory_id)
+        raise Mem0UpstreamError(
+            method="DELETE",
+            path=f"/memories/{memory_id}",
+            status_code=404,
+            response_text="not found",
+            message="not found",
+        )
 
 
 def test_memory_routes_round_trip_with_fake_upstream(tmp_path) -> None:
@@ -547,6 +570,36 @@ def test_get_memory_rejects_stale_projection_when_upstream_missing(tmp_path) -> 
     assert mem0.get_memory_ids == ["mem-1"]
 
 
+def test_get_memory_maps_upstream_404_to_not_found(tmp_path) -> None:
+    mem0 = UpstreamNotFoundMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    add_response = client.post(
+        "/v3/memories/add/",
+        json={
+            "text": "hello",
+            "user_id": "root",
+            "project_id": "repo-a",
+            "app_id": "app-a",
+        },
+    )
+    assert add_response.status_code == 200
+
+    response = client.get("/v1/memories/mem-1?project_id=repo-a&app_id=app-a")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Memory not found"}
+    assert mem0.get_memory_ids == ["mem-1"]
+
+
 def test_delete_memory_missing_index_uses_query_app_id_for_failed_event(
     tmp_path,
 ) -> None:
@@ -630,6 +683,54 @@ def test_delete_memory_rejects_wrong_query_app_id_without_remote_delete(
 
     assert event is not None
     assert json.loads(event.request_json)["app_id"] == "app-b"
+
+
+def test_delete_memory_maps_upstream_404_to_not_found_and_records_failed_event(
+    tmp_path,
+) -> None:
+    mem0 = UpstreamNotFoundMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    add_response = client.post(
+        "/v3/memories/add/",
+        json={
+            "text": "hello",
+            "user_id": "root",
+            "project_id": "repo-a",
+            "app_id": "app-a",
+        },
+    )
+    assert add_response.status_code == 200
+    mem0.deleted_ids.clear()
+
+    response = client.delete("/v1/memories/mem-1?project_id=repo-a&app_id=app-a")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Memory not found"}
+    assert mem0.deleted_ids == ["mem-1"]
+
+    with app.state.session_factory() as session:
+        event = session.scalar(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.delete",
+                Event.status == EventStatus.FAILED,
+                Event.subject_id == "mem-1",
+            )
+        )
+
+    assert event is not None
+    error = json.loads(event.error_json)
+    assert error["upstream_status_code"] == 404
+    assert error["upstream_method"] == "DELETE"
 
 
 def test_route_scoped_requests_allow_different_project_and_app_scope(tmp_path) -> None:
