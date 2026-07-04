@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.categories import extract_category
 from mem0_sidecar.core.scope import Scope, normalize_scope
-from mem0_sidecar.store.models import MemoryIndex
+from mem0_sidecar.store.models import MemoryIndex, Project
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EntityRepository,
@@ -146,6 +146,22 @@ def _validate_get_response(memory_id: str, response: Any) -> dict[str, Any]:
     if not isinstance(response, dict) or memory_id not in extract_memory_ids(response):
         raise KeyError(memory_id)
     return response
+
+
+def _effective_request_app_id(
+    session: Session,
+    *,
+    project_id: str,
+    request_app_id: str | None,
+) -> str:
+    if request_app_id:
+        return request_app_id
+
+    project = session.get(Project, project_id)
+    if project is not None and project.default_app_id:
+        return project.default_app_id
+
+    return project_id
 
 
 def _memory_delete_request(
@@ -295,11 +311,16 @@ class MemoryService:
         memory_id: str,
         request_app_id: str | None = None,
     ) -> dict[str, Any]:
+        effective_app_id = _effective_request_app_id(
+            self.session,
+            project_id=project_id,
+            request_app_id=request_app_id,
+        )
         memory_repo = MemoryIndexRepository(self.session)
         memory = memory_repo.get_memory(
             project_id=project_id,
             mem0_memory_id=memory_id,
-            app_id=request_app_id,
+            app_id=effective_app_id,
         )
         if memory is None:
             raise KeyError(memory_id)
@@ -313,11 +334,16 @@ class MemoryService:
         memory_id: str,
         request_app_id: str | None = None,
     ) -> dict[str, Any]:
+        effective_app_id = _effective_request_app_id(
+            self.session,
+            project_id=project_id,
+            request_app_id=request_app_id,
+        )
         memory_repo = MemoryIndexRepository(self.session)
         memory = memory_repo.get_memory(
             project_id=project_id,
             mem0_memory_id=memory_id,
-            app_id=request_app_id,
+            app_id=effective_app_id,
         )
         if memory is None:
             event_repo = EventRepository(self.session)
@@ -328,7 +354,7 @@ class MemoryService:
                     project_id=project_id,
                     memory_id=memory_id,
                     memory=None,
-                    request_app_id=request_app_id,
+                    request_app_id=effective_app_id,
                 ),
                 subject_type="memory",
                 subject_id=memory_id,

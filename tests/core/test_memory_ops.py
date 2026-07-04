@@ -383,6 +383,35 @@ async def test_memory_service_get_memory_rejects_wrong_app_without_remote_call(
 
 
 @pytest.mark.asyncio
+async def test_memory_service_get_memory_defaults_to_project_app_scope(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        user_id="root",
+        agent_id="codex",
+        app_id="app-a",
+        run_id=None,
+        category=None,
+        metadata={},
+    )
+
+    mem0 = FakeMem0Client()
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    with pytest.raises((KeyError, ValueError)):
+        await service.get_memory(project_id="repo-a", memory_id="mem-1")
+
+    assert mem0.get_memory_ids == []
+
+
+@pytest.mark.asyncio
 async def test_memory_service_get_memory_rejects_missing_upstream_memory(
     db_session,
 ) -> None:
@@ -511,6 +540,36 @@ async def test_memory_service_delete_rejects_wrong_app_without_remote_delete(
     failed_event = EventRepository(db_session).list_project_events("repo-a")[0]
     assert failed_event.status is EventStatus.FAILED
     assert json.loads(failed_event.request_json)["app_id"] == "app-b"
+
+
+@pytest.mark.asyncio
+async def test_memory_service_delete_defaults_to_project_app_scope(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        user_id="alice",
+        app_id="app-a",
+        category=None,
+        metadata={},
+    )
+
+    mem0 = FakeMem0Client()
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    with pytest.raises((KeyError, ValueError)):
+        await service.delete_memory(project_id="repo-a", memory_id="mem-1")
+
+    assert mem0.deleted_ids == []
+    failed_event = EventRepository(db_session).list_project_events("repo-a")[0]
+    assert failed_event.status is EventStatus.FAILED
+    assert json.loads(failed_event.request_json)["app_id"] == "repo-a"
 
 
 @pytest.mark.asyncio
