@@ -83,7 +83,7 @@ class CategoryRepository:
                 name=str(item["name"]),
                 description=str(item.get("description", "")),
                 schema_json=_json(item.get("schema", {})),
-                enabled=1,
+                enabled=1 if bool(item.get("enabled", True)) else 0,
                 strategy=str(item.get("strategy", "metadata")),
             )
             self.session.add(category)

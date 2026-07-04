@@ -1,0 +1,44 @@
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.orm import Session
+
+from mem0_sidecar.core.dashboard_categories import (
+    CategoryAdminService,
+    CategoryValidationError,
+)
+from mem0_sidecar.http_adapter.dependencies import get_session
+from mem0_sidecar.http_adapter.project_scope import ensure_project
+from mem0_sidecar.store.repositories import CategoryRepository
+
+category_router = APIRouter()
+SessionDependency = Annotated[Session, Depends(get_session)]
+
+
+@category_router.get("/v1/projects/{project_id}/categories")
+def list_project_categories(
+    project_id: str,
+    session: SessionDependency,
+) -> dict[str, Any]:
+    service = CategoryAdminService(CategoryRepository(session))
+    return service.list_categories(project_id)
+
+
+@category_router.put("/v1/projects/{project_id}/categories")
+def replace_project_categories(
+    project_id: str,
+    payload: dict[str, Any],
+    request: Request,
+    session: SessionDependency,
+) -> dict[str, Any]:
+    ensure_project(session, request.app.state.settings, project_id)
+    service = CategoryAdminService(CategoryRepository(session))
+    try:
+        result = service.replace_categories(
+            project_id=project_id,
+            items=list(payload.get("categories", [])),
+        )
+    except CategoryValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return result
