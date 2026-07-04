@@ -298,3 +298,34 @@ def test_verify_dashboard_overlay_rejects_missing_manifest_file(tmp_path):
 
     assert result.returncode == 1
     assert manifest["files"][2] in result.stderr
+
+
+def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
+    tmp_path,
+):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    content = (dashboard / "src/app/(root)/dashboard/categories/page.tsx").read_text()
+
+    assert '"use client";' in content
+    assert "sidecarGet<SidecarCategoryResponse>" in content
+    assert "sidecarPut<SidecarCategoryResponse>" in content
+    assert 'const PROJECT_ID = "default";' in content
+    assert 'toast({ title: "Categories saved", variant: "success" });' in content
+    assert "JSON.parse(category.schemaText)" in content
+    assert "LockedPage" not in content
