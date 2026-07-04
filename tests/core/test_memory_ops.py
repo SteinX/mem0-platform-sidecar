@@ -56,6 +56,12 @@ class FailingDeleteMem0Client(FakeMem0Client):
         raise RuntimeError("boom")
 
 
+class MissingGetMem0Client(FakeMem0Client):
+    async def get_memory(self, memory_id: str) -> dict[str, Any]:
+        self.get_memory_ids.append(memory_id)
+        return {"results": None}
+
+
 def test_extract_memory_id_accepts_common_shapes() -> None:
     assert extract_memory_id({"id": "mem-1"}) == "mem-1"
     assert extract_memory_id({"memory_id": "mem-2"}) == "mem-2"
@@ -374,6 +380,35 @@ async def test_memory_service_get_memory_rejects_wrong_app_without_remote_call(
         )
 
     assert mem0.get_memory_ids == []
+
+
+@pytest.mark.asyncio
+async def test_memory_service_get_memory_rejects_missing_upstream_memory(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        user_id="root",
+        agent_id="codex",
+        app_id="repo-a",
+        run_id=None,
+        category=None,
+        metadata={},
+    )
+
+    mem0 = MissingGetMem0Client()
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    with pytest.raises(KeyError):
+        await service.get_memory(project_id="repo-a", memory_id="mem-1")
+
+    assert mem0.get_memory_ids == ["mem-1"]
 
 
 @pytest.mark.asyncio

@@ -142,6 +142,12 @@ def _event_payload(event: Any) -> dict[str, Any]:
     }
 
 
+def _validate_get_response(memory_id: str, response: Any) -> dict[str, Any]:
+    if not isinstance(response, dict) or memory_id not in extract_memory_ids(response):
+        raise KeyError(memory_id)
+    return response
+
+
 def _memory_delete_request(
     *,
     project_id: str,
@@ -298,7 +304,7 @@ class MemoryService:
         if memory is None:
             raise KeyError(memory_id)
 
-        return await self.mem0.get_memory(memory_id)
+        return _validate_get_response(memory_id, await self.mem0.get_memory(memory_id))
 
     async def delete_memory(
         self,
