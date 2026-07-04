@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -8,6 +9,33 @@ LOCKED_TARGETS = [
     "src/app/(root)/dashboard/categories/page.tsx",
     "src/app/(root)/dashboard/export/page.tsx",
 ]
+
+
+def npm_exec_pnpm_package(dashboard_dir: Path) -> str:
+    package_json = dashboard_dir / "package.json"
+    if not package_json.exists():
+        return "pnpm"
+
+    package_data = json.loads(package_json.read_text())
+    package_manager = package_data.get("packageManager")
+    if isinstance(package_manager, str) and package_manager.startswith("pnpm@"):
+        return package_manager
+    return "pnpm"
+
+
+def typecheck_command(dashboard_dir: Path) -> list[str]:
+    if shutil.which("pnpm"):
+        return ["pnpm", "typecheck"]
+    if shutil.which("npm"):
+        return [
+            "npm",
+            "exec",
+            "--yes",
+            npm_exec_pnpm_package(dashboard_dir),
+            "--",
+            "typecheck",
+        ]
+    raise FileNotFoundError("Neither pnpm nor npm is available on PATH")
 
 
 def main() -> int:
@@ -31,7 +59,11 @@ def main() -> int:
             print(f"{relative} still imports or renders LockedPage", file=sys.stderr)
             return 1
 
-    subprocess.run(["pnpm", "typecheck"], cwd=dashboard_dir, check=True)
+    try:
+        subprocess.run(typecheck_command(dashboard_dir), cwd=dashboard_dir, check=True)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return 0
 
 

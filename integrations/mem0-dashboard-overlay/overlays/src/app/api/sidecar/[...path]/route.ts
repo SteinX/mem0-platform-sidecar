@@ -1,13 +1,17 @@
 import { NextRequest } from "next/server";
 
-const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);
+const METHODS_WITH_BODY = new Set(["POST", "PUT"]);
 
-function getSidecarBaseUrl(): string {
+function getSidecarBaseUrl(): string | null {
   const baseUrl = process.env.SIDECAR_INTERNAL_API_URL;
   if (!baseUrl) {
-    throw new Error("SIDECAR_INTERNAL_API_URL is required");
+    return null;
   }
   return baseUrl.replace(/\/$/, "");
+}
+
+function jsonError(message: string, status: number): Response {
+  return Response.json({ error: message }, { status });
 }
 
 async function proxy(
@@ -16,7 +20,12 @@ async function proxy(
 ) {
   const params = await context.params;
   const upstreamPath = params.path.join("/");
-  const url = new URL(`${getSidecarBaseUrl()}/${upstreamPath}`);
+  const baseUrl = getSidecarBaseUrl();
+  if (!baseUrl) {
+    return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);
+  }
+
+  const url = new URL(`${baseUrl}/${upstreamPath}`);
   request.nextUrl.searchParams.forEach((value, key) => {
     url.searchParams.append(key, value);
   });
@@ -37,7 +46,13 @@ async function proxy(
     init.body = await request.text();
   }
 
-  const response = await fetch(url, init);
+  let response: Response;
+  try {
+    response = await fetch(url, init);
+  } catch {
+    return jsonError("Sidecar upstream request failed", 502);
+  }
+
   const responseText = await response.text();
   return new Response(responseText, {
     status: response.status,

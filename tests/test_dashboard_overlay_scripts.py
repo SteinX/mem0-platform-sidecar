@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -67,6 +68,66 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
     assert "export async function sidecarPost<T>" in helper_content
     assert "export type SidecarCategory =" in type_content
     assert "export type SidecarExportJob =" in type_content
+
+
+def test_apply_dashboard_overlay_normalizes_sidecar_paths_and_removes_patch_footgun(
+    tmp_path,
+):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+    helper_content = (dashboard / "src/utils/sidecar-api.ts").read_text()
+
+    assert "function normalizeSidecarPath(path: string): string" in helper_content
+    assert "return path.startsWith(\"/\") ? path : `/${path}`;" in helper_content
+    assert "METHODS_WITH_BODY = new Set([\"POST\", \"PUT\"]);" in route_content
+    assert "export const PATCH = proxy;" not in route_content
+
+
+def test_apply_dashboard_overlay_route_handles_proxy_errors_explicitly(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+
+    assert (
+        "function jsonError(message: string, status: number): Response"
+        in route_content
+    )
+    assert (
+        'return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);'
+        in route_content
+    )
+    assert 'return jsonError("Sidecar upstream request failed", 502);' in route_content
 
 
 def test_verify_dashboard_overlay_rejects_locked_pages(tmp_path):
@@ -143,6 +204,57 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_verify_dashboard_overlay_falls_back_to_npm_exec_pnpm_when_global_pnpm_missing(
+    tmp_path,
+):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+    (dashboard / "package.json").write_text('{"packageManager":"pnpm@10.34.2"}\n')
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    npm_log = tmp_path / "npm.log"
+    npm = bin_dir / "npm"
+    npm.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" > {npm_log}\n"
+        "exit 0\n"
+    )
+    npm.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{Path('/usr/bin')}:{Path('/bin')}"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert npm_log.read_text().strip() == "exec --yes pnpm@10.34.2 -- typecheck"
 
 
 def test_verify_dashboard_overlay_rejects_missing_manifest_file(tmp_path):

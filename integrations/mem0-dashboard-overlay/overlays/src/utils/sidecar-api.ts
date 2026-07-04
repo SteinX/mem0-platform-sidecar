@@ -1,5 +1,9 @@
 const SIDECAR_API_PREFIX = "/api/sidecar";
 
+function normalizeSidecarPath(path: string): string {
+  return path.startsWith("/") ? path : `/${path}`;
+}
+
 async function parseResponse<T>(response: Response): Promise<T> {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -17,7 +21,10 @@ async function parseResponse<T>(response: Response): Promise<T> {
 function withParams(path: string, params: Record<string, string> = {}): string {
   const search = new URLSearchParams(params);
   const query = search.toString();
-  return query ? `${SIDECAR_API_PREFIX}${path}?${query}` : `${SIDECAR_API_PREFIX}${path}`;
+  const normalizedPath = normalizeSidecarPath(path);
+  return query
+    ? `${SIDECAR_API_PREFIX}${normalizedPath}?${query}`
+    : `${SIDECAR_API_PREFIX}${normalizedPath}`;
 }
 
 export async function sidecarGet<T>(
@@ -29,7 +36,7 @@ export async function sidecarGet<T>(
 }
 
 export async function sidecarPut<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(`${SIDECAR_API_PREFIX}${path}`, {
+  const response = await fetch(`${SIDECAR_API_PREFIX}${normalizeSidecarPath(path)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -38,7 +45,7 @@ export async function sidecarPut<T>(path: string, body: unknown): Promise<T> {
 }
 
 export async function sidecarPost<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(`${SIDECAR_API_PREFIX}${path}`, {
+  const response = await fetch(`${SIDECAR_API_PREFIX}${normalizeSidecarPath(path)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
