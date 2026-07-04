@@ -344,3 +344,48 @@ def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
     assert "Retry load" in content
     assert "void loadCategories();" in content
     assert "LockedPage" not in content
+
+
+def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    content = (dashboard / "src/app/(root)/dashboard/export/page.tsx").read_text()
+
+    assert '"use client";' in content
+    assert "sidecarGet<SidecarExportListResponse>" in content
+    assert 'await sidecarPost<SidecarExportJob>("/v1/exports"' in content
+    assert '`/v1/exports/${job.id}/download`' in content
+    assert (
+        "function downloadJson(filename: string, payload: SidecarExportDownload)"
+        in content
+    )
+    assert 'const PROJECT_ID = "default";' in content
+    assert 'format: "json",' in content
+    assert "Object.fromEntries(" in content
+    assert 'toast({ title: "Export created", variant: "success" });' in content
+    assert 'title: "Failed to load exports"' in content
+    assert 'title: "Failed to create export"' in content
+    assert 'title: "Failed to download export"' in content
+    assert (
+        "formatDistanceToNow(new Date(job.created_at), { addSuffix: true })"
+        in content
+    )
+    assert "job.status !== \"SUCCEEDED\"" in content
+    assert "Create JSON Export" in content
+    assert "Download" in content
+    assert "LockedPage" not in content
