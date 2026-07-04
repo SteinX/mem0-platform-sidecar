@@ -9,11 +9,26 @@ OVERLAY = ROOT / "integrations" / "mem0-dashboard-overlay"
 NULL_PAGE = "export default function Page() { return null; }\n"
 
 
+def write_verify_fixture(dashboard: Path) -> None:
+    for relative in [
+        "src/app/(root)/dashboard/categories/page.tsx",
+        "src/app/(root)/dashboard/export/page.tsx",
+        "src/app/api/sidecar/[...path]/route.ts",
+        "src/utils/sidecar-api.ts",
+        "src/types/sidecar.ts",
+        "src/app/(root)/dashboard/components/main-nav.tsx",
+    ]:
+        target = dashboard / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(NULL_PAGE)
+
+
 def test_dashboard_overlay_manifest_lists_phase1_files():
     manifest = json.loads((OVERLAY / "manifest.json").read_text())
 
     assert "src/app/(root)/dashboard/categories/page.tsx" in manifest["files"]
     assert "src/app/(root)/dashboard/export/page.tsx" in manifest["files"]
+    assert "src/app/(root)/dashboard/components/main-nav.tsx" in manifest["files"]
     assert "src/app/api/sidecar/[...path]/route.ts" in manifest["files"]
 
 
@@ -132,24 +147,21 @@ def test_apply_dashboard_overlay_route_handles_proxy_errors_explicitly(tmp_path)
 
 def test_verify_dashboard_overlay_rejects_locked_pages(tmp_path):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
-            str(dashboard),
-        ],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
+    write_verify_fixture(dashboard)
+    locked_page = dashboard / "src/app/(root)/dashboard/categories/page.tsx"
+    main_nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    locked_page.write_text(
+        "import { LockedPage } from '@/components/self-hosted/locked-page';"
     )
-
-    assert result.returncode == 0, result.stderr
-
-    categories = dashboard / "src/app/(root)/dashboard/categories"
-    (categories / "page.tsx").write_text(
-        'export default function Page() { return "LockedPage"; }\n'
+    main_nav.write_text(
+        'badge: "SELF-HOSTED"\n'
+        'title: "Categories"\n'
+        'title: "Webhooks"\n'
+        'badge: "PRO"\n'
+        'title: "Analytics"\n'
+        'badge: "PRO"\n'
+        'title: "Export"\n'
+        'badge: "SELF-HOSTED"\n'
     )
 
     result = subprocess.run(
@@ -162,11 +174,49 @@ def test_verify_dashboard_overlay_rejects_locked_pages(tmp_path):
         text=True,
         capture_output=True,
         check=False,
-        env={"PATH": f"{dashboard}:{Path('/usr/bin')}:{Path('/bin')}"},
+        env={
+            **os.environ,
+            "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1",
+        },
     )
 
     assert result.returncode == 1
-    assert "LockedPage" in result.stderr
+    assert "still imports or renders LockedPage" in result.stderr
+
+
+def test_verify_dashboard_overlay_rejects_incorrect_navigation_badges(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    write_verify_fixture(dashboard)
+    main_nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    main_nav.write_text(
+        'title: "Categories"\n'
+        'badge: "PRO"\n'
+        'title: "Webhooks"\n'
+        'badge: "PRO"\n'
+        'title: "Analytics"\n'
+        'badge: "PRO"\n'
+        'title: "Export"\n'
+        'badge: "SELF-HOSTED"\n'
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1",
+        },
+    )
+
+    assert result.returncode == 1
+    assert 'Categories badge mismatch: expected "SELF-HOSTED"' in result.stderr
 
 
 def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
@@ -206,7 +256,7 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
-def test_verify_dashboard_overlay_falls_back_to_npm_exec_pnpm_when_global_pnpm_missing(
+def test_verify_dashboard_overlay_uses_npm_exec_pnpm_when_global_pnpm_missing(
     tmp_path,
 ):
     dashboard = tmp_path / "dashboard"
