@@ -27,8 +27,12 @@ function downloadJson(filename: string, payload: SidecarExportDownload) {
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = filename;
+  document.body.appendChild(anchor);
   anchor.click();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => {
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+  }, 0);
 }
 
 export default function ExportPage() {
@@ -39,15 +43,19 @@ export default function ExportPage() {
   const [runId, setRunId] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isCreating, setIsCreating] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const loadJobs = async () => {
     setIsLoading(true);
+    setLoadError(null);
     try {
       const response = await sidecarGet<SidecarExportListResponse>("/v1/exports", {
         project_id: PROJECT_ID,
       });
       setJobs(response.results);
     } catch (error) {
+      setJobs([]);
+      setLoadError(error instanceof Error ? error.message : String(error));
       toast({
         title: "Failed to load exports",
         description: error instanceof Error ? error.message : String(error),
@@ -150,32 +158,68 @@ export default function ExportPage() {
       </Card>
 
       <div className="grid gap-3">
-        {jobs.map((job) => (
-          <Card key={job.id} className="border-memBorder-primary">
-            <CardContent className="flex flex-wrap items-center justify-between gap-4 p-4">
+        {isLoading ? (
+          <Card className="border-memBorder-primary">
+            <CardContent className="p-5">
+              <p className="text-sm text-onSurface-default-secondary">
+                Loading export jobs...
+              </p>
+            </CardContent>
+          </Card>
+        ) : loadError ? (
+          <Card className="border-memBorder-primary">
+            <CardContent className="flex flex-col items-start gap-3 p-5">
               <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-xs">{job.id}</span>
-                  <Badge variant="outline">{job.status}</Badge>
-                </div>
                 <p className="text-sm text-onSurface-default-secondary">
-                  {job.exported_count} exported, {job.skipped_count} skipped
+                  Failed to load export jobs.
                 </p>
-                <p className="text-xs text-onSurface-default-tertiary">
-                  Created {formatDistanceToNow(new Date(job.created_at), { addSuffix: true })}
-                </p>
+                <p className="text-xs text-onSurface-default-tertiary">{loadError}</p>
               </div>
               <Button
                 variant="outline"
-                disabled={job.status !== "SUCCEEDED"}
-                onClick={() => void downloadExport(job)}
+                onClick={() => void loadJobs()}
+                disabled={isLoading}
               >
-                <Download className="mr-2 size-4" />
-                Download
+                Retry load
               </Button>
             </CardContent>
           </Card>
-        ))}
+        ) : jobs.length === 0 ? (
+          <Card className="border-memBorder-primary">
+            <CardContent className="p-5">
+              <p className="text-sm text-onSurface-default-secondary">
+                No exports yet.
+              </p>
+            </CardContent>
+          </Card>
+        ) : (
+          jobs.map((job) => (
+            <Card key={job.id} className="border-memBorder-primary">
+              <CardContent className="flex flex-wrap items-center justify-between gap-4 p-4">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs">{job.id}</span>
+                    <Badge variant="outline">{job.status}</Badge>
+                  </div>
+                  <p className="text-sm text-onSurface-default-secondary">
+                    {job.exported_count} exported, {job.skipped_count} skipped
+                  </p>
+                  <p className="text-xs text-onSurface-default-tertiary">
+                    Created {formatDistanceToNow(new Date(job.created_at), { addSuffix: true })}
+                  </p>
+                </div>
+                <Button
+                  variant="outline"
+                  disabled={job.status !== "SUCCEEDED"}
+                  onClick={() => void downloadExport(job)}
+                >
+                  <Download className="mr-2 size-4" />
+                  Download
+                </Button>
+              </CardContent>
+            </Card>
+          ))
+        )}
       </div>
     </div>
   );

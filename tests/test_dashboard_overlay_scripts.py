@@ -389,3 +389,59 @@ def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_pa
     assert "Create JSON Export" in content
     assert "Download" in content
     assert "LockedPage" not in content
+
+
+def test_apply_dashboard_overlay_export_page_uses_safe_blob_download_cleanup(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    content = (dashboard / "src/app/(root)/dashboard/export/page.tsx").read_text()
+
+    assert "document.body.appendChild(anchor);" in content
+    assert "anchor.click();" in content
+    assert "window.setTimeout(() => {" in content
+    assert "document.body.removeChild(anchor);" in content
+    assert "URL.revokeObjectURL(url);" in content
+
+
+def test_apply_dashboard_overlay_export_page_includes_loading_error_and_empty_states(
+    tmp_path,
+):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    content = (dashboard / "src/app/(root)/dashboard/export/page.tsx").read_text()
+
+    assert 'const [loadError, setLoadError] = useState<string | null>(null);' in content
+    assert "Loading export jobs..." in content
+    assert "Failed to load export jobs." in content
+    assert "Retry load" in content
+    assert "No exports yet." in content
