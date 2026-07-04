@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.http_adapter.app import create_app
-from mem0_sidecar.store.repositories import MemoryIndexRepository
+from mem0_sidecar.store.repositories import ExportJobRepository, MemoryIndexRepository
 
 
 class ExportFakeMem0Client:
@@ -98,3 +98,51 @@ def test_export_routes_reject_unsupported_format(tmp_path):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Only json export format is supported"
+
+
+def test_export_routes_return_404_for_missing_job(tmp_path):
+    app = _app(tmp_path, ExportFakeMem0Client())
+    client = TestClient(app)
+
+    response = client.get("/v1/exports/missing-job", params={"project_id": "default"})
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Export not found"
+
+
+def test_export_routes_return_409_when_downloading_before_completion(tmp_path):
+    app = _app(tmp_path, ExportFakeMem0Client())
+    with app.state.session_factory() as session:
+        job = ExportJobRepository(session).create(
+            project_id="default",
+            export_format="json",
+            filters={},
+        )
+        ExportJobRepository(session).mark_running("default", job.id)
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get(
+        f"/v1/exports/{job.id}/download",
+        params={"project_id": "default"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Export is not complete"
+
+
+def test_export_routes_isolate_access_by_project(tmp_path):
+    app = _app(tmp_path, ExportFakeMem0Client())
+    with app.state.session_factory() as session:
+        job = ExportJobRepository(session).create(
+            project_id="alpha",
+            export_format="json",
+            filters={},
+        )
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get(f"/v1/exports/{job.id}", params={"project_id": "beta"})
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Export not found"
