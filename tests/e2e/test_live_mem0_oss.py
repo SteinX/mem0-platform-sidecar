@@ -126,6 +126,8 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
     app_id = "dashboard-overlay"
     user_id = "root"
     marker = f"dashboard overlay export marker {uuid4()}"
+    out_of_scope_marker = f"dashboard overlay out-of-scope marker {uuid4()}"
+    cleanup_targets: list[tuple[str, str]] = []
 
     categories_response = client.put(
         f"/v1/projects/{project_id}/categories",
@@ -157,6 +159,22 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
     )
     assert add_response.status_code == 200, add_response.text
     memory_id = add_response.json()["event"]["subject_id"]
+    cleanup_targets.append((memory_id, app_id))
+
+    out_of_scope_response = client.post(
+        "/v3/memories/add/",
+        json={
+            "project_id": project_id,
+            "app_id": f"{app_id}-other",
+            "user_id": f"{user_id}-other",
+            "infer": False,
+            "metadata": {"category": "preferences"},
+            "messages": [{"role": "user", "content": out_of_scope_marker}],
+        },
+    )
+    assert out_of_scope_response.status_code == 200, out_of_scope_response.text
+    out_of_scope_memory_id = out_of_scope_response.json()["event"]["subject_id"]
+    cleanup_targets.append((out_of_scope_memory_id, f"{app_id}-other"))
 
     try:
         export_response = client.post(
@@ -179,9 +197,13 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
         assert download_response.status_code == 200, download_response.text
         payload = download_response.json()
         assert any(marker in str(memory) for memory in payload["memories"])
-    finally:
-        delete_response = client.delete(
-            f"/v1/memories/{memory_id}",
-            params={"project_id": project_id, "app_id": app_id},
+        assert all(
+            out_of_scope_marker not in str(memory) for memory in payload["memories"]
         )
-        assert delete_response.status_code == 200, delete_response.text
+    finally:
+        for cleanup_memory_id, cleanup_app_id in cleanup_targets:
+            delete_response = client.delete(
+                f"/v1/memories/{cleanup_memory_id}",
+                params={"project_id": project_id, "app_id": cleanup_app_id},
+            )
+            assert delete_response.status_code == 200, delete_response.text

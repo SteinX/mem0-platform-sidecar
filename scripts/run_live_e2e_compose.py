@@ -27,6 +27,25 @@ def compose_command(project_name: str) -> list[str]:
     ]
 
 
+def resolve_upstream_context() -> Path:
+    override = os.environ.get("MEM0_E2E_UPSTREAM_CONTEXT")
+    if override:
+        return Path(override).expanduser().resolve()
+
+    git_common_dir_result = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    git_common_dir = Path(git_common_dir_result.stdout.strip())
+    if not git_common_dir.is_absolute():
+        git_common_dir = (ROOT / git_common_dir).resolve()
+    main_checkout_root = git_common_dir.parent
+    return (main_checkout_root.parent / "upstream").resolve()
+
+
 def build_runner_env(*, project_id: str) -> dict[str, str]:
     env = {
         key: value
@@ -35,6 +54,7 @@ def build_runner_env(*, project_id: str) -> dict[str, str]:
     }
     env["MEM0_E2E_BASE_URL"] = INTERNAL_MEM0_BASE_URL
     env["MEM0_E2E_PROJECT_ID"] = project_id
+    env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(resolve_upstream_context())
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
@@ -132,6 +152,7 @@ def main() -> int:
     )
     timeout_seconds = int(os.environ.get("MEM0_E2E_STARTUP_TIMEOUT", "180"))
     compose_env = os.environ.copy()
+    compose_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(resolve_upstream_context())
     base_compose = compose_command(project_name)
 
     try:

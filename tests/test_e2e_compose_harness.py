@@ -3,19 +3,38 @@ from scripts.run_live_e2e_compose import (
     compose_command,
     compose_run_command,
     compose_up_command,
+    resolve_upstream_context,
 )
 
 
 def test_build_runner_env_points_live_e2e_at_compose_service(monkeypatch) -> None:
     monkeypatch.setenv("MEM0_E2E_BASE_URL", "http://external.example")
     monkeypatch.setenv("MEM0_E2E_API_KEY", "external-key")
+    monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/custom-upstream")
 
     env = build_runner_env(project_id="sidecar-local-e2e")
 
     assert env["MEM0_E2E_BASE_URL"] == "http://mem0:8000"
     assert env["MEM0_E2E_PROJECT_ID"] == "sidecar-local-e2e"
+    assert env["MEM0_E2E_UPSTREAM_CONTEXT"] == "/tmp/custom-upstream"
     assert env["PYTHONDONTWRITEBYTECODE"] == "1"
     assert "MEM0_E2E_API_KEY" not in env
+
+
+def test_build_runner_env_defaults_upstream_context_from_git_layout(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("MEM0_E2E_UPSTREAM_CONTEXT", raising=False)
+
+    env = build_runner_env(project_id="sidecar-local-e2e")
+
+    assert env["MEM0_E2E_UPSTREAM_CONTEXT"] == str(resolve_upstream_context())
+
+
+def test_resolve_upstream_context_prefers_explicit_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/explicit-upstream")
+
+    assert str(resolve_upstream_context()) == "/tmp/explicit-upstream"
 
 
 def test_compose_command_uses_e2e_file_and_isolated_project() -> None:
