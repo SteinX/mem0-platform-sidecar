@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.categories import extract_category
 from mem0_sidecar.core.scope import Scope, normalize_scope
+from mem0_sidecar.mem0_client.client import Mem0UpstreamError
+from mem0_sidecar.observability import get_request_id
 from mem0_sidecar.store.models import MemoryIndex, Project
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
@@ -142,6 +144,22 @@ def _event_payload(event: Any) -> dict[str, Any]:
     }
 
 
+def _error_payload(exc: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+    if request_id := get_request_id():
+        payload["request_id"] = request_id
+    if isinstance(exc, Mem0UpstreamError):
+        payload["upstream_method"] = exc.method
+        payload["upstream_path"] = exc.path
+        payload["upstream_status_code"] = exc.status_code
+        if exc.response_text is not None:
+            payload["upstream_response_text"] = exc.response_text[:1000]
+    return payload
+
+
 def _validate_get_response(memory_id: str, response: Any) -> dict[str, Any]:
     if not isinstance(response, dict) or memory_id not in extract_memory_ids(response):
         raise KeyError(memory_id)
@@ -268,7 +286,7 @@ class MemoryService:
             event_repo.mark_succeeded(event.id, response=memory_response)
             return {"memory": memory_response, "event": _event_payload(event)}
         except Exception as exc:
-            event_repo.mark_failed(event.id, error={"message": str(exc)})
+            event_repo.mark_failed(event.id, error=_error_payload(exc))
             self.session.commit()
             raise
 
@@ -391,6 +409,6 @@ class MemoryService:
             event_repo.mark_succeeded(event.id, response=response)
             return {"memory": response, "event": _event_payload(event)}
         except Exception as exc:
-            event_repo.mark_failed(event.id, error={"message": str(exc)})
+            event_repo.mark_failed(event.id, error=_error_payload(exc))
             self.session.commit()
             raise

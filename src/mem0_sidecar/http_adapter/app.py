@@ -5,6 +5,7 @@ from mem0_sidecar.config import SidecarSettings, load_settings
 from mem0_sidecar.http_adapter.event_routes import event_router
 from mem0_sidecar.http_adapter.memory_routes import memory_router
 from mem0_sidecar.mem0_client.client import Mem0RestClient
+from mem0_sidecar.observability import RequestLoggingMiddleware, configure_logging
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base
 from mem0_sidecar.store.repositories import ProjectRepository
@@ -17,6 +18,7 @@ def create_app(
     mem0_client=None,
 ) -> FastAPI:
     settings = settings or load_settings()
+    configure_logging(settings)
 
     if session_factory is None:
         engine = create_engine_from_url(settings.database_url)
@@ -35,12 +37,25 @@ def create_app(
         mem0_client = Mem0RestClient(
             base_url=settings.mem0_base_url,
             api_key=settings.mem0_api_key,
+            api_key_header_name=settings.mem0_api_key_header_name,
+            api_key_prefix=settings.mem0_api_key_prefix,
+            extra_headers=settings.mem0_extra_headers,
+            request_timeout_seconds=settings.mem0_request_timeout_seconds,
+            connect_timeout_seconds=settings.mem0_connect_timeout_seconds,
+            verify_tls=settings.mem0_verify_tls,
+            ca_bundle=settings.mem0_ca_bundle,
+            memories_path=settings.mem0_memories_path,
+            search_path=settings.mem0_search_path,
         )
 
     app = FastAPI(title="Mem0 Platform Sidecar")
     app.state.settings = settings
     app.state.session_factory = session_factory
     app.state.mem0_client = mem0_client
+    app.add_middleware(
+        RequestLoggingMiddleware,
+        request_id_header=settings.request_id_header,
+    )
     app.include_router(memory_router)
     app.include_router(event_router)
 

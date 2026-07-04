@@ -88,3 +88,29 @@ def test_create_app_bootstraps_default_project(tmp_path) -> None:
     assert project is not None
     assert project.name == settings.default_project_id
     assert project.mem0_base_url == settings.mem0_base_url
+
+
+def test_create_app_configures_mem0_client_from_settings(tmp_path) -> None:
+    settings = SidecarSettings(
+        database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+        mem0_base_url="https://mem0.example/api",
+        mem0_api_key="token",
+        mem0_api_key_header_name="Authorization",
+        mem0_api_key_prefix="Bearer",
+        mem0_extra_headers={"X-Mem0-Org": "org-1"},
+        mem0_request_timeout_seconds=14.0,
+        mem0_connect_timeout_seconds=2.0,
+        mem0_verify_tls=False,
+    )
+
+    app = create_app(settings=settings)
+
+    mem0 = app.state.mem0_client
+    assert mem0.base_url == "https://mem0.example/api"
+    assert mem0.api_key == "token"
+    assert mem0.api_key_header_name == "Authorization"
+    assert mem0.api_key_prefix == "Bearer"
+    assert mem0.extra_headers == {"X-Mem0-Org": "org-1"}
+    assert mem0.request_timeout_seconds == 14.0
+    assert mem0.connect_timeout_seconds == 2.0
+    assert mem0.verify_tls is False

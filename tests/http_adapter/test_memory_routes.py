@@ -136,6 +136,9 @@ def test_failed_mutation_leaves_failed_event_queryable(tmp_path) -> None:
     assert len(events) == 1
     assert events[0]["status"] == EventStatus.FAILED.value
     assert events[0]["operation"] == "memory.add"
+    assert events[0]["error"]["error_type"] == "RuntimeError"
+    assert events[0]["error"]["message"] == "boom"
+    assert events[0]["error"]["request_id"]
 
     with app.state.session_factory() as session:
         persisted = session.scalars(
