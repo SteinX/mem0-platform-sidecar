@@ -10,6 +10,8 @@ from mem0_sidecar.store.models import (
     Entity,
     Event,
     EventStatus,
+    ExportJob,
+    ExportStatus,
     Job,
     JobStatus,
     MemoryIndex,
@@ -296,6 +298,89 @@ class EntityRepository:
         entity.last_seen_at = _utc_now()
         self.session.flush()
         return entity
+
+
+class ExportJobRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        project_id: str,
+        export_format: str,
+        filters: dict[str, Any],
+    ) -> ExportJob:
+        job = ExportJob(
+            project_id=project_id,
+            format=export_format,
+            filters_json=_json(filters),
+            status=ExportStatus.PENDING,
+        )
+        self.session.add(job)
+        self.session.flush()
+        return job
+
+    def get(self, project_id: str, job_id: str) -> ExportJob:
+        job = self.session.scalar(
+            select(ExportJob).where(
+                ExportJob.project_id == project_id,
+                ExportJob.id == job_id,
+            )
+        )
+        if job is None:
+            raise KeyError(job_id)
+        return job
+
+    def list_project_exports(self, project_id: str) -> list[ExportJob]:
+        return list(
+            self.session.scalars(
+                select(ExportJob)
+                .where(ExportJob.project_id == project_id)
+                .order_by(ExportJob.created_at.desc(), ExportJob.id.desc())
+            )
+        )
+
+    def mark_running(self, job_id: str) -> ExportJob:
+        job = self.session.get(ExportJob, job_id)
+        if job is None:
+            raise KeyError(job_id)
+        job.status = ExportStatus.RUNNING
+        job.started_at = _utc_now()
+        self.session.flush()
+        return job
+
+    def mark_succeeded(
+        self,
+        job_id: str,
+        *,
+        result: dict[str, Any],
+        total_count: int,
+        exported_count: int,
+        skipped_count: int,
+    ) -> ExportJob:
+        job = self.session.get(ExportJob, job_id)
+        if job is None:
+            raise KeyError(job_id)
+        job.status = ExportStatus.SUCCEEDED
+        job.result_json = _json(result)
+        job.error_json = _json({})
+        job.total_count = total_count
+        job.exported_count = exported_count
+        job.skipped_count = skipped_count
+        job.completed_at = _utc_now()
+        self.session.flush()
+        return job
+
+    def mark_failed(self, job_id: str, *, error: dict[str, Any]) -> ExportJob:
+        job = self.session.get(ExportJob, job_id)
+        if job is None:
+            raise KeyError(job_id)
+        job.status = ExportStatus.FAILED
+        job.error_json = _json(error)
+        job.completed_at = _utc_now()
+        self.session.flush()
+        return job
 
 
 class JobRepository:

@@ -1,10 +1,13 @@
+import json
+
 import pytest
 
-from mem0_sidecar.store.models import EventStatus, JobStatus, Project
+from mem0_sidecar.store.models import EventStatus, ExportStatus, JobStatus, Project
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EntityRepository,
     EventRepository,
+    ExportJobRepository,
     JobRepository,
     MemoryIndexRepository,
     ProjectRepository,
@@ -233,6 +236,61 @@ def test_memory_index_repository_get_memory_can_include_deleted_rows(
 
     assert memory is not None
     assert memory.deleted_at is not None
+
+
+def test_export_job_repository_lifecycle(db_session):
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="default",
+        name="default",
+        mem0_base_url="http://mem0:8000",
+    )
+    repo = ExportJobRepository(db_session)
+
+    job = repo.create(
+        project_id="default",
+        export_format="json",
+        filters={"app_id": "codex"},
+    )
+    assert job.status == ExportStatus.PENDING
+    assert json.loads(job.filters_json) == {"app_id": "codex"}
+
+    repo.mark_running(job.id)
+    assert job.status == ExportStatus.RUNNING
+    assert job.started_at is not None
+
+    repo.mark_succeeded(
+        job.id,
+        result={"memories": [], "skipped": []},
+        total_count=1,
+        exported_count=0,
+        skipped_count=1,
+    )
+    assert job.status == ExportStatus.SUCCEEDED
+    assert json.loads(job.result_json) == {"memories": [], "skipped": []}
+    assert job.total_count == 1
+    assert job.exported_count == 0
+    assert job.skipped_count == 1
+    assert job.completed_at is not None
+
+
+def test_export_job_repository_get_is_project_scoped(db_session):
+    for project_id in ("default", "other"):
+        ProjectRepository(db_session).upsert_default_project(
+            project_id=project_id,
+            name=project_id,
+            mem0_base_url="http://mem0:8000",
+        )
+
+    repo = ExportJobRepository(db_session)
+    job = repo.create(project_id="default", export_format="json", filters={})
+
+    assert repo.get("default", job.id).id == job.id
+    try:
+        repo.get("other", job.id)
+    except KeyError as exc:
+        assert str(exc).strip("'") == job.id
+    else:
+        raise AssertionError("Expected project-scoped lookup to fail")
 
 
 def test_project_repository_preserves_existing_defaults_on_routed_upsert(

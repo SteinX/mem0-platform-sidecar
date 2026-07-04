@@ -2,6 +2,8 @@ from mem0_sidecar.store.models import (
     Category,
     Event,
     EventStatus,
+    ExportJob,
+    ExportStatus,
     Job,
     JobStatus,
     MemoryIndex,
@@ -52,6 +54,14 @@ def test_control_plane_models_persist(db_session) -> None:
             status=JobStatus.PENDING,
         )
     )
+    db_session.add(
+        ExportJob(
+            project_id="repo-a",
+            status=ExportStatus.PENDING,
+            format="json",
+            filters_json='{"app_id":"repo-a"}',
+        )
+    )
     db_session.commit()
 
     assert (
@@ -77,4 +87,8 @@ def test_control_plane_models_persist(db_session) -> None:
     )
     assert db_session.query(Job).filter_by(project_id="repo-a").one().job_type == (
         "entity.rebuild"
+    )
+    assert (
+        db_session.query(ExportJob).filter_by(project_id="repo-a").one().status
+        is ExportStatus.PENDING
     )

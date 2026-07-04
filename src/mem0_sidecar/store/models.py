@@ -35,6 +35,13 @@ class JobStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class ExportStatus(StrEnum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
 class Project(Base):
     __tablename__ = "projects"
 
@@ -185,3 +192,26 @@ class Job(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
+
+
+class ExportJob(Base):
+    __tablename__ = "export_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    status: Mapped[ExportStatus] = mapped_column(
+        SAEnum(ExportStatus), default=ExportStatus.PENDING, nullable=False
+    )
+    format: Mapped[str] = mapped_column(String(32), nullable=False)
+    filters_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    result_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    result_ref: Mapped[str | None] = mapped_column(String(1024))
+    error_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    exported_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
