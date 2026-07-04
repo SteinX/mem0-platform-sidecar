@@ -1,0 +1,11 @@
+{
+  "name": "mem0-dashboard-overlay-phase1",
+  "description": "Unlock self-hosted Categories and Export dashboard pages backed by mem0-platform-sidecar.",
+  "files": [
+    "src/app/(root)/dashboard/categories/page.tsx",
+    "src/app/(root)/dashboard/export/page.tsx",
+    "src/app/api/sidecar/[...path]/route.ts",
+    "src/utils/sidecar-api.ts",
+    "src/types/sidecar.ts"
+  ]
+}

@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+import json
+import shutil
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: apply-dashboard-overlay <dashboard-dir>", file=sys.stderr)
+        return 2
+
+    overlay_root = Path(__file__).resolve().parents[1]
+    dashboard_dir = Path(sys.argv[1]).resolve()
+    manifest = json.loads((overlay_root / "manifest.json").read_text())
+    source_root = overlay_root / "overlays"
+
+    for relative in manifest["files"]:
+        source = source_root / relative
+        target = dashboard_dir / relative
+        if not source.exists():
+            print(f"overlay source missing: {source}", file=sys.stderr)
+            return 1
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        print(f"copied {relative}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
