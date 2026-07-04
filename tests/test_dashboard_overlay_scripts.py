@@ -328,4 +328,19 @@ def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
     assert 'const PROJECT_ID = "default";' in content
     assert 'toast({ title: "Categories saved", variant: "success" });' in content
     assert "JSON.parse(category.schemaText)" in content
+    assert "type EditableCategory = {" in content
+    assert "id: string;" in content
+    assert "crypto.randomUUID()" in content
+    assert "key={category.id}" in content
+    assert 'key={`${category.name}-${index}`}' not in content
+    assert "const isEditorDisabled = isLoading || isSaving || !hasLoaded;" in content
+    assert "disabled={isEditorDisabled}" in content
+    assert (
+        "onCheckedChange={(enabled) => updateCategory(index, { enabled })}"
+        in content
+    )
+    assert "disabled={isEditorDisabled}" in content
+    assert 'title: "Failed to load categories"' in content
+    assert "Retry load" in content
+    assert "void loadCategories();" in content
     assert "LockedPage" not in content

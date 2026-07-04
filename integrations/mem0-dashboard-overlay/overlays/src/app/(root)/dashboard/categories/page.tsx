@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Plus, Save, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,7 @@ import { SidecarCategory, SidecarCategoryResponse } from "@/types/sidecar";
 import { sidecarGet, sidecarPut } from "@/utils/sidecar-api";
 
 type EditableCategory = {
+  id: string;
   name: string;
   description: string;
   schemaText: string;
@@ -23,8 +24,13 @@ type EditableCategory = {
 
 const PROJECT_ID = "default";
 
+function createCategoryId(): string {
+  return crypto.randomUUID();
+}
+
 function toEditable(category: SidecarCategory): EditableCategory {
   return {
+    id: createCategoryId(),
     name: category.name,
     description: category.description,
     schemaText: JSON.stringify(category.schema ?? {}, null, 2),
@@ -35,6 +41,7 @@ function toEditable(category: SidecarCategory): EditableCategory {
 
 function emptyCategory(): EditableCategory {
   return {
+    id: createCategoryId(),
     name: "",
     description: "",
     schemaText: "{}",
@@ -47,32 +54,36 @@ export default function CategoriesPage() {
   const [categories, setCategories] = useState<EditableCategory[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   const enabledCount = useMemo(
     () => categories.filter((category) => category.enabled).length,
     [categories],
   );
 
-  useEffect(() => {
-    async function loadCategories() {
-      try {
-        const response = await sidecarGet<SidecarCategoryResponse>(
-          `/v1/projects/${PROJECT_ID}/categories`,
-        );
-        setCategories(response.categories.map(toEditable));
-      } catch (error) {
-        toast({
-          title: "Failed to load categories",
-          description: error instanceof Error ? error.message : String(error),
-          variant: "destructive",
-        });
-      } finally {
-        setIsLoading(false);
-      }
+  const loadCategories = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const response = await sidecarGet<SidecarCategoryResponse>(
+        `/v1/projects/${PROJECT_ID}/categories`,
+      );
+      setCategories(response.categories.map(toEditable));
+      setHasLoaded(true);
+    } catch (error) {
+      setHasLoaded(false);
+      toast({
+        title: "Failed to load categories",
+        description: error instanceof Error ? error.message : String(error),
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
     }
-
-    void loadCategories();
   }, []);
+
+  useEffect(() => {
+    void loadCategories();
+  }, [loadCategories]);
 
   const updateCategory = (
     index: number,
@@ -84,6 +95,8 @@ export default function CategoriesPage() {
       ),
     );
   };
+
+  const isEditorDisabled = isLoading || isSaving || !hasLoaded;
 
   const saveCategories = async () => {
     setIsSaving(true);
@@ -127,26 +140,45 @@ export default function CategoriesPage() {
           <Button
             variant="outline"
             onClick={() => setCategories((current) => [...current, emptyCategory()])}
+            disabled={isEditorDisabled}
           >
             <Plus className="mr-2 size-4" />
             Add
           </Button>
-          <Button onClick={saveCategories} disabled={isSaving || isLoading}>
+          <Button onClick={saveCategories} disabled={isEditorDisabled}>
             <Save className="mr-2 size-4" />
             Save
           </Button>
         </div>
       </div>
 
+      {!hasLoaded ? (
+        <Card className="border-memBorder-primary">
+          <CardContent className="flex flex-col items-start gap-3 p-5">
+            <p className="text-sm text-onSurface-default-secondary">
+              Load categories before editing or saving changes.
+            </p>
+            <Button
+              variant="outline"
+              onClick={() => void loadCategories()}
+              disabled={isLoading}
+            >
+              Retry load
+            </Button>
+          </CardContent>
+        </Card>
+      ) : null}
+
       <div className="grid gap-4">
         {categories.map((category, index) => (
-          <Card key={`${category.name}-${index}`} className="border-memBorder-primary">
+          <Card key={category.id} className="border-memBorder-primary">
             <CardContent className="grid gap-4 p-5 md:grid-cols-[1fr_1fr_auto]">
               <div className="space-y-2">
                 <Label>Name</Label>
                 <Input
                   value={category.name}
                   onChange={(event) => updateCategory(index, { name: event.target.value })}
+                  disabled={isEditorDisabled}
                 />
                 <Label>Description</Label>
                 <Input
@@ -154,6 +186,7 @@ export default function CategoriesPage() {
                   onChange={(event) =>
                     updateCategory(index, { description: event.target.value })
                   }
+                  disabled={isEditorDisabled}
                 />
               </div>
               <div className="space-y-2">
@@ -164,12 +197,14 @@ export default function CategoriesPage() {
                   onChange={(event) =>
                     updateCategory(index, { schemaText: event.target.value })
                   }
+                  disabled={isEditorDisabled}
                 />
               </div>
               <div className="flex items-start gap-3">
                 <Switch
                   checked={category.enabled}
                   onCheckedChange={(enabled) => updateCategory(index, { enabled })}
+                  disabled={isEditorDisabled}
                 />
                 <Button
                   variant="ghost"
@@ -179,6 +214,7 @@ export default function CategoriesPage() {
                       current.filter((_, itemIndex) => itemIndex !== index),
                     )
                   }
+                  disabled={isEditorDisabled}
                 >
                   <Trash2 className="size-4 text-onSurface-danger-primary" />
                 </Button>
