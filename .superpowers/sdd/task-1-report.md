@@ -93,3 +93,29 @@ Results:
 8 passed, 1 warning in 0.45s
 All checks passed!
 ```
+
+## Task 1 Bug Fix Addendum
+
+Fixed the remaining route validation gap where `PUT /v1/projects/{project_id}/categories` treated a missing `categories` field as an empty replacement. The handler now rejects payloads like `{}` with a clean `400` and the existing `Categories must be a list of category objects` detail instead of silently deleting all categories.
+
+Regression coverage added:
+
+- `test_put_project_categories_rejects_missing_categories_field`
+
+Verification:
+
+```bash
+python -m pytest /workspace/data/mem0/mem0-platform-sidecar/.worktrees/dashboard-overlay-phase1/tests/http_adapter/test_category_routes.py -k missing_categories_field -q
+python -m pytest /workspace/data/mem0/mem0-platform-sidecar/.worktrees/dashboard-overlay-phase1/tests/http_adapter/test_category_routes.py -q
+```
+
+Results:
+
+```text
+FAILED tests/http_adapter/test_category_routes.py::test_put_project_categories_rejects_missing_categories_field
+6 passed, 1 warning in 1.14s
+```
+
+```text
+6 passed, 1 warning in 0.46s
+```

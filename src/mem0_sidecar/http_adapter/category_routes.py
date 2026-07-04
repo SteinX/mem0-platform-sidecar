@@ -17,7 +17,9 @@ INVALID_CATEGORIES_MESSAGE = "Categories must be a list of category objects"
 
 
 def _extract_categories(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    categories = payload.get("categories", [])
+    if "categories" not in payload:
+        raise CategoryValidationError(INVALID_CATEGORIES_MESSAGE)
+    categories = payload["categories"]
     if not isinstance(categories, list):
         raise CategoryValidationError(INVALID_CATEGORIES_MESSAGE)
     if any(not isinstance(item, dict) for item in categories):

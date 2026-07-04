@@ -130,3 +130,16 @@ def test_put_project_categories_rejects_duplicate_names(tmp_path):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Category names must be unique per project"
+
+
+def test_put_project_categories_rejects_missing_categories_field(tmp_path):
+    app = _app(tmp_path)
+    client = TestClient(app)
+
+    response = client.put(
+        "/v1/projects/default/categories",
+        json={},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Categories must be a list of category objects"
