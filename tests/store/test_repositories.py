@@ -377,6 +377,42 @@ def test_export_job_repository_get_is_project_scoped(db_session):
         raise AssertionError("Expected project-scoped lookup to fail")
 
 
+def test_memory_index_repository_lists_export_candidates(db_session):
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="default",
+        name="default",
+        mem0_base_url="http://mem0:8000",
+    )
+    repo = MemoryIndexRepository(db_session)
+    repo.upsert_memory(
+        project_id="default",
+        mem0_memory_id="mem-a",
+        user_id="root",
+        app_id="codex",
+        agent_id=None,
+        run_id=None,
+        category="preferences",
+        metadata={"source": "test"},
+    )
+    repo.upsert_memory(
+        project_id="default",
+        mem0_memory_id="mem-b",
+        user_id="other",
+        app_id="codex",
+        agent_id=None,
+        run_id=None,
+        category=None,
+        metadata={},
+    )
+
+    candidates = repo.list_export_candidates(
+        project_id="default",
+        filters={"user_id": "root", "app_id": "codex"},
+    )
+
+    assert [item.mem0_memory_id for item in candidates] == ["mem-a"]
+
+
 def test_project_repository_preserves_existing_defaults_on_routed_upsert(
     db_session,
 ) -> None:

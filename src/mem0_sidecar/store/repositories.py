@@ -218,6 +218,30 @@ class MemoryIndexRepository:
 
         return set(self.session.scalars(statement))
 
+    def list_export_candidates(
+        self,
+        *,
+        project_id: str,
+        filters: dict[str, Any],
+    ) -> list[MemoryIndex]:
+        statement = (
+            select(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.deleted_at.is_(None),
+            )
+            .order_by(MemoryIndex.created_at, MemoryIndex.mem0_memory_id)
+        )
+        if (user_id := filters.get("user_id")) is not None:
+            statement = statement.where(MemoryIndex.user_id == user_id)
+        if (app_id := filters.get("app_id")) is not None:
+            statement = statement.where(MemoryIndex.app_id == app_id)
+        if (agent_id := filters.get("agent_id")) is not None:
+            statement = statement.where(MemoryIndex.agent_id == agent_id)
+        if (run_id := filters.get("run_id")) is not None:
+            statement = statement.where(MemoryIndex.run_id == run_id)
+        return list(self.session.scalars(statement))
+
     def upsert_memory(
         self,
         *,
