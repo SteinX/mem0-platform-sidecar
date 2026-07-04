@@ -70,3 +70,26 @@ All checks passed!
 - Preserved `enabled` when storing categories so the admin API round-trips boolean state correctly.
 - Validation now rejects empty names, non-object schemas, and duplicate names per project.
 - The test suite is green, with only the existing FastAPI/TestClient deprecation warning remaining.
+
+## Review Fix Addendum
+
+Fixed the category route to reject malformed `categories` payloads before they reach the service layer. The handler now requires `categories` to be a list of JSON objects and returns a clean `400` response with `Categories must be a list of category objects` instead of raising an internal error.
+
+I added regression coverage for:
+
+- string and dict-shaped `categories` payloads
+- `enabled=False` round-tripping through the PUT/GET flow
+
+Verification:
+
+```bash
+python -m pytest tests/http_adapter/test_category_routes.py tests/core/test_dashboard_categories.py -q
+python -m ruff check src/mem0_sidecar/http_adapter/category_routes.py tests/http_adapter/test_category_routes.py
+```
+
+Results:
+
+```text
+8 passed, 1 warning in 0.45s
+All checks passed!
+```

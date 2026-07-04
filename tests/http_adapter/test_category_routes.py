@@ -1,5 +1,6 @@
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from mem0_sidecar.config import SidecarSettings
@@ -60,6 +61,57 @@ def test_put_and_get_project_categories(tmp_path):
     response = client.get("/v1/projects/default/categories")
     assert response.status_code == 200
     assert response.json()["categories"][0]["name"] == "preferences"
+
+
+def test_put_project_categories_round_trips_enabled_false(tmp_path):
+    app = _app(tmp_path)
+    client = TestClient(app)
+
+    response = client.put(
+        "/v1/projects/default/categories",
+        json={
+            "categories": [
+                {
+                    "name": "preferences",
+                    "description": "Durable user preferences",
+                    "schema": {"type": "object"},
+                    "enabled": False,
+                    "strategy": "metadata",
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["categories"][0]["enabled"] is False
+
+    response = client.get("/v1/projects/default/categories")
+    assert response.status_code == 200
+    assert response.json()["categories"][0]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "categories",
+    [
+        "oops",
+        {"name": "work", "schema": {}},
+    ],
+)
+def test_put_project_categories_rejects_malformed_categories_payload(
+    tmp_path,
+    categories,
+):
+    app = _app(tmp_path)
+    client = TestClient(app)
+
+    response = client.put(
+        "/v1/projects/default/categories",
+        json={"categories": categories},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Categories must be a list of category objects"
 
 
 def test_put_project_categories_rejects_duplicate_names(tmp_path):

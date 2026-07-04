@@ -13,6 +13,16 @@ from mem0_sidecar.store.repositories import CategoryRepository
 
 category_router = APIRouter()
 SessionDependency = Annotated[Session, Depends(get_session)]
+INVALID_CATEGORIES_MESSAGE = "Categories must be a list of category objects"
+
+
+def _extract_categories(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    categories = payload.get("categories", [])
+    if not isinstance(categories, list):
+        raise CategoryValidationError(INVALID_CATEGORIES_MESSAGE)
+    if any(not isinstance(item, dict) for item in categories):
+        raise CategoryValidationError(INVALID_CATEGORIES_MESSAGE)
+    return categories
 
 
 @category_router.get("/v1/projects/{project_id}/categories")
@@ -36,7 +46,7 @@ def replace_project_categories(
     try:
         result = service.replace_categories(
             project_id=project_id,
-            items=list(payload.get("categories", [])),
+            items=_extract_categories(payload),
         )
     except CategoryValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
