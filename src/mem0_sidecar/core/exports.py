@@ -1,6 +1,7 @@
 import json
 from typing import Any
 
+from mem0_sidecar.core.memory_ops import _validate_get_response
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
 from mem0_sidecar.store.models import ExportJob, ExportStatus
@@ -80,9 +81,7 @@ class ExportService:
         try:
             for candidate in candidates:
                 try:
-                    exported.append(
-                        await self.mem0.get_memory(candidate.mem0_memory_id)
-                    )
+                    response = await self.mem0.get_memory(candidate.mem0_memory_id)
                 except Mem0UpstreamError as exc:
                     if exc.status_code == 404:
                         skipped.append(
@@ -93,6 +92,17 @@ class ExportService:
                         )
                         continue
                     raise
+                try:
+                    exported.append(
+                        _validate_get_response(candidate.mem0_memory_id, response)
+                    )
+                except KeyError:
+                    skipped.append(
+                        {
+                            "id": candidate.mem0_memory_id,
+                            "reason": "upstream_mismatch",
+                        }
+                    )
 
             result = {
                 "project_id": project_id,
