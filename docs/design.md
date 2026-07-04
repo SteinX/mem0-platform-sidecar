@@ -239,6 +239,14 @@ PYTHONDONTWRITEBYTECODE=1 python scripts/run_live_e2e_compose.py
 - entity and event tool behavior;
 - contract tests for tool inputs and outputs.
 
+### Dashboard Overlay
+
+The dashboard overlay is an optional integration layer for the upstream Mem0
+OSS dashboard. It keeps overlay source in this repository, applies it to
+upstream `server/dashboard`, and uses sidecar admin APIs for Categories and
+Export. The overlay should stay page-scoped and repeatable so upstream syncs
+remain manageable.
+
 ### Phase 4: Official Integration Validation
 
 - repeatable Codex smoke test;

@@ -59,6 +59,27 @@ Common `MEM0_SIDECAR_MEM0_BASE_URL` shapes:
 On Linux, `host.docker.internal` may require an explicit Compose `extra_hosts`
 entry in your deployment file. Prefer a Docker network alias when possible.
 
+## Dashboard Overlay
+
+Apply the overlay to an upstream dashboard checkout, then verify it before you
+wire the runtime variable:
+
+```bash
+python integrations/mem0-dashboard-overlay/scripts/apply-dashboard-overlay \
+  /path/to/mem0/server/dashboard
+python integrations/mem0-dashboard-overlay/scripts/verify-dashboard-overlay \
+  /path/to/mem0/server/dashboard
+```
+
+The dashboard runtime, not the sidecar service, reads
+`SIDECAR_INTERNAL_API_URL`. For local or Docker-based dashboard runs, point it
+at the sidecar service URL, for example
+`SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765`.
+
+The dev compose file remains sidecar-only. It does not start the dashboard and
+does not need dashboard overlay wiring. Keep `docs/superpowers/` internal and
+ignored.
+
 ## Configuration
 
 The service reads these environment variables:

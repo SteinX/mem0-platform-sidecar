@@ -173,6 +173,30 @@ Common `MEM0_SIDECAR_MEM0_BASE_URL` values:
 On Linux, `host.docker.internal` may require an explicit compose
 `extra_hosts` entry. Prefer a Docker network alias when possible.
 
+## Dashboard Overlay
+
+The sidecar includes an optional Mem0 OSS dashboard overlay that unlocks the
+self-hosted Categories and Export pages. The overlay source lives under
+`integrations/mem0-dashboard-overlay/` and is applied to an upstream
+`server/dashboard` checkout.
+
+```bash
+python integrations/mem0-dashboard-overlay/scripts/apply-dashboard-overlay \
+  /path/to/mem0/server/dashboard
+python integrations/mem0-dashboard-overlay/scripts/verify-dashboard-overlay \
+  /path/to/mem0/server/dashboard
+```
+
+The overlay uses a same-origin Next.js proxy route at `/api/sidecar/...`.
+Configure the dashboard runtime with:
+
+```bash
+SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
+```
+
+Task-only notes under `docs/superpowers/` remain ignored and internal; keep
+them out of published docs and stack configuration.
+
 ## Add To An Existing Mem0 OSS Compose Stack
 
 When Mem0 OSS already runs in a compose stack, add the sidecar on the same
