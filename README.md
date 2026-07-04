@@ -296,4 +296,4 @@ of failing. A skipped live E2E test is not a live pass.
 
 - [Development](docs/development.md)
 - [E2E Testing](docs/e2e.md)
-- [Design Spec](docs/superpowers/specs/2026-07-03-mem0-platform-sidecar-design.md)
+- [Design](docs/design.md)
