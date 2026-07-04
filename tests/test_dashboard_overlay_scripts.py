@@ -307,6 +307,57 @@ def test_verify_dashboard_overlay_uses_npm_exec_pnpm_when_global_pnpm_missing(
     assert npm_log.read_text().strip() == "exec --yes pnpm@10.34.2 -- typecheck"
 
 
+def test_verify_dashboard_overlay_uses_pinned_default_when_package_manager_missing(
+    tmp_path,
+):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+    (dashboard / "package.json").write_text('{"scripts":{"typecheck":"tsc"}}\n')
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    npm_log = tmp_path / "npm-default.log"
+    npm = bin_dir / "npm"
+    npm.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" > {npm_log}\n"
+        "exit 0\n"
+    )
+    npm.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{Path('/usr/bin')}:{Path('/bin')}"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert npm_log.read_text().strip() == "exec --yes pnpm@10.34.2 -- typecheck"
+
+
 def test_verify_dashboard_overlay_rejects_missing_manifest_file(tmp_path):
     dashboard = tmp_path / "dashboard"
     dashboard.mkdir()

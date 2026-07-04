@@ -17,18 +17,19 @@ EXPECTED_BADGES = {
     "Analytics": "PRO",
     "Export": "SELF-HOSTED",
 }
+DEFAULT_PNPM_PACKAGE = "pnpm@10.34.2"
 
 
 def npm_exec_pnpm_package(dashboard_dir: Path) -> str:
     package_json = dashboard_dir / "package.json"
     if not package_json.exists():
-        return "pnpm"
+        return DEFAULT_PNPM_PACKAGE
 
     package_data = json.loads(package_json.read_text())
     package_manager = package_data.get("packageManager")
     if isinstance(package_manager, str) and package_manager.startswith("pnpm@"):
         return package_manager
-    return "pnpm"
+    return DEFAULT_PNPM_PACKAGE
 
 
 def typecheck_command(dashboard_dir: Path) -> list[str]:
