@@ -176,9 +176,11 @@ On Linux, `host.docker.internal` may require an explicit compose
 ## Dashboard Overlay
 
 The sidecar includes an optional Mem0 OSS dashboard overlay that unlocks the
-self-hosted Categories and Export pages. The overlay source lives under
-`integrations/mem0-dashboard-overlay/` and is applied to an upstream
-`server/dashboard` checkout.
+self-hosted Categories and Export pages. Phase 1 is intentionally narrow:
+Categories and Export are self-hosted, while the rest of the Cloud-only
+dashboard remains unchanged and unimplemented in the overlay. The overlay source
+lives under `integrations/mem0-dashboard-overlay/` and is applied to an
+upstream `server/dashboard` checkout.
 
 ```bash
 python integrations/mem0-dashboard-overlay/scripts/apply-dashboard-overlay \
@@ -193,6 +195,19 @@ Configure the dashboard runtime with:
 ```bash
 SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
 ```
+
+If verification fails or an upstream dashboard upgrade goes sideways, back out
+the overlay in the dashboard checkout before trying again:
+
+1. Run `git status` in the dashboard checkout and review the overlay-applied
+   files.
+2. Revert only the overlay changes with that checkout's VCS tools, or discard
+   and recreate the checkout from a clean copy if you applied the overlay to a
+   temporary tree.
+3. Do not use `git reset --hard` unless you have already backed up the checkout
+   and understand the local changes you are discarding.
+4. If the dashboard was already deployed, rebuild and restart it after the
+   rollback so the reverted files are the ones in service.
 
 Task-only notes under `docs/superpowers/` remain ignored and internal; keep
 them out of published docs and stack configuration.

@@ -9,6 +9,9 @@ Phase 1 covers:
 - Categories
 - Export
 
+That means Phase 1 self-hosts those two pages only. Other Cloud-only dashboard
+pages and features remain unchanged and are not implemented by this overlay.
+
 Apply to an upstream dashboard checkout:
 
 ```bash
@@ -32,3 +35,15 @@ SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
 
 The dashboard runtime, not the sidecar service, reads
 `SIDECAR_INTERNAL_API_URL`.
+
+If the overlay fails verification or an upstream dashboard upgrade breaks the
+checkout, back it out before applying it again:
+
+1. Run `git status` in the dashboard checkout and inspect the overlay-applied
+   files.
+2. Revert only the overlay changes with the dashboard checkout's VCS tools, or
+   replace the checkout with a clean copy if you used a throwaway tree.
+3. Avoid `git reset --hard` unless you have a backup and are intentionally
+   discarding local work.
+4. Rebuild and restart the dashboard if the reverted checkout is already
+   deployed.
