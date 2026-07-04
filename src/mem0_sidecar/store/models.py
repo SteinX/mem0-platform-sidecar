@@ -2,7 +2,15 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -200,16 +208,31 @@ class ExportJob(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
     status: Mapped[ExportStatus] = mapped_column(
-        SAEnum(ExportStatus), default=ExportStatus.PENDING, nullable=False
+        SAEnum(ExportStatus),
+        default=ExportStatus.PENDING,
+        server_default=text("'PENDING'"),
+        nullable=False,
     )
     format: Mapped[str] = mapped_column(String(32), nullable=False)
-    filters_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
-    result_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    filters_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
+    result_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
     result_ref: Mapped[str | None] = mapped_column(String(1024))
-    error_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
-    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    exported_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    skipped_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
+    total_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    exported_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    skipped_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

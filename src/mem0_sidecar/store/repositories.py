@@ -341,10 +341,8 @@ class ExportJobRepository:
             )
         )
 
-    def mark_running(self, job_id: str) -> ExportJob:
-        job = self.session.get(ExportJob, job_id)
-        if job is None:
-            raise KeyError(job_id)
+    def mark_running(self, project_id: str, job_id: str) -> ExportJob:
+        job = self.get(project_id, job_id)
         job.status = ExportStatus.RUNNING
         job.started_at = _utc_now()
         self.session.flush()
@@ -352,6 +350,7 @@ class ExportJobRepository:
 
     def mark_succeeded(
         self,
+        project_id: str,
         job_id: str,
         *,
         result: dict[str, Any],
@@ -359,9 +358,7 @@ class ExportJobRepository:
         exported_count: int,
         skipped_count: int,
     ) -> ExportJob:
-        job = self.session.get(ExportJob, job_id)
-        if job is None:
-            raise KeyError(job_id)
+        job = self.get(project_id, job_id)
         job.status = ExportStatus.SUCCEEDED
         job.result_json = _json(result)
         job.error_json = _json({})
@@ -372,10 +369,10 @@ class ExportJobRepository:
         self.session.flush()
         return job
 
-    def mark_failed(self, job_id: str, *, error: dict[str, Any]) -> ExportJob:
-        job = self.session.get(ExportJob, job_id)
-        if job is None:
-            raise KeyError(job_id)
+    def mark_failed(
+        self, project_id: str, job_id: str, *, error: dict[str, Any]
+    ) -> ExportJob:
+        job = self.get(project_id, job_id)
         job.status = ExportStatus.FAILED
         job.error_json = _json(error)
         job.completed_at = _utc_now()

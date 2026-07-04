@@ -254,23 +254,107 @@ def test_export_job_repository_lifecycle(db_session):
     assert job.status == ExportStatus.PENDING
     assert json.loads(job.filters_json) == {"app_id": "codex"}
 
-    repo.mark_running(job.id)
-    assert job.status == ExportStatus.RUNNING
-    assert job.started_at is not None
+    repo.mark_running("default", job.id)
+    db_session.commit()
+    db_session.expire_all()
+    running = repo.get("default", job.id)
+    assert running.status == ExportStatus.RUNNING
+    assert running.started_at is not None
 
     repo.mark_succeeded(
+        "default",
         job.id,
         result={"memories": [], "skipped": []},
         total_count=1,
         exported_count=0,
         skipped_count=1,
     )
-    assert job.status == ExportStatus.SUCCEEDED
-    assert json.loads(job.result_json) == {"memories": [], "skipped": []}
-    assert job.total_count == 1
-    assert job.exported_count == 0
-    assert job.skipped_count == 1
-    assert job.completed_at is not None
+    db_session.commit()
+    db_session.expire_all()
+    succeeded = repo.get("default", job.id)
+    assert succeeded.status == ExportStatus.SUCCEEDED
+    assert json.loads(succeeded.result_json) == {"memories": [], "skipped": []}
+    assert succeeded.total_count == 1
+    assert succeeded.exported_count == 0
+    assert succeeded.skipped_count == 1
+    assert succeeded.completed_at is not None
+
+
+def test_export_job_repository_lifecycle_is_project_scoped(db_session) -> None:
+    project_repo = ProjectRepository(db_session)
+    for project_id in ("default", "other"):
+        project_repo.upsert_default_project(
+            project_id=project_id,
+            name=project_id,
+            mem0_base_url="http://mem0:8000",
+        )
+
+    repo = ExportJobRepository(db_session)
+    job = repo.create(project_id="default", export_format="json", filters={})
+
+    with pytest.raises(KeyError):
+        repo.mark_running("other", job.id)
+
+    repo.mark_running("default", job.id)
+
+    with pytest.raises(KeyError):
+        repo.mark_succeeded(
+            "other",
+            job.id,
+            result={"memories": []},
+            total_count=1,
+            exported_count=1,
+            skipped_count=0,
+        )
+
+    with pytest.raises(KeyError):
+        repo.mark_failed("other", job.id, error={"message": "boom"})
+
+
+def test_export_job_repository_failed_lifecycle_and_listing_reload_from_database(
+    db_session,
+) -> None:
+    project_repo = ProjectRepository(db_session)
+    project_repo.upsert_default_project(
+        project_id="default",
+        name="default",
+        mem0_base_url="http://mem0:8000",
+    )
+    project_repo.upsert_default_project(
+        project_id="other",
+        name="other",
+        mem0_base_url="http://mem0:8000",
+    )
+    repo = ExportJobRepository(db_session)
+
+    older = repo.create(
+        project_id="default",
+        export_format="json",
+        filters={"app_id": "older"},
+    )
+    failed = repo.create(
+        project_id="default",
+        export_format="csv",
+        filters={"app_id": "failed"},
+    )
+    repo.create(
+        project_id="other",
+        export_format="json",
+        filters={"app_id": "hidden"},
+    )
+    db_session.commit()
+
+    repo.mark_failed("default", failed.id, error={"message": "boom"})
+    db_session.commit()
+    db_session.expire_all()
+
+    reloaded = repo.get("default", failed.id)
+    assert reloaded.status == ExportStatus.FAILED
+    assert json.loads(reloaded.error_json) == {"message": "boom"}
+    assert reloaded.completed_at is not None
+
+    listed = repo.list_project_exports("default")
+    assert [job.id for job in listed] == [failed.id, older.id]
 
 
 def test_export_job_repository_get_is_project_scoped(db_session):
