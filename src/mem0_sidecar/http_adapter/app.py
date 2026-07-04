@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import text
 
 from mem0_sidecar.config import SidecarSettings, load_settings
 from mem0_sidecar.http_adapter.event_routes import event_router
@@ -46,5 +47,26 @@ def create_app(
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok", "service": "mem0-platform-sidecar"}
+
+    @app.get("/readyz")
+    def readyz() -> dict[str, str]:
+        try:
+            with app.state.session_factory() as session:
+                session.execute(text("SELECT 1"))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "status": "error",
+                    "service": "mem0-platform-sidecar",
+                    "database": "unavailable",
+                },
+            ) from exc
+
+        return {
+            "status": "ok",
+            "service": "mem0-platform-sidecar",
+            "database": "ok",
+        }
 
     return app

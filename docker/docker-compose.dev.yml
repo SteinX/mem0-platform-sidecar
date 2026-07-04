@@ -4,21 +4,15 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     environment:
-      MEM0_SIDECAR_DATABASE_URL: sqlite:////data/mem0_sidecar.sqlite3
-      MEM0_SIDECAR_MEM0_BASE_URL: http://mem0:8000
-      MEM0_SIDECAR_DEFAULT_PROJECT_ID: default
+      MEM0_SIDECAR_DATABASE_URL: ${MEM0_SIDECAR_DATABASE_URL:-sqlite:////data/mem0_sidecar.sqlite3}
+      MEM0_SIDECAR_MEM0_BASE_URL: ${MEM0_SIDECAR_MEM0_BASE_URL:-http://host.docker.internal:8000}
+      MEM0_SIDECAR_DEFAULT_PROJECT_ID: ${MEM0_SIDECAR_DEFAULT_PROJECT_ID:-default}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - sidecar-data:/data
     ports:
       - "8765:8765"
-    command:
-      - uvicorn
-      - mem0_sidecar.http_adapter.app:create_app
-      - --factory
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8765"
 
 volumes:
   sidecar-data:

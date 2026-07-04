@@ -15,6 +15,51 @@ def test_healthz_reports_sidecar_status() -> None:
     assert response.json() == {"status": "ok", "service": "mem0-platform-sidecar"}
 
 
+def test_readyz_checks_database_session(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "service": "mem0-platform-sidecar",
+        "database": "ok",
+    }
+
+
+def test_readyz_returns_503_when_database_session_fails(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+        )
+    )
+
+    def failing_session_factory():
+        raise RuntimeError("database unavailable")
+
+    app.state.session_factory = failing_session_factory
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "status": "error",
+            "service": "mem0-platform-sidecar",
+            "database": "unavailable",
+        }
+    }
+
+
 def test_create_app_stores_injected_settings_and_clients(tmp_path) -> None:
     settings = SidecarSettings(
         database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",

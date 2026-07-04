@@ -39,11 +39,19 @@ it, and asserts durable sidecar add/delete events.
 
 ## Suggested Verification
 
-Run the full test suite with the E2E marker enabled:
+Run the default regression suite:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider
 ```
 
-Live Mem0 OSS verification should be run only when a compatible service is
-available.
+This command allows the live Mem0 OSS E2E test to skip when
+`MEM0_E2E_BASE_URL` is not set. A skipped live E2E test is not a live pass.
+
+Run the real live check explicitly when a compatible service is available:
+
+```bash
+MEM0_E2E_BASE_URL=http://127.0.0.1:8000 \
+MEM0_E2E_PROJECT_ID=sidecar-e2e \
+PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/e2e/test_live_mem0_oss.py -v -rs -p no:cacheprovider
+```
