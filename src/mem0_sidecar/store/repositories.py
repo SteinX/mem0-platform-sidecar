@@ -174,12 +174,15 @@ class MemoryIndexRepository:
         *,
         project_id: str,
         mem0_memory_id: str,
+        app_id: str | None = None,
         include_deleted: bool = False,
     ) -> MemoryIndex | None:
         statement = select(MemoryIndex).where(
-                MemoryIndex.project_id == project_id,
-                MemoryIndex.mem0_memory_id == mem0_memory_id,
-            )
+            MemoryIndex.project_id == project_id,
+            MemoryIndex.mem0_memory_id == mem0_memory_id,
+        )
+        if app_id is not None:
+            statement = statement.where(MemoryIndex.app_id == app_id)
         if not include_deleted:
             statement = statement.where(MemoryIndex.deleted_at.is_(None))
         return self.session.scalar(statement)

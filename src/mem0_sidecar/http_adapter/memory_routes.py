@@ -71,11 +71,13 @@ async def get_memory(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
+    request_app_id = resolve_app_id(request)
     service = MemoryService(session=session, mem0=mem0)
     try:
         return await service.get_memory(
             project_id=project_id,
             memory_id=memory_id,
+            request_app_id=request_app_id,
         )
     except KeyError as exc:
         session.rollback()

@@ -478,6 +478,36 @@ def test_get_memory_does_not_bootstrap_unknown_project_on_read(tmp_path) -> None
     assert project_z is None
 
 
+def test_get_memory_rejects_wrong_query_app_id_without_remote_read(tmp_path) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    add_response = client.post(
+        "/v3/memories/add/",
+        json={
+            "text": "hello",
+            "user_id": "root",
+            "project_id": "repo-a",
+            "app_id": "app-a",
+        },
+    )
+    assert add_response.status_code == 200
+
+    response = client.get("/v1/memories/mem-1?project_id=repo-a&app_id=app-b")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Memory not found"}
+    assert mem0.get_memory_ids == []
+
+
 def test_delete_memory_missing_index_uses_query_app_id_for_failed_event(
     tmp_path,
 ) -> None:
@@ -517,7 +547,53 @@ def test_delete_memory_missing_index_uses_query_app_id_for_failed_event(
     assert json.loads(event.request_json)["app_id"] == "app-x"
 
 
-def test_route_scoped_requests_reject_conflicting_project_scope(tmp_path) -> None:
+def test_delete_memory_rejects_wrong_query_app_id_without_remote_delete(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+
+    add_response = client.post(
+        "/v3/memories/add/",
+        json={
+            "text": "hello",
+            "user_id": "root",
+            "project_id": "repo-a",
+            "app_id": "app-a",
+        },
+    )
+    assert add_response.status_code == 200
+    mem0.deleted_ids.clear()
+
+    response = client.delete("/v1/memories/mem-1?project_id=repo-a&app_id=app-b")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Memory not found"}
+    assert mem0.deleted_ids == []
+
+    with app.state.session_factory() as session:
+        event = session.scalar(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.delete",
+                Event.status == EventStatus.FAILED,
+                Event.subject_id == "mem-1",
+            )
+        )
+
+    assert event is not None
+    assert json.loads(event.request_json)["app_id"] == "app-b"
+
+
+def test_route_scoped_requests_allow_different_project_and_app_scope(tmp_path) -> None:
     app = create_app(
         settings=SidecarSettings(
             database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",

@@ -282,9 +282,19 @@ class MemoryService:
             scope=scope,
         )
 
-    async def get_memory(self, *, project_id: str, memory_id: str) -> dict[str, Any]:
+    async def get_memory(
+        self,
+        *,
+        project_id: str,
+        memory_id: str,
+        request_app_id: str | None = None,
+    ) -> dict[str, Any]:
         memory_repo = MemoryIndexRepository(self.session)
-        memory = memory_repo.get_memory(project_id=project_id, mem0_memory_id=memory_id)
+        memory = memory_repo.get_memory(
+            project_id=project_id,
+            mem0_memory_id=memory_id,
+            app_id=request_app_id,
+        )
         if memory is None:
             raise KeyError(memory_id)
 
@@ -298,7 +308,11 @@ class MemoryService:
         request_app_id: str | None = None,
     ) -> dict[str, Any]:
         memory_repo = MemoryIndexRepository(self.session)
-        memory = memory_repo.get_memory(project_id=project_id, mem0_memory_id=memory_id)
+        memory = memory_repo.get_memory(
+            project_id=project_id,
+            mem0_memory_id=memory_id,
+            app_id=request_app_id,
+        )
         if memory is None:
             event_repo = EventRepository(self.session)
             event = event_repo.create_event(
