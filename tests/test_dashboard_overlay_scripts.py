@@ -38,6 +38,37 @@ def test_apply_dashboard_overlay_copies_files(tmp_path):
         assert (dashboard / relative).exists(), relative
 
 
+def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+    helper_content = (dashboard / "src/utils/sidecar-api.ts").read_text()
+    type_content = (dashboard / "src/types/sidecar.ts").read_text()
+
+    assert "export const GET = proxy;" in route_content
+    assert "export const POST = proxy;" in route_content
+    assert "export async function sidecarGet<T>" in helper_content
+    assert "export async function sidecarPut<T>" in helper_content
+    assert "export async function sidecarPost<T>" in helper_content
+    assert "export type SidecarCategory =" in type_content
+    assert "export type SidecarExportJob =" in type_content
+
+
 def test_verify_dashboard_overlay_rejects_locked_pages(tmp_path):
     dashboard = tmp_path / "dashboard"
     dashboard.mkdir()
