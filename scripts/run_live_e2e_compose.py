@@ -81,6 +81,17 @@ def compose_run_command(project_name: str) -> list[str]:
     ]
 
 
+def compose_down_command(project_name: str) -> list[str]:
+    return [
+        *compose_command(project_name),
+        "down",
+        "-v",
+        "--remove-orphans",
+        "--rmi",
+        "local",
+    ]
+
+
 def wait_for_mem0_ready(
     project_name: str,
     *,
@@ -171,7 +182,7 @@ def main() -> int:
         raise
     finally:
         subprocess.run(
-            [*base_compose, "down", "-v", "--remove-orphans"],
+            compose_down_command(project_name),
             cwd=ROOT,
             env=compose_env,
             check=False,

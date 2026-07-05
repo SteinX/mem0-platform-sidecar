@@ -1,6 +1,7 @@
 from scripts.run_live_e2e_compose import (
     build_runner_env,
     compose_command,
+    compose_down_command,
     compose_run_command,
     compose_up_command,
     resolve_upstream_context,
@@ -57,3 +58,10 @@ def test_compose_run_command_executes_pytest_inside_compose_network() -> None:
 
     assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
     assert command[-4:] == ["run", "--rm", "--build", "e2e-runner"]
+
+
+def test_compose_down_command_removes_local_test_images() -> None:
+    command = compose_down_command("sidecar-e2e-test")
+
+    assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
+    assert command[-5:] == ["down", "-v", "--remove-orphans", "--rmi", "local"]
