@@ -195,6 +195,8 @@ Configure the dashboard runtime with:
 ```bash
 SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
 SIDECAR_PROJECT_ID=default
+# Only mirror this when the Mem0 OSS server itself runs auth-disabled for local dev.
+AUTH_DISABLED=false
 ```
 
 Set `SIDECAR_PROJECT_ID` in the dashboard runtime to the sidecar project that
@@ -202,6 +204,12 @@ should own dashboard category and export actions. If it is not set, the overlay
 falls back to `MEM0_SIDECAR_DEFAULT_PROJECT_ID`, then `default`. The project id
 is resolved through a server-side dashboard route at runtime, so it is not baked
 into the browser bundle.
+
+The proxy validates the dashboard refresh-token cookie before forwarding
+sidecar requests. For local development stacks that intentionally run the Mem0
+OSS server with `AUTH_DISABLED=true`, set the same value in the dashboard
+runtime so the overlay follows that auth-disabled mode. Do not use auth-disabled
+dashboard proxying for production deployments.
 
 If verification fails or an upstream dashboard upgrade goes sideways, back out
 the overlay in the dashboard checkout before trying again:

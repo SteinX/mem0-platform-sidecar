@@ -241,6 +241,9 @@ def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
 
     assert 'const COOKIE_NAME = "mem0_refresh_token";' in route_content
     assert "async function validateDashboardSession()" in route_content
+    assert "function isAuthDisabled()" in route_content
+    assert 'process.env.AUTH_DISABLED?.toLowerCase()' in route_content
+    assert "if (isAuthDisabled()) {" in route_content
     assert 'return jsonError("Unauthorized", 401);' in route_content
     assert "AUTH_ENDPOINTS.REFRESH" in route_content
     assert "getServerApiUrl()" in route_content

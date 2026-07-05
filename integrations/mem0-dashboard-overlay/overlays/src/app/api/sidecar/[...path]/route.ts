@@ -57,7 +57,16 @@ function isAllowedSidecarRequest(method: string, path: string): boolean {
   return isProjectCategoriesPath(method, path) || isExportPath(method, path);
 }
 
+function isAuthDisabled() {
+  const value = process.env.AUTH_DISABLED?.toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
 async function validateDashboardSession(): Promise<boolean> {
+  if (isAuthDisabled()) {
+    return true;
+  }
+
   const cookieStore = await cookies();
   const refreshToken = cookieStore.get(COOKIE_NAME)?.value;
   if (!refreshToken) {

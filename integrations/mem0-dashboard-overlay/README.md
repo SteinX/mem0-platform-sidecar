@@ -32,6 +32,8 @@ Configure the dashboard runtime with:
 ```bash
 SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
 SIDECAR_PROJECT_ID=default
+# Only mirror this when the Mem0 OSS server itself runs auth-disabled for local dev.
+AUTH_DISABLED=false
 ```
 
 The dashboard runtime, not the sidecar service, reads
@@ -39,6 +41,11 @@ The dashboard runtime, not the sidecar service, reads
 server-side runtime config route; if unset, the overlay falls back to
 `MEM0_SIDECAR_DEFAULT_PROJECT_ID`, then `default`. This keeps the selected
 sidecar project out of the browser build artifact.
+
+The sidecar proxy validates the dashboard refresh-token cookie by default. If
+the Mem0 OSS server is intentionally running with `AUTH_DISABLED=true` for local
+development, set `AUTH_DISABLED=true` in the dashboard runtime as well so the
+overlay follows that mode. Keep auth disabled off in production.
 
 If the overlay fails verification or an upstream dashboard upgrade breaks the
 checkout, back it out before applying it again:
