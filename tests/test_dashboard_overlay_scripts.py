@@ -182,6 +182,12 @@ def test_apply_dashboard_overlay_route_restricts_sidecar_paths(tmp_path):
     route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
 
     assert "function isAllowedSidecarRequest(" in route_content
+    assert "function getConfiguredProjectId()" in route_content
+    assert "function scopedSidecarPath(" in route_content
+    assert "function scopedExportBody(" in route_content
+    assert 'key !== "project_id"' in route_content
+    assert 'url.searchParams.set("project_id", configuredProjectId);' in route_content
+    assert "project_id: configuredProjectId" in route_content
     assert 'return jsonError("Sidecar route is not allowed", 403);' in route_content
     assert "isProjectCategoriesPath" in route_content
     assert "isExportPath" in route_content

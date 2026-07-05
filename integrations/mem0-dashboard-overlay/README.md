@@ -47,6 +47,10 @@ the Mem0 OSS server is intentionally running with `AUTH_DISABLED=true` for local
 development, set `AUTH_DISABLED=true` in the dashboard runtime as well so the
 overlay follows that mode. Keep auth disabled off in production.
 
+The proxy enforces the configured dashboard project for every forwarded
+Categories and Export request. Caller-supplied `project_id` values in paths,
+query strings, or export request bodies are rewritten to `SIDECAR_PROJECT_ID`.
+
 If the overlay fails verification or an upstream dashboard upgrade breaks the
 checkout, back it out before applying it again:
 

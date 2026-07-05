@@ -211,6 +211,10 @@ OSS server with `AUTH_DISABLED=true`, set the same value in the dashboard
 runtime so the overlay follows that auth-disabled mode. Do not use auth-disabled
 dashboard proxying for production deployments.
 
+The proxy also enforces the configured dashboard project on every forwarded
+Categories and Export request. Caller-supplied `project_id` values in paths,
+query strings, or export request bodies are rewritten to `SIDECAR_PROJECT_ID`.
+
 If verification fails or an upstream dashboard upgrade goes sideways, back out
 the overlay in the dashboard checkout before trying again:
 
