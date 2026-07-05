@@ -76,7 +76,15 @@ def compose_run_command(project_name: str) -> list[str]:
         *compose_command(project_name),
         "run",
         "--rm",
-        "--build",
+        "--no-deps",
+        "e2e-runner",
+    ]
+
+
+def compose_build_runner_command(project_name: str) -> list[str]:
+    return [
+        *compose_command(project_name),
+        "build",
         "e2e-runner",
     ]
 
@@ -172,6 +180,10 @@ def main() -> int:
             project_name,
             timeout_seconds=timeout_seconds,
             env=compose_env,
+        )
+        run(
+            compose_build_runner_command(project_name),
+            env=build_runner_env(project_id=project_id),
         )
         run(
             compose_run_command(project_name),

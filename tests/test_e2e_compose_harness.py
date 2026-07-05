@@ -1,11 +1,16 @@
+from pathlib import Path
+
 from scripts.run_live_e2e_compose import (
     build_runner_env,
+    compose_build_runner_command,
     compose_command,
     compose_down_command,
     compose_run_command,
     compose_up_command,
     resolve_upstream_context,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_build_runner_env_points_live_e2e_at_compose_service(monkeypatch) -> None:
@@ -57,7 +62,15 @@ def test_compose_run_command_executes_pytest_inside_compose_network() -> None:
     command = compose_run_command("sidecar-e2e-test")
 
     assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
-    assert command[-4:] == ["run", "--rm", "--build", "e2e-runner"]
+    assert command[-4:] == ["run", "--rm", "--no-deps", "e2e-runner"]
+    assert "--build" not in command
+
+
+def test_compose_build_runner_command_builds_only_runner() -> None:
+    command = compose_build_runner_command("sidecar-e2e-test")
+
+    assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
+    assert command[-2:] == ["build", "e2e-runner"]
 
 
 def test_compose_down_command_removes_local_test_images() -> None:
@@ -65,3 +78,12 @@ def test_compose_down_command_removes_local_test_images() -> None:
 
     assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
     assert command[-5:] == ["down", "-v", "--remove-orphans", "--rmi", "local"]
+
+
+def test_e2e_postgres_healthcheck_waits_for_final_server() -> None:
+    compose_file = ROOT / "docker" / "docker-compose.e2e.yml"
+
+    content = compose_file.read_text()
+
+    assert "cat /proc/1/comm" in content
+    assert "pg_isready -q -d postgres -U postgres" in content
