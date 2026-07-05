@@ -231,6 +231,23 @@ the overlay in the dashboard checkout before trying again:
 Task-only notes under `docs/superpowers/` remain ignored and internal; keep
 them out of published docs and stack configuration.
 
+## GHCR Images
+
+GitHub Actions publishes release-ready images to GitHub Container Registry:
+
+- `ghcr.io/steinx/mem0-platform-sidecar`
+- `ghcr.io/steinx/mem0-dashboard-sidecar`
+
+Publishing runs when a GitHub release is published, and can also be started
+manually from the `Publish GHCR Images` workflow. Release runs tag both images
+with the release tag, `latest`, and a short commit SHA tag. Manual runs tag both
+images with the requested `image_tag` and a short commit SHA tag; set
+`push_latest` only when intentionally moving the `latest` tag outside a release.
+
+The dashboard image is built from `mem0ai/mem0` at `mem0_ref` after applying
+and verifying the dashboard overlay in this repository. The default manual
+`mem0_ref` is `main`.
+
 ## Add To An Existing Mem0 OSS Compose Stack
 
 When Mem0 OSS already runs in a compose stack, add the sidecar on the same
