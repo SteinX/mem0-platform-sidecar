@@ -135,6 +135,42 @@ async def test_memory_service_adds_memory_indexes_projection_and_event(
     }
 
 
+@pytest.mark.asyncio
+async def test_memory_service_add_ignores_disabled_categories(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    CategoryRepository(db_session).replace_project_categories(
+        project_id="repo-a",
+        categories=[
+            {
+                "name": "decision",
+                "description": "Architecture decisions",
+                "enabled": False,
+            }
+        ],
+    )
+    service = MemoryService(session=db_session, mem0=FakeMem0Client())
+
+    await service.add_memory(
+        project_id="repo-a",
+        payload={
+            "text": "Use a sidecar control plane",
+            "user_id": "root",
+            "metadata": {"type": "decision"},
+        },
+    )
+    db_session.commit()
+
+    indexed = db_session.query(MemoryIndex).filter_by(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+    ).one()
+    assert indexed.category is None
+
+
 class ResultsOnlyAddMem0Client(FakeMem0Client):
     async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.add_payloads.append(payload)

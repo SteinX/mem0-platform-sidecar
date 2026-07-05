@@ -34,6 +34,16 @@ def _extract_filters(payload: dict[str, Any]) -> dict[str, Any]:
         raise ExportValidationError(
             f"Unsupported export filter keys: {', '.join(unknown_keys)}"
         )
+    invalid_value_keys = sorted(
+        key
+        for key, value in filters.items()
+        if value is not None and not isinstance(value, str)
+    )
+    if invalid_value_keys:
+        raise ExportValidationError(
+            "Export filter values must be strings or null: "
+            f"{', '.join(invalid_value_keys)}"
+        )
     return filters
 
 
