@@ -113,6 +113,23 @@ def test_export_routes_reject_non_object_filters(tmp_path):
     assert response.json()["detail"] == "Export filters must be a JSON object"
 
 
+def test_export_routes_reject_unknown_filter_keys(tmp_path):
+    app = _app(tmp_path, ExportFakeMem0Client())
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/exports",
+        json={
+            "project_id": "default",
+            "format": "json",
+            "filters": {"category": "preferences"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Unsupported export filter keys: category"
+
+
 def test_export_routes_return_404_for_missing_job(tmp_path):
     app = _app(tmp_path, ExportFakeMem0Client())
     client = TestClient(app)

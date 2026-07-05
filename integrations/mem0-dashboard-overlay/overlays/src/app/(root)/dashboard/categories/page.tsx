@@ -12,6 +12,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/components/ui/use-toast";
 import { SidecarCategory, SidecarCategoryResponse } from "@/types/sidecar";
 import { sidecarGet, sidecarPut } from "@/utils/sidecar-api";
+import { getSidecarProjectId } from "@/utils/sidecar-project";
 
 type EditableCategory = {
   id: string;
@@ -22,7 +23,7 @@ type EditableCategory = {
   strategy: string;
 };
 
-const PROJECT_ID = "default";
+const PROJECT_ID = getSidecarProjectId();
 
 function createCategoryId(): string {
   return crypto.randomUUID();

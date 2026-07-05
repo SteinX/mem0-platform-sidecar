@@ -12,6 +12,7 @@ export_router = APIRouter()
 SessionDependency = Annotated[Session, Depends(get_session)]
 Mem0Dependency = Annotated[Any, Depends(get_mem0_client)]
 INVALID_FILTERS_MESSAGE = "Export filters must be a JSON object"
+SUPPORTED_FILTER_KEYS = frozenset({"user_id", "app_id", "agent_id", "run_id"})
 
 
 def _service(session: Session, mem0: Any) -> ExportService:
@@ -28,6 +29,11 @@ def _extract_filters(payload: dict[str, Any]) -> dict[str, Any]:
         return {}
     if not isinstance(filters, dict):
         raise ExportValidationError(INVALID_FILTERS_MESSAGE)
+    unknown_keys = sorted(set(filters) - SUPPORTED_FILTER_KEYS)
+    if unknown_keys:
+        raise ExportValidationError(
+            f"Unsupported export filter keys: {', '.join(unknown_keys)}"
+        )
     return filters
 
 

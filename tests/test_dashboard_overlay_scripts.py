@@ -27,6 +27,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/app/(root)/dashboard/categories/page.tsx",
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/[...path]/route.ts",
+        "src/utils/sidecar-project.ts",
         "src/utils/sidecar-api.ts",
         "src/types/sidecar.ts",
         "src/app/(root)/dashboard/components/main-nav.tsx",
@@ -43,6 +44,7 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
     assert "src/app/(root)/dashboard/export/page.tsx" in manifest["files"]
     assert "src/app/(root)/dashboard/components/main-nav.tsx" in manifest["files"]
     assert "src/app/api/sidecar/[...path]/route.ts" in manifest["files"]
+    assert "src/utils/sidecar-project.ts" in manifest["files"]
 
 
 def test_apply_dashboard_overlay_copies_files(tmp_path):
@@ -108,6 +110,7 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
 
     route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
     helper_content = (dashboard / "src/utils/sidecar-api.ts").read_text()
+    project_helper_content = (dashboard / "src/utils/sidecar-project.ts").read_text()
     type_content = (dashboard / "src/types/sidecar.ts").read_text()
 
     assert "export const GET = proxy;" in route_content
@@ -115,6 +118,8 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
     assert "export async function sidecarGet<T>" in helper_content
     assert "export async function sidecarPut<T>" in helper_content
     assert "export async function sidecarPost<T>" in helper_content
+    assert "export function getSidecarProjectId()" in project_helper_content
+    assert "NEXT_PUBLIC_MEM0_SIDECAR_PROJECT_ID" in project_helper_content
     assert "export type SidecarCategory =" in type_content
     assert "export type SidecarExportJob =" in type_content
 
@@ -465,7 +470,9 @@ def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
     assert '"use client";' in content
     assert "sidecarGet<SidecarCategoryResponse>" in content
     assert "sidecarPut<SidecarCategoryResponse>" in content
-    assert 'const PROJECT_ID = "default";' in content
+    assert 'import { getSidecarProjectId } from "@/utils/sidecar-project";' in content
+    assert "const PROJECT_ID = getSidecarProjectId();" in content
+    assert 'const PROJECT_ID = "default";' not in content
     assert 'toast({ title: "Categories saved", variant: "success" });' in content
     assert "JSON.parse(category.schemaText)" in content
     assert "type EditableCategory = {" in content
@@ -514,7 +521,9 @@ def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_pa
         "function downloadJson(filename: string, payload: SidecarExportDownload)"
         in content
     )
-    assert 'const PROJECT_ID = "default";' in content
+    assert 'import { getSidecarProjectId } from "@/utils/sidecar-project";' in content
+    assert "const PROJECT_ID = getSidecarProjectId();" in content
+    assert 'const PROJECT_ID = "default";' not in content
     assert 'format: "json",' in content
     assert "Object.fromEntries(" in content
     assert 'toast({ title: "Export created", variant: "success" });' in content

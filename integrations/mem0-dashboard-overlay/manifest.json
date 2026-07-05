@@ -6,6 +6,7 @@
     "src/app/(root)/dashboard/export/page.tsx",
     "src/app/(root)/dashboard/components/main-nav.tsx",
     "src/app/api/sidecar/[...path]/route.ts",
+    "src/utils/sidecar-project.ts",
     "src/utils/sidecar-api.ts",
     "src/types/sidecar.ts"
   ]

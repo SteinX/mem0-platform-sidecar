@@ -31,10 +31,14 @@ Configure the dashboard runtime with:
 
 ```bash
 SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
+NEXT_PUBLIC_MEM0_SIDECAR_PROJECT_ID=default
 ```
 
 The dashboard runtime, not the sidecar service, reads
-`SIDECAR_INTERNAL_API_URL`.
+`SIDECAR_INTERNAL_API_URL`. The browser bundle reads
+`NEXT_PUBLIC_MEM0_SIDECAR_PROJECT_ID`; set it to the same project used by the
+sidecar deployment, especially when `MEM0_SIDECAR_DEFAULT_PROJECT_ID` is not
+`default`.
 
 If the overlay fails verification or an upstream dashboard upgrade breaks the
 checkout, back it out before applying it again:

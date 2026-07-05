@@ -16,8 +16,9 @@ import {
   SidecarExportListResponse,
 } from "@/types/sidecar";
 import { sidecarGet, sidecarPost } from "@/utils/sidecar-api";
+import { getSidecarProjectId } from "@/utils/sidecar-project";
 
-const PROJECT_ID = "default";
+const PROJECT_ID = getSidecarProjectId();
 
 function downloadJson(filename: string, payload: SidecarExportDownload) {
   const blob = new Blob([JSON.stringify(payload, null, 2)], {
