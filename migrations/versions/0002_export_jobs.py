@@ -26,10 +26,6 @@ export_status = sa.Enum(
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    if bind.dialect.name != "sqlite":
-        export_status.create(bind, checkfirst=True)
-
     op.create_table(
         "export_jobs",
         sa.Column("id", sa.String(length=36), nullable=False),

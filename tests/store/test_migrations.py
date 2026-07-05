@@ -1,4 +1,6 @@
+import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import sqlalchemy as sa
 from alembic import command
@@ -101,3 +103,30 @@ def test_export_jobs_migration_supports_runtime_defaults_and_downgrade(
 
     inspector = sa.inspect(sa.create_engine(database_url, future=True))
     assert "export_jobs" not in inspector.get_table_names()
+
+
+def test_export_jobs_migration_does_not_precreate_postgres_enum(monkeypatch) -> None:
+    migration = importlib.import_module("migrations.versions.0002_export_jobs")
+    created_tables: list[str] = []
+
+    def create_table(name: str, *args, **kwargs) -> None:
+        created_tables.append(name)
+
+    def fail_manual_enum_create(*args, **kwargs) -> None:
+        raise AssertionError("exportstatus should be created by create_table")
+
+    monkeypatch.setattr(
+        migration,
+        "op",
+        SimpleNamespace(
+            get_bind=lambda: SimpleNamespace(
+                dialect=SimpleNamespace(name="postgresql")
+            ),
+            create_table=create_table,
+        ),
+    )
+    monkeypatch.setattr(migration.export_status, "create", fail_manual_enum_create)
+
+    migration.upgrade()
+
+    assert created_tables == ["export_jobs"]

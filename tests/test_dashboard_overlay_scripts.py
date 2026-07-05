@@ -184,6 +184,33 @@ def test_apply_dashboard_overlay_route_handles_proxy_errors_explicitly(tmp_path)
     assert 'return jsonError("Sidecar upstream request failed", 502);' in route_content
 
 
+def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+
+    assert 'const COOKIE_NAME = "mem0_refresh_token";' in route_content
+    assert "async function validateDashboardSession()" in route_content
+    assert 'return jsonError("Unauthorized", 401);' in route_content
+    assert "AUTH_ENDPOINTS.REFRESH" in route_content
+    assert "getServerApiUrl()" in route_content
+
+
 def test_verify_dashboard_overlay_rejects_locked_pages(tmp_path):
     dashboard = tmp_path / "dashboard"
     write_verify_fixture(dashboard)
