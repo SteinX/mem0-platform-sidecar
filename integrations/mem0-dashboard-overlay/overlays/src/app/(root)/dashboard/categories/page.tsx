@@ -23,8 +23,6 @@ type EditableCategory = {
   strategy: string;
 };
 
-const PROJECT_ID = getSidecarProjectId();
-
 function createCategoryId(): string {
   return crypto.randomUUID();
 }
@@ -53,6 +51,7 @@ function emptyCategory(): EditableCategory {
 
 export default function CategoriesPage() {
   const [categories, setCategories] = useState<EditableCategory[]>([]);
+  const [projectId, setProjectId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -65,12 +64,15 @@ export default function CategoriesPage() {
   const loadCategories = useCallback(async () => {
     setIsLoading(true);
     try {
+      const resolvedProjectId = await getSidecarProjectId();
+      setProjectId(resolvedProjectId);
       const response = await sidecarGet<SidecarCategoryResponse>(
-        `/v1/projects/${PROJECT_ID}/categories`,
+        `/v1/projects/${resolvedProjectId}/categories`,
       );
       setCategories(response.categories.map(toEditable));
       setHasLoaded(true);
     } catch (error) {
+      setProjectId(null);
       setHasLoaded(false);
       toast({
         title: "Failed to load categories",
@@ -97,9 +99,18 @@ export default function CategoriesPage() {
     );
   };
 
-  const isEditorDisabled = isLoading || isSaving || !hasLoaded;
+  const isEditorDisabled = isLoading || isSaving || !hasLoaded || !projectId;
 
   const saveCategories = async () => {
+    if (!projectId) {
+      toast({
+        title: "Failed to save categories",
+        description: "Sidecar project is not loaded.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     setIsSaving(true);
     try {
       const payload = {
@@ -112,7 +123,7 @@ export default function CategoriesPage() {
         })),
       };
       const response = await sidecarPut<SidecarCategoryResponse>(
-        `/v1/projects/${PROJECT_ID}/categories`,
+        `/v1/projects/${projectId}/categories`,
         payload,
       );
       setCategories(response.categories.map(toEditable));
@@ -134,7 +145,8 @@ export default function CategoriesPage() {
         <div className="space-y-1">
           <h1 className="text-xl font-semibold font-fustat">Custom Categories</h1>
           <p className="text-sm text-onSurface-default-secondary">
-            Project {PROJECT_ID} has {categories.length} categories, {enabledCount} enabled.
+            Project {projectId ?? "..."} has {categories.length} categories,{" "}
+            {enabledCount} enabled.
           </p>
         </div>
         <div className="flex gap-2">

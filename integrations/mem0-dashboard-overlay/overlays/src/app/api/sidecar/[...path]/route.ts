@@ -39,6 +39,24 @@ function jsonError(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
 }
 
+function isProjectCategoriesPath(method: string, path: string): boolean {
+  return (
+    (method === "GET" || method === "PUT") &&
+    /^\/v1\/projects\/[^/]+\/categories$/.test(path)
+  );
+}
+
+function isExportPath(method: string, path: string): boolean {
+  if ((method === "GET" || method === "POST") && path === "/v1/exports") {
+    return true;
+  }
+  return method === "GET" && /^\/v1\/exports\/[^/]+\/download$/.test(path);
+}
+
+function isAllowedSidecarRequest(method: string, path: string): boolean {
+  return isProjectCategoriesPath(method, path) || isExportPath(method, path);
+}
+
 async function validateDashboardSession(): Promise<boolean> {
   const cookieStore = await cookies();
   const refreshToken = cookieStore.get(COOKIE_NAME)?.value;
@@ -75,9 +93,13 @@ async function proxy(
 ) {
   const params = await context.params;
   const upstreamPath = params.path.join("/");
+  const normalizedPath = `/${upstreamPath}`;
   const baseUrl = getSidecarBaseUrl();
   if (!baseUrl) {
     return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);
+  }
+  if (!isAllowedSidecarRequest(request.method, normalizedPath)) {
+    return jsonError("Sidecar route is not allowed", 403);
   }
   if (!(await validateDashboardSession())) {
     return jsonError("Unauthorized", 401);
@@ -123,4 +145,3 @@ async function proxy(
 export const GET = proxy;
 export const POST = proxy;
 export const PUT = proxy;
-export const DELETE = proxy;

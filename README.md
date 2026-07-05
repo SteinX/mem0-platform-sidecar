@@ -194,12 +194,14 @@ Configure the dashboard runtime with:
 
 ```bash
 SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
-NEXT_PUBLIC_MEM0_SIDECAR_PROJECT_ID=default
+SIDECAR_PROJECT_ID=default
 ```
 
-Set `NEXT_PUBLIC_MEM0_SIDECAR_PROJECT_ID` to the sidecar project that should own
-dashboard category and export actions. This should match a non-default
-`MEM0_SIDECAR_DEFAULT_PROJECT_ID` when your sidecar deployment uses one.
+Set `SIDECAR_PROJECT_ID` in the dashboard runtime to the sidecar project that
+should own dashboard category and export actions. If it is not set, the overlay
+falls back to `MEM0_SIDECAR_DEFAULT_PROJECT_ID`, then `default`. The project id
+is resolved through a server-side dashboard route at runtime, so it is not baked
+into the browser bundle.
 
 If verification fails or an upstream dashboard upgrade goes sideways, back out
 the overlay in the dashboard checkout before trying again:

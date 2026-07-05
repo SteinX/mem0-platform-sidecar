@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Download, FolderInput, RefreshCw } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 
@@ -17,8 +17,6 @@ import {
 } from "@/types/sidecar";
 import { sidecarGet, sidecarPost } from "@/utils/sidecar-api";
 import { getSidecarProjectId } from "@/utils/sidecar-project";
-
-const PROJECT_ID = getSidecarProjectId();
 
 function downloadJson(filename: string, payload: SidecarExportDownload) {
   const blob = new Blob([JSON.stringify(payload, null, 2)], {
@@ -38,6 +36,7 @@ function downloadJson(filename: string, payload: SidecarExportDownload) {
 
 export default function ExportPage() {
   const [jobs, setJobs] = useState<SidecarExportJob[]>([]);
+  const [projectId, setProjectId] = useState<string | null>(null);
   const [appId, setAppId] = useState("");
   const [userId, setUserId] = useState("");
   const [agentId, setAgentId] = useState("");
@@ -46,15 +45,18 @@ export default function ExportPage() {
   const [isCreating, setIsCreating] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  const loadJobs = async () => {
+  const loadJobs = useCallback(async () => {
     setIsLoading(true);
     setLoadError(null);
     try {
+      const resolvedProjectId = await getSidecarProjectId();
+      setProjectId(resolvedProjectId);
       const response = await sidecarGet<SidecarExportListResponse>("/v1/exports", {
-        project_id: PROJECT_ID,
+        project_id: resolvedProjectId,
       });
       setJobs(response.results);
     } catch (error) {
+      setProjectId(null);
       setJobs([]);
       setLoadError(error instanceof Error ? error.message : String(error));
       toast({
@@ -65,13 +67,22 @@ export default function ExportPage() {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     void loadJobs();
-  }, []);
+  }, [loadJobs]);
 
   const createExport = async () => {
+    if (!projectId) {
+      toast({
+        title: "Failed to create export",
+        description: "Sidecar project is not loaded.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     setIsCreating(true);
     try {
       const filters = Object.fromEntries(
@@ -83,7 +94,7 @@ export default function ExportPage() {
         }).filter(([, value]) => value),
       );
       await sidecarPost<SidecarExportJob>("/v1/exports", {
-        project_id: PROJECT_ID,
+        project_id: projectId,
         format: "json",
         filters,
       });
@@ -101,10 +112,19 @@ export default function ExportPage() {
   };
 
   const downloadExport = async (job: SidecarExportJob) => {
+    if (!projectId) {
+      toast({
+        title: "Failed to download export",
+        description: "Sidecar project is not loaded.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     try {
       const payload = await sidecarGet<SidecarExportDownload>(
         `/v1/exports/${job.id}/download`,
-        { project_id: PROJECT_ID },
+        { project_id: projectId },
       );
       downloadJson(`mem0-export-${job.id}.json`, payload);
     } catch (error) {
@@ -122,10 +142,14 @@ export default function ExportPage() {
         <div className="space-y-1">
           <h1 className="font-fustat text-xl font-semibold">Export</h1>
           <p className="text-sm text-onSurface-default-secondary">
-            Export scoped memories from project {PROJECT_ID}.
+            Export scoped memories from project {projectId ?? "..."}.
           </p>
         </div>
-        <Button variant="outline" onClick={loadJobs} disabled={isLoading}>
+        <Button
+          variant="outline"
+          onClick={() => void loadJobs()}
+          disabled={isLoading}
+        >
           <RefreshCw className="mr-2 size-4" />
           Refresh
         </Button>
@@ -150,7 +174,7 @@ export default function ExportPage() {
             <Input value={runId} onChange={(event) => setRunId(event.target.value)} />
           </div>
           <div className="md:col-span-4">
-            <Button onClick={createExport} disabled={isCreating}>
+            <Button onClick={createExport} disabled={isCreating || !projectId}>
               <FolderInput className="mr-2 size-4" />
               Create JSON Export
             </Button>
