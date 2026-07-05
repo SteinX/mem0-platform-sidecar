@@ -100,6 +100,19 @@ def test_export_routes_reject_unsupported_format(tmp_path):
     assert response.json()["detail"] == "Only json export format is supported"
 
 
+def test_export_routes_reject_non_object_filters(tmp_path):
+    app = _app(tmp_path, ExportFakeMem0Client())
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/v1/exports",
+        json={"project_id": "default", "format": "json", "filters": ["not-object"]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Export filters must be a JSON object"
+
+
 def test_export_routes_return_404_for_missing_job(tmp_path):
     app = _app(tmp_path, ExportFakeMem0Client())
     client = TestClient(app)

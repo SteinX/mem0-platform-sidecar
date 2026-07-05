@@ -9,6 +9,19 @@ OVERLAY = ROOT / "integrations" / "mem0-dashboard-overlay"
 NULL_PAGE = "export default function Page() { return null; }\n"
 
 
+def write_dashboard_package(dashboard: Path) -> None:
+    dashboard.mkdir()
+    (dashboard / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "mem0-dashboard",
+                "packageManager": "pnpm@10.34.2",
+                "scripts": {"typecheck": "tsc --noEmit"},
+            }
+        )
+    )
+
+
 def write_verify_fixture(dashboard: Path) -> None:
     for relative in [
         "src/app/(root)/dashboard/categories/page.tsx",
@@ -34,7 +47,7 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
 
 def test_apply_dashboard_overlay_copies_files(tmp_path):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
     manifest = json.loads((OVERLAY / "manifest.json").read_text())
 
     result = subprocess.run(
@@ -54,9 +67,30 @@ def test_apply_dashboard_overlay_copies_files(tmp_path):
         assert (dashboard / relative).exists(), relative
 
 
+def test_apply_dashboard_overlay_rejects_non_dashboard_target(tmp_path):
+    target = tmp_path / "not-dashboard"
+    target.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(target),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "does not look like a Mem0 dashboard checkout" in result.stderr
+    assert not (target / "src").exists()
+
+
 def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_path):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
 
     result = subprocess.run(
         [
@@ -89,7 +123,7 @@ def test_apply_dashboard_overlay_normalizes_sidecar_paths_and_removes_patch_foot
     tmp_path,
 ):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
 
     result = subprocess.run(
         [
@@ -116,7 +150,7 @@ def test_apply_dashboard_overlay_normalizes_sidecar_paths_and_removes_patch_foot
 
 def test_apply_dashboard_overlay_route_handles_proxy_errors_explicitly(tmp_path):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
 
     result = subprocess.run(
         [
@@ -221,7 +255,7 @@ def test_verify_dashboard_overlay_rejects_incorrect_navigation_badges(tmp_path):
 
 def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
     result = subprocess.run(
         [
             sys.executable,
@@ -258,10 +292,13 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
 
 def test_verify_dashboard_overlay_uses_npm_exec_pnpm_when_global_pnpm_missing(
     tmp_path,
-):
+) -> None:
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
-    (dashboard / "package.json").write_text('{"packageManager":"pnpm@10.34.2"}\n')
+    write_dashboard_package(dashboard)
+    (dashboard / "package.json").write_text(
+        '{"name":"mem0-dashboard","packageManager":"pnpm@10.34.2",'
+        '"scripts":{"typecheck":"tsc"}}\n'
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -309,10 +346,12 @@ def test_verify_dashboard_overlay_uses_npm_exec_pnpm_when_global_pnpm_missing(
 
 def test_verify_dashboard_overlay_uses_pinned_default_when_package_manager_missing(
     tmp_path,
-):
+) -> None:
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
-    (dashboard / "package.json").write_text('{"scripts":{"typecheck":"tsc"}}\n')
+    write_dashboard_package(dashboard)
+    (dashboard / "package.json").write_text(
+        '{"name":"mem0-dashboard","scripts":{"typecheck":"tsc"}}\n'
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -360,7 +399,7 @@ def test_verify_dashboard_overlay_uses_pinned_default_when_package_manager_missi
 
 def test_verify_dashboard_overlay_rejects_missing_manifest_file(tmp_path):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
     manifest = json.loads((OVERLAY / "manifest.json").read_text())
     pnpm = dashboard / "pnpm"
     pnpm.write_text("#!/bin/sh\nexit 0\n")
@@ -405,7 +444,7 @@ def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
     tmp_path,
 ):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
 
     result = subprocess.run(
         [
@@ -449,7 +488,7 @@ def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
 
 def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_path):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
 
     result = subprocess.run(
         [
@@ -494,7 +533,7 @@ def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_pa
 
 def test_apply_dashboard_overlay_export_page_uses_safe_blob_download_cleanup(tmp_path):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
 
     result = subprocess.run(
         [
@@ -523,7 +562,7 @@ def test_apply_dashboard_overlay_export_page_includes_loading_error_and_empty_st
     tmp_path,
 ):
     dashboard = tmp_path / "dashboard"
-    dashboard.mkdir()
+    write_dashboard_package(dashboard)
 
     result = subprocess.run(
         [

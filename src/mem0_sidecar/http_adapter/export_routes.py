@@ -11,6 +11,7 @@ from mem0_sidecar.store.repositories import ExportJobRepository, MemoryIndexRepo
 export_router = APIRouter()
 SessionDependency = Annotated[Session, Depends(get_session)]
 Mem0Dependency = Annotated[Any, Depends(get_mem0_client)]
+INVALID_FILTERS_MESSAGE = "Export filters must be a JSON object"
 
 
 def _service(session: Session, mem0: Any) -> ExportService:
@@ -19,6 +20,15 @@ def _service(session: Session, mem0: Any) -> ExportService:
         memories=MemoryIndexRepository(session),
         mem0=mem0,
     )
+
+
+def _extract_filters(payload: dict[str, Any]) -> dict[str, Any]:
+    filters = payload.get("filters")
+    if filters is None:
+        return {}
+    if not isinstance(filters, dict):
+        raise ExportValidationError(INVALID_FILTERS_MESSAGE)
+    return filters
 
 
 @export_router.post("/v1/exports")
@@ -34,7 +44,7 @@ async def create_export(
         result = await _service(session, mem0).create_export(
             project_id=project_id,
             export_format=str(payload.get("format", "json")),
-            filters=dict(payload.get("filters") or {}),
+            filters=_extract_filters(payload),
         )
     except ExportValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
