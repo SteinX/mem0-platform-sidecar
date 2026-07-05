@@ -10,6 +10,8 @@ from mem0_sidecar.store.models import (
     Entity,
     Event,
     EventStatus,
+    ExportJob,
+    ExportStatus,
     Job,
     JobStatus,
     MemoryIndex,
@@ -83,7 +85,7 @@ class CategoryRepository:
                 name=str(item["name"]),
                 description=str(item.get("description", "")),
                 schema_json=_json(item.get("schema", {})),
-                enabled=1,
+                enabled=1 if bool(item.get("enabled", True)) else 0,
                 strategy=str(item.get("strategy", "metadata")),
             )
             self.session.add(category)
@@ -216,6 +218,30 @@ class MemoryIndexRepository:
 
         return set(self.session.scalars(statement))
 
+    def list_export_candidates(
+        self,
+        *,
+        project_id: str,
+        filters: dict[str, Any],
+    ) -> list[MemoryIndex]:
+        statement = (
+            select(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.deleted_at.is_(None),
+            )
+            .order_by(MemoryIndex.created_at, MemoryIndex.mem0_memory_id)
+        )
+        if (user_id := filters.get("user_id")) is not None:
+            statement = statement.where(MemoryIndex.user_id == user_id)
+        if (app_id := filters.get("app_id")) is not None:
+            statement = statement.where(MemoryIndex.app_id == app_id)
+        if (agent_id := filters.get("agent_id")) is not None:
+            statement = statement.where(MemoryIndex.agent_id == agent_id)
+        if (run_id := filters.get("run_id")) is not None:
+            statement = statement.where(MemoryIndex.run_id == run_id)
+        return list(self.session.scalars(statement))
+
     def upsert_memory(
         self,
         *,
@@ -296,6 +322,86 @@ class EntityRepository:
         entity.last_seen_at = _utc_now()
         self.session.flush()
         return entity
+
+
+class ExportJobRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        project_id: str,
+        export_format: str,
+        filters: dict[str, Any],
+    ) -> ExportJob:
+        job = ExportJob(
+            project_id=project_id,
+            format=export_format,
+            filters_json=_json(filters),
+            status=ExportStatus.PENDING,
+        )
+        self.session.add(job)
+        self.session.flush()
+        return job
+
+    def get(self, project_id: str, job_id: str) -> ExportJob:
+        job = self.session.scalar(
+            select(ExportJob).where(
+                ExportJob.project_id == project_id,
+                ExportJob.id == job_id,
+            )
+        )
+        if job is None:
+            raise KeyError(job_id)
+        return job
+
+    def list_project_exports(self, project_id: str) -> list[ExportJob]:
+        return list(
+            self.session.scalars(
+                select(ExportJob)
+                .where(ExportJob.project_id == project_id)
+                .order_by(ExportJob.created_at.desc(), ExportJob.id.desc())
+            )
+        )
+
+    def mark_running(self, project_id: str, job_id: str) -> ExportJob:
+        job = self.get(project_id, job_id)
+        job.status = ExportStatus.RUNNING
+        job.started_at = _utc_now()
+        self.session.flush()
+        return job
+
+    def mark_succeeded(
+        self,
+        project_id: str,
+        job_id: str,
+        *,
+        result: dict[str, Any],
+        total_count: int,
+        exported_count: int,
+        skipped_count: int,
+    ) -> ExportJob:
+        job = self.get(project_id, job_id)
+        job.status = ExportStatus.SUCCEEDED
+        job.result_json = _json(result)
+        job.error_json = _json({})
+        job.total_count = total_count
+        job.exported_count = exported_count
+        job.skipped_count = skipped_count
+        job.completed_at = _utc_now()
+        self.session.flush()
+        return job
+
+    def mark_failed(
+        self, project_id: str, job_id: str, *, error: dict[str, Any]
+    ) -> ExportJob:
+        job = self.get(project_id, job_id)
+        job.status = ExportStatus.FAILED
+        job.error_json = _json(error)
+        job.completed_at = _utc_now()
+        self.session.flush()
+        return job
 
 
 class JobRepository:

@@ -173,6 +173,64 @@ Common `MEM0_SIDECAR_MEM0_BASE_URL` values:
 On Linux, `host.docker.internal` may require an explicit compose
 `extra_hosts` entry. Prefer a Docker network alias when possible.
 
+## Dashboard Overlay
+
+The sidecar includes an optional Mem0 OSS dashboard overlay that unlocks the
+self-hosted Categories and Export pages. Phase 1 is intentionally narrow:
+Categories and Export are self-hosted, while the rest of the Cloud-only
+dashboard remains unchanged and unimplemented in the overlay. The overlay source
+lives under `integrations/mem0-dashboard-overlay/` and is applied to an
+upstream `server/dashboard` checkout.
+
+```bash
+python integrations/mem0-dashboard-overlay/scripts/apply-dashboard-overlay \
+  /path/to/mem0/server/dashboard
+python integrations/mem0-dashboard-overlay/scripts/verify-dashboard-overlay \
+  /path/to/mem0/server/dashboard
+```
+
+The overlay uses a same-origin Next.js proxy route at `/api/sidecar/...`.
+Configure the dashboard runtime with:
+
+```bash
+SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
+SIDECAR_PROJECT_ID=default
+# Only mirror this when the Mem0 OSS server itself runs auth-disabled for local dev.
+AUTH_DISABLED=false
+```
+
+Set `SIDECAR_PROJECT_ID` in the dashboard runtime to the sidecar project that
+should own dashboard category and export actions. If it is not set, the overlay
+falls back to `MEM0_SIDECAR_DEFAULT_PROJECT_ID`, then `default`. The project id
+is resolved through a server-side dashboard route at runtime, so it is not baked
+into the browser bundle.
+
+The proxy validates the dashboard refresh-token cookie before forwarding
+sidecar requests. For local development stacks that intentionally run the Mem0
+OSS server with `AUTH_DISABLED=true`, set the same value in the dashboard
+runtime so the overlay follows that auth-disabled mode. Do not use auth-disabled
+dashboard proxying for production deployments.
+
+The proxy also enforces the configured dashboard project on every forwarded
+Categories and Export request. Caller-supplied `project_id` values in paths,
+query strings, or export request bodies are rewritten to `SIDECAR_PROJECT_ID`.
+
+If verification fails or an upstream dashboard upgrade goes sideways, back out
+the overlay in the dashboard checkout before trying again:
+
+1. Run `git status` in the dashboard checkout and review the overlay-applied
+   files.
+2. Revert only the overlay changes with that checkout's VCS tools, or discard
+   and recreate the checkout from a clean copy if you applied the overlay to a
+   temporary tree.
+3. Do not use `git reset --hard` unless you have already backed up the checkout
+   and understand the local changes you are discarding.
+4. If the dashboard was already deployed, rebuild and restart it after the
+   rollback so the reverted files are the ones in service.
+
+Task-only notes under `docs/superpowers/` remain ignored and internal; keep
+them out of published docs and stack configuration.
+
 ## Add To An Existing Mem0 OSS Compose Stack
 
 When Mem0 OSS already runs in a compose stack, add the sidecar on the same

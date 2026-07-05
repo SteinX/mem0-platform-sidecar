@@ -239,6 +239,7 @@ class MemoryService:
             for category in CategoryRepository(self.session).list_project_categories(
                 project_id
             )
+            if category.enabled
         }
         category = extract_category(metadata, category_names)
         oss_payload = _oss_add_payload(payload, scope=scope)

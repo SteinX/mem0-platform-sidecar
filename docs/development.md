@@ -59,6 +59,41 @@ Common `MEM0_SIDECAR_MEM0_BASE_URL` shapes:
 On Linux, `host.docker.internal` may require an explicit Compose `extra_hosts`
 entry in your deployment file. Prefer a Docker network alias when possible.
 
+## Dashboard Overlay
+
+Apply the overlay to an upstream dashboard checkout, then verify it before you
+wire the runtime variable:
+
+```bash
+python integrations/mem0-dashboard-overlay/scripts/apply-dashboard-overlay \
+  /path/to/mem0/server/dashboard
+python integrations/mem0-dashboard-overlay/scripts/verify-dashboard-overlay \
+  /path/to/mem0/server/dashboard
+```
+
+The dashboard runtime, not the sidecar service, reads
+`SIDECAR_INTERNAL_API_URL`. For local or Docker-based dashboard runs, point it
+at the sidecar service URL, for example
+`SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765`.
+
+Phase 1 only self-hosts Categories and Export. Other Cloud-only dashboard
+pages and features remain unchanged and are not implemented by this overlay.
+
+If verification fails or an upstream upgrade breaks the dashboard checkout,
+back out the overlay before retrying:
+
+1. Run `git status` in the dashboard checkout and review the files touched by
+   the overlay.
+2. Revert only the overlay-applied files with that checkout's VCS tools, or use
+   a clean temp copy of the upstream dashboard if you need to start over.
+3. Avoid destructive history rewrites such as `git reset --hard` unless you have
+   a backup and have confirmed you are discarding only the overlay work.
+4. Rebuild and restart the dashboard if it has already been deployed.
+
+The dev compose file remains sidecar-only. It does not start the dashboard and
+does not need dashboard overlay wiring. Keep `docs/superpowers/` internal and
+ignored.
+
 ## Configuration
 
 The service reads these environment variables:

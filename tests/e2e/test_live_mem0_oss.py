@@ -117,3 +117,93 @@ def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
     operations = [event["operation"] for event in events_response.json()["results"]]
     assert "memory.add" in operations
     assert "memory.delete" in operations
+
+
+def test_live_categories_and_export_flow(tmp_path) -> None:
+    settings = _live_settings(tmp_path)
+    client = TestClient(create_app(settings=settings))
+    project_id = "e2e-dashboard-overlay"
+    app_id = "dashboard-overlay"
+    user_id = "root"
+    marker = f"dashboard overlay export marker {uuid4()}"
+    out_of_scope_marker = f"dashboard overlay out-of-scope marker {uuid4()}"
+    cleanup_targets: list[tuple[str, str]] = []
+
+    categories_response = client.put(
+        f"/v1/projects/{project_id}/categories",
+        json={
+            "categories": [
+                {
+                    "name": "preferences",
+                    "description": "E2E preferences category",
+                    "schema": {},
+                    "enabled": True,
+                    "strategy": "metadata",
+                }
+            ]
+        },
+    )
+    assert categories_response.status_code == 200, categories_response.text
+    assert categories_response.json()["categories"][0]["name"] == "preferences"
+
+    add_response = client.post(
+        "/v3/memories/add/",
+        json={
+            "project_id": project_id,
+            "app_id": app_id,
+            "user_id": user_id,
+            "infer": False,
+            "metadata": {"category": "preferences"},
+            "messages": [{"role": "user", "content": marker}],
+        },
+    )
+    assert add_response.status_code == 200, add_response.text
+    memory_id = add_response.json()["event"]["subject_id"]
+    cleanup_targets.append((memory_id, app_id))
+
+    out_of_scope_response = client.post(
+        "/v3/memories/add/",
+        json={
+            "project_id": project_id,
+            "app_id": f"{app_id}-other",
+            "user_id": f"{user_id}-other",
+            "infer": False,
+            "metadata": {"category": "preferences"},
+            "messages": [{"role": "user", "content": out_of_scope_marker}],
+        },
+    )
+    assert out_of_scope_response.status_code == 200, out_of_scope_response.text
+    out_of_scope_memory_id = out_of_scope_response.json()["event"]["subject_id"]
+    cleanup_targets.append((out_of_scope_memory_id, f"{app_id}-other"))
+
+    try:
+        export_response = client.post(
+            "/v1/exports",
+            json={
+                "project_id": project_id,
+                "format": "json",
+                "filters": {"app_id": app_id, "user_id": user_id},
+            },
+        )
+        assert export_response.status_code == 200, export_response.text
+        job = export_response.json()
+        assert job["status"] == "SUCCEEDED"
+        assert job["exported_count"] >= 1
+
+        download_response = client.get(
+            f"/v1/exports/{job['id']}/download",
+            params={"project_id": project_id},
+        )
+        assert download_response.status_code == 200, download_response.text
+        payload = download_response.json()
+        assert any(marker in str(memory) for memory in payload["memories"])
+        assert all(
+            out_of_scope_marker not in str(memory) for memory in payload["memories"]
+        )
+    finally:
+        for cleanup_memory_id, cleanup_app_id in cleanup_targets:
+            delete_response = client.delete(
+                f"/v1/memories/{cleanup_memory_id}",
+                params={"project_id": project_id, "app_id": cleanup_app_id},
+            )
+            assert delete_response.status_code == 200, delete_response.text

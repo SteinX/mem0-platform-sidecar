@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+LOCKED_TARGETS = [
+    "src/app/(root)/dashboard/categories/page.tsx",
+    "src/app/(root)/dashboard/export/page.tsx",
+]
+MAIN_NAV = "src/app/(root)/dashboard/components/main-nav.tsx"
+EXPECTED_BADGES = {
+    "Categories": "SELF-HOSTED",
+    "Webhooks": "PRO",
+    "Analytics": "PRO",
+    "Export": "SELF-HOSTED",
+}
+DEFAULT_PNPM_PACKAGE = "pnpm@10.34.2"
+
+
+def npm_exec_pnpm_package(dashboard_dir: Path) -> str:
+    package_json = dashboard_dir / "package.json"
+    if not package_json.exists():
+        return DEFAULT_PNPM_PACKAGE
+
+    package_data = json.loads(package_json.read_text())
+    package_manager = package_data.get("packageManager")
+    if isinstance(package_manager, str) and package_manager.startswith("pnpm@"):
+        return package_manager
+    return DEFAULT_PNPM_PACKAGE
+
+
+def typecheck_command(dashboard_dir: Path) -> list[str]:
+    if shutil.which("pnpm"):
+        return ["pnpm", "typecheck"]
+    if shutil.which("npm"):
+        return [
+            "npm",
+            "exec",
+            "--yes",
+            npm_exec_pnpm_package(dashboard_dir),
+            "--",
+            "typecheck",
+        ]
+    raise FileNotFoundError("Neither pnpm nor npm is available on PATH")
+
+
+def verify_main_nav_badges(main_nav_content: str) -> str | None:
+    cursor = 0
+    for title, badge in EXPECTED_BADGES.items():
+        title_marker = f'title: "{title}"'
+        title_index = main_nav_content.find(title_marker, cursor)
+        if title_index == -1:
+            return f'main-nav missing item: "{title}"'
+
+        badge_marker = f'badge: "{badge}"'
+        badge_index = main_nav_content.find(badge_marker, title_index)
+        next_title_index = len(main_nav_content)
+        for next_title in EXPECTED_BADGES:
+            if next_title == title:
+                continue
+            candidate = main_nav_content.find(f'title: "{next_title}"', title_index + 1)
+            if candidate != -1:
+                next_title_index = min(next_title_index, candidate)
+
+        if badge_index == -1 or badge_index > next_title_index:
+            return f'{title} badge mismatch: expected "{badge}"'
+
+        cursor = title_index + 1
+    return None
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: verify-dashboard-overlay <dashboard-dir>", file=sys.stderr)
+        return 2
+
+    overlay_root = Path(__file__).resolve().parents[1]
+    dashboard_dir = Path(sys.argv[1]).resolve()
+
+    manifest = json.loads((overlay_root / "manifest.json").read_text())
+    for relative in manifest["files"]:
+        target = dashboard_dir / relative
+        if not target.exists():
+            print(f"missing manifest file: {relative}", file=sys.stderr)
+            return 1
+
+    for relative in LOCKED_TARGETS:
+        content = (dashboard_dir / relative).read_text()
+        if "LockedPage" in content:
+            print(f"{relative} still imports or renders LockedPage", file=sys.stderr)
+            return 1
+
+    badge_error = verify_main_nav_badges((dashboard_dir / MAIN_NAV).read_text())
+    if badge_error is not None:
+        print(badge_error, file=sys.stderr)
+        return 1
+
+    if os.environ.get("MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK") == "1":
+        return 0
+
+    try:
+        subprocess.run(typecheck_command(dashboard_dir), cwd=dashboard_dir, check=True)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -2,7 +2,9 @@ from fastapi import FastAPI, HTTPException
 from sqlalchemy import text
 
 from mem0_sidecar.config import SidecarSettings, load_settings
+from mem0_sidecar.http_adapter.category_routes import category_router
 from mem0_sidecar.http_adapter.event_routes import event_router
+from mem0_sidecar.http_adapter.export_routes import export_router
 from mem0_sidecar.http_adapter.memory_routes import memory_router
 from mem0_sidecar.mem0_client.client import Mem0RestClient
 from mem0_sidecar.observability import RequestLoggingMiddleware, configure_logging
@@ -58,6 +60,8 @@ def create_app(
     )
     app.include_router(memory_router)
     app.include_router(event_router)
+    app.include_router(category_router)
+    app.include_router(export_router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
