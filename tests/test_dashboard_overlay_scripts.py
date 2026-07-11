@@ -157,8 +157,14 @@ def test_apply_dashboard_overlay_normalizes_sidecar_paths_and_removes_patch_foot
 
     assert "function normalizeSidecarPath(path: string): string" in helper_content
     assert "return path.startsWith(\"/\") ? path : `/${path}`;" in helper_content
-    assert "METHODS_WITH_BODY = new Set([\"POST\", \"PUT\"]);" in route_content
-    assert "export const PATCH = proxy;" not in route_content
+    assert "export async function sidecarPatch<T>" in helper_content
+    assert "export async function sidecarDelete(" in helper_content
+    assert (
+        'const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);'
+        in route_content
+    )
+    assert "export const PATCH = proxy;" in route_content
+    assert "export const DELETE = proxy;" in route_content
 
 
 def test_apply_dashboard_overlay_route_restricts_sidecar_paths(tmp_path):
@@ -190,8 +196,13 @@ def test_apply_dashboard_overlay_route_restricts_sidecar_paths(tmp_path):
     assert "project_id: configuredProjectId" in route_content
     assert 'return jsonError("Sidecar route is not allowed", 403);' in route_content
     assert "isProjectCategoriesPath" in route_content
+    assert "isProjectCategoryItemPath" in route_content
+    assert "categoryItemMatch" in route_content
     assert "isExportPath" in route_content
-    assert "export const DELETE = proxy;" not in route_content
+    assert (
+        'method === "DELETE" && /^\\/v1\\/exports\\/[^/]+$/.test(path)'
+        not in route_content
+    )
 
 
 def test_apply_dashboard_overlay_route_handles_proxy_errors_explicitly(tmp_path):

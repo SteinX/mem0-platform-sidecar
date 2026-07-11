@@ -3,7 +3,7 @@ import { NextRequest } from "next/server";
 import { AUTH_ENDPOINTS } from "@/utils/api-endpoints";
 import { getServerApiUrl } from "@/lib/server-api-url";
 
-const METHODS_WITH_BODY = new Set(["POST", "PUT"]);
+const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);
 const COOKIE_NAME = "mem0_refresh_token";
 
 function shouldUseSecureCookie() {
@@ -49,8 +49,15 @@ function jsonError(message: string, status: number): Response {
 
 function isProjectCategoriesPath(method: string, path: string): boolean {
   return (
-    (method === "GET" || method === "PUT") &&
+    (method === "GET" || method === "POST" || method === "PUT") &&
     /^\/v1\/projects\/[^/]+\/categories$/.test(path)
+  );
+}
+
+function isProjectCategoryItemPath(method: string, path: string): boolean {
+  return (
+    (method === "PATCH" || method === "DELETE") &&
+    /^\/v1\/projects\/[^/]+\/categories\/[^/]+$/.test(path)
   );
 }
 
@@ -62,7 +69,11 @@ function isExportPath(method: string, path: string): boolean {
 }
 
 function isAllowedSidecarRequest(method: string, path: string): boolean {
-  return isProjectCategoriesPath(method, path) || isExportPath(method, path);
+  return (
+    isProjectCategoriesPath(method, path) ||
+    isProjectCategoryItemPath(method, path) ||
+    isExportPath(method, path)
+  );
 }
 
 function scopedSidecarPath(
@@ -75,6 +86,13 @@ function scopedSidecarPath(
   }
   if (isProjectCategoriesPath(method, path)) {
     return `/v1/projects/${encodeURIComponent(configuredProjectId)}/categories`;
+  }
+  const categoryItemMatch = path.match(
+    /^\/v1\/projects\/[^/]+\/categories\/([^/]+)$/,
+  );
+  if (categoryItemMatch) {
+    const categoryId = categoryItemMatch[1];
+    return `/v1/projects/${encodeURIComponent(configuredProjectId)}/categories/${encodeURIComponent(categoryId)}`;
   }
   return path;
 }
@@ -218,3 +236,5 @@ async function proxy(
 export const GET = proxy;
 export const POST = proxy;
 export const PUT = proxy;
+export const PATCH = proxy;
+export const DELETE = proxy;
