@@ -359,7 +359,145 @@ def verify_categories_page(dashboard_dir: Path) -> str | None:
         return "Categories must not present Schema JSON as the primary editor"
     if "SELF-HOSTED" in categories_content:
         return "Categories must not contain SELF-HOSTED copy"
+
+    categories_table = extract_categories_table_markup(page_content)
+    if categories_table is None:
+        return "Categories page missing rendered Categories table"
+
+    table_tag = extract_jsx_component_tags(categories_table, "Table")
+    if len(table_tag) != 1 or not tag_has_classes(
+        table_tag[0], "table-fixed", "sm:table-auto"
+    ):
+        return "Categories table missing fixed mobile table layout"
+
+    category_row = extract_category_row_markup(categories_table)
+    if category_row is None:
+        return "Categories table missing rendered keyboard row"
+
+    category_cell = extract_category_cell_markup(category_row)
+    if category_cell is None or not tag_has_classes(
+        category_cell, "break-words"
+    ):
+        return "Categories table missing a wrapping mobile Category cell"
+    description = extract_category_description_markup(category_cell)
+    if description is None or not tag_has_classes(
+        description,
+        "whitespace-normal",
+        "break-words",
+        "sm:max-w-xl",
+        "sm:truncate",
+    ):
+        return "Categories mobile Category cell must wrap its description"
+    if not has_mobile_category_status(category_cell):
+        return "Categories mobile Category cell must preserve status"
+    if not has_hidden_desktop_status_column(categories_table, category_row):
+        return "Categories table Status header and cell must be hidden below sm"
     return None
+
+
+def extract_jsx_component_elements(content: str, component: str) -> list[str]:
+    code = strip_comments(content)
+    elements: list[str] = []
+    marker = f"<{component}"
+    closing_marker = f"</{component}>"
+    index = 0
+    while True:
+        start = code.find(marker, index)
+        if start == -1:
+            return elements
+        following_index = start + len(marker)
+        if (
+            following_index < len(code)
+            and not code[following_index].isspace()
+            and code[following_index] != ">"
+        ):
+            index = following_index
+            continue
+        end = code.find(closing_marker, following_index)
+        if end == -1:
+            index = following_index
+            continue
+        elements.append(code[start : end + len(closing_marker)])
+        index = end + len(closing_marker)
+
+
+def tag_has_classes(tag: str, *classes: str) -> bool:
+    class_name = re.search(r'\bclassName\s*=\s*"([^"]*)"', tag)
+    if class_name is None:
+        return False
+    actual_classes = set(class_name.group(1).split())
+    return all(expected in actual_classes for expected in classes)
+
+
+def extract_categories_table_markup(page_content: str) -> str | None:
+    tables = [
+        table
+        for table in extract_jsx_component_elements(page_content, "Table")
+        if "<TableHeader>" in table and "<TableBody>" in table
+    ]
+    return tables[0] if len(tables) == 1 else None
+
+
+def extract_category_row_markup(categories_table: str) -> str | None:
+    rows = [
+        row
+        for row in extract_jsx_component_elements(categories_table, "TableRow")
+        if re.search(r'\brole\s*=\s*"button"', row) is not None
+    ]
+    return rows[0] if len(rows) == 1 else None
+
+
+def extract_category_cell_markup(category_row: str) -> str | None:
+    cells = [
+        cell
+        for cell in extract_jsx_component_elements(category_row, "TableCell")
+        if "category.name" in cell
+        and "category.description" in cell
+        and "isAdvanced" in cell
+    ]
+    return cells[0] if len(cells) == 1 else None
+
+
+def extract_category_description_markup(category_cell: str) -> str | None:
+    descriptions = [
+        description
+        for description in extract_jsx_component_elements(category_cell, "p")
+        if "category.description" in description
+    ]
+    return descriptions[0] if len(descriptions) == 1 else None
+
+
+def has_mobile_category_status(category_cell: str) -> bool:
+    status_spans = [
+        span
+        for span in extract_jsx_component_elements(category_cell, "span")
+        if 'category.enabled ? "Enabled" : "Disabled"' in span
+    ]
+    return len(status_spans) == 1 and tag_has_classes(status_spans[0], "sm:hidden")
+
+
+def has_hidden_desktop_status_column(
+    categories_table: str, category_row: str
+) -> bool:
+    status_headers = [
+        header
+        for header in extract_jsx_component_elements(categories_table, "TableHead")
+        if re.search(r">\s*Status\s*</TableHead>$", header) is not None
+    ]
+    if len(status_headers) != 1 or not tag_has_classes(
+        status_headers[0], "hidden", "sm:table-cell"
+    ):
+        return False
+
+    status_cells = [
+        cell
+        for cell in extract_jsx_component_elements(category_row, "TableCell")
+        if 'category.enabled ? "Enabled" : "Disabled"' in cell
+        and "category.name" not in cell
+    ]
+    return len(status_cells) == 1 and tag_has_classes(
+        status_cells[0], "hidden", "sm:table-cell"
+    )
 
 
 def extract_export_format_tag(export_content: str, format_name: str) -> str | None:

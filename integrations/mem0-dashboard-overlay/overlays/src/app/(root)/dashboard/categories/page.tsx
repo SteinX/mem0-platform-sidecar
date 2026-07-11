@@ -116,11 +116,11 @@ export default function CategoriesPage() {
       ) : null}
 
       <div className="border-y border-memBorder-primary">
-        <Table>
+        <Table className="table-fixed sm:table-auto">
           <TableHeader>
             <TableRow>
-              <TableHead className="min-w-52">Category</TableHead>
-              <TableHead>Status</TableHead>
+              <TableHead className="sm:min-w-52">Category</TableHead>
+              <TableHead className="hidden sm:table-cell">Status</TableHead>
               <TableHead className="hidden md:table-cell">Strategy</TableHead>
               <TableHead className="hidden sm:table-cell">Fields</TableHead>
               <TableHead className="hidden lg:table-cell">Version</TableHead>
@@ -158,18 +158,28 @@ export default function CategoriesPage() {
                       }
                     }}
                   >
-                    <TableCell>
+                    <TableCell className="break-words">
                       <div className="min-w-0 space-y-1">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="font-medium">{category.name}</span>
+                          <span className="min-w-0 break-words font-medium">
+                            {category.name}
+                          </span>
                           {isAdvanced ? <Badge variant="outline">Advanced</Badge> : null}
                         </div>
-                        <p className="max-w-xl truncate text-xs text-onSurface-default-secondary">
+                        <p className="whitespace-normal break-words text-xs text-onSurface-default-secondary sm:max-w-xl sm:truncate">
                           {category.description || "No description"}
                         </p>
+                        <span className="sm:hidden">
+                          <span className={category.enabled
+                            ? "text-onSurface-success-primary"
+                            : "text-onSurface-default-secondary"}
+                          >
+                            {category.enabled ? "Enabled" : "Disabled"}
+                          </span>
+                        </span>
                       </div>
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="hidden sm:table-cell">
                       <span className={category.enabled
                         ? "text-onSurface-success-primary"
                         : "text-onSurface-default-secondary"}

@@ -534,6 +534,66 @@ def test_verify_rejects_missing_category_patch_proxy(tmp_path):
     assert "PATCH" in result.stderr
 
 
+def test_verify_rejects_categories_table_without_mobile_fixed_layout(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/categories/page.tsx"
+    content = page.read_text().replace(
+        '<Table className="table-fixed sm:table-auto">', "<Table>", 1
+    )
+    page.write_text(
+        (
+            'const mobileTableDecoy = '
+            '"<Table className=\\"table-fixed sm:table-auto\\">";\n'
+        )
+        + content
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "fixed mobile table layout" in result.stderr
+
+
+def test_verify_rejects_categories_table_without_mobile_wrapping_and_status(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/categories/page.tsx"
+    content = page.read_text().replace(
+        "<Table>", '<Table className="table-fixed sm:table-auto">', 1
+    )
+    content = content.replace('className="break-words"', 'className=""', 1)
+    content = content.replace(
+        (
+            'className="whitespace-normal break-words text-xs '
+            'text-onSurface-default-secondary sm:max-w-xl sm:truncate"'
+        ),
+        'className="max-w-xl truncate text-xs text-onSurface-default-secondary"',
+        1,
+    )
+    content = content.replace('className="sm:hidden"', 'className="hidden"', 1)
+    content = content.replace(
+        '<TableHead className="hidden sm:table-cell">Status</TableHead>',
+        "<TableHead>Status</TableHead>",
+        1,
+    )
+    content = content.replace(
+        '<TableCell className="hidden sm:table-cell">\n                      <span',
+        '<TableCell>\n                      <span',
+        1,
+    )
+    page.write_text(
+        (
+            'const mobileCategoryDecoy = '
+            '"break-words whitespace-normal sm:hidden hidden sm:table-cell";\n'
+        )
+        + content
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "mobile Category cell" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("format_name", "replacement"),
     [
