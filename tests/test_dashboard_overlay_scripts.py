@@ -736,12 +736,20 @@ def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_pa
     assert 'title: "Failed to load exports"' in content
     assert 'title: "Failed to create export"' in content
     assert 'title: "Failed to download export"' in content
-    assert (
-        "formatDistanceToNow(new Date(job.created_at), { addSuffix: true })"
-        in content
-    )
     assert "job.status !== \"SUCCEEDED\"" in content
-    assert "Create JSON Export" in content
+    assert "Create export" in content
+    assert "Coming soon" in content
+    assert 'value="json"' in content
+    assert 'value="csv"' in content
+    assert 'value="pydantic"' in content
+    assert "disabled" in content
+    assert "formatFilterSummary" in content
+    assert "job.completed_at" in content
+    assert "job.error" in content
+    assert "exported_count" in content
+    assert "skipped_count" in content
+    assert "Create JSON Export" not in content
+    assert "SELF-HOSTED" not in content
     assert "Download" in content
     assert "LockedPage" not in content
 
