@@ -128,55 +128,79 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
     marker = f"dashboard overlay export marker {uuid4()}"
     out_of_scope_marker = f"dashboard overlay out-of-scope marker {uuid4()}"
     cleanup_targets: list[tuple[str, str]] = []
-
-    categories_response = client.put(
-        f"/v1/projects/{project_id}/categories",
-        json={
-            "categories": [
-                {
-                    "name": "preferences",
-                    "description": "E2E preferences category",
-                    "schema": {},
-                    "enabled": True,
-                    "strategy": "metadata",
-                }
-            ]
+    category_id: str | None = None
+    category_schema = {
+        "type": "object",
+        "properties": {
+            "theme": {"type": "string", "enum": ["light", "dark"]},
+            "score": {"type": "number"},
+            "birthday": {"type": "string", "format": "date"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "profile": {
+                "type": "object",
+                "properties": {"nickname": {"type": "string"}},
+                "required": ["nickname"],
+            },
         },
-    )
-    assert categories_response.status_code == 200, categories_response.text
-    assert categories_response.json()["categories"][0]["name"] == "preferences"
-
-    add_response = client.post(
-        "/v3/memories/add/",
-        json={
-            "project_id": project_id,
-            "app_id": app_id,
-            "user_id": user_id,
-            "infer": False,
-            "metadata": {"category": "preferences"},
-            "messages": [{"role": "user", "content": marker}],
-        },
-    )
-    assert add_response.status_code == 200, add_response.text
-    memory_id = add_response.json()["event"]["subject_id"]
-    cleanup_targets.append((memory_id, app_id))
-
-    out_of_scope_response = client.post(
-        "/v3/memories/add/",
-        json={
-            "project_id": project_id,
-            "app_id": f"{app_id}-other",
-            "user_id": f"{user_id}-other",
-            "infer": False,
-            "metadata": {"category": "preferences"},
-            "messages": [{"role": "user", "content": out_of_scope_marker}],
-        },
-    )
-    assert out_of_scope_response.status_code == 200, out_of_scope_response.text
-    out_of_scope_memory_id = out_of_scope_response.json()["event"]["subject_id"]
-    cleanup_targets.append((out_of_scope_memory_id, f"{app_id}-other"))
+        "required": ["theme"],
+    }
 
     try:
+        categories_response = client.post(
+            f"/v1/projects/{project_id}/categories",
+            json={
+                "name": "preferences",
+                "description": "E2E preferences category",
+                "schema": category_schema,
+                "enabled": True,
+                "strategy": "metadata",
+            },
+        )
+        assert categories_response.status_code == 201, categories_response.text
+        category = categories_response.json()
+        category_id = category["id"]
+        assert category["schema"] == category_schema
+
+        patch_response = client.patch(
+            f"/v1/projects/{project_id}/categories/{category_id}",
+            json={"description": "Updated E2E preferences category"},
+        )
+        assert patch_response.status_code == 200, patch_response.text
+        assert (
+            patch_response.json()["description"] == "Updated E2E preferences category"
+        )
+        assert patch_response.json()["version"] == 2
+
+        add_response = client.post(
+            "/v3/memories/add/",
+            json={
+                "project_id": project_id,
+                "app_id": app_id,
+                "user_id": user_id,
+                "infer": False,
+                "metadata": {"category": "preferences"},
+                "messages": [{"role": "user", "content": marker}],
+            },
+        )
+        assert add_response.status_code == 200, add_response.text
+        memory_id = add_response.json()["event"]["subject_id"]
+        cleanup_targets.append((memory_id, app_id))
+
+        out_of_scope_response = client.post(
+            "/v3/memories/add/",
+            json={
+                "project_id": project_id,
+                "app_id": f"{app_id}-other",
+                "user_id": f"{user_id}-other",
+                "infer": False,
+                "metadata": {"category": "preferences"},
+                "messages": [{"role": "user", "content": out_of_scope_marker}],
+            },
+        )
+        assert out_of_scope_response.status_code == 200, out_of_scope_response.text
+        out_of_scope_memory_id = out_of_scope_response.json()["event"]["subject_id"]
+        cleanup_targets.append((out_of_scope_memory_id, f"{app_id}-other"))
+
         export_response = client.post(
             "/v1/exports",
             json={
@@ -200,6 +224,14 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
         assert all(
             out_of_scope_marker not in str(memory) for memory in payload["memories"]
         )
+
+        disable_response = client.patch(
+            f"/v1/projects/{project_id}/categories/{category_id}",
+            json={"enabled": False},
+        )
+        assert disable_response.status_code == 200, disable_response.text
+        assert disable_response.json()["enabled"] is False
+        assert disable_response.json()["version"] == 3
     finally:
         for cleanup_memory_id, cleanup_app_id in cleanup_targets:
             delete_response = client.delete(
@@ -207,3 +239,10 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
                 params={"project_id": project_id, "app_id": cleanup_app_id},
             )
             assert delete_response.status_code == 200, delete_response.text
+        if category_id is not None:
+            delete_category_response = client.delete(
+                f"/v1/projects/{project_id}/categories/{category_id}"
+            )
+            assert (
+                delete_category_response.status_code == 204
+            ), delete_category_response.text
