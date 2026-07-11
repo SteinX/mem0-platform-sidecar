@@ -446,9 +446,11 @@ def test_verify_rejects_missing_category_patch_proxy(tmp_path):
         ("csv", ""),
         ("csv", "disabled={false}"),
         ("csv", "disabled={futureFormatsDisabled}"),
+        ("csv", "data-disabled"),
         ("pydantic", ""),
         ("pydantic", "disabled={false}"),
         ("pydantic", "disabled={futureFormatsDisabled}"),
+        ("pydantic", "data-disabled"),
     ],
 )
 def test_verify_rejects_invalid_future_format_disabled_attribute(
@@ -515,6 +517,29 @@ def test_verify_ignores_comment_decoy_group_labels(tmp_path):
     result = run_verify_without_typecheck(dashboard)
 
     assert result.returncode == 0, result.stderr
+
+
+def test_verify_rejects_swapped_rendered_navigation_item_bindings(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    assert "<NavigationItems" in content
+    assert 'group="memory-tools"' in content
+    assert 'items={MEMORY_TOOL_ITEMS}' in content
+    assert 'group="cloud-features"' in content
+    assert 'items={CLOUD_FEATURE_ITEMS}' in content
+    swapped = content.replace("items={MEMORY_TOOL_ITEMS}", "items={TEMP_ITEMS}", 1)
+    swapped = swapped.replace(
+        "items={CLOUD_FEATURE_ITEMS}", "items={MEMORY_TOOL_ITEMS}", 1
+    )
+    nav.write_text(
+        swapped.replace("items={TEMP_ITEMS}", "items={CLOUD_FEATURE_ITEMS}", 1)
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "memory-tools" in result.stderr
 
 
 def test_verify_rejects_missing_webhooks_pro_badge(tmp_path):

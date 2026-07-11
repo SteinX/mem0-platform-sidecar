@@ -36,7 +36,21 @@ import {
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 
-const MEMORY_TOOL_ITEMS = [
+type NavigationItem = {
+  title: string;
+  url: string;
+  icon: React.ElementType;
+  badge?: string;
+};
+
+type NavigationItemsProps = {
+  group: "memory-tools" | "cloud-features";
+  items: readonly NavigationItem[];
+  pathname: string;
+  isSidebarCollapsed: boolean;
+};
+
+const MEMORY_TOOL_ITEMS: NavigationItem[] = [
   {
     title: "Categories",
     url: "/dashboard/categories",
@@ -49,7 +63,7 @@ const MEMORY_TOOL_ITEMS = [
   },
 ];
 
-const CLOUD_FEATURE_ITEMS = [
+const CLOUD_FEATURE_ITEMS: NavigationItem[] = [
   {
     title: "Webhooks",
     url: "/dashboard/webhooks",
@@ -63,6 +77,50 @@ const CLOUD_FEATURE_ITEMS = [
     badge: "PRO",
   },
 ];
+
+function NavigationItems({
+  items,
+  pathname,
+  isSidebarCollapsed,
+}: NavigationItemsProps) {
+  return (
+    <>
+      {items.map((item) => (
+        <SidebarMenuItem key={item.title}>
+          <SidebarMenuButton
+            asChild
+            collapsed={isSidebarCollapsed}
+            active={pathname === item.url}
+            tooltip={isSidebarCollapsed ? item.title : undefined}
+          >
+            <Link
+              href={item.url}
+              className={cn(
+                "flex items-center w-full",
+                isSidebarCollapsed ? "justify-center mx-auto" : "gap-1.5",
+              )}
+            >
+              <item.icon className="size-4 shrink-0" />
+              {!isSidebarCollapsed && (
+                <>
+                  <span>{item.title}</span>
+                  {item.badge && (
+                    <Badge
+                      variant="outline"
+                      className="ml-auto text-memGold-600 border-memGold-300 typo-caption-sm px-1.5 py-0"
+                    >
+                      {item.badge}
+                    </Badge>
+                  )}
+                </>
+              )}
+            </Link>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
+      ))}
+    </>
+  );
+}
 
 export function MainNav({
   className,
@@ -144,29 +202,12 @@ export function MainNav({
                     MEMORY TOOLS
                   </SidebarGroupLabel>
                 )}
-                {MEMORY_TOOL_ITEMS.map((item) => (
-                  <SidebarMenuItem key={item.title}>
-                    <SidebarMenuButton
-                      asChild
-                      collapsed={isSidebarCollapsed}
-                      active={pathname === item.url}
-                      tooltip={isSidebarCollapsed ? item.title : undefined}
-                    >
-                      <Link
-                        href={item.url}
-                        className={cn(
-                          "flex items-center w-full",
-                          isSidebarCollapsed
-                            ? "justify-center mx-auto"
-                            : "gap-1.5",
-                        )}
-                      >
-                        <item.icon className="size-4 shrink-0" />
-                        {!isSidebarCollapsed && <span>{item.title}</span>}
-                      </Link>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                ))}
+                <NavigationItems
+                  group="memory-tools"
+                  items={MEMORY_TOOL_ITEMS}
+                  pathname={pathname}
+                  isSidebarCollapsed={isSidebarCollapsed}
+                />
               </div>
 
               {isSidebarCollapsed && (
@@ -192,41 +233,12 @@ export function MainNav({
                   </CollapsibleTrigger>
                 )}
                 <CollapsibleContent className="flex flex-col gap-0">
-                  {CLOUD_FEATURE_ITEMS.map((item) => (
-                    <SidebarMenuItem key={item.title}>
-                      <SidebarMenuButton
-                        asChild
-                        collapsed={isSidebarCollapsed}
-                        active={pathname === item.url}
-                        tooltip={isSidebarCollapsed ? item.title : undefined}
-                      >
-                        <Link
-                          href={item.url}
-                          className={cn(
-                            "flex items-center w-full",
-                            isSidebarCollapsed
-                              ? "justify-center mx-auto"
-                              : "gap-1.5",
-                          )}
-                        >
-                          <item.icon className="size-4 shrink-0" />
-                          {!isSidebarCollapsed && (
-                            <>
-                              <span>{item.title}</span>
-                              {item.badge && (
-                                <Badge
-                                  variant="outline"
-                                  className="ml-auto text-memGold-600 border-memGold-300 typo-caption-sm px-1.5 py-0"
-                                >
-                                  {item.badge}
-                                </Badge>
-                              )}
-                            </>
-                          )}
-                        </Link>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  ))}
+                  <NavigationItems
+                    group="cloud-features"
+                    items={CLOUD_FEATURE_ITEMS}
+                    pathname={pathname}
+                    isSidebarCollapsed={isSidebarCollapsed}
+                  />
                 </CollapsibleContent>
               </Collapsible>
 

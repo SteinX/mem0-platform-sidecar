@@ -152,10 +152,13 @@ def extract_balanced(content: str, start: int, opening: str, closing: str) -> st
 
 def extract_named_array(content: str, name: str) -> str | None:
     code = strip_comments(content)
-    match = re.search(rf"\bconst\s+{re.escape(name)}\s*=\s*\[", code)
+    match = re.search(
+        rf"\bconst\s+{re.escape(name)}(?:\s*:\s*[^=]+)?\s*=\s*\[",
+        code,
+    )
     if match is None:
         return None
-    start = code.find("[", match.start())
+    start = match.end() - 1
     return extract_balanced(code, start, "[", "]")
 
 
@@ -222,12 +225,22 @@ def verify_main_nav_groups(main_nav_content: str) -> str | None:
     )
     if memory_tools_error is not None:
         return memory_tools_error
-    return verify_nav_items(
+    cloud_features_error = verify_nav_items(
         extract_named_array(main_nav_content, "CLOUD_FEATURE_ITEMS"),
         "CLOUD_FEATURE_ITEMS",
         ["Webhooks", "Analytics"],
         "PRO",
     )
+    if cloud_features_error is not None:
+        return cloud_features_error
+    for group, items in (
+        ("memory-tools", "MEMORY_TOOL_ITEMS"),
+        ("cloud-features", "CLOUD_FEATURE_ITEMS"),
+    ):
+        binding_error = verify_rendered_nav_binding(main_nav_content, group, items)
+        if binding_error is not None:
+            return binding_error
+    return None
 
 
 def verify_categories_page(dashboard_dir: Path) -> str | None:
@@ -268,12 +281,57 @@ def extract_export_format_tag(export_content: str, format_name: str) -> str | No
         index = start + len(tag)
 
 
+def extract_jsx_component_tags(content: str, component: str) -> list[str]:
+    code = strip_comments(content)
+    marker = f"<{component}"
+    tags: list[str] = []
+    index = 0
+    while True:
+        start = code.find(marker, index)
+        if start == -1:
+            return tags
+        following_index = start + len(marker)
+        if following_index < len(code) and not code[following_index].isspace():
+            index = following_index
+            continue
+        tag = extract_balanced(code, start, "<", ">")
+        if tag is None:
+            return tags
+        tags.append(tag)
+        index = start + len(tag)
+
+
+def verify_rendered_nav_binding(
+    main_nav_content: str, group: str, items: str
+) -> str | None:
+    tags = extract_jsx_component_tags(main_nav_content, "NavigationItems")
+    matching_tags = [
+        tag
+        for tag in tags
+        if re.search(rf'\bgroup\s*=\s*"{re.escape(group)}"', tag)
+    ]
+    if len(matching_tags) != 1:
+        return f"main-nav must render one {group} NavigationItems binding"
+    if (
+        re.search(
+            rf"\bitems\s*=\s*\{{\s*{re.escape(items)}\s*\}}",
+            matching_tags[0],
+        )
+        is None
+    ):
+        return f"main-nav {group} must render items={{{items}}}"
+    return None
+
+
 def verify_disabled_export_format(export_content: str, format_name: str) -> str | None:
     tag = extract_export_format_tag(export_content, format_name)
     if tag is None:
         return f'Export page missing {format_name.upper()} format option'
-    plain_disabled = re.search(r"\bdisabled(?=\s|/|>)", tag)
-    explicit_true = re.search(r"\bdisabled\s*=\s*\{\s*true\s*\}", tag)
+    plain_disabled = re.search(r"(?:^|\s)disabled(?=\s|/|>)", tag)
+    explicit_true = re.search(
+        r"(?:^|\s)disabled\s*=\s*\{\s*true\s*\}(?=\s|/|>)",
+        tag,
+    )
     if plain_disabled is None and explicit_true is None:
         return f"Export {format_name.upper()} format must use disabled or disabled={{true}}"
     return None
