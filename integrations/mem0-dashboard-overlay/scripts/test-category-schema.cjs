@@ -111,6 +111,19 @@ function testArrayDefaultElementsFollowItemType(schema) {
   );
 }
 
+function testDirectEnumDefaultMustMatchOption(schema) {
+  const field = emptyField(schema, "status", "enum");
+  field.enumValues = ["open", "closed"];
+  field.hasDefault = true;
+  field.defaultValue = "unknown";
+
+  const validation = schema.validateCategoryFields([field]);
+  assert.equal(
+    validation.fieldErrors[field.id],
+    "Default must be one of the enum options",
+  );
+}
+
 function testDuplicateKeysMarkEverySibling(schema) {
   const first = emptyField(schema, "duplicate", "string");
   const second = emptyField(schema, "duplicate", "number");
@@ -188,12 +201,13 @@ function main() {
   testSupportedRoundTripAndEmptyStringDefault(schema);
   testTypeInconsistentDefaultsUseAdvancedMode(schema);
   testArrayDefaultElementsFollowItemType(schema);
+  testDirectEnumDefaultMustMatchOption(schema);
   testDuplicateKeysMarkEverySibling(schema);
   testChildScopesRemainIndependent(schema);
   testMalformedRequiredUsesAdvancedMode(schema);
   testAdvancedSchemasStillCountProperties(schema);
   testUnsupportedPathsUseBracketNotation(schema);
-  console.log("category schema harness: 8 contracts passed");
+  console.log("category schema harness: 9 contracts passed");
 }
 
 try {

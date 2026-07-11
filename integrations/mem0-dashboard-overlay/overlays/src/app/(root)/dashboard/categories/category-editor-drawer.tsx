@@ -45,12 +45,16 @@ import {
 } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
 import { SidecarCategory, SidecarCategoryInput } from "@/types/sidecar";
+import { editorToSchema, validateCategoryFields } from "@/utils/category-schema";
 import {
-  CategoryField,
-  editorToSchema,
-  schemaToEditor,
-  validateCategoryFields,
-} from "@/utils/category-schema";
+  type CategoryDraft,
+  activateAdvancedMode,
+  categoryDraftFingerprint,
+  createCategoryDraft,
+  parseAdvancedSchema,
+  planBuilderTransition,
+  resetToEmptyBuilder,
+} from "@/utils/category-editor-state";
 import { sidecarDelete, sidecarPatch, sidecarPost } from "@/utils/sidecar-api";
 
 import { CategoryFieldEditor } from "./category-field-editor";
@@ -64,49 +68,8 @@ type CategoryEditorDrawerProps = {
   onDeleted: (categoryId: string) => void;
 };
 
-type EditorMode = "builder" | "advanced";
-
-type CategoryDraft = {
-  name: string;
-  description: string;
-  enabled: boolean;
-  strategy: string;
-  mode: EditorMode;
-  fields: CategoryField[];
-  rawSchemaText: string;
-  unsupportedPaths: string[];
-};
-
-const EMPTY_SCHEMA = { type: "object", properties: {} };
-
-function createDraft(category: SidecarCategory | null): CategoryDraft {
-  const editor = schemaToEditor(category?.schema ?? EMPTY_SCHEMA);
-  return {
-    name: category?.name ?? "",
-    description: category?.description ?? "",
-    enabled: category?.enabled ?? true,
-    strategy: category?.strategy ?? "metadata",
-    mode: editor.mode,
-    fields: editor.fields,
-    rawSchemaText: editor.rawSchemaText,
-    unsupportedPaths: editor.unsupportedPaths,
-  };
-}
-
-function draftFingerprint(draft: CategoryDraft): string {
-  return JSON.stringify(draft);
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function parseAdvancedSchema(rawSchemaText: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(rawSchemaText);
-  if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
-    throw new Error("Advanced schema must be a JSON object.");
-  }
-  return parsed as Record<string, unknown>;
 }
 
 export function CategoryEditorDrawer({
@@ -117,9 +80,9 @@ export function CategoryEditorDrawer({
   onSaved,
   onDeleted,
 }: CategoryEditorDrawerProps) {
-  const [draft, setDraft] = useState<CategoryDraft>(() => createDraft(category));
+  const [draft, setDraft] = useState<CategoryDraft>(() => createCategoryDraft(category));
   const [initialFingerprint, setInitialFingerprint] = useState(() =>
-    draftFingerprint(createDraft(category)),
+    categoryDraftFingerprint(createCategoryDraft(category)),
   );
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
@@ -133,9 +96,9 @@ export function CategoryEditorDrawer({
     if (!open) {
       return;
     }
-    const nextDraft = createDraft(category);
+    const nextDraft = createCategoryDraft(category);
     setDraft(nextDraft);
-    setInitialFingerprint(draftFingerprint(nextDraft));
+    setInitialFingerprint(categoryDraftFingerprint(nextDraft));
     setFieldErrors({});
     setFormError(null);
     setShowDiscardDialog(false);
@@ -143,7 +106,7 @@ export function CategoryEditorDrawer({
     setShowBuilderResetDialog(false);
   }, [category, open]);
 
-  const isDirty = draftFingerprint(draft) !== initialFingerprint;
+  const isDirty = categoryDraftFingerprint(draft) !== initialFingerprint;
   const generatedSchema = useMemo(
     () => JSON.stringify(editorToSchema(draft.fields), null, 2),
     [draft.fields],
@@ -162,38 +125,31 @@ export function CategoryEditorDrawer({
   };
 
   const switchToAdvanced = () => {
-    setDraft((current) => ({
-      ...current,
-      mode: "advanced",
-      rawSchemaText: JSON.stringify(editorToSchema(current.fields), null, 2),
-      unsupportedPaths: [],
-    }));
+    const nextDraft = activateAdvancedMode(draft);
+    if (nextDraft === draft) {
+      return;
+    }
+    setDraft(nextDraft);
     setFieldErrors({});
     setFormError(null);
   };
 
   const switchToBuilder = () => {
-    try {
-      const schema = parseAdvancedSchema(draft.rawSchemaText);
-      const editor = schemaToEditor(schema);
-      if (editor.mode === "advanced") {
-        setDraft((current) => ({
-          ...current,
-          unsupportedPaths: editor.unsupportedPaths,
-        }));
-        setShowBuilderResetDialog(true);
-        return;
-      }
+    const transition = planBuilderTransition(draft);
+    if (transition.status === "ready") {
+      setDraft(transition.draft);
+      setFormError(null);
+      return;
+    }
+    if (transition.status === "confirm") {
       setDraft((current) => ({
         ...current,
-        mode: "builder",
-        fields: editor.fields,
-        unsupportedPaths: [],
+        unsupportedPaths: transition.unsupportedPaths,
       }));
-      setFormError(null);
-    } catch (error) {
-      setFormError(errorMessage(error));
+      setShowBuilderResetDialog(true);
+      return;
     }
+    setFormError(transition.message);
   };
 
   const saveCategory = async () => {
@@ -328,7 +284,7 @@ export function CategoryEditorDrawer({
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <Label>Strategy</Label>
+                  <Label htmlFor="category-strategy">Strategy</Label>
                   <Select
                     value={draft.strategy}
                     disabled={isBusy}
@@ -337,7 +293,7 @@ export function CategoryEditorDrawer({
                       strategy,
                     }))}
                   >
-                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectTrigger id="category-strategy"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="metadata">Metadata</SelectItem>
                       {draft.strategy !== "metadata" ? (
@@ -535,12 +491,7 @@ export function CategoryEditorDrawer({
           <AlertDialogFooter>
             <AlertDialogCancel>Keep advanced schema</AlertDialogCancel>
             <AlertDialogAction onClick={() => {
-              setDraft((current) => ({
-                ...current,
-                mode: "builder",
-                fields: [],
-                unsupportedPaths: [],
-              }));
+              setDraft((current) => resetToEmptyBuilder(current));
               setFieldErrors({});
               setFormError(null);
             }}>

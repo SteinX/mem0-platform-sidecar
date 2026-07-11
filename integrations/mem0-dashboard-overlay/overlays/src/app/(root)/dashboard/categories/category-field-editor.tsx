@@ -161,9 +161,16 @@ export function CategoryFieldEditor({
         const fieldTypes = depth === 1
           ? ROOT_TYPES.filter((type) => type.value !== "object")
           : ROOT_TYPES;
+        const errorId = `${field.id}-error`;
 
         return (
-          <div key={field.id} className="border-b border-memBorder-primary pb-4 last:border-0">
+          <div
+            key={field.id}
+            role="group"
+            aria-invalid={Boolean(errors[field.id])}
+            aria-describedby={errors[field.id] ? errorId : undefined}
+            className="border-b border-memBorder-primary pb-4 last:border-0"
+          >
             <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,1fr)_160px_auto]">
               <div className="min-w-0 space-y-1.5">
                 <Label htmlFor={`${field.id}-key`}>Field key</Label>
@@ -171,19 +178,21 @@ export function CategoryFieldEditor({
                   id={`${field.id}-key`}
                   value={field.key}
                   placeholder="field_name"
-                  aria-invalid={Boolean(errors[field.id])}
                   disabled={disabled}
                   onChange={(event) => updateField(index, { key: event.target.value })}
                 />
               </div>
               <div className="space-y-1.5">
-                <Label>Type</Label>
+                <Label htmlFor={`${field.id}-type`}>Type</Label>
                 <Select
                   value={field.type}
                   disabled={disabled}
                   onValueChange={(value: CategoryFieldType) => updateField(index, { type: value })}
                 >
-                  <SelectTrigger aria-label={`Type for ${field.key || `field ${index + 1}`}`}>
+                  <SelectTrigger
+                    id={`${field.id}-type`}
+                    aria-label={`Type for ${field.key || `field ${index + 1}`}`}
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -219,7 +228,9 @@ export function CategoryFieldEditor({
             </div>
 
             {errors[field.id] ? (
-              <p className="mt-1 text-xs text-onSurface-danger-primary">{errors[field.id]}</p>
+              <p id={errorId} className="mt-1 text-xs text-onSurface-danger-primary">
+                {errors[field.id]}
+              </p>
             ) : null}
 
             <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-3">
@@ -244,7 +255,26 @@ export function CategoryFieldEditor({
             {field.hasDefault ? (
               <div className="mt-3 max-w-md space-y-1.5">
                 <Label htmlFor={`${field.id}-default`}>Default</Label>
-                {field.type === "boolean" ? (
+                {field.type === "enum" ? (
+                  <Select
+                    value={field.defaultValue || undefined}
+                    disabled={disabled}
+                    onValueChange={(defaultValue) => updateField(index, { defaultValue })}
+                  >
+                    <SelectTrigger id={`${field.id}-default`}>
+                      <SelectValue placeholder="Select an option" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {field.enumValues
+                        .filter((value) => value.trim())
+                        .map((value, optionIndex) => (
+                          <SelectItem key={`${value}-${optionIndex}`} value={value}>
+                            {value}
+                          </SelectItem>
+                        ))}
+                    </SelectContent>
+                  </Select>
+                ) : field.type === "boolean" ? (
                   <Select
                     value={field.defaultValue || "false"}
                     disabled={disabled}
@@ -289,7 +319,7 @@ export function CategoryFieldEditor({
             {field.type === "array" ? (
               <div className="mt-3 max-w-md space-y-3">
                 <div className="space-y-1.5">
-                  <Label>List item type</Label>
+                  <Label htmlFor={`${field.id}-array-item-type`}>List item type</Label>
                   <Select
                     value={field.arrayItemType}
                     disabled={disabled}
@@ -297,7 +327,7 @@ export function CategoryFieldEditor({
                       updateField(index, { arrayItemType })
                     }
                   >
-                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectTrigger id={`${field.id}-array-item-type`}><SelectValue /></SelectTrigger>
                     <SelectContent>
                       {SCALAR_TYPES.map((type) => (
                         <SelectItem key={type.value} value={type.value}>{type.label}</SelectItem>

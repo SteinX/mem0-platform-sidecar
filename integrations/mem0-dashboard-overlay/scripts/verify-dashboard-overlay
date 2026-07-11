@@ -71,6 +71,19 @@ def category_schema_harness_command(
     ]
 
 
+def category_editor_state_harness_command(
+    overlay_root: Path, dashboard_dir: Path
+) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-category-editor-state.cjs"),
+        str(dashboard_dir),
+    ]
+
+
 def verify_main_nav_badges(main_nav_content: str) -> str | None:
     cursor = 0
     for title, badge in EXPECTED_BADGES.items():
@@ -134,6 +147,11 @@ def main() -> int:
         )
         subprocess.run(
             category_schema_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
+        subprocess.run(
+            category_editor_state_harness_command(overlay_root, dashboard_dir),
             cwd=dashboard_dir,
             check=True,
         )

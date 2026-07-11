@@ -482,6 +482,8 @@ function validateDefaultValue(
     setFieldError(fieldErrors, field.id, "Default must be true or false");
   } else if (field.type === "date" && !isIsoDate(value)) {
     setFieldError(fieldErrors, field.id, "Default must use YYYY-MM-DD");
+  } else if (field.type === "enum" && !field.enumValues.includes(field.defaultValue)) {
+    setFieldError(fieldErrors, field.id, "Default must be one of the enum options");
   } else if (field.type === "array") {
     const arrayDefault = parseJsonArray(value);
     if (arrayDefault === null) {

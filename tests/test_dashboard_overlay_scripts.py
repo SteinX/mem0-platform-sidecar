@@ -34,6 +34,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/utils/sidecar-api.ts",
         "src/utils/sidecar-proxy.ts",
         "src/utils/category-schema.ts",
+        "src/utils/category-editor-state.ts",
         "src/types/sidecar.ts",
         "src/app/(root)/dashboard/components/main-nav.tsx",
     ]:
@@ -52,6 +53,7 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
     assert "src/app/api/sidecar/[...path]/route.ts" in manifest["files"]
     assert "src/utils/sidecar-project.ts" in manifest["files"]
     assert "src/utils/sidecar-proxy.ts" in manifest["files"]
+    assert "src/utils/category-editor-state.ts" in manifest["files"]
 
 
 def test_dashboard_overlay_includes_category_schema_builder_contract():
@@ -74,6 +76,27 @@ def test_dashboard_overlay_includes_category_schema_builder_contract():
         assert symbol in schema_content
     assert 'mode: "advanced"' in schema_content
     assert 'format: "date"' in schema_content
+
+
+def test_dashboard_overlay_includes_category_editor_state_contract():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    state_path = "src/utils/category-editor-state.ts"
+
+    assert state_path in manifest["files"]
+
+    state_content = (OVERLAY / "overlays" / state_path).read_text()
+    for symbol in (
+        "export type CategoryDraft",
+        "export function createCategoryDraft",
+        "export function categoryDraftFingerprint",
+        "export function activateAdvancedMode",
+        "export function planBuilderTransition",
+        "export function resetToEmptyBuilder",
+    ):
+        assert symbol in state_content
+
+    harness = OVERLAY / "scripts" / "test-category-editor-state.cjs"
+    assert harness.exists()
 
 
 def test_apply_dashboard_overlay_copies_files(tmp_path):
@@ -418,6 +441,7 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     harness_args = node_log.read_text().splitlines()
     assert any("test-sidecar-proxy.cjs" in args for args in harness_args)
     assert any("test-category-schema.cjs" in args for args in harness_args)
+    assert any("test-category-editor-state.cjs" in args for args in harness_args)
     assert all(args.endswith(str(dashboard)) for args in harness_args)
 
 

@@ -13,6 +13,7 @@
     "src/utils/sidecar-api.ts",
     "src/utils/sidecar-proxy.ts",
     "src/utils/category-schema.ts",
+    "src/utils/category-editor-state.ts",
     "src/types/sidecar.ts"
   ]
 }
