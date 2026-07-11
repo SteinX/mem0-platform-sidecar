@@ -3,9 +3,11 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.http_adapter.app import create_app
+from mem0_sidecar.store.models import MemoryIndex
 
 pytestmark = pytest.mark.e2e
 
@@ -185,6 +187,16 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
         assert add_response.status_code == 200, add_response.text
         memory_id = add_response.json()["event"]["subject_id"]
         cleanup_targets.append((memory_id, app_id))
+        with client.app.state.session_factory() as session:
+            indexed_memory = session.scalar(
+                select(MemoryIndex).where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.mem0_memory_id == memory_id,
+                    MemoryIndex.app_id == app_id,
+                )
+            )
+        assert indexed_memory is not None
+        assert indexed_memory.category == "preferences"
 
         out_of_scope_response = client.post(
             "/v3/memories/add/",
@@ -233,16 +245,18 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
         assert disable_response.json()["enabled"] is False
         assert disable_response.json()["version"] == 3
     finally:
-        for cleanup_memory_id, cleanup_app_id in cleanup_targets:
-            delete_response = client.delete(
-                f"/v1/memories/{cleanup_memory_id}",
-                params={"project_id": project_id, "app_id": cleanup_app_id},
-            )
-            assert delete_response.status_code == 200, delete_response.text
-        if category_id is not None:
-            delete_category_response = client.delete(
-                f"/v1/projects/{project_id}/categories/{category_id}"
-            )
-            assert (
-                delete_category_response.status_code == 204
-            ), delete_category_response.text
+        try:
+            for cleanup_memory_id, cleanup_app_id in cleanup_targets:
+                delete_response = client.delete(
+                    f"/v1/memories/{cleanup_memory_id}",
+                    params={"project_id": project_id, "app_id": cleanup_app_id},
+                )
+                assert delete_response.status_code == 200, delete_response.text
+        finally:
+            if category_id is not None:
+                delete_category_response = client.delete(
+                    f"/v1/projects/{project_id}/categories/{category_id}"
+                )
+                assert (
+                    delete_category_response.status_code == 204
+                ), delete_category_response.text
