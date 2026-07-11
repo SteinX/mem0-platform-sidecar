@@ -15,7 +15,7 @@ import {
   WebhookIcon,
   Wrench,
 } from "lucide-react";
-import { useDispatch, useSelector } from "react-redux";
+import { useDispatch, useSelector, useStore } from "react-redux";
 import { RootState } from "@/store/store";
 import { toggleSidebar } from "@/store/reducers/layoutReducer";
 import { Badge } from "@/components/ui/badge";
@@ -129,6 +129,7 @@ export function MainNav({
 }: React.HTMLAttributes<HTMLElement>) {
   const pathname = usePathname();
   const dispatch = useDispatch();
+  const store = useStore<RootState>();
   const isSidebarCollapsed = useSelector(
     (state: RootState) => state.layout.isSidebarCollapsed,
   );
@@ -137,7 +138,10 @@ export function MainNav({
   React.useEffect(() => {
     const sidebarMediaQuery = window.matchMedia("(max-width: 767px)");
     const collapseSidebarOnNarrowViewport = () => {
-      if (sidebarMediaQuery.matches && !isSidebarCollapsed) {
+      if (
+        sidebarMediaQuery.matches &&
+        !store.getState().layout.isSidebarCollapsed
+      ) {
         dispatch(toggleSidebar());
       }
     };
@@ -150,7 +154,7 @@ export function MainNav({
         collapseSidebarOnNarrowViewport,
       );
     };
-  }, [dispatch, isSidebarCollapsed]);
+  }, [dispatch, store]);
 
   return (
     <Sidebar

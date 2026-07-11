@@ -173,6 +173,32 @@ def extract_named_function_body(content: str, name: str) -> str | None:
     return extract_balanced(code, start, "{", "}")
 
 
+def extract_named_component_body(content: str, name: str) -> str | None:
+    code = strip_comments(content)
+    match = re.search(rf"\bfunction\s+{re.escape(name)}\s*\(", code)
+    if match is None:
+        return None
+    parameters_start = code.find("(", match.start())
+    parameters = extract_balanced(code, parameters_start, "(", ")")
+    if parameters is None:
+        return None
+    body_start = code.find("{", parameters_start + len(parameters))
+    if body_start == -1:
+        return None
+    return extract_balanced(code, body_start, "{", "}")
+
+
+def extract_react_use_effect_calls(component_body: str) -> list[str]:
+    effect_calls: list[str] = []
+    for match in re.finditer(r"\bReact\.useEffect\s*\(", component_body):
+        arguments_start = component_body.find("(", match.start())
+        arguments = extract_balanced(component_body, arguments_start, "(", ")")
+        if arguments is None:
+            return []
+        effect_calls.append(arguments)
+    return effect_calls
+
+
 def extract_object_initializers(array_content: str) -> list[str]:
     objects: list[str] = []
     index = 0
@@ -244,41 +270,71 @@ def verify_main_nav_groups(main_nav_content: str) -> str | None:
 
 
 def verify_responsive_nav_collapse(main_nav_content: str) -> str | None:
-    code = strip_comments(main_nav_content)
-    if re.search(r"\bfunction\s+MainNav\s*\(", code) is None:
+    main_nav_body = extract_named_component_body(main_nav_content, "MainNav")
+    if main_nav_body is None:
         return "main-nav missing MainNav component"
-    required_patterns = (
+    for pattern, error in (
         (
-            r'\buseDispatch\b',
+            r"\bconst\s+dispatch\s*=\s*useDispatch\(\s*\)",
             "main-nav must use Redux dispatch for responsive sidebar collapse",
         ),
         (
-            r'\btoggleSidebar\b',
-            "main-nav must use toggleSidebar for responsive sidebar collapse",
+            r"\bconst\s+store\s*=\s*useStore\s*<\s*RootState\s*>\s*\(\s*\)",
+            "main-nav must read live Redux state for responsive sidebar collapse",
         ),
-        (
+    ):
+        if re.search(pattern, main_nav_body) is None:
+            return error
+
+    effect_calls = extract_react_use_effect_calls(main_nav_body)
+    responsive_effects = [
+        effect_call
+        for effect_call in effect_calls
+        if re.search(
             r'window\.matchMedia\(\s*["\']\(max-width:\s*767px\)["\']\s*\)',
-            "main-nav must watch the 767px responsive sidebar breakpoint",
+            effect_call,
+        )
+        is not None
+    ]
+    if len(responsive_effects) != 1:
+        return "main-nav responsive collapse must run in React.useEffect inside MainNav"
+
+    responsive_effect = responsive_effects[0]
+    effect_arguments = responsive_effect[1:-1]
+    if (
+        re.search(r",\s*\[\s*dispatch\s*,\s*store\s*\]\s*$", effect_arguments)
+        is None
+    ):
+        return "main-nav responsive collapse effect must use stable dispatch and store dependencies"
+
+    required_patterns = (
+        (
+            r"\bconst\s+collapseSidebarOnNarrowViewport\s*=\s*\(\s*\)\s*=>",
+            "main-nav responsive collapse effect missing collapse callback",
         ),
         (
-            r'if\s*\(\s*sidebarMediaQuery\.matches\s*&&\s*!isSidebarCollapsed\s*\)',
-            "main-nav must collapse only an expanded sidebar on narrow viewports",
+            r"if\s*\(\s*sidebarMediaQuery\.matches\s*&&\s*!store\.getState\(\)\.layout\.isSidebarCollapsed\s*\)",
+            "main-nav responsive collapse must read current Redux state before toggling",
         ),
         (
-            r'dispatch\(\s*toggleSidebar\(\s*\)\s*\)',
-            "main-nav must dispatch toggleSidebar for narrow viewports",
+            r"dispatch\(\s*toggleSidebar\(\s*\)\s*\)",
+            "main-nav responsive collapse must dispatch toggleSidebar",
         ),
         (
-            r'sidebarMediaQuery\.addEventListener\(\s*["\']change["\']\s*,',
-            "main-nav must respond when the viewport becomes narrow",
+            r"\bcollapseSidebarOnNarrowViewport\(\s*\)\s*;",
+            "main-nav responsive collapse effect must invoke its collapse callback",
         ),
         (
-            r'sidebarMediaQuery\.removeEventListener\(\s*["\']change["\']\s*,',
-            "main-nav must clean up its responsive sidebar listener",
+            r'sidebarMediaQuery\.addEventListener\(\s*["\']change["\']\s*,\s*collapseSidebarOnNarrowViewport\s*\)',
+            "main-nav responsive collapse effect missing its change listener",
+        ),
+        (
+            r'sidebarMediaQuery\.removeEventListener\(\s*["\']change["\']\s*,\s*collapseSidebarOnNarrowViewport\s*,?\s*\)',
+            "main-nav responsive collapse effect must remove the same change listener",
         ),
     )
     for pattern, error in required_patterns:
-        if re.search(pattern, code) is None:
+        if re.search(pattern, responsive_effect) is None:
             return error
     return None
 

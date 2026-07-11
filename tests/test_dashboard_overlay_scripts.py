@@ -423,6 +423,78 @@ def test_verify_requires_responsive_sidebar_collapse(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+RESPONSIVE_SIDEBAR_DECOY = """
+function ResponsiveSidebarDecoy() {
+  React.useEffect(() => {
+    const sidebarMediaQuery = window.matchMedia("(max-width: 767px)");
+    const collapseSidebarOnNarrowViewport = () => {
+      if (
+        sidebarMediaQuery.matches &&
+        !store.getState().layout.isSidebarCollapsed
+      ) {
+        dispatch(toggleSidebar());
+      }
+    };
+    collapseSidebarOnNarrowViewport();
+    sidebarMediaQuery.addEventListener("change", collapseSidebarOnNarrowViewport);
+    return () => {
+      sidebarMediaQuery.removeEventListener(
+        "change",
+        collapseSidebarOnNarrowViewport,
+      );
+    };
+  }, [dispatch, store]);
+}
+"""
+
+
+def test_verify_rejects_responsive_effect_decoy_outside_main_nav(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    assert '  React.useEffect(() => {' in content
+    nav.write_text(
+        content.replace('  React.useEffect(() => {', '  React.useMemo(() => {', 1)
+        + RESPONSIVE_SIDEBAR_DECOY
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "MainNav" in result.stderr
+
+
+def test_verify_rejects_missing_live_responsive_collapse_invocation(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    active_invocation = "    collapseSidebarOnNarrowViewport();\n"
+    assert active_invocation in content
+    nav.write_text(content.replace(active_invocation, "", 1) + RESPONSIVE_SIDEBAR_DECOY)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "invoke" in result.stderr
+
+
+def test_verify_rejects_missing_live_responsive_change_listener(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    active_listener = (
+        '    sidebarMediaQuery.addEventListener("change", '
+        "collapseSidebarOnNarrowViewport);\n"
+    )
+    assert active_listener in content
+    nav.write_text(content.replace(active_listener, "", 1) + RESPONSIVE_SIDEBAR_DECOY)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "listener" in result.stderr
+
+
 def test_verify_rejects_json_first_categories_regression(tmp_path):
     dashboard = applied_overlay(tmp_path)
     drawer = (
