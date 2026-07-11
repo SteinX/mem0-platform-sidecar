@@ -131,10 +131,15 @@ def strip_comments(content: str) -> str:
 def extract_balanced(content: str, start: int, opening: str, closing: str) -> str | None:
     depth = 0
     quote: str | None = None
+    escaped = False
     for index in range(start, len(content)):
         character = content[index]
         if quote is not None:
+            if escaped:
+                escaped = False
+                continue
             if character == "\\":
+                escaped = True
                 continue
             if character == quote:
                 quote = None

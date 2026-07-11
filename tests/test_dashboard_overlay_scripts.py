@@ -423,6 +423,20 @@ def test_verify_requires_responsive_sidebar_collapse(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_verify_accepts_escaped_quote_string_inside_main_nav(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    effect_start = "  React.useEffect(() => {"
+    escaped_quote = '  const escapedQuote = "value: \\"}";\n'
+    assert effect_start in content
+    nav.write_text(content.replace(effect_start, escaped_quote + effect_start, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
+
+
 RESPONSIVE_SIDEBAR_DECOY = """
 function ResponsiveSidebarDecoy() {
   React.useEffect(() => {
