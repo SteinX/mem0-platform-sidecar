@@ -143,3 +143,98 @@ def test_put_project_categories_rejects_missing_categories_field(tmp_path):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Categories must be a list of category objects"
+
+
+def test_category_item_routes_create_patch_delete(tmp_path):
+    client = TestClient(_app(tmp_path))
+    create_response = client.post(
+        "/v1/projects/default/categories",
+        json={
+            "name": "preferences",
+            "description": "Durable preferences",
+            "schema": {"type": "object"},
+            "enabled": True,
+            "strategy": "metadata",
+        },
+    )
+    assert create_response.status_code == 201
+    category = create_response.json()
+
+    patch_response = client.patch(
+        f"/v1/projects/default/categories/{category['id']}",
+        json={"description": "Updated", "enabled": False},
+    )
+    assert patch_response.status_code == 200
+    assert patch_response.json()["description"] == "Updated"
+    assert patch_response.json()["enabled"] is False
+    assert patch_response.json()["version"] == 2
+
+    delete_response = client.delete(
+        f"/v1/projects/default/categories/{category['id']}"
+    )
+    assert delete_response.status_code == 204
+    assert client.get("/v1/projects/default/categories").json()["categories"] == []
+
+
+def test_category_item_routes_reject_duplicate_names(tmp_path):
+    client = TestClient(_app(tmp_path))
+    first = client.post(
+        "/v1/projects/default/categories", json={"name": "work", "schema": {}}
+    )
+    second = client.post(
+        "/v1/projects/default/categories", json={"name": "work", "schema": {}}
+    )
+    assert first.status_code == 201
+    assert second.status_code == 400
+    assert second.json()["detail"] == "Category names must be unique per project"
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        ({"name": "  "}, "Category name is required"),
+        ({"name": "work", "schema": []}, "Category schema must be a JSON object"),
+    ],
+)
+def test_create_category_rejects_invalid_payload(tmp_path, payload, detail):
+    response = TestClient(_app(tmp_path)).post(
+        "/v1/projects/default/categories", json=payload
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == detail
+
+
+@pytest.mark.parametrize("method", ["patch", "delete"])
+def test_category_item_routes_return_404_for_missing_id(tmp_path, method):
+    client = TestClient(_app(tmp_path))
+    response = getattr(client, method)(
+        "/v1/projects/default/categories/missing",
+        **({"json": {"enabled": False}} if method == "patch" else {}),
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Category not found"
+
+
+def test_category_item_routes_are_project_scoped(tmp_path):
+    client = TestClient(_app(tmp_path))
+    created = client.post(
+        "/v1/projects/alpha/categories", json={"name": "work", "schema": {}}
+    ).json()
+    response = client.patch(
+        f"/v1/projects/beta/categories/{created['id']}",
+        json={"enabled": False},
+    )
+    assert response.status_code == 404
+
+
+def test_legacy_bulk_put_still_replaces_categories(tmp_path):
+    client = TestClient(_app(tmp_path))
+    client.post(
+        "/v1/projects/default/categories", json={"name": "old", "schema": {}}
+    )
+    response = client.put(
+        "/v1/projects/default/categories",
+        json={"categories": [{"name": "new", "schema": {}}]},
+    )
+    assert response.status_code == 200
+    assert [item["name"] for item in response.json()["categories"]] == ["new"]
