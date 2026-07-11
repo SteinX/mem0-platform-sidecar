@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -85,61 +86,148 @@ def category_editor_state_harness_command(
     ]
 
 
-def item_block(content: str, title: str) -> str | None:
-    marker = f'title: "{title}"'
-    start = content.find(marker)
+def strip_comments(content: str) -> str:
+    result: list[str] = []
+    index = 0
+    quote: str | None = None
+    while index < len(content):
+        character = content[index]
+        next_character = content[index + 1] if index + 1 < len(content) else ""
+        if quote is not None:
+            result.append(character)
+            if character == "\\" and index + 1 < len(content):
+                index += 1
+                result.append(content[index])
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in ('"', "'", "`"):
+            quote = character
+            result.append(character)
+            index += 1
+            continue
+        if character == "/" and next_character == "/":
+            while index < len(content) and content[index] != "\n":
+                result.append(" ")
+                index += 1
+            continue
+        if character == "/" and next_character == "*":
+            result.extend((" ", " "))
+            index += 2
+            while index < len(content) - 1:
+                if content[index] == "*" and content[index + 1] == "/":
+                    result.extend((" ", " "))
+                    index += 2
+                    break
+                result.append("\n" if content[index] == "\n" else " ")
+                index += 1
+            continue
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def extract_balanced(content: str, start: int, opening: str, closing: str) -> str | None:
+    depth = 0
+    quote: str | None = None
+    for index in range(start, len(content)):
+        character = content[index]
+        if quote is not None:
+            if character == "\\":
+                continue
+            if character == quote:
+                quote = None
+            continue
+        if character in ('"', "'", "`"):
+            quote = character
+        elif character == opening:
+            depth += 1
+        elif character == closing:
+            depth -= 1
+            if depth == 0:
+                return content[start : index + 1]
+    return None
+
+
+def extract_named_array(content: str, name: str) -> str | None:
+    code = strip_comments(content)
+    match = re.search(rf"\bconst\s+{re.escape(name)}\s*=\s*\[", code)
+    if match is None:
+        return None
+    start = code.find("[", match.start())
+    return extract_balanced(code, start, "[", "]")
+
+
+def extract_named_function_body(content: str, name: str) -> str | None:
+    code = strip_comments(content)
+    match = re.search(rf"\bfunction\s+{re.escape(name)}\s*\(", code)
+    if match is None:
+        return None
+    start = code.find("{", match.end())
     if start == -1:
         return None
-    end = content.find('title: "', start + len(marker))
-    return content[start:] if end == -1 else content[start:end]
+    return extract_balanced(code, start, "{", "}")
 
 
-def nav_titles(content: str) -> list[str]:
-    return [part.split('"', 1)[0] for part in content.split('title: "')[1:]]
+def extract_object_initializers(array_content: str) -> list[str]:
+    objects: list[str] = []
+    index = 0
+    while index < len(array_content):
+        if array_content[index] == "{":
+            item = extract_balanced(array_content, index, "{", "}")
+            if item is None:
+                return []
+            objects.append(item)
+            index += len(item)
+        else:
+            index += 1
+    return objects
+
+
+def string_property(item: str, name: str) -> str | None:
+    match = re.search(rf'\b{re.escape(name)}\s*:\s*"([^"]*)"', item)
+    return match.group(1) if match is not None else None
+
+
+def verify_nav_items(
+    array_content: str | None,
+    array_name: str,
+    expected_titles: list[str],
+    expected_badge: str | None,
+) -> str | None:
+    if array_content is None:
+        return f"main-nav missing {array_name} initializer"
+    items = extract_object_initializers(array_content)
+    titles = [string_property(item, "title") for item in items]
+    if titles != expected_titles:
+        return f"main-nav {array_name} must contain only " + " and ".join(expected_titles)
+    for item, title in zip(items, expected_titles, strict=True):
+        badge = string_property(item, "badge")
+        if expected_badge is None and badge is not None:
+            if badge == "SELF-HOSTED":
+                return "main-nav must not contain SELF-HOSTED badges"
+            return f"main-nav {title} must not have a badge"
+        if expected_badge is not None and badge != expected_badge:
+            return f"main-nav {title} must have a {expected_badge} badge"
+    return None
 
 
 def verify_main_nav_groups(main_nav_content: str) -> str | None:
-    memory_tools_start = main_nav_content.find("MEMORY TOOLS")
-    if memory_tools_start == -1:
-        return "main-nav missing MEMORY TOOLS group"
-
-    cloud_features_start = main_nav_content.find("CLOUD FEATURES", memory_tools_start)
-    if cloud_features_start == -1:
-        return "main-nav missing CLOUD FEATURES group"
-
-    account_start = main_nav_content.find("ACCOUNT", cloud_features_start)
-    if account_start == -1:
-        return "main-nav missing ACCOUNT group"
-
-    memory_tools = main_nav_content[memory_tools_start:cloud_features_start]
-    cloud_features = main_nav_content[cloud_features_start:account_start]
-    if "SELF-HOSTED" in main_nav_content:
-        return "main-nav must not contain SELF-HOSTED badges"
-
-    if nav_titles(memory_tools) != ["Categories", "Export"]:
-        return "main-nav MEMORY TOOLS must contain only Categories and Export"
-    if nav_titles(cloud_features) != ["Webhooks", "Analytics"]:
-        return "main-nav CLOUD FEATURES must contain only Webhooks and Analytics"
-
-    for title in ("Categories", "Export"):
-        if f'title: "{title}"' not in memory_tools:
-            return f'main-nav MEMORY TOOLS missing item: "{title}"'
-        if f'title: "{title}"' in cloud_features:
-            return f'main-nav {title} must not be in CLOUD FEATURES'
-        block = item_block(memory_tools, title)
-        if block is not None and "badge:" in block:
-            return f'main-nav {title} must not have a badge'
-
-    for title in ("Webhooks", "Analytics"):
-        if f'title: "{title}"' in memory_tools:
-            return f'main-nav {title} must not be in MEMORY TOOLS'
-        if f'title: "{title}"' not in cloud_features:
-            return f'main-nav CLOUD FEATURES missing item: "{title}"'
-        block = item_block(cloud_features, title)
-        if block is None or 'badge: "PRO"' not in block:
-            return f'main-nav {title} must have a PRO badge'
-
-    return None
+    memory_tools_error = verify_nav_items(
+        extract_named_array(main_nav_content, "MEMORY_TOOL_ITEMS"),
+        "MEMORY_TOOL_ITEMS",
+        ["Categories", "Export"],
+        None,
+    )
+    if memory_tools_error is not None:
+        return memory_tools_error
+    return verify_nav_items(
+        extract_named_array(main_nav_content, "CLOUD_FEATURE_ITEMS"),
+        "CLOUD_FEATURE_ITEMS",
+        ["Webhooks", "Analytics"],
+        "PRO",
+    )
 
 
 def verify_categories_page(dashboard_dir: Path) -> str | None:
@@ -160,14 +248,34 @@ def verify_categories_page(dashboard_dir: Path) -> str | None:
     return None
 
 
+def extract_export_format_tag(export_content: str, format_name: str) -> str | None:
+    marker = "<RadioGroupItem"
+    index = 0
+    while True:
+        start = export_content.find(marker, index)
+        if start == -1:
+            return None
+        tag = extract_balanced(
+            export_content,
+            start,
+            "<",
+            ">",
+        )
+        if tag is None:
+            return None
+        if re.search(rf'\bvalue\s*=\s*"{re.escape(format_name)}"', tag):
+            return tag
+        index = start + len(tag)
+
+
 def verify_disabled_export_format(export_content: str, format_name: str) -> str | None:
-    marker = f'<RadioGroupItem value="{format_name}"'
-    start = export_content.find(marker)
-    if start == -1:
+    tag = extract_export_format_tag(export_content, format_name)
+    if tag is None:
         return f'Export page missing {format_name.upper()} format option'
-    end = export_content.find("/>", start)
-    if end == -1 or "disabled" not in export_content[start:end]:
-        return f'Export {format_name.upper()} format must remain disabled'
+    plain_disabled = re.search(r"\bdisabled(?=\s|/|>)", tag)
+    explicit_true = re.search(r"\bdisabled\s*=\s*\{\s*true\s*\}", tag)
+    if plain_disabled is None and explicit_true is None:
+        return f"Export {format_name.upper()} format must use disabled or disabled={{true}}"
     return None
 
 
@@ -189,20 +297,32 @@ def verify_export_page(dashboard_dir: Path) -> str | None:
 def verify_proxy_contract(dashboard_dir: Path) -> str | None:
     proxy_content = (dashboard_dir / SIDECAR_PROXY).read_text()
     route_content = (dashboard_dir / SIDECAR_ROUTE).read_text()
+    collection_function = extract_named_function_body(
+        proxy_content, "isProjectCategoriesPath"
+    )
     if (
-        "isProjectCategoriesPath" not in proxy_content
-        or 'method === "POST"' not in proxy_content
+        collection_function is None
+        or re.search(r'\bmethod\s*===\s*"POST"', collection_function) is None
     ):
         return "sidecar proxy missing category collection POST support"
-    if "isProjectCategoryItemPath" not in proxy_content:
+    item_function = extract_named_function_body(
+        proxy_content, "isProjectCategoryItemPath"
+    )
+    if item_function is None:
         return "sidecar proxy missing category item route recognition"
     for method in ("PATCH", "DELETE"):
-        if f'method === "{method}"' not in proxy_content:
+        if re.search(rf'\bmethod\s*===\s*"{method}"', item_function) is None:
             return f"sidecar proxy missing category item {method} support"
     if 'const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);' not in proxy_content:
         return "sidecar proxy METHODS_WITH_BODY must include PATCH"
     for method in ("PATCH", "DELETE"):
-        if f"export const {method} = proxy;" not in route_content:
+        if (
+            re.search(
+                rf"\bexport\s+const\s+{method}\s*=\s*proxy\s*;",
+                strip_comments(route_content),
+            )
+            is None
+        ):
             return f"sidecar route missing {method} handler"
     return None
 

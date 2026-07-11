@@ -36,6 +36,34 @@ import {
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 
+const MEMORY_TOOL_ITEMS = [
+  {
+    title: "Categories",
+    url: "/dashboard/categories",
+    icon: Tags,
+  },
+  {
+    title: "Export",
+    url: "/dashboard/export",
+    icon: FolderInput,
+  },
+];
+
+const CLOUD_FEATURE_ITEMS = [
+  {
+    title: "Webhooks",
+    url: "/dashboard/webhooks",
+    icon: WebhookIcon,
+    badge: "PRO",
+  },
+  {
+    title: "Analytics",
+    url: "/dashboard/analytics",
+    icon: ChartLine,
+    badge: "PRO",
+  },
+];
+
 export function MainNav({
   className,
   ...props
@@ -116,25 +144,12 @@ export function MainNav({
                     MEMORY TOOLS
                   </SidebarGroupLabel>
                 )}
-                {[
-                  {
-                    title: "Categories",
-                    url: "/dashboard/categories",
-                    icon: Tags,
-                    active: pathname === "/dashboard/categories",
-                  },
-                  {
-                    title: "Export",
-                    url: "/dashboard/export",
-                    icon: FolderInput,
-                    active: pathname === "/dashboard/export",
-                  },
-                ].map((item) => (
+                {MEMORY_TOOL_ITEMS.map((item) => (
                   <SidebarMenuItem key={item.title}>
                     <SidebarMenuButton
                       asChild
                       collapsed={isSidebarCollapsed}
-                      active={item.active}
+                      active={pathname === item.url}
                       tooltip={isSidebarCollapsed ? item.title : undefined}
                     >
                       <Link
@@ -177,20 +192,7 @@ export function MainNav({
                   </CollapsibleTrigger>
                 )}
                 <CollapsibleContent className="flex flex-col gap-0">
-                  {[
-                    {
-                      title: "Webhooks",
-                      url: "/dashboard/webhooks",
-                      icon: WebhookIcon,
-                      badge: "PRO",
-                    },
-                    {
-                      title: "Analytics",
-                      url: "/dashboard/analytics",
-                      icon: ChartLine,
-                      badge: "PRO",
-                    },
-                  ].map((item) => (
+                  {CLOUD_FEATURE_ITEMS.map((item) => (
                     <SidebarMenuItem key={item.title}>
                       <SidebarMenuButton
                         asChild

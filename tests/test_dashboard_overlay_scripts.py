@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 OVERLAY = ROOT / "integrations" / "mem0-dashboard-overlay"
 NULL_PAGE = "export default function Page() { return null; }\n"
@@ -396,12 +398,21 @@ def test_verify_dashboard_overlay_rejects_locked_pages(tmp_path):
 def test_verify_rejects_categories_outside_memory_tools(tmp_path):
     dashboard = applied_overlay(tmp_path)
     nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
-    nav.write_text(nav.read_text().replace("MEMORY TOOLS", "CLOUD FEATURES", 1))
+    content = nav.read_text()
+    memory_start = content.index("const MEMORY_TOOL_ITEMS")
+    cloud_start = content.index("const CLOUD_FEATURE_ITEMS")
+    memory_items = content[memory_start:cloud_start].replace(
+        'title: "Categories"', 'title: "Webhooks"', 1
+    )
+    cloud_items = content[cloud_start:].replace(
+        'title: "Webhooks"', 'title: "Categories"', 1
+    )
+    nav.write_text(content[:memory_start] + memory_items + cloud_items)
 
     result = run_verify_without_typecheck(dashboard)
 
     assert result.returncode == 1
-    assert "MEMORY TOOLS" in result.stderr
+    assert "MEMORY_TOOL_ITEMS" in result.stderr
 
 
 def test_verify_rejects_json_first_categories_regression(tmp_path):
@@ -429,20 +440,33 @@ def test_verify_rejects_missing_category_patch_proxy(tmp_path):
     assert "PATCH" in result.stderr
 
 
-def test_verify_rejects_enabled_csv_option(tmp_path):
+@pytest.mark.parametrize(
+    ("format_name", "replacement"),
+    [
+        ("csv", ""),
+        ("csv", "disabled={false}"),
+        ("csv", "disabled={futureFormatsDisabled}"),
+        ("pydantic", ""),
+        ("pydantic", "disabled={false}"),
+        ("pydantic", "disabled={futureFormatsDisabled}"),
+    ],
+)
+def test_verify_rejects_invalid_future_format_disabled_attribute(
+    tmp_path, format_name, replacement
+):
     dashboard = applied_overlay(tmp_path)
     page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
     page.write_text(
         page.read_text().replace(
-            'value="csv" id="export-format-csv" disabled',
-            'value="csv" id="export-format-csv"',
+            f'value="{format_name}" id="export-format-{format_name}" disabled',
+            f'value="{format_name}" id="export-format-{format_name}" {replacement}',
         )
     )
 
     result = run_verify_without_typecheck(dashboard)
 
     assert result.returncode == 1
-    assert "CSV" in result.stderr
+    assert format_name.upper() in result.stderr
 
 
 def test_verify_rejects_self_hosted_export_badge(tmp_path):
@@ -462,6 +486,37 @@ def test_verify_rejects_self_hosted_export_badge(tmp_path):
     assert "SELF-HOSTED" in result.stderr
 
 
+def test_verify_rejects_badge_before_memory_tool_title(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    assert "const MEMORY_TOOL_ITEMS" in content
+    nav.write_text(
+        content.replace(
+            '  {\n    title: "Categories",',
+            '  {\n    badge: "SELF-HOSTED",\n    title: "Categories",',
+            1,
+        )
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "SELF-HOSTED" in result.stderr
+
+
+def test_verify_ignores_comment_decoy_group_labels(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    nav.write_text(
+        "// MEMORY TOOLS\n// CLOUD FEATURES\n// ACCOUNT\n" + nav.read_text()
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_verify_rejects_missing_webhooks_pro_badge(tmp_path):
     dashboard = applied_overlay(tmp_path)
     nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
@@ -479,6 +534,35 @@ def test_verify_rejects_missing_webhooks_pro_badge(tmp_path):
 
     assert result.returncode == 1
     assert "Webhooks" in result.stderr
+
+
+def test_verify_rejects_missing_category_delete_route_export(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    route = dashboard / "src/app/api/sidecar/[...path]/route.ts"
+    route.write_text(route.read_text().replace("export const DELETE = proxy;", ""))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "DELETE" in result.stderr
+
+
+@pytest.mark.parametrize("method", ("PATCH", "DELETE"))
+def test_verify_rejects_missing_category_item_method_branch(tmp_path, method):
+    dashboard = applied_overlay(tmp_path)
+    proxy = dashboard / "src/utils/sidecar-proxy.ts"
+    content = proxy.read_text()
+    function_start = content.index("function isProjectCategoryItemPath")
+    function_end = content.index("\n}\n", function_start) + 2
+    item_function = content[function_start:function_end].replace(
+        f'method === "{method}"', f'method === "{method}-MISSING"', 1
+    )
+    proxy.write_text(content[:function_start] + item_function + content[function_end:])
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert method in result.stderr
 
 
 def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
