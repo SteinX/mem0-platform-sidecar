@@ -25,6 +25,8 @@ def write_dashboard_package(dashboard: Path) -> None:
 def write_verify_fixture(dashboard: Path) -> None:
     for relative in [
         "src/app/(root)/dashboard/categories/page.tsx",
+        "src/app/(root)/dashboard/categories/category-field-editor.tsx",
+        "src/app/(root)/dashboard/categories/category-editor-drawer.tsx",
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/config/route.ts",
         "src/app/api/sidecar/[...path]/route.ts",
@@ -616,7 +618,7 @@ def test_verify_dashboard_overlay_rejects_missing_manifest_file(tmp_path):
     assert manifest["files"][2] in result.stderr
 
 
-def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
+def test_apply_dashboard_overlay_replaces_categories_with_productized_editor(
     tmp_path,
 ):
     dashboard = tmp_path / "dashboard"
@@ -636,35 +638,40 @@ def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
 
     assert result.returncode == 0, result.stderr
 
-    content = (dashboard / "src/app/(root)/dashboard/categories/page.tsx").read_text()
+    categories = dashboard / "src/app/(root)/dashboard/categories"
+    page_content = (categories / "page.tsx").read_text()
+    drawer_content = (categories / "category-editor-drawer.tsx").read_text()
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
 
-    assert '"use client";' in content
-    assert "sidecarGet<SidecarCategoryResponse>" in content
-    assert "sidecarPut<SidecarCategoryResponse>" in content
-    assert 'import { getSidecarProjectId } from "@/utils/sidecar-project";' in content
-    assert "await getSidecarProjectId()" in content
-    assert 'const PROJECT_ID = "default";' not in content
-    assert 'toast({ title: "Categories saved", variant: "success" });' in content
-    assert "JSON.parse(category.schemaText)" in content
-    assert "type EditableCategory = {" in content
-    assert "id: string;" in content
-    assert "crypto.randomUUID()" in content
-    assert "key={category.id}" in content
-    assert 'key={`${category.name}-${index}`}' not in content
+    assert '"use client";' in page_content
+    assert "sidecarGet<SidecarCategoryResponse>" in page_content
     assert (
-        "const isEditorDisabled = isLoading || isSaving || !hasLoaded || !projectId;"
-        in content
+        'import { getSidecarProjectId } from "@/utils/sidecar-project";'
+        in page_content
     )
-    assert "disabled={isEditorDisabled}" in content
+    assert "await getSidecarProjectId()" in page_content
+    assert "sidecarPost<SidecarCategory>" in drawer_content
+    assert "sidecarPatch<SidecarCategory>" in drawer_content
+    assert "sidecarDelete(" in drawer_content
+    assert "CategoryEditorDrawer" in page_content
+    assert "CategoryFieldEditor" in drawer_content
+    assert "Create category" in page_content
+    assert "Advanced schema" in drawer_content
+    assert "Generated schema" in drawer_content
+    assert "Discard changes?" in drawer_content
+    assert "Delete category?" in drawer_content
+    assert "Schema JSON" not in page_content
+    assert "sidecarPut<SidecarCategoryResponse>" not in page_content
+    assert "SELF-HOSTED" not in page_content
+    assert "LockedPage" not in page_content
     assert (
-        "onCheckedChange={(enabled) => updateCategory(index, { enabled })}"
-        in content
+        "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+        in manifest["files"]
     )
-    assert "disabled={isEditorDisabled}" in content
-    assert 'title: "Failed to load categories"' in content
-    assert "Retry load" in content
-    assert "void loadCategories();" in content
-    assert "LockedPage" not in content
+    assert (
+        "src/app/(root)/dashboard/categories/category-editor-drawer.tsx"
+        in manifest["files"]
+    )
 
 
 def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_path):
