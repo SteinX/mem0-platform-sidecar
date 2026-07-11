@@ -110,6 +110,54 @@ export function MainNav({
                 <div className="h-[1px] w-full bg-memBorder-primary my-2" />
               )}
 
+              <div className="flex flex-col gap-0">
+                {!isSidebarCollapsed && (
+                  <SidebarGroupLabel className="mb-0">
+                    MEMORY TOOLS
+                  </SidebarGroupLabel>
+                )}
+                {[
+                  {
+                    title: "Categories",
+                    url: "/dashboard/categories",
+                    icon: Tags,
+                    active: pathname === "/dashboard/categories",
+                  },
+                  {
+                    title: "Export",
+                    url: "/dashboard/export",
+                    icon: FolderInput,
+                    active: pathname === "/dashboard/export",
+                  },
+                ].map((item) => (
+                  <SidebarMenuItem key={item.title}>
+                    <SidebarMenuButton
+                      asChild
+                      collapsed={isSidebarCollapsed}
+                      active={item.active}
+                      tooltip={isSidebarCollapsed ? item.title : undefined}
+                    >
+                      <Link
+                        href={item.url}
+                        className={cn(
+                          "flex items-center w-full",
+                          isSidebarCollapsed
+                            ? "justify-center mx-auto"
+                            : "gap-1.5",
+                        )}
+                      >
+                        <item.icon className="size-4 shrink-0" />
+                        {!isSidebarCollapsed && <span>{item.title}</span>}
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
+              </div>
+
+              {isSidebarCollapsed && (
+                <div className="h-[1px] w-full bg-memBorder-primary my-2" />
+              )}
+
               <Collapsible
                 open={isCloudOpen}
                 onOpenChange={setIsCloudOpen}
@@ -131,12 +179,6 @@ export function MainNav({
                 <CollapsibleContent className="flex flex-col gap-0">
                   {[
                     {
-                      title: "Categories",
-                      url: "/dashboard/categories",
-                      icon: Tags,
-                      badge: "SELF-HOSTED",
-                    },
-                    {
                       title: "Webhooks",
                       url: "/dashboard/webhooks",
                       icon: WebhookIcon,
@@ -147,12 +189,6 @@ export function MainNav({
                       url: "/dashboard/analytics",
                       icon: ChartLine,
                       badge: "PRO",
-                    },
-                    {
-                      title: "Export",
-                      url: "/dashboard/export",
-                      icon: FolderInput,
-                      badge: "SELF-HOSTED",
                     },
                   ].map((item) => (
                     <SidebarMenuItem key={item.title}>
@@ -178,11 +214,7 @@ export function MainNav({
                               {item.badge && (
                                 <Badge
                                   variant="outline"
-                                  className={
-                                    item.badge === "PRO"
-                                      ? "ml-auto text-memGold-600 border-memGold-300 typo-caption-sm px-1.5 py-0"
-                                      : "ml-auto text-emerald-600 border-emerald-300 typo-caption-sm px-1.5 py-0"
-                                  }
+                                  className="ml-auto text-memGold-600 border-memGold-300 typo-caption-sm px-1.5 py-0"
                                 >
                                   {item.badge}
                                 </Badge>

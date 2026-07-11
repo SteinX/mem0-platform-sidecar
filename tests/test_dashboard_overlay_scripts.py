@@ -22,6 +22,39 @@ def write_dashboard_package(dashboard: Path) -> None:
     )
 
 
+def applied_overlay(tmp_path: Path) -> Path:
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return dashboard
+
+
+def run_verify_without_typecheck(dashboard: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1"},
+    )
+
+
 def write_verify_fixture(dashboard: Path) -> None:
     for relative in [
         "src/app/(root)/dashboard/categories/page.tsx",
@@ -360,39 +393,92 @@ def test_verify_dashboard_overlay_rejects_locked_pages(tmp_path):
     assert "still imports or renders LockedPage" in result.stderr
 
 
-def test_verify_dashboard_overlay_rejects_incorrect_navigation_badges(tmp_path):
-    dashboard = tmp_path / "dashboard"
-    write_verify_fixture(dashboard)
-    main_nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
-    main_nav.write_text(
-        'title: "Categories"\n'
-        'badge: "PRO"\n'
-        'title: "Webhooks"\n'
-        'badge: "PRO"\n'
-        'title: "Analytics"\n'
-        'badge: "PRO"\n'
-        'title: "Export"\n'
-        'badge: "SELF-HOSTED"\n'
-    )
+def test_verify_rejects_categories_outside_memory_tools(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    nav.write_text(nav.read_text().replace("MEMORY TOOLS", "CLOUD FEATURES", 1))
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
-            str(dashboard),
-        ],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-        env={
-            **os.environ,
-            "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1",
-        },
-    )
+    result = run_verify_without_typecheck(dashboard)
 
     assert result.returncode == 1
-    assert 'Categories badge mismatch: expected "SELF-HOSTED"' in result.stderr
+    assert "MEMORY TOOLS" in result.stderr
+
+
+def test_verify_rejects_json_first_categories_regression(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    drawer = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-editor-drawer.tsx"
+    )
+    drawer.write_text(drawer.read_text().replace("Generated schema", "Schema JSON", 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Schema JSON" in result.stderr
+
+
+def test_verify_rejects_missing_category_patch_proxy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    route = dashboard / "src/app/api/sidecar/[...path]/route.ts"
+    route.write_text(route.read_text().replace("export const PATCH = proxy;", ""))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "PATCH" in result.stderr
+
+
+def test_verify_rejects_enabled_csv_option(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    page.write_text(
+        page.read_text().replace(
+            'value="csv" id="export-format-csv" disabled',
+            'value="csv" id="export-format-csv"',
+        )
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "CSV" in result.stderr
+
+
+def test_verify_rejects_self_hosted_export_badge(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    nav.write_text(
+        nav.read_text().replace(
+            'title: "Export",',
+            'title: "Export",\n                      badge: "SELF-HOSTED",',
+            1,
+        )
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "SELF-HOSTED" in result.stderr
+
+
+def test_verify_rejects_missing_webhooks_pro_badge(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    webhooks_start = content.index('title: "Webhooks"')
+    analytics_start = content.index('title: "Analytics"', webhooks_start)
+    webhooks_section = content[webhooks_start:analytics_start].replace(
+        'badge: "PRO",', "", 1
+    )
+    nav.write_text(
+        content[:webhooks_start] + webhooks_section + content[analytics_start:]
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Webhooks" in result.stderr
 
 
 def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
