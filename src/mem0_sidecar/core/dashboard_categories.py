@@ -29,6 +29,31 @@ def normalize_category_payload(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_category_patch(item: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    if "name" in item:
+        name = str(item["name"]).strip()
+        if not name:
+            raise CategoryValidationError("Category name is required")
+        normalized["name"] = name
+    if "description" in item:
+        normalized["description"] = str(item["description"])
+    if "schema" in item:
+        schema = item["schema"]
+        if schema is None:
+            schema = {}
+        if not isinstance(schema, dict):
+            raise CategoryValidationError("Category schema must be a JSON object")
+        normalized["schema"] = schema
+    if "enabled" in item:
+        normalized["enabled"] = bool(item["enabled"])
+    if "strategy" in item:
+        normalized["strategy"] = str(item["strategy"])
+    if not normalized:
+        raise CategoryValidationError("At least one category field is required")
+    return normalized
+
+
 def category_to_dict(category: Category) -> dict[str, Any]:
     return {
         "id": category.id,
@@ -51,6 +76,38 @@ class CategoryAdminService:
     def list_categories(self, project_id: str) -> dict[str, Any]:
         categories = self.repository.list_project_categories(project_id)
         return {"categories": [category_to_dict(category) for category in categories]}
+
+    def create_category(
+        self, *, project_id: str, item: dict[str, Any]
+    ) -> dict[str, Any]:
+        normalized = normalize_category_payload(item)
+        self._ensure_unique_name(project_id, normalized["name"])
+        category = self.repository.create_project_category(
+            project_id=project_id, item=normalized
+        )
+        return category_to_dict(category)
+
+    def update_category(
+        self, *, project_id: str, category_id: str, item: dict[str, Any]
+    ) -> dict[str, Any]:
+        updates = normalize_category_patch(item)
+        self.repository.get_project_category(project_id, category_id)
+        if "name" in updates:
+            self._ensure_unique_name(project_id, updates["name"], category_id)
+        category = self.repository.update_project_category(
+            project_id, category_id, updates
+        )
+        return category_to_dict(category)
+
+    def delete_category(self, *, project_id: str, category_id: str) -> None:
+        self.repository.delete_project_category(project_id, category_id)
+
+    def _ensure_unique_name(
+        self, project_id: str, name: str, category_id: str | None = None
+    ) -> None:
+        existing = self.repository.find_project_category_by_name(project_id, name)
+        if existing is not None and existing.id != category_id:
+            raise CategoryValidationError("Category names must be unique per project")
 
     def replace_categories(
         self,

@@ -14,6 +14,46 @@ from mem0_sidecar.store.repositories import (
 )
 
 
+def test_category_repository_item_lifecycle_is_project_scoped(db_session):
+    projects = ProjectRepository(db_session)
+    projects.upsert_default_project(
+        project_id="alpha", name="alpha", mem0_base_url="http://mem0:8000"
+    )
+    projects.upsert_default_project(
+        project_id="beta", name="beta", mem0_base_url="http://mem0:8000"
+    )
+    repository = CategoryRepository(db_session)
+
+    created = repository.create_project_category(
+        project_id="alpha",
+        item={
+            "name": "preferences",
+            "description": "Durable preferences",
+            "schema": {"type": "object"},
+            "enabled": True,
+            "strategy": "metadata",
+        },
+    )
+    db_session.commit()
+
+    assert repository.get_project_category("alpha", created.id).name == "preferences"
+    assert repository.find_project_category_by_name("alpha", "preferences") is not None
+    assert repository.find_project_category_by_name("beta", "preferences") is None
+
+    updated = repository.update_project_category(
+        "alpha", created.id, {"description": "Updated", "enabled": False}
+    )
+    db_session.commit()
+    assert updated.description == "Updated"
+    assert updated.enabled == 0
+    assert updated.version == 2
+
+    repository.delete_project_category("alpha", created.id)
+    db_session.commit()
+    with pytest.raises(KeyError):
+        repository.get_project_category("alpha", created.id)
+
+
 def test_repositories_support_control_plane_flow(db_session) -> None:
     project_repo = ProjectRepository(db_session)
     category_repo = CategoryRepository(db_session)

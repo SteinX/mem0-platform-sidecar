@@ -69,6 +69,63 @@ class CategoryRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
+    def get_project_category(self, project_id: str, category_id: str) -> Category:
+        category = self.session.scalar(
+            select(Category).where(
+                Category.project_id == project_id, Category.id == category_id
+            )
+        )
+        if category is None:
+            raise KeyError(category_id)
+        return category
+
+    def find_project_category_by_name(
+        self, project_id: str, name: str
+    ) -> Category | None:
+        return self.session.scalar(
+            select(Category).where(
+                Category.project_id == project_id, Category.name == name
+            )
+        )
+
+    def create_project_category(
+        self, project_id: str, item: dict[str, Any]
+    ) -> Category:
+        category = Category(
+            project_id=project_id,
+            name=str(item["name"]),
+            description=str(item.get("description", "")),
+            schema_json=_json(item.get("schema", {})),
+            enabled=1 if bool(item.get("enabled", True)) else 0,
+            strategy=str(item.get("strategy", "metadata")),
+        )
+        self.session.add(category)
+        self.session.flush()
+        return category
+
+    def update_project_category(
+        self, project_id: str, category_id: str, updates: dict[str, Any]
+    ) -> Category:
+        category = self.get_project_category(project_id, category_id)
+        if "name" in updates:
+            category.name = str(updates["name"])
+        if "description" in updates:
+            category.description = str(updates["description"])
+        if "schema" in updates:
+            category.schema_json = _json(updates["schema"])
+        if "enabled" in updates:
+            category.enabled = 1 if bool(updates["enabled"]) else 0
+        if "strategy" in updates:
+            category.strategy = str(updates["strategy"])
+        category.version += 1
+        self.session.flush()
+        return category
+
+    def delete_project_category(self, project_id: str, category_id: str) -> None:
+        category = self.get_project_category(project_id, category_id)
+        self.session.delete(category)
+        self.session.flush()
+
     def replace_project_categories(
         self, *, project_id: str, categories: list[dict[str, Any]]
     ) -> list[Category]:
