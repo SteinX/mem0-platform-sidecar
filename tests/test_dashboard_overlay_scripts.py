@@ -31,6 +31,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/utils/sidecar-project.ts",
         "src/utils/sidecar-api.ts",
         "src/utils/sidecar-proxy.ts",
+        "src/utils/category-schema.ts",
         "src/types/sidecar.ts",
         "src/app/(root)/dashboard/components/main-nav.tsx",
     ]:
@@ -49,6 +50,28 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
     assert "src/app/api/sidecar/[...path]/route.ts" in manifest["files"]
     assert "src/utils/sidecar-project.ts" in manifest["files"]
     assert "src/utils/sidecar-proxy.ts" in manifest["files"]
+
+
+def test_dashboard_overlay_includes_category_schema_builder_contract():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    schema_path = "src/utils/category-schema.ts"
+
+    assert schema_path in manifest["files"]
+
+    dashboard = OVERLAY / "overlays"
+    schema_content = (dashboard / schema_path).read_text()
+    for symbol in (
+        "export type CategoryFieldType",
+        "export type CategoryField",
+        "export function createEmptyField",
+        "export function schemaToEditor",
+        "export function editorToSchema",
+        "export function validateCategoryFields",
+        "export function countSchemaFields",
+    ):
+        assert symbol in schema_content
+    assert 'mode: "advanced"' in schema_content
+    assert 'format: "date"' in schema_content
 
 
 def test_apply_dashboard_overlay_copies_files(tmp_path):
