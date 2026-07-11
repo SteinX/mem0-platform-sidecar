@@ -8,6 +8,7 @@ export type CategoryField = {
   description: string;
   type: CategoryFieldType;
   required: boolean;
+  hasDefault: boolean;
   defaultValue: string;
   enumValues: string[];
   arrayItemType: CategoryScalarType;
@@ -46,6 +47,7 @@ export function createEmptyField(): CategoryField {
     description: "",
     type: "string",
     required: false,
+    hasDefault: false,
     defaultValue: "",
     enumValues: [],
     arrayItemType: "string",
@@ -83,15 +85,17 @@ export function schemaToEditor(schema: unknown): CategorySchemaEditor {
   }
 
   const fields: CategoryField[] = [];
+  const propertyKeys = isSchemaObject(properties)
+    ? new Set(Object.keys(properties))
+    : new Set<string>();
+  validateRequiredKeys(rootRequired, propertyKeys, "$.required", unsupportedPaths);
   if (isSchemaObject(properties)) {
-    const propertyKeys = new Set(Object.keys(properties));
-    validateRequiredKeys(rootRequired, propertyKeys, "$.required", unsupportedPaths);
     for (const [key, property] of Object.entries(properties)) {
       const field = schemaPropertyToField(
         property,
         key,
         rootRequired.includes(key),
-        `$.properties.${jsonPathKey(key)}`,
+        propertyPath("$.properties", key),
         unsupportedPaths,
         0,
       );
@@ -143,11 +147,10 @@ export function validateCategoryFields(fields: CategoryField[]): CategorySchemaV
 }
 
 export function countSchemaFields(schema: unknown): number {
-  const editor = schemaToEditor(schema);
-  if (editor.mode === "advanced") {
+  if (!isSchemaObject(schema)) {
     return 0;
   }
-  return countFields(editor.fields);
+  return countProperties(schema.properties);
 }
 
 function advancedEditor(
@@ -186,7 +189,9 @@ function schemaPropertyToField(
   const base = createSchemaField(key, value, required);
   if (SCALAR_TYPES.has(type)) {
     addUnsupportedKeys(value, SCALAR_KEYS, path, unsupportedPaths);
-    return scalarFieldFromSchema(base, value, path, unsupportedPaths);
+    const field = scalarFieldFromSchema(base, value, path, unsupportedPaths);
+    validateSchemaDefault(field, value, path, unsupportedPaths);
+    return field;
   }
 
   if (type === "array") {
@@ -203,6 +208,7 @@ function schemaPropertyToField(
       `${path}.items.enum`,
       unsupportedPaths,
     );
+    validateSchemaDefault(base, value, path, unsupportedPaths);
     return base;
   }
 
@@ -236,7 +242,7 @@ function schemaPropertyToField(
           childValue,
           childKey,
           childRequired.includes(childKey),
-          `${path}.properties.${jsonPathKey(childKey)}`,
+          propertyPath(`${path}.properties`, childKey),
           unsupportedPaths,
           depth + 1,
         );
@@ -245,6 +251,7 @@ function schemaPropertyToField(
         }
       }
     }
+    validateSchemaDefault(base, value, path, unsupportedPaths);
     return base;
   }
 
@@ -258,6 +265,7 @@ function createSchemaField(key: string, schema: SchemaObject, required: boolean)
   field.title = stringValue(schema.title);
   field.description = stringValue(schema.description);
   field.required = required;
+  field.hasDefault = hasOwn(schema, "default");
   field.defaultValue = defaultValueToEditor(schema.default);
   return field;
 }
@@ -365,9 +373,11 @@ function fieldToSchema(field: CategoryField): SchemaObject {
     Object.assign(schema, scalarSchema(field.type, field.enumValues));
   }
 
-  const parsedDefault = parseDefaultValue(field);
-  if (parsedDefault !== undefined) {
-    schema.default = parsedDefault;
+  if (field.hasDefault) {
+    const parsedDefault = parseDefaultValue(field);
+    if (parsedDefault !== undefined) {
+      schema.default = parsedDefault;
+    }
   }
   return schema;
 }
@@ -383,9 +393,6 @@ function scalarSchema(type: CategoryScalarType, enumValues: string[]): SchemaObj
 }
 
 function parseDefaultValue(field: CategoryField): unknown {
-  if (field.defaultValue.trim() === "") {
-    return undefined;
-  }
   if (field.type === "number") {
     return Number(field.defaultValue);
   }
@@ -407,15 +414,20 @@ function validateFields(
   fieldErrors: Record<string, string>,
   nested: boolean,
 ): void {
-  const keys = new Set<string>();
+  const keyCounts = new Map<string, number>();
+  for (const field of fields) {
+    const key = field.key.trim();
+    if (key) {
+      keyCounts.set(key, (keyCounts.get(key) ?? 0) + 1);
+    }
+  }
+
   for (const field of fields) {
     const key = field.key.trim();
     if (!key) {
       setFieldError(fieldErrors, field.id, "Field key is required");
-    } else if (keys.has(key)) {
+    } else if ((keyCounts.get(key) ?? 0) > 1) {
       setFieldError(fieldErrors, field.id, "Field keys must be unique");
-    } else {
-      keys.add(key);
     }
 
     if (field.type === "object") {
@@ -460,21 +472,88 @@ function validateDefaultValue(
   field: CategoryField,
   fieldErrors: Record<string, string>,
 ): void {
-  const value = field.defaultValue.trim();
-  if (!value) {
+  if (!field.hasDefault) {
     return;
   }
-  if (field.type === "number" && !Number.isFinite(Number(value))) {
+  const value = field.defaultValue.trim();
+  if (field.type === "number" && (!value || !Number.isFinite(Number(value)))) {
     setFieldError(fieldErrors, field.id, "Default must be a number");
   } else if (field.type === "boolean" && value !== "true" && value !== "false") {
     setFieldError(fieldErrors, field.id, "Default must be true or false");
   } else if (field.type === "date" && !isIsoDate(value)) {
     setFieldError(fieldErrors, field.id, "Default must use YYYY-MM-DD");
-  } else if (field.type === "array" && !isJsonArray(value)) {
-    setFieldError(fieldErrors, field.id, "Default must be a JSON array");
+  } else if (field.type === "array") {
+    const arrayDefault = parseJsonArray(value);
+    if (arrayDefault === null) {
+      setFieldError(fieldErrors, field.id, "Default must be a JSON array");
+    } else if (
+      !arrayDefault.every((item) =>
+        isScalarDefaultCompatible(
+          field.arrayItemType,
+          item,
+          field.arrayEnumValues,
+        ),
+      )
+    ) {
+      setFieldError(
+        fieldErrors,
+        field.id,
+        "Default array items must match the item type",
+      );
+    }
   } else if (field.type === "object" && !isJsonObject(value)) {
     setFieldError(fieldErrors, field.id, "Default must be a JSON object");
   }
+}
+
+function validateSchemaDefault(
+  field: CategoryField,
+  schema: SchemaObject,
+  path: string,
+  unsupportedPaths: string[],
+): void {
+  if (field.hasDefault && !isCategoryDefaultCompatible(field, schema.default)) {
+    addUnsupportedPath(unsupportedPaths, `${path}.default`);
+  }
+}
+
+function isCategoryDefaultCompatible(field: CategoryField, value: unknown): boolean {
+  if (field.type === "array") {
+    return (
+      Array.isArray(value) &&
+      value.every((item) =>
+        isScalarDefaultCompatible(
+          field.arrayItemType,
+          item,
+          field.arrayEnumValues,
+        ),
+      )
+    );
+  }
+  if (field.type === "object") {
+    return isSchemaObject(value);
+  }
+  return isScalarDefaultCompatible(field.type, value, field.enumValues);
+}
+
+function isScalarDefaultCompatible(
+  type: CategoryScalarType,
+  value: unknown,
+  enumValues: string[],
+): boolean {
+  if (type === "string") {
+    return typeof value === "string";
+  }
+  if (type === "number") {
+    return typeof value === "number" && Number.isFinite(value);
+  }
+  if (type === "boolean") {
+    return typeof value === "boolean";
+  }
+  if (type === "date") {
+    return typeof value === "string" && isIsoDate(value);
+  }
+  return typeof value === "string" && enumValues.includes(value);
 }
 
 function isIsoDate(value: string): boolean {
@@ -490,11 +569,12 @@ function isIsoDate(value: string): boolean {
   );
 }
 
-function isJsonArray(value: string): boolean {
+function parseJsonArray(value: string): unknown[] | null {
   try {
-    return Array.isArray(JSON.parse(value));
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -518,6 +598,9 @@ function parseRequired(
   if (!Array.isArray(required) || required.some((key) => typeof key !== "string")) {
     addUnsupportedPath(unsupportedPaths, path);
     return [];
+  }
+  if (new Set(required).size !== required.length) {
+    addUnsupportedPath(unsupportedPaths, path);
   }
   return required;
 }
@@ -553,7 +636,7 @@ function addUnsupportedKeys(
 ): void {
   for (const key of Object.keys(schema)) {
     if (!allowedKeys.has(key)) {
-      addUnsupportedPath(unsupportedPaths, `${path}.${jsonPathKey(key)}`);
+      addUnsupportedPath(unsupportedPaths, propertyPath(path, key));
     }
   }
 }
@@ -564,8 +647,15 @@ function addUnsupportedPath(paths: string[], path: string): void {
   }
 }
 
-function countFields(fields: CategoryField[]): number {
-  return fields.reduce((count, field) => count + 1 + countFields(field.children), 0);
+function countProperties(properties: unknown): number {
+  if (!isSchemaObject(properties)) {
+    return 0;
+  }
+  return Object.values(properties).reduce<number>(
+    (count, property) =>
+      count + 1 + (isSchemaObject(property) ? countProperties(property.properties) : 0),
+    0,
+  );
 }
 
 function defaultValueToEditor(value: unknown): string {
@@ -578,6 +668,10 @@ function defaultValueToEditor(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function hasOwn(schema: SchemaObject, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(schema, key);
+}
+
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
@@ -586,8 +680,10 @@ function isSchemaObject(value: unknown): value is SchemaObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function jsonPathKey(key: string): string {
-  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) ? key : `[${JSON.stringify(key)}]`;
+function propertyPath(path: string, key: string): string {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)
+    ? `${path}.${key}`
+    : `${path}[${JSON.stringify(key)}]`;
 }
 
 function setFieldError(

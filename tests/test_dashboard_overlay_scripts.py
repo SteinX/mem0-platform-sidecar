@@ -394,7 +394,7 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     node = dashboard / "node"
     node.write_text(
         "#!/bin/sh\n"
-        f"printf '%s\\n' \"$*\" > {node_log}\n"
+        f"printf '%s\\n' \"$*\" >> {node_log}\n"
         "exit 0\n"
     )
     node.chmod(0o755)
@@ -413,9 +413,10 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    harness_args = node_log.read_text().strip()
-    assert "test-sidecar-proxy.cjs" in harness_args
-    assert harness_args.endswith(str(dashboard))
+    harness_args = node_log.read_text().splitlines()
+    assert any("test-sidecar-proxy.cjs" in args for args in harness_args)
+    assert any("test-category-schema.cjs" in args for args in harness_args)
+    assert all(args.endswith(str(dashboard)) for args in harness_args)
 
 
 def test_verify_dashboard_overlay_skip_typecheck_bypasses_node_tools(tmp_path):
