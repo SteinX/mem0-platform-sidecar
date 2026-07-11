@@ -2,8 +2,8 @@ import { cookies } from "next/headers";
 import { NextRequest } from "next/server";
 import { AUTH_ENDPOINTS } from "@/utils/api-endpoints";
 import { getServerApiUrl } from "@/lib/server-api-url";
+import { proxySidecarRequest } from "@/utils/sidecar-proxy";
 
-const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);
 const COOKIE_NAME = "mem0_refresh_token";
 
 function shouldUseSecureCookie() {
@@ -43,82 +43,6 @@ function getConfiguredProjectId(): string {
   );
 }
 
-function jsonError(message: string, status: number): Response {
-  return Response.json({ error: message }, { status });
-}
-
-function isProjectCategoriesPath(method: string, path: string): boolean {
-  return (
-    (method === "GET" || method === "POST" || method === "PUT") &&
-    /^\/v1\/projects\/[^/]+\/categories$/.test(path)
-  );
-}
-
-function isProjectCategoryItemPath(method: string, path: string): boolean {
-  return (
-    (method === "PATCH" || method === "DELETE") &&
-    /^\/v1\/projects\/[^/]+\/categories\/[^/]+$/.test(path)
-  );
-}
-
-function isExportPath(method: string, path: string): boolean {
-  if ((method === "GET" || method === "POST") && path === "/v1/exports") {
-    return true;
-  }
-  return method === "GET" && /^\/v1\/exports\/[^/]+\/download$/.test(path);
-}
-
-function isAllowedSidecarRequest(method: string, path: string): boolean {
-  return (
-    isProjectCategoriesPath(method, path) ||
-    isProjectCategoryItemPath(method, path) ||
-    isExportPath(method, path)
-  );
-}
-
-function scopedSidecarPath(
-  method: string,
-  path: string,
-  configuredProjectId: string,
-): string | null {
-  if (!isAllowedSidecarRequest(method, path)) {
-    return null;
-  }
-  if (isProjectCategoriesPath(method, path)) {
-    return `/v1/projects/${encodeURIComponent(configuredProjectId)}/categories`;
-  }
-  const categoryItemMatch = path.match(
-    /^\/v1\/projects\/[^/]+\/categories\/([^/]+)$/,
-  );
-  if (categoryItemMatch) {
-    const categoryId = categoryItemMatch[1];
-    return `/v1/projects/${encodeURIComponent(configuredProjectId)}/categories/${encodeURIComponent(categoryId)}`;
-  }
-  return path;
-}
-
-function scopedExportBody(
-  bodyText: string,
-  configuredProjectId: string,
-): string | Response {
-  const payloadText = bodyText.trim() || "{}";
-  let payload: unknown;
-  try {
-    payload = JSON.parse(payloadText);
-  } catch {
-    return jsonError("Invalid JSON body", 400);
-  }
-
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-    return jsonError("Invalid JSON body", 400);
-  }
-
-  return JSON.stringify({
-    ...payload,
-    project_id: configuredProjectId,
-  });
-}
-
 function isAuthDisabled() {
   const value = process.env.AUTH_DISABLED?.toLowerCase();
   return value === "1" || value === "true" || value === "yes" || value === "on";
@@ -136,12 +60,15 @@ async function validateDashboardSession(): Promise<boolean> {
   }
 
   try {
-    const response = await fetch(`${getServerApiUrl()}${AUTH_ENDPOINTS.REFRESH}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: refreshToken }),
-      cache: "no-store",
-    });
+    const response = await fetch(
+      `${getServerApiUrl()}${AUTH_ENDPOINTS.REFRESH}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+        cache: "no-store",
+      },
+    );
 
     if (!response.ok) {
       cookieStore.delete(COOKIE_NAME);
@@ -165,71 +92,11 @@ async function proxy(
   const params = await context.params;
   const upstreamPath = params.path.join("/");
   const normalizedPath = `/${upstreamPath}`;
-  const configuredProjectId = getConfiguredProjectId();
-  const baseUrl = getSidecarBaseUrl();
-  if (!baseUrl) {
-    return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);
-  }
-  const scopedPath = scopedSidecarPath(
-    request.method,
-    normalizedPath,
-    configuredProjectId,
-  );
-  if (!scopedPath) {
-    return jsonError("Sidecar route is not allowed", 403);
-  }
-  if (!(await validateDashboardSession())) {
-    return jsonError("Unauthorized", 401);
-  }
-
-  const url = new URL(`${baseUrl}${scopedPath}`);
-  request.nextUrl.searchParams.forEach((value, key) => {
-    if (key !== "project_id") {
-      url.searchParams.append(key, value);
-    }
-  });
-  if (isExportPath(request.method, scopedPath)) {
-    url.searchParams.set("project_id", configuredProjectId);
-  }
-
-  const headers = new Headers();
-  headers.set("Content-Type", "application/json");
-  const requestId = request.headers.get("X-Request-ID");
-  if (requestId) {
-    headers.set("X-Request-ID", requestId);
-  }
-
-  const init: RequestInit = {
-    method: request.method,
-    headers,
-  };
-
-  if (METHODS_WITH_BODY.has(request.method)) {
-    const bodyText = await request.text();
-    if (request.method === "POST" && scopedPath === "/v1/exports") {
-      const scopedBody = scopedExportBody(bodyText, configuredProjectId);
-      if (scopedBody instanceof Response) {
-        return scopedBody;
-      }
-      init.body = scopedBody;
-    } else {
-      init.body = bodyText;
-    }
-  }
-
-  let response: Response;
-  try {
-    response = await fetch(url, init);
-  } catch {
-    return jsonError("Sidecar upstream request failed", 502);
-  }
-
-  const responseText = await response.text();
-  return new Response(responseText, {
-    status: response.status,
-    headers: {
-      "Content-Type": response.headers.get("Content-Type") ?? "application/json",
-    },
+  return proxySidecarRequest(request, normalizedPath, {
+    baseUrl: getSidecarBaseUrl(),
+    configuredProjectId: getConfiguredProjectId(),
+    validateDashboardSession,
+    fetchUpstream: fetch,
   });
 }
 

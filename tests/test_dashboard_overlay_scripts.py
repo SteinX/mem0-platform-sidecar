@@ -30,6 +30,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/app/api/sidecar/[...path]/route.ts",
         "src/utils/sidecar-project.ts",
         "src/utils/sidecar-api.ts",
+        "src/utils/sidecar-proxy.ts",
         "src/types/sidecar.ts",
         "src/app/(root)/dashboard/components/main-nav.tsx",
     ]:
@@ -47,6 +48,7 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
     assert "src/app/api/sidecar/config/route.ts" in manifest["files"]
     assert "src/app/api/sidecar/[...path]/route.ts" in manifest["files"]
     assert "src/utils/sidecar-project.ts" in manifest["files"]
+    assert "src/utils/sidecar-proxy.ts" in manifest["files"]
 
 
 def test_apply_dashboard_overlay_copies_files(tmp_path):
@@ -115,6 +117,7 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
         dashboard / "src/app/api/sidecar/config/route.ts"
     ).read_text()
     helper_content = (dashboard / "src/utils/sidecar-api.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
     project_helper_content = (dashboard / "src/utils/sidecar-project.ts").read_text()
     type_content = (dashboard / "src/types/sidecar.ts").read_text()
 
@@ -125,6 +128,7 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
     assert "export async function sidecarGet<T>" in helper_content
     assert "export async function sidecarPut<T>" in helper_content
     assert "export async function sidecarPost<T>" in helper_content
+    assert "export async function proxySidecarRequest(" in proxy_content
     assert "export async function getSidecarProjectId()" in project_helper_content
     assert 'fetch("/api/sidecar/config"' in project_helper_content
     assert "NEXT_PUBLIC_MEM0_SIDECAR_PROJECT_ID" not in project_helper_content
@@ -154,6 +158,7 @@ def test_apply_dashboard_overlay_normalizes_sidecar_paths_and_removes_patch_foot
 
     route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
     helper_content = (dashboard / "src/utils/sidecar-api.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
 
     assert "function normalizeSidecarPath(path: string): string" in helper_content
     assert "return path.startsWith(\"/\") ? path : `/${path}`;" in helper_content
@@ -161,7 +166,7 @@ def test_apply_dashboard_overlay_normalizes_sidecar_paths_and_removes_patch_foot
     assert "export async function sidecarDelete(" in helper_content
     assert (
         'const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);'
-        in route_content
+        in proxy_content
     )
     assert "export const PATCH = proxy;" in route_content
     assert "export const DELETE = proxy;" in route_content
@@ -186,22 +191,23 @@ def test_apply_dashboard_overlay_route_restricts_sidecar_paths(tmp_path):
     assert result.returncode == 0, result.stderr
 
     route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
 
-    assert "function isAllowedSidecarRequest(" in route_content
+    assert "function isAllowedSidecarRequest(" in proxy_content
     assert "function getConfiguredProjectId()" in route_content
-    assert "function scopedSidecarPath(" in route_content
-    assert "function scopedExportBody(" in route_content
-    assert 'key !== "project_id"' in route_content
-    assert 'url.searchParams.set("project_id", configuredProjectId);' in route_content
-    assert "project_id: configuredProjectId" in route_content
-    assert 'return jsonError("Sidecar route is not allowed", 403);' in route_content
-    assert "isProjectCategoriesPath" in route_content
-    assert "isProjectCategoryItemPath" in route_content
-    assert "categoryItemMatch" in route_content
-    assert "isExportPath" in route_content
+    assert "function scopedSidecarPath(" in proxy_content
+    assert "function scopedExportBody(" in proxy_content
+    assert 'key !== "project_id"' in proxy_content
+    assert 'url.searchParams.set("project_id", configuredProjectId);' in proxy_content
+    assert "project_id: configuredProjectId" in proxy_content
+    assert 'return jsonError("Sidecar route is not allowed", 403);' in proxy_content
+    assert "isProjectCategoriesPath" in proxy_content
+    assert "isProjectCategoryItemPath" in proxy_content
+    assert "categoryItemMatch" in proxy_content
+    assert "isExportPath" in proxy_content
     assert (
         'method === "DELETE" && /^\\/v1\\/exports\\/[^/]+$/.test(path)'
-        not in route_content
+        not in proxy_content
     )
 
 
@@ -223,17 +229,17 @@ def test_apply_dashboard_overlay_route_handles_proxy_errors_explicitly(tmp_path)
 
     assert result.returncode == 0, result.stderr
 
-    route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
 
     assert (
         "function jsonError(message: string, status: number): Response"
-        in route_content
+        in proxy_content
     )
     assert (
         'return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);'
-        in route_content
+        in proxy_content
     )
-    assert 'return jsonError("Sidecar upstream request failed", 502);' in route_content
+    assert 'return jsonError("Sidecar upstream request failed", 502);' in proxy_content
 
 
 def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
@@ -255,13 +261,14 @@ def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
     assert result.returncode == 0, result.stderr
 
     route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
 
     assert 'const COOKIE_NAME = "mem0_refresh_token";' in route_content
     assert "async function validateDashboardSession()" in route_content
     assert "function isAuthDisabled()" in route_content
     assert 'process.env.AUTH_DISABLED?.toLowerCase()' in route_content
     assert "if (isAuthDisabled()) {" in route_content
-    assert 'return jsonError("Unauthorized", 401);' in route_content
+    assert 'return jsonError("Unauthorized", 401);' in proxy_content
     assert "AUTH_ENDPOINTS.REFRESH" in route_content
     assert "getServerApiUrl()" in route_content
 
@@ -360,6 +367,14 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     pnpm = dashboard / "pnpm"
     pnpm.write_text("#!/bin/sh\nexit 0\n")
     pnpm.chmod(0o755)
+    node_log = dashboard / "node.log"
+    node = dashboard / "node"
+    node.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" > {node_log}\n"
+        "exit 0\n"
+    )
+    node.chmod(0o755)
 
     result = subprocess.run(
         [
@@ -372,6 +387,50 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
         capture_output=True,
         check=False,
         env={"PATH": f"{dashboard}:{Path('/usr/bin')}:{Path('/bin')}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    harness_args = node_log.read_text().strip()
+    assert "test-sidecar-proxy.cjs" in harness_args
+    assert harness_args.endswith(str(dashboard))
+
+
+def test_verify_dashboard_overlay_skip_typecheck_bypasses_node_tools(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    for command in ("pnpm", "node"):
+        executable = dashboard / command
+        executable.write_text("#!/bin/sh\nexit 99\n")
+        executable.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            "PATH": f"{dashboard}:{Path('/usr/bin')}:{Path('/bin')}",
+            "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1",
+        },
     )
 
     assert result.returncode == 0, result.stderr
@@ -410,6 +469,9 @@ def test_verify_dashboard_overlay_uses_npm_exec_pnpm_when_global_pnpm_missing(
         "exit 0\n"
     )
     npm.chmod(0o755)
+    node = bin_dir / "node"
+    node.write_text("#!/bin/sh\nexit 0\n")
+    node.chmod(0o755)
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{Path('/usr/bin')}:{Path('/bin')}"
@@ -463,6 +525,9 @@ def test_verify_dashboard_overlay_uses_pinned_default_when_package_manager_missi
         "exit 0\n"
     )
     npm.chmod(0o755)
+    node = bin_dir / "node"
+    node.write_text("#!/bin/sh\nexit 0\n")
+    node.chmod(0o755)
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{Path('/usr/bin')}:{Path('/bin')}"

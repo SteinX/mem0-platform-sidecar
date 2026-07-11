@@ -9,6 +9,7 @@
     "src/app/api/sidecar/[...path]/route.ts",
     "src/utils/sidecar-project.ts",
     "src/utils/sidecar-api.ts",
+    "src/utils/sidecar-proxy.ts",
     "src/types/sidecar.ts"
   ]
 }

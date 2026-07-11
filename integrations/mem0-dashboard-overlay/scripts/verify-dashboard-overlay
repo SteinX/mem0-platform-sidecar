@@ -47,6 +47,17 @@ def typecheck_command(dashboard_dir: Path) -> list[str]:
     raise FileNotFoundError("Neither pnpm nor npm is available on PATH")
 
 
+def proxy_harness_command(overlay_root: Path, dashboard_dir: Path) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-sidecar-proxy.cjs"),
+        str(dashboard_dir),
+    ]
+
+
 def verify_main_nav_badges(main_nav_content: str) -> str | None:
     cursor = 0
     for title, badge in EXPECTED_BADGES.items():
@@ -103,6 +114,11 @@ def main() -> int:
 
     try:
         subprocess.run(typecheck_command(dashboard_dir), cwd=dashboard_dir, check=True)
+        subprocess.run(
+            proxy_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 1
