@@ -243,6 +243,46 @@ def verify_main_nav_groups(main_nav_content: str) -> str | None:
     return None
 
 
+def verify_responsive_nav_collapse(main_nav_content: str) -> str | None:
+    code = strip_comments(main_nav_content)
+    if re.search(r"\bfunction\s+MainNav\s*\(", code) is None:
+        return "main-nav missing MainNav component"
+    required_patterns = (
+        (
+            r'\buseDispatch\b',
+            "main-nav must use Redux dispatch for responsive sidebar collapse",
+        ),
+        (
+            r'\btoggleSidebar\b',
+            "main-nav must use toggleSidebar for responsive sidebar collapse",
+        ),
+        (
+            r'window\.matchMedia\(\s*["\']\(max-width:\s*767px\)["\']\s*\)',
+            "main-nav must watch the 767px responsive sidebar breakpoint",
+        ),
+        (
+            r'if\s*\(\s*sidebarMediaQuery\.matches\s*&&\s*!isSidebarCollapsed\s*\)',
+            "main-nav must collapse only an expanded sidebar on narrow viewports",
+        ),
+        (
+            r'dispatch\(\s*toggleSidebar\(\s*\)\s*\)',
+            "main-nav must dispatch toggleSidebar for narrow viewports",
+        ),
+        (
+            r'sidebarMediaQuery\.addEventListener\(\s*["\']change["\']\s*,',
+            "main-nav must respond when the viewport becomes narrow",
+        ),
+        (
+            r'sidebarMediaQuery\.removeEventListener\(\s*["\']change["\']\s*,',
+            "main-nav must clean up its responsive sidebar listener",
+        ),
+    )
+    for pattern, error in required_patterns:
+        if re.search(pattern, code) is None:
+            return error
+    return None
+
+
 def verify_categories_page(dashboard_dir: Path) -> str | None:
     page_content = (dashboard_dir / CATEGORIES_PAGE).read_text()
     drawer_content = (dashboard_dir / CATEGORY_EDITOR_DRAWER).read_text()
@@ -408,6 +448,7 @@ def main() -> int:
 
     checks = (
         verify_main_nav_groups((dashboard_dir / MAIN_NAV).read_text()),
+        verify_responsive_nav_collapse((dashboard_dir / MAIN_NAV).read_text()),
         verify_categories_page(dashboard_dir),
         verify_export_page(dashboard_dir),
         verify_proxy_contract(dashboard_dir),

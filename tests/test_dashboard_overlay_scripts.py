@@ -415,6 +415,14 @@ def test_verify_rejects_categories_outside_memory_tools(tmp_path):
     assert "MEMORY_TOOL_ITEMS" in result.stderr
 
 
+def test_verify_requires_responsive_sidebar_collapse(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_verify_rejects_json_first_categories_regression(tmp_path):
     dashboard = applied_overlay(tmp_path)
     drawer = (

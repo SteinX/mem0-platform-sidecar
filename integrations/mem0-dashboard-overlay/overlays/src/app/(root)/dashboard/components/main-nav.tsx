@@ -15,8 +15,9 @@ import {
   WebhookIcon,
   Wrench,
 } from "lucide-react";
-import { useSelector } from "react-redux";
+import { useDispatch, useSelector } from "react-redux";
 import { RootState } from "@/store/store";
+import { toggleSidebar } from "@/store/reducers/layoutReducer";
 import { Badge } from "@/components/ui/badge";
 import {
   Collapsible,
@@ -127,10 +128,29 @@ export function MainNav({
   ...props
 }: React.HTMLAttributes<HTMLElement>) {
   const pathname = usePathname();
+  const dispatch = useDispatch();
   const isSidebarCollapsed = useSelector(
     (state: RootState) => state.layout.isSidebarCollapsed,
   );
   const [isCloudOpen, setIsCloudOpen] = React.useState(true);
+
+  React.useEffect(() => {
+    const sidebarMediaQuery = window.matchMedia("(max-width: 767px)");
+    const collapseSidebarOnNarrowViewport = () => {
+      if (sidebarMediaQuery.matches && !isSidebarCollapsed) {
+        dispatch(toggleSidebar());
+      }
+    };
+
+    collapseSidebarOnNarrowViewport();
+    sidebarMediaQuery.addEventListener("change", collapseSidebarOnNarrowViewport);
+    return () => {
+      sidebarMediaQuery.removeEventListener(
+        "change",
+        collapseSidebarOnNarrowViewport,
+      );
+    };
+  }, [dispatch, isSidebarCollapsed]);
 
   return (
     <Sidebar
