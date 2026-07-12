@@ -2,8 +2,10 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 from mem0_sidecar.config import SidecarSettings
+from mem0_sidecar.core.dashboard_categories import CategoryAdminService
 from mem0_sidecar.http_adapter.app import create_app
 
 
@@ -189,6 +191,72 @@ def test_category_item_routes_reject_duplicate_names(tmp_path):
     assert second.json()["detail"] == "Category names must be unique per project"
 
 
+def test_create_category_maps_unique_constraint_race_to_400(tmp_path, monkeypatch):
+    client = TestClient(_app(tmp_path))
+    assert client.post(
+        "/v1/projects/default/categories", json={"name": "work", "schema": {}}
+    ).status_code == 201
+    monkeypatch.setattr(
+        CategoryAdminService,
+        "_ensure_unique_name",
+        lambda self, project_id, name, category_id=None: None,
+    )
+
+    response = client.post(
+        "/v1/projects/default/categories", json={"name": "work", "schema": {}}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Category names must be unique per project"
+    assert len(client.get("/v1/projects/default/categories").json()["categories"]) == 1
+
+
+def test_rename_category_maps_unique_constraint_race_to_400(tmp_path, monkeypatch):
+    client = TestClient(_app(tmp_path))
+    first = client.post(
+        "/v1/projects/default/categories", json={"name": "work", "schema": {}}
+    ).json()
+    second = client.post(
+        "/v1/projects/default/categories", json={"name": "personal", "schema": {}}
+    ).json()
+    monkeypatch.setattr(
+        CategoryAdminService,
+        "_ensure_unique_name",
+        lambda self, project_id, name, category_id=None: None,
+    )
+
+    response = client.patch(
+        f"/v1/projects/default/categories/{second['id']}", json={"name": "work"}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Category names must be unique per project"
+    categories = client.get("/v1/projects/default/categories").json()["categories"]
+    assert {category["id"]: category["name"] for category in categories} == {
+        first["id"]: "work",
+        second["id"]: "personal",
+    }
+
+
+def test_create_category_does_not_misclassify_other_integrity_errors(
+    tmp_path, monkeypatch
+):
+    def raise_unrelated_error(self, *, project_id, item):
+        raise IntegrityError(
+            "INSERT INTO categories",
+            {},
+            Exception("FOREIGN KEY constraint failed"),
+        )
+
+    monkeypatch.setattr(CategoryAdminService, "create_category", raise_unrelated_error)
+    client = TestClient(_app(tmp_path))
+
+    with pytest.raises(IntegrityError, match="FOREIGN KEY constraint failed"):
+        client.post(
+            "/v1/projects/default/categories", json={"name": "work", "schema": {}}
+        )
+
+
 @pytest.mark.parametrize(
     ("payload", "detail"),
     [
@@ -238,3 +306,23 @@ def test_legacy_bulk_put_still_replaces_categories(tmp_path):
     )
     assert response.status_code == 200
     assert [item["name"] for item in response.json()["categories"]] == ["new"]
+
+
+def test_legacy_bulk_put_can_replace_a_category_with_the_same_name(tmp_path):
+    client = TestClient(_app(tmp_path))
+    client.post(
+        "/v1/projects/default/categories",
+        json={"name": "work", "description": "Before", "schema": {}},
+    )
+
+    response = client.put(
+        "/v1/projects/default/categories",
+        json={
+            "categories": [
+                {"name": "work", "description": "After", "schema": {}}
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["categories"][0]["description"] == "After"
