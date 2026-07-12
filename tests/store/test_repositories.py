@@ -1,14 +1,21 @@
 import json
+from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import UniqueConstraint, insert
 from sqlalchemy.exc import IntegrityError
 
+from mem0_sidecar.core.explorer_filters import (
+    MEMORY_FILTER_FIELDS,
+    parse_explorer_query,
+)
 from mem0_sidecar.store.models import (
     Category,
     EventStatus,
     ExportStatus,
     JobStatus,
+    MemoryIndex,
     Project,
 )
 from mem0_sidecar.store.repositories import (
@@ -516,6 +523,412 @@ def test_memory_index_repository_lists_export_candidates(db_session):
     )
 
     assert [item.mem0_memory_id for item in candidates] == ["mem-a"]
+
+
+def _explorer_query(**overrides):
+    payload = {"page_size": 100, **overrides}
+    return parse_explorer_query(payload, allowed_fields=MEMORY_FILTER_FIELDS)
+
+
+def _add_explorer_memory(
+    db_session,
+    *,
+    project_id: str,
+    mem0_memory_id: str,
+    app_id: str = "app-a",
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    run_id: str | None = None,
+    category: str | None = None,
+    metadata: dict[str, object] | None = None,
+    created_at: datetime | None = None,
+    deleted_at: datetime | None = None,
+) -> MemoryIndex:
+    memory = MemoryIndex(
+        project_id=project_id,
+        mem0_memory_id=mem0_memory_id,
+        app_id=app_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        run_id=run_id,
+        category=category,
+        metadata_projection_json=json.dumps(metadata or {}, sort_keys=True),
+        created_at=created_at or datetime(2026, 7, 1, tzinfo=UTC),
+        deleted_at=deleted_at,
+    )
+    db_session.add(memory)
+    return memory
+
+
+def test_memory_explorer_scope_is_outer_to_all_and_any_filters(db_session):
+    projects = ProjectRepository(db_session)
+    for project_id in ("alpha", "beta"):
+        projects.upsert_default_project(
+            project_id=project_id,
+            name=project_id,
+            mem0_base_url="http://mem0:8000",
+        )
+
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-all",
+        user_id="alice",
+        category="work",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-user",
+        user_id="alice",
+        category="personal",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-category",
+        user_id="bob",
+        category="work",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        app_id="app-b",
+        mem0_memory_id="mem-other-app",
+        user_id="alice",
+        category="work",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="beta",
+        mem0_memory_id="mem-other-project",
+        user_id="alice",
+        category="work",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-deleted",
+        user_id="alice",
+        category="work",
+        deleted_at=datetime(2026, 7, 2, tzinfo=UTC),
+    )
+    db_session.flush()
+
+    filters = [
+        {"field": "user_id", "operator": "equals", "value": "alice"},
+        {"field": "category", "operator": "equals", "value": "work"},
+    ]
+    repository = MemoryIndexRepository(db_session)
+
+    all_page = repository.query_project_memories(
+        "alpha", "app-a", _explorer_query(match="all", filters=filters)
+    )
+    any_page = repository.query_project_memories(
+        "alpha", "app-a", _explorer_query(match="any", filters=filters)
+    )
+
+    assert [item.mem0_memory_id for item in all_page.items] == ["mem-all"]
+    assert all_page.total == 1
+    assert all_page.scan_count == 0
+    assert {item.mem0_memory_id for item in any_page.items} == {
+        "mem-all",
+        "mem-user",
+        "mem-category",
+    }
+    assert any_page.total == 3
+    with pytest.raises(FrozenInstanceError):
+        all_page.total = 2
+
+
+@pytest.mark.parametrize(
+    ("entity_type", "expected_ids"),
+    [
+        ("user", {"mem-user", "mem-mixed"}),
+        ("agent", {"mem-agent", "mem-mixed"}),
+        ("app", {"mem-user", "mem-agent", "mem-run", "mem-mixed"}),
+        ("run", {"mem-run"}),
+    ],
+)
+def test_memory_explorer_entity_type_matches_identity_column_presence(
+    db_session, entity_type, expected_ids
+):
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-user",
+        user_id="alice",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-agent",
+        agent_id="codex",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-run",
+        run_id="run-1",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-mixed",
+        user_id="alice",
+        agent_id="codex",
+    )
+    db_session.flush()
+
+    page = MemoryIndexRepository(db_session).query_project_memories(
+        "alpha",
+        "app-a",
+        _explorer_query(
+            filters=[
+                {
+                    "field": "entity_type",
+                    "operator": "equals",
+                    "value": entity_type,
+                }
+            ]
+        ),
+    )
+
+    assert {item.mem0_memory_id for item in page.items} == expected_ids
+
+
+def test_memory_explorer_date_range_is_inclusive_and_paging_is_stable(db_session):
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    start = datetime(2026, 7, 10, 12, tzinfo=UTC)
+    end = start + timedelta(days=1)
+    for memory_id, created_at in (
+        ("mem-before", start - timedelta(microseconds=1)),
+        ("mem-b", start),
+        ("mem-a", start),
+        ("mem-c", start),
+        ("mem-end", end),
+        ("mem-after", end + timedelta(microseconds=1)),
+    ):
+        _add_explorer_memory(
+            db_session,
+            project_id="alpha",
+            mem0_memory_id=memory_id,
+            created_at=created_at,
+        )
+    db_session.flush()
+
+    repository = MemoryIndexRepository(db_session)
+    date_range = {"from": start.isoformat(), "to": end.isoformat()}
+    first_page = repository.query_project_memories(
+        "alpha",
+        "app-a",
+        _explorer_query(
+            date_range=date_range,
+            sort="created_at_asc",
+            page=1,
+            page_size=2,
+        ),
+    )
+    second_page = repository.query_project_memories(
+        "alpha",
+        "app-a",
+        _explorer_query(
+            date_range=date_range,
+            sort="created_at_asc",
+            page=2,
+            page_size=2,
+        ),
+    )
+    descending = repository.query_project_memories(
+        "alpha",
+        "app-a",
+        _explorer_query(date_range=date_range, sort="created_at_desc"),
+    )
+
+    assert [item.mem0_memory_id for item in first_page.items] == ["mem-a", "mem-b"]
+    assert [item.mem0_memory_id for item in second_page.items] == [
+        "mem-c",
+        "mem-end",
+    ]
+    assert first_page.total == second_page.total == 4
+    assert [item.mem0_memory_id for item in descending.items] == [
+        "mem-end",
+        "mem-c",
+        "mem-b",
+        "mem-a",
+    ]
+
+
+def test_memory_explorer_metadata_exact_match_uses_safe_scalar_narrowing(db_session):
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-both",
+        user_id="alice",
+        metadata={"source": "codex"},
+    )
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-scalar",
+        user_id="alice",
+        metadata={"source": "chatgpt"},
+    )
+    malformed = _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-malformed",
+        user_id="alice",
+    )
+    malformed.metadata_projection_json = "{not-json"
+    _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-metadata",
+        user_id="bob",
+        metadata={"source": "codex"},
+    )
+    db_session.flush()
+
+    filters = [
+        {"field": "user_id", "operator": "equals", "value": "alice"},
+        {
+            "field": "metadata",
+            "operator": "contains",
+            "value": {"key": "source", "value": "codex"},
+        },
+    ]
+    repository = MemoryIndexRepository(db_session)
+    all_page = repository.query_project_memories(
+        "alpha", "app-a", _explorer_query(match="all", filters=filters)
+    )
+    any_page = repository.query_project_memories(
+        "alpha", "app-a", _explorer_query(match="any", filters=filters)
+    )
+
+    assert [item.mem0_memory_id for item in all_page.items] == ["mem-both"]
+    assert all_page.total == 1
+    assert all_page.scan_count == 3
+    assert {item.mem0_memory_id for item in any_page.items} == {
+        "mem-both",
+        "mem-scalar",
+        "mem-malformed",
+        "mem-metadata",
+    }
+    assert any_page.total == 4
+    assert any_page.scan_count == 4
+
+
+def test_memory_explorer_rejects_metadata_scans_over_5000_before_loading(
+    db_session,
+):
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 7, 1, tzinfo=UTC)
+    db_session.execute(
+        insert(MemoryIndex),
+        [
+            {
+                "project_id": "alpha",
+                "mem0_memory_id": f"mem-{index:04d}",
+                "app_id": "app-a",
+                "user_id": "alice" if index == 0 else "bob",
+                "metadata_projection_json": '{"source": "codex"}',
+                "created_at": created_at,
+            }
+            for index in range(5001)
+        ],
+    )
+    repository = MemoryIndexRepository(db_session)
+    metadata_filter = {
+        "field": "metadata",
+        "operator": "contains",
+        "value": {"key": "source", "value": "codex"},
+    }
+
+    narrowed = repository.query_project_memories(
+        "alpha",
+        "app-a",
+        _explorer_query(
+            match="all",
+            filters=[
+                {"field": "user_id", "operator": "equals", "value": "alice"},
+                metadata_filter,
+            ],
+        ),
+    )
+
+    assert [item.mem0_memory_id for item in narrowed.items] == ["mem-0000"]
+    assert narrowed.scan_count == 1
+    with pytest.raises(
+        ValueError, match="^metadata filter scan exceeds 5000 records$"
+    ):
+        repository.query_project_memories(
+            "alpha",
+            "app-a",
+            _explorer_query(filters=[metadata_filter]),
+        )
+
+
+def test_memory_index_repository_mark_stale_never_crosses_projects(db_session):
+    projects = ProjectRepository(db_session)
+    for project_id in ("alpha", "beta"):
+        projects.upsert_default_project(
+            project_id=project_id,
+            name=project_id,
+            mem0_base_url="http://mem0:8000",
+        )
+    alpha_shared = _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-shared",
+    )
+    beta_shared = _add_explorer_memory(
+        db_session,
+        project_id="beta",
+        mem0_memory_id="mem-shared",
+    )
+    beta_only = _add_explorer_memory(
+        db_session,
+        project_id="beta",
+        mem0_memory_id="mem-beta-only",
+    )
+    old_deleted_at = datetime(2026, 7, 1, tzinfo=UTC)
+    alpha_deleted = _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="mem-deleted",
+        deleted_at=old_deleted_at,
+    )
+    db_session.flush()
+
+    changed = MemoryIndexRepository(db_session).mark_stale(
+        "alpha",
+        ["mem-shared", "mem-shared", "mem-beta-only", "mem-deleted"],
+    )
+
+    assert changed == 1
+    assert alpha_shared.deleted_at is not None
+    assert beta_shared.deleted_at is None
+    assert beta_only.deleted_at is None
+    assert alpha_deleted.deleted_at == old_deleted_at
 
 
 def test_project_repository_preserves_existing_defaults_on_routed_upsert(

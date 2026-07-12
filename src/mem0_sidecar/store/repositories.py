@@ -1,10 +1,13 @@
 import json
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
+from mem0_sidecar.core.explorer_filters import ExplorerFilter, ExplorerQuery
 from mem0_sidecar.store.models import (
     Category,
     Entity,
@@ -25,6 +28,90 @@ def _json(value: Any) -> str:
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class MemoryIndexPage:
+    items: list[MemoryIndex]
+    total: int
+    scan_count: int
+
+
+_MEMORY_FILTER_COLUMNS = {
+    "user_id": MemoryIndex.user_id,
+    "agent_id": MemoryIndex.agent_id,
+    "app_id": MemoryIndex.app_id,
+    "run_id": MemoryIndex.run_id,
+    "memory_id": MemoryIndex.mem0_memory_id,
+    "category": MemoryIndex.category,
+}
+
+_ENTITY_TYPE_COLUMNS = {
+    "user": MemoryIndex.user_id,
+    "agent": MemoryIndex.agent_id,
+    "app": MemoryIndex.app_id,
+    "run": MemoryIndex.run_id,
+}
+
+
+def _scalar_filter_expression(item: ExplorerFilter):
+    if item.field == "entity_type":
+        if item.operator == "in":
+            values = item.value
+            return or_(*(_ENTITY_TYPE_COLUMNS[value].is_not(None) for value in values))
+        column = _ENTITY_TYPE_COLUMNS[item.value]
+        if item.operator == "equals":
+            return column.is_not(None)
+        return column.is_(None)
+
+    column = _MEMORY_FILTER_COLUMNS[item.field]
+    if item.operator == "equals":
+        return column == item.value
+    if item.operator == "not_equals":
+        return column != item.value
+    return column.in_(item.value)
+
+
+def _metadata_projection(memory: MemoryIndex) -> dict[str, Any]:
+    try:
+        value = json.loads(memory.metadata_projection_json)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _matches_filter(memory: MemoryIndex, item: ExplorerFilter) -> bool:
+    if item.field == "metadata":
+        projection = _metadata_projection(memory)
+        expected = item.value
+        return projection.get(expected["key"]) == expected["value"]
+
+    if item.field == "entity_type":
+        if item.operator == "in":
+            return any(
+                getattr(memory, _ENTITY_TYPE_COLUMNS[value].key) is not None
+                for value in item.value
+            )
+        present = getattr(memory, _ENTITY_TYPE_COLUMNS[item.value].key) is not None
+        return present if item.operator == "equals" else not present
+
+    actual = getattr(memory, _MEMORY_FILTER_COLUMNS[item.field].key)
+    if item.operator == "equals":
+        return actual == item.value
+    if item.operator == "not_equals":
+        return actual is not None and actual != item.value
+    return actual in item.value
+
+
+def _matches_query_filters(memory: MemoryIndex, query: ExplorerQuery) -> bool:
+    matches = (_matches_filter(memory, item) for item in query.filters)
+    return all(matches) if query.match == "all" else any(matches)
+
+
+def _memory_order_by(query: ExplorerQuery):
+    if query.sort == "created_at_asc":
+        return (MemoryIndex.created_at.asc(), MemoryIndex.mem0_memory_id.asc())
+    return (MemoryIndex.created_at.desc(), MemoryIndex.mem0_memory_id.desc())
 
 
 class ProjectRepository:
@@ -295,6 +382,106 @@ class MemoryIndexRepository:
         if (run_id := filters.get("run_id")) is not None:
             statement = statement.where(MemoryIndex.run_id == run_id)
         return list(self.session.scalars(statement))
+
+    def query_project_memories(
+        self,
+        project_id: str,
+        app_id: str,
+        query: ExplorerQuery,
+    ) -> MemoryIndexPage:
+        scope_conditions = [
+            MemoryIndex.project_id == project_id,
+            MemoryIndex.app_id == app_id,
+            MemoryIndex.deleted_at.is_(None),
+        ]
+        if query.date_range.from_at is not None:
+            scope_conditions.append(MemoryIndex.created_at >= query.date_range.from_at)
+        if query.date_range.to_at is not None:
+            scope_conditions.append(MemoryIndex.created_at <= query.date_range.to_at)
+
+        scalar_filters = [item for item in query.filters if item.field != "metadata"]
+        metadata_filters = [item for item in query.filters if item.field == "metadata"]
+        scalar_expressions = [
+            _scalar_filter_expression(item) for item in scalar_filters
+        ]
+
+        if not metadata_filters:
+            conditions = list(scope_conditions)
+            if scalar_expressions:
+                combine = and_ if query.match == "all" else or_
+                conditions.append(combine(*scalar_expressions))
+
+            total = self.session.scalar(
+                select(func.count()).select_from(MemoryIndex).where(*conditions)
+            )
+            offset = (query.page - 1) * query.page_size
+            statement = (
+                select(MemoryIndex)
+                .where(*conditions)
+                .order_by(*_memory_order_by(query))
+                .offset(offset)
+                .limit(query.page_size)
+            )
+            return MemoryIndexPage(
+                items=list(self.session.scalars(statement)),
+                total=total or 0,
+                scan_count=0,
+            )
+
+        candidate_conditions = list(scope_conditions)
+        if query.match == "all" and scalar_expressions:
+            candidate_conditions.append(and_(*scalar_expressions))
+
+        scan_count = self.session.scalar(
+            select(func.count())
+            .select_from(MemoryIndex)
+            .where(*candidate_conditions)
+        ) or 0
+        if scan_count > 5000:
+            raise ValueError("metadata filter scan exceeds 5000 records")
+
+        candidates = list(
+            self.session.scalars(
+                select(MemoryIndex)
+                .where(*candidate_conditions)
+                .order_by(*_memory_order_by(query))
+            )
+        )
+        matches = [
+            memory
+            for memory in candidates
+            if _matches_query_filters(memory, query)
+        ]
+        offset = (query.page - 1) * query.page_size
+        return MemoryIndexPage(
+            items=matches[offset : offset + query.page_size],
+            total=len(matches),
+            scan_count=scan_count,
+        )
+
+    def mark_stale(
+        self,
+        project_id: str,
+        mem0_memory_ids: Iterable[str],
+    ) -> int:
+        memory_ids = set(mem0_memory_ids)
+        if not memory_ids:
+            return 0
+
+        memories = list(
+            self.session.scalars(
+                select(MemoryIndex).where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.mem0_memory_id.in_(memory_ids),
+                    MemoryIndex.deleted_at.is_(None),
+                )
+            )
+        )
+        stale_at = _utc_now()
+        for memory in memories:
+            memory.deleted_at = stale_at
+        self.session.flush()
+        return len(memories)
 
     def upsert_memory(
         self,
