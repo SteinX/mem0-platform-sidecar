@@ -95,6 +95,104 @@ async def test_mem0_client_gets_memory_by_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mem0_client_lists_memories_with_query_params() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/memories"
+        assert request.url.params["top_k"] == "1000"
+        assert request.url.params["show_expired"] == "true"
+        return httpx.Response(200, json={"results": [{"id": "mem-1"}]})
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.list_memories({"top_k": 1000, "show_expired": True})
+
+    assert result == {"results": [{"id": "mem-1"}]}
+
+
+@pytest.mark.asyncio
+async def test_mem0_client_normalizes_non_dict_list_response() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"id": "mem-1"}])
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.list_memories({})
+
+    assert result == {"results": [{"id": "mem-1"}]}
+
+
+@pytest.mark.asyncio
+async def test_mem0_client_gets_memory_history_with_url_safe_id() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.raw_path == b"/memories/mem%2Fa/history"
+        return httpx.Response(200, json={"results": [{"id": "event-1"}]})
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.get_memory_history("mem/a")
+
+    assert result == {"results": [{"id": "event-1"}]}
+
+
+@pytest.mark.asyncio
+async def test_mem0_client_normalizes_non_dict_history_response() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"id": "event-1"}])
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.get_memory_history("mem-1")
+
+    assert result == {"results": [{"id": "event-1"}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "expected_path"),
+    [
+        ("list", "/memories"),
+        ("history", "/memories/mem%2Fa/history"),
+    ],
+)
+async def test_mem0_client_list_and_history_errors_retain_request_context(
+    operation: str,
+    expected_path: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="backend warming up")
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(client_module.Mem0UpstreamError) as exc_info:
+        if operation == "list":
+            await client.list_memories({"top_k": 1000})
+        else:
+            await client.get_memory_history("mem/a")
+
+    error = exc_info.value
+    assert error.method == "GET"
+    assert error.path == expected_path
+    assert error.status_code == 503
+
+
+@pytest.mark.asyncio
 async def test_mem0_client_deletes_memory_by_id() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "DELETE"

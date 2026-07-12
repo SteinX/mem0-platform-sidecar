@@ -1,6 +1,7 @@
 import logging
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -191,6 +192,16 @@ class Mem0RestClient:
 
     async def search_memories(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", self.search_path, payload=payload)
+
+    async def list_memories(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("GET", self.memories_path, params=params)
+
+    async def get_memory_history(self, memory_id: str) -> dict[str, Any]:
+        encoded = quote(memory_id, safe="")
+        return await self._request(
+            "GET",
+            f"{self.memories_path}/{encoded}/history",
+        )
 
     async def get_memory(self, memory_id: str) -> dict[str, Any]:
         return await self._request("GET", f"{self.memories_path}/{memory_id}")
