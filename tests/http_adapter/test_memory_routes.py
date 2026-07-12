@@ -2,7 +2,8 @@ import json
 from typing import Any
 
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import insert, select
+from sqlalchemy.orm import Session
 
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.core.memory_ops import (
@@ -12,7 +13,11 @@ from mem0_sidecar.core.memory_ops import (
 from mem0_sidecar.http_adapter.app import create_app
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.store.models import Event, EventStatus, MemoryIndex, Project
-from mem0_sidecar.store.repositories import EventRepository, ProjectRepository
+from mem0_sidecar.store.repositories import (
+    EventRepository,
+    MemoryIndexRepository,
+    ProjectRepository,
+)
 
 
 class FakeMem0Client:
@@ -71,6 +76,72 @@ class UpstreamNotFoundMem0Client(FakeMem0Client):
             response_text="not found",
             message="not found",
         )
+
+
+class ExplorerRouteMem0Client(FakeMem0Client):
+    def __init__(self, records: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.records = dict(records or {})
+        self.update_calls: list[tuple[str, dict[str, Any]]] = []
+        self.update_error: Exception | None = None
+        self.history_calls: list[str] = []
+        self.history_response: Any = {"results": []}
+        self.list_calls: list[dict[str, Any]] = []
+        self.list_response: Any = {"results": []}
+
+    async def get_memory(self, memory_id: str) -> Any:
+        self.get_memory_ids.append(memory_id)
+        value = self.records[memory_id]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    async def update_memory(
+        self,
+        memory_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.update_calls.append((memory_id, payload))
+        if self.update_error is not None:
+            raise self.update_error
+        record = self.records[memory_id]
+        assert isinstance(record, dict)
+        if "text" in payload:
+            record["memory"] = payload["text"]
+        if "metadata" in payload:
+            record["metadata"] = payload["metadata"]
+        if "expiration_date" in payload:
+            record["expiration_date"] = payload["expiration_date"]
+        return {"message": "updated"}
+
+    async def get_memory_history(self, memory_id: str) -> Any:
+        self.history_calls.append(memory_id)
+        return self.history_response
+
+    async def list_memories(self, params: dict[str, Any]) -> Any:
+        self.list_calls.append(params)
+        return self.list_response
+
+
+def _index_route_memory(
+    app,
+    memory_id: str,
+    *,
+    project_id: str = "repo-a",
+    app_id: str = "app-a",
+) -> None:
+    with app.state.session_factory() as session:
+        MemoryIndexRepository(session).upsert_memory(
+            project_id=project_id,
+            mem0_memory_id=memory_id,
+            user_id="root",
+            agent_id="codex",
+            app_id=app_id,
+            run_id="run-1",
+            category="decision",
+            metadata={"type": "decision"},
+        )
+        session.commit()
 
 
 def test_memory_routes_round_trip_with_fake_upstream(tmp_path) -> None:
@@ -762,3 +833,459 @@ def test_route_scoped_requests_allow_different_project_and_app_scope(tmp_path) -
         "/v1/event/does-not-matter?project_id=repo-a&app_id=repo-b"
     )
     assert event_response.status_code == 404
+
+
+def test_query_memories_uses_body_scope_and_returns_public_envelope(tmp_path) -> None:
+    expected_memory = {
+        "id": "mem-1",
+        "memory": "hello",
+        "metadata": {"type": "decision"},
+        "categories": ["decision"],
+        "user_id": "root",
+        "agent_id": "codex",
+        "app_id": "app-a",
+        "run_id": "run-1",
+        "created_at": "2026-07-01T10:00:00Z",
+        "updated_at": "2026-07-02T10:00:00Z",
+        "expiration_date": None,
+    }
+    mem0 = ExplorerRouteMem0Client({"mem-1": dict(expected_memory)})
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+
+    response = TestClient(app).post(
+        "/v1/memories/query?project_id=repo-b&app_id=app-b",
+        json={"project_id": "repo-a", "app_id": "app-a"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "results": [expected_memory],
+        "page": 1,
+        "page_size": 20,
+        "total": 1,
+        "has_more": False,
+        "stale_skipped": 0,
+    }
+    assert mem0.get_memory_ids == ["mem-1"]
+
+
+def test_query_memories_commits_stale_cleanup(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client({"mem-stale": ValueError("malformed")})
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-stale")
+
+    response = TestClient(app).post(
+        "/v1/memories/query",
+        json={"project_id": "repo-a", "app_id": "app-a"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stale_skipped"] == 1
+    with app.state.session_factory() as session:
+        stale = MemoryIndexRepository(session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="mem-stale",
+            include_deleted=True,
+        )
+    assert stale is not None and stale.deleted_at is not None
+
+
+def test_query_memories_does_not_bootstrap_unknown_project(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=ExplorerRouteMem0Client(),
+    )
+
+    response = TestClient(app).post(
+        "/v1/memories/query",
+        json={"project_id": "repo-z", "app_id": "app-z"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "results": [],
+        "page": 1,
+        "page_size": 20,
+        "total": 0,
+        "has_more": False,
+        "stale_skipped": 0,
+    }
+    with app.state.session_factory() as session:
+        project = session.scalar(select(Project).where(Project.id == "repo-z"))
+    assert project is None
+
+
+def test_query_memories_maps_invalid_filters_to_422(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=ExplorerRouteMem0Client(),
+    )
+
+    response = TestClient(app).post(
+        "/v1/memories/query",
+        json={
+            "project_id": "repo-a",
+            "app_id": "app-a",
+            "filters": [
+                {"field": "secret", "operator": "equals", "value": "x"}
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "not allowed" in response.json()["detail"]
+
+
+def test_query_memories_maps_metadata_scan_limit_to_422(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=ExplorerRouteMem0Client(),
+    )
+    with app.state.session_factory() as session:
+        session.execute(
+            insert(MemoryIndex),
+            [
+                {
+                    "project_id": "repo-a",
+                    "mem0_memory_id": f"mem-{index:04d}",
+                    "app_id": "app-a",
+                    "metadata_projection_json": '{"source": "codex"}',
+                }
+                for index in range(5001)
+            ],
+        )
+        session.commit()
+
+    response = TestClient(app).post(
+        "/v1/memories/query",
+        json={
+            "project_id": "repo-a",
+            "app_id": "app-a",
+            "filters": [
+                {
+                    "field": "metadata",
+                    "operator": "contains",
+                    "value": {"key": "source", "value": "codex"},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "metadata filter scan exceeds 5000 records"
+    }
+
+
+def test_patch_memory_requires_json_object(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=ExplorerRouteMem0Client(),
+    )
+
+    response = TestClient(app).patch(
+        "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
+        json=["not", "an", "object"],
+    )
+
+    assert response.status_code == 422
+
+
+def test_patch_memory_commits_success(tmp_path, monkeypatch) -> None:
+    record = {
+        "id": "mem-1",
+        "memory": "before",
+        "metadata": {"type": "decision"},
+    }
+    mem0 = ExplorerRouteMem0Client({"mem-1": record})
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+    commit_calls: list[Session] = []
+    original_commit = Session.commit
+
+    def track_commit(session: Session) -> None:
+        commit_calls.append(session)
+        original_commit(session)
+
+    monkeypatch.setattr(Session, "commit", track_commit)
+
+    response = TestClient(app).patch(
+        "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
+        json={"text": "after"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["memory"]["memory"] == "after"
+    assert mem0.update_calls == [("mem-1", {"text": "after"})]
+    assert len(commit_calls) == 1
+    with app.state.session_factory() as session:
+        event = session.scalar(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.update",
+                Event.status == EventStatus.SUCCEEDED,
+            )
+        )
+    assert event is not None
+
+
+def test_patch_memory_rolls_back_and_maps_validation_to_422(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=ExplorerRouteMem0Client(),
+    )
+    _index_route_memory(app, "mem-1")
+    rollback_calls: list[Session] = []
+    original_rollback = Session.rollback
+
+    def track_rollback(session: Session) -> None:
+        rollback_calls.append(session)
+        original_rollback(session)
+
+    monkeypatch.setattr(Session, "rollback", track_rollback)
+
+    response = TestClient(app).patch(
+        "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
+        json={"unsupported": True},
+    )
+
+    assert response.status_code == 422
+    assert "Unsupported memory update fields" in response.json()["detail"]
+    assert len(rollback_calls) == 1
+
+
+def test_patch_memory_wrong_app_is_404_without_upstream_access(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client(
+        {"mem-1": {"id": "mem-1", "memory": "before"}}
+    )
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+
+    response = TestClient(app).patch(
+        "/v1/memories/mem-1?project_id=repo-a&app_id=app-b",
+        json={"text": "after"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Memory not found"}
+    assert mem0.update_calls == []
+    assert mem0.get_memory_ids == []
+
+
+def test_patch_memory_rolls_back_unexpected_failure(tmp_path, monkeypatch) -> None:
+    mem0 = ExplorerRouteMem0Client(
+        {"mem-1": {"id": "mem-1", "memory": "before"}}
+    )
+    mem0.update_error = RuntimeError("boom")
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+    rollback_calls: list[Session] = []
+    original_rollback = Session.rollback
+
+    def track_rollback(session: Session) -> None:
+        rollback_calls.append(session)
+        original_rollback(session)
+
+    monkeypatch.setattr(Session, "rollback", track_rollback)
+
+    response = TestClient(app, raise_server_exceptions=False).patch(
+        "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
+        json={"text": "after"},
+    )
+
+    assert response.status_code == 500
+    assert len(rollback_calls) == 1
+
+
+def test_memory_history_wrong_app_is_404_without_upstream_access(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+
+    response = TestClient(app).get(
+        "/v1/memories/mem-1/history?project_id=repo-a&app_id=app-b"
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Memory not found"}
+    assert mem0.history_calls == []
+
+
+def test_memory_history_returns_scoped_results(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    mem0.history_response = {"history": [{"event": "UPDATE"}]}
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+
+    response = TestClient(app).get(
+        "/v1/memories/mem-1/history?project_id=repo-a&app_id=app-a"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"results": [{"event": "UPDATE"}]}
+    assert mem0.history_calls == ["mem-1"]
+
+
+def test_reconcile_rejects_path_project_mismatch_without_upstream_access(
+    tmp_path,
+) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+
+    response = TestClient(app).post(
+        "/v1/projects/repo-a/memories/reconcile?project_id=repo-b&app_id=app-a",
+        json={},
+    )
+
+    assert response.status_code == 403
+    assert mem0.list_calls == []
+
+
+def test_reconcile_passes_runtime_adoption_gate(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+            allow_adopt_unscoped_memories=False,
+        ),
+        mem0_client=mem0,
+    )
+
+    response = TestClient(app).post(
+        "/v1/projects/repo-a/memories/reconcile",
+        json={
+            "project_id": "repo-a",
+            "app_id": "app-a",
+            "adopt_unscoped": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "Unscoped memory adoption is disabled at runtime"
+    }
+    assert mem0.list_calls == []
+
+
+def test_reconcile_passes_default_project_and_commits_adoption(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    mem0.list_response = {
+        "results": [{"id": "mem-1", "memory": "hello", "metadata": {}}]
+    }
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+            MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED=True,
+        ),
+        mem0_client=mem0,
+    )
+
+    response = TestClient(app).post(
+        "/v1/projects/repo-a/memories/reconcile",
+        json={
+            "project_id": "repo-a",
+            "app_id": "app-a",
+            "adopt_unscoped": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "scanned": 1,
+        "indexed": 1,
+        "skipped_unscoped": 0,
+        "skipped_other_scope": 0,
+        "stale_marked": 0,
+    }
+    assert mem0.list_calls == [{"top_k": 5000, "show_expired": True}]
+    with app.state.session_factory() as session:
+        adopted = MemoryIndexRepository(session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="mem-1",
+            app_id="app-a",
+        )
+    assert adopted is not None
