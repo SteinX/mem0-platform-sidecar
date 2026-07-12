@@ -423,6 +423,36 @@ def test_verify_requires_responsive_sidebar_collapse(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_verify_rejects_category_field_editor_group_invalid_and_input_missing_state(
+    tmp_path,
+):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    content = field_editor.read_text()
+    group_invalid_attribute = "            aria-invalid={Boolean(errors[field.id])}\n"
+    input_invalid_attribute = (
+        "                  aria-invalid={Boolean(errors[field.id])}\n"
+    )
+
+    assert '            role="group"\n' + group_invalid_attribute not in content
+    assert input_invalid_attribute in content
+
+    mutated_content = content.replace(input_invalid_attribute, "", 1).replace(
+        '            role="group"\n',
+        '            role="group"\n' + group_invalid_attribute,
+        1,
+    )
+    field_editor.write_text(mutated_content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Category field editor group must not use aria-invalid" in result.stderr
+
+
 def test_verify_accepts_escaped_quote_string_inside_main_nav(tmp_path):
     dashboard = applied_overlay(tmp_path)
     nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"

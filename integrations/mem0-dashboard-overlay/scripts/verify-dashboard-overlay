@@ -16,6 +16,9 @@ CATEGORIES_PAGE = "src/app/(root)/dashboard/categories/page.tsx"
 CATEGORY_EDITOR_DRAWER = (
     "src/app/(root)/dashboard/categories/category-editor-drawer.tsx"
 )
+CATEGORY_FIELD_EDITOR = (
+    "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+)
 EXPORT_PAGE = "src/app/(root)/dashboard/export/page.tsx"
 SIDECAR_PROXY = "src/utils/sidecar-proxy.ts"
 SIDECAR_ROUTE = "src/app/api/sidecar/[...path]/route.ts"
@@ -347,6 +350,7 @@ def verify_responsive_nav_collapse(main_nav_content: str) -> str | None:
 def verify_categories_page(dashboard_dir: Path) -> str | None:
     page_content = (dashboard_dir / CATEGORIES_PAGE).read_text()
     drawer_content = (dashboard_dir / CATEGORY_EDITOR_DRAWER).read_text()
+    field_editor_content = (dashboard_dir / CATEGORY_FIELD_EDITOR).read_text()
     if "CategoryEditorDrawer" not in page_content:
         return "Categories page missing CategoryEditorDrawer"
     if "Create category" not in page_content:
@@ -359,6 +363,12 @@ def verify_categories_page(dashboard_dir: Path) -> str | None:
         return "Categories must not present Schema JSON as the primary editor"
     if "SELF-HOSTED" in categories_content:
         return "Categories must not contain SELF-HOSTED copy"
+
+    field_editor_accessibility_error = verify_category_field_editor_accessibility(
+        field_editor_content
+    )
+    if field_editor_accessibility_error is not None:
+        return field_editor_accessibility_error
 
     categories_table = extract_categories_table_markup(page_content)
     if categories_table is None:
@@ -393,6 +403,52 @@ def verify_categories_page(dashboard_dir: Path) -> str | None:
     if not has_hidden_desktop_status_column(categories_table, category_row):
         return "Categories table Status header and cell must be hidden below sm"
     return None
+
+
+def verify_category_field_editor_accessibility(field_editor_content: str) -> str | None:
+    group_tags = [
+        tag
+        for tag in extract_jsx_component_tags(field_editor_content, "div")
+        if re.search(r'\brole\s*=\s*"group"', tag) is not None
+    ]
+    if len(group_tags) != 1:
+        return "Category field editor must render one field group"
+    group_tag = group_tags[0]
+    if re.search(r"\baria-invalid(?:\s*=|(?=\s|/|>))", group_tag) is not None:
+        return "Category field editor group must not use aria-invalid"
+    if not has_field_error_description(group_tag):
+        return "Category field editor group must describe its field error"
+
+    field_key_inputs = [
+        tag
+        for tag in extract_jsx_component_tags(field_editor_content, "Input")
+        if re.search(r"\bid\s*=\s*\{\s*`\$\{field\.id\}-key`\s*\}", tag)
+        is not None
+    ]
+    if len(field_key_inputs) != 1:
+        return "Category field editor Field key Input is missing"
+    field_key_input = field_key_inputs[0]
+    if (
+        re.search(
+            r"\baria-invalid\s*=\s*\{\s*Boolean\(errors\[field\.id\]\)\s*\}",
+            field_key_input,
+        )
+        is None
+    ):
+        return "Category field editor Field key Input must use aria-invalid"
+    if not has_field_error_description(field_key_input):
+        return "Category field editor Field key Input must describe its field error"
+    return None
+
+
+def has_field_error_description(tag: str) -> bool:
+    return (
+        re.search(
+            r"\baria-describedby\s*=\s*\{\s*errors\[field\.id\]\s*\?\s*errorId\s*:\s*undefined\s*\}",
+            tag,
+        )
+        is not None
+    )
 
 
 def extract_jsx_component_elements(content: str, component: str) -> list[str]:

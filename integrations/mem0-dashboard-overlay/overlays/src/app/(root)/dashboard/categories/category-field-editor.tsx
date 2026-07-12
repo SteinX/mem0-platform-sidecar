@@ -167,7 +167,6 @@ export function CategoryFieldEditor({
           <div
             key={field.id}
             role="group"
-            aria-invalid={Boolean(errors[field.id])}
             aria-describedby={errors[field.id] ? errorId : undefined}
             className="border-b border-memBorder-primary pb-4 last:border-0"
           >
@@ -179,6 +178,8 @@ export function CategoryFieldEditor({
                   value={field.key}
                   placeholder="field_name"
                   disabled={disabled}
+                  aria-invalid={Boolean(errors[field.id])}
+                  aria-describedby={errors[field.id] ? errorId : undefined}
                   onChange={(event) => updateField(index, { key: event.target.value })}
                 />
               </div>
