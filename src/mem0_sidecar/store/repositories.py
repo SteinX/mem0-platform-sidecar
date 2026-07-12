@@ -2,7 +2,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.store.models import (
@@ -129,11 +129,8 @@ class CategoryRepository:
     def replace_project_categories(
         self, *, project_id: str, categories: list[dict[str, Any]]
     ) -> list[Category]:
-        existing = self.session.scalars(
-            select(Category).where(Category.project_id == project_id)
-        ).all()
-        for category in existing:
-            self.session.delete(category)
+        self.session.execute(delete(Category).where(Category.project_id == project_id))
+        self.session.flush()
 
         created: list[Category] = []
         for item in categories:

@@ -91,6 +91,34 @@ def test_category_repository_item_lifecycle_is_project_scoped(db_session):
         repository.get_project_category("alpha", created.id)
 
 
+def test_category_repository_replaces_category_with_same_name(db_session):
+    projects = ProjectRepository(db_session)
+    projects.upsert_default_project(
+        project_id="alpha", name="alpha", mem0_base_url="http://mem0:8000"
+    )
+    repository = CategoryRepository(db_session)
+    original = repository.create_project_category(
+        project_id="alpha",
+        item={"name": "work", "description": "Before", "schema": {}},
+    )
+    original_id = original.id
+    db_session.commit()
+
+    replacements = repository.replace_project_categories(
+        project_id="alpha",
+        categories=[{"name": "work", "description": "After", "schema": {}}],
+    )
+    db_session.commit()
+
+    assert len(replacements) == 1
+    assert replacements[0].id != original_id
+    assert replacements[0].description == "After"
+    remaining_ids = [
+        category.id for category in repository.list_project_categories("alpha")
+    ]
+    assert remaining_ids == [replacements[0].id]
+
+
 def test_repositories_support_control_plane_flow(db_session) -> None:
     project_repo = ProjectRepository(db_session)
     category_repo = CategoryRepository(db_session)

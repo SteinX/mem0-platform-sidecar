@@ -2,7 +2,6 @@ from collections.abc import Callable
 from typing import Annotated, Any, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -12,7 +11,6 @@ from mem0_sidecar.core.dashboard_categories import (
 )
 from mem0_sidecar.http_adapter.dependencies import get_session
 from mem0_sidecar.http_adapter.project_scope import ensure_project
-from mem0_sidecar.store.models import Category
 from mem0_sidecar.store.repositories import CategoryRepository
 
 category_router = APIRouter()
@@ -88,13 +86,9 @@ def replace_project_categories(
     try:
         items = _extract_categories(payload)
 
-        def replace() -> dict[str, Any]:
-            session.execute(delete(Category).where(Category.project_id == project_id))
-            return service.replace_categories(project_id=project_id, items=items)
-
         return _commit_category_mutation(
             session,
-            replace,
+            lambda: service.replace_categories(project_id=project_id, items=items),
         )
     except CategoryValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
