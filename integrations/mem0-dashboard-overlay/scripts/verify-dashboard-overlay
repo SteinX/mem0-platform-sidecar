@@ -543,8 +543,39 @@ def extract_jsx_component_elements(content: str, component: str) -> list[str]:
         index = end + len(closing_marker)
 
 
+def extract_jsx_opening_tag(content: str) -> str | None:
+    start = content.find("<")
+    if start == -1:
+        return None
+    expression_depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(start + 1, len(content)):
+        character = content[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in ('"', "'", "`"):
+            quote = character
+        elif character == "{":
+            expression_depth += 1
+        elif character == "}" and expression_depth > 0:
+            expression_depth -= 1
+        elif character == ">" and expression_depth == 0:
+            return content[start : index + 1]
+    return None
+
+
 def tag_has_classes(tag: str, *classes: str) -> bool:
-    class_name = re.search(r'\bclassName\s*=\s*"([^"]*)"', tag)
+    opening_tag = extract_jsx_opening_tag(tag)
+    if opening_tag is None:
+        return False
+    class_name = re.search(r'\bclassName\s*=\s*"([^"]*)"', opening_tag)
     if class_name is None:
         return False
     actual_classes = set(class_name.group(1).split())
@@ -655,7 +686,7 @@ def extract_jsx_component_tags(content: str, component: str) -> list[str]:
         if following_index < len(code) and not code[following_index].isspace():
             index = following_index
             continue
-        tag = extract_balanced(code, start, "<", ">")
+        tag = extract_jsx_opening_tag(code[start:])
         if tag is None:
             return tags
         tags.append(tag)
@@ -698,16 +729,25 @@ def verify_disabled_export_format(export_content: str, format_name: str) -> str 
     return None
 
 
-def extract_nearest_jsx_tag_before(
+def extract_jsx_ancestor_opening_tag(
     content: str, component: str, marker: str
 ) -> str | None:
     marker_index = content.find(marker)
     if marker_index == -1:
         return None
-    start = content.rfind(f"<{component}", 0, marker_index)
-    if start == -1:
-        return None
-    return extract_balanced(content, start, "<", ">")
+    component_pattern = re.compile(rf"</?{re.escape(component)}(?=\s|/?>)")
+    ancestors: list[str] = []
+    for match in component_pattern.finditer(content, 0, marker_index):
+        if content.startswith("</", match.start()):
+            if ancestors:
+                ancestors.pop()
+            continue
+        opening_tag = extract_jsx_opening_tag(content[match.start() :])
+        if opening_tag is None:
+            return None
+        if not opening_tag.rstrip().endswith("/>"):
+            ancestors.append(opening_tag)
+    return ancestors[-1] if ancestors else None
 
 
 def verify_export_page_mobile_layout(export_content: str) -> str | None:
@@ -755,7 +795,7 @@ def verify_export_page_mobile_layout(export_content: str) -> str | None:
         project_values[0], "break-all", "sm:truncate"
     ):
         return "mobile Export project ID must wrap before desktop truncation"
-    project_wrapper = extract_nearest_jsx_tag_before(
+    project_wrapper = extract_jsx_ancestor_opening_tag(
         page_body, "div", 'projectId ?? "Loading project..."'
     )
     if project_wrapper is None or not tag_has_classes(
@@ -814,7 +854,7 @@ def verify_export_page_mobile_layout(export_content: str) -> str | None:
             for tag in extract_jsx_component_tags(page_body, "Input")
             if input_marker in tag
         ]
-        wrapper = extract_nearest_jsx_tag_before(page_body, "div", input_marker)
+        wrapper = extract_jsx_ancestor_opening_tag(page_body, "div", input_marker)
         if len(input_tags) != 1 or not tag_has_classes(
             input_tags[0], "w-full", "min-w-0"
         ):
@@ -880,7 +920,9 @@ def verify_export_page_mobile_layout(export_content: str) -> str | None:
             for element in extract_jsx_component_elements(job_body, "dd")
             if f"formatTime(job.{time_name})" in element
         ]
-        if len(time_values) != 1 or not tag_has_classes(time_values[0], "break-all"):
+        if len(time_values) != 1 or not tag_has_classes(
+            time_values[0], "break-words"
+        ):
             return f"mobile Export {time_name} value must wrap"
 
     job_errors = [

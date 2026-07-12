@@ -358,12 +358,12 @@ function ExportJobRow({
             </div>
             <div className="min-w-0">
               <dt className="text-xs text-onSurface-default-tertiary">Created</dt>
-              <dd className="break-all">{formatTime(job.created_at)}</dd>
+              <dd className="break-words">{formatTime(job.created_at)}</dd>
             </div>
             {job.completed_at ? (
               <div className="min-w-0">
                 <dt className="text-xs text-onSurface-default-tertiary">Completed</dt>
-                <dd className="break-all">{formatTime(job.completed_at)}</dd>
+                <dd className="break-words">{formatTime(job.completed_at)}</dd>
               </div>
             ) : null}
           </dl>

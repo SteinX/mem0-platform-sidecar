@@ -982,11 +982,11 @@ def test_verify_rejects_invalid_future_format_disabled_attribute(
             'sm:grid-cols-2 xl:grid-cols-4">',
         ),
         (
-            '<dd className="break-all">{formatTime(job.created_at)}</dd>',
+            '<dd className="break-words">{formatTime(job.created_at)}</dd>',
             '<dd>{formatTime(job.created_at)}</dd>',
         ),
         (
-            '<dd className="break-all">{formatTime(job.completed_at)}</dd>',
+            '<dd className="break-words">{formatTime(job.completed_at)}</dd>',
             '<dd>{formatTime(job.completed_at)}</dd>',
         ),
         (
@@ -1022,6 +1022,69 @@ def test_verify_rejects_removed_mobile_export_layout_protection(
 
     assert result.returncode == 1
     assert "mobile Export" in result.stderr
+
+
+def test_verify_rejects_export_input_wrapper_sibling_class_decoy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text()
+    content = content.replace(
+        '<div className="min-w-0 space-y-2">\n'
+        '              <Label htmlFor="export-app-id">',
+        '<div className="space-y-2">\n'
+        '              <Label htmlFor="export-app-id">',
+        1,
+    )
+    content = content.replace(
+        '<Input className="w-full min-w-0" id="export-app-id"',
+        '<div className="min-w-0" />\n'
+        '              <Input className="w-full min-w-0" id="export-app-id"',
+        1,
+    )
+    page.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "app input grid child" in result.stderr
+
+
+def test_verify_rejects_export_format_label_descendant_class_decoy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text()
+    content = content.replace(
+        '                className="flex min-h-16 w-full min-w-0 '
+        'cursor-pointer items-center gap-3 rounded-md border '
+        'border-memBorder-primary px-3 py-2"\n',
+        "",
+        1,
+    )
+    content = content.replace(
+        '<span className="min-w-0 space-y-0.5">',
+        '<span className="w-full min-w-0 space-y-0.5">',
+        1,
+    )
+    page.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "JSON option must allow shrinking" in result.stderr
+
+
+def test_verify_accepts_mobile_export_timestamps_with_word_wrapping(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text()
+    assert '<dd className="break-words">{formatTime(job.created_at)}</dd>' in content
+    assert '<dd className="break-words">{formatTime(job.completed_at)}</dd>' in content
+    assert '<dd className="break-all">{formatTime(' not in content
+    page.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_verify_rejects_self_hosted_export_badge(tmp_path):
