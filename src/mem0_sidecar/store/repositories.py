@@ -2,9 +2,10 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.explorer_filters import ExplorerFilter, ExplorerQuery
@@ -35,6 +36,12 @@ class MemoryIndexPage:
     items: list[MemoryIndex]
     total: int
     scan_count: int
+
+
+@dataclass(frozen=True)
+class MemoryClaimResult:
+    status: Literal["claimed", "conflict"]
+    memory: MemoryIndex | None
 
 
 _MEMORY_FILTER_COLUMNS = {
@@ -522,6 +529,7 @@ class MemoryIndexRepository:
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> MemoryIndex:
+        projection_now = _utc_now()
         memory = self.session.scalar(
             select(MemoryIndex).where(
                 MemoryIndex.project_id == project_id,
@@ -539,8 +547,90 @@ class MemoryIndexRepository:
         memory.category = category
         memory.metadata_projection_json = _json(metadata or {})
         memory.deleted_at = None
+        memory.updated_at = projection_now
         self.session.flush()
         return memory
+
+    def claim_memory(
+        self,
+        *,
+        project_id: str,
+        mem0_memory_id: str,
+        user_id: str | None,
+        app_id: str,
+        category: str | None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> MemoryClaimResult:
+        projection_now = _utc_now()
+        values = {
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "app_id": app_id,
+            "run_id": run_id,
+            "category": category,
+            "metadata_projection_json": _json(metadata or {}),
+            "deleted_at": None,
+            "updated_at": projection_now,
+        }
+
+        def update_claimable() -> int:
+            result = self.session.execute(
+                update(MemoryIndex)
+                .where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.mem0_memory_id == mem0_memory_id,
+                    or_(
+                        MemoryIndex.app_id == app_id,
+                        MemoryIndex.deleted_at.is_not(None),
+                    ),
+                )
+                .values(**values)
+                .execution_options(synchronize_session="fetch")
+            )
+            return result.rowcount or 0
+
+        def claimed_result() -> MemoryClaimResult:
+            memory = self.session.scalar(
+                select(MemoryIndex).where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.mem0_memory_id == mem0_memory_id,
+                )
+            )
+            if memory is None:
+                raise RuntimeError("Claimed memory projection could not be loaded")
+            return MemoryClaimResult(status="claimed", memory=memory)
+
+        if update_claimable():
+            self.session.flush()
+            return claimed_result()
+
+        existing_id = self.session.scalar(
+            select(MemoryIndex.id).where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.mem0_memory_id == mem0_memory_id,
+            )
+        )
+        if existing_id is not None:
+            return MemoryClaimResult(status="conflict", memory=None)
+
+        try:
+            with self.session.begin_nested():
+                memory = MemoryIndex(
+                    project_id=project_id,
+                    mem0_memory_id=mem0_memory_id,
+                    **values,
+                )
+                self.session.add(memory)
+                self.session.flush()
+        except IntegrityError:
+            if update_claimable():
+                self.session.flush()
+                return claimed_result()
+            return MemoryClaimResult(status="conflict", memory=None)
+
+        return MemoryClaimResult(status="claimed", memory=memory)
 
     def delete_memory(
         self,

@@ -1,16 +1,20 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
 
 import pytest
-from sqlalchemy import UniqueConstraint, insert
+from sqlalchemy import UniqueConstraint, create_engine, insert
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.explorer_filters import (
     MEMORY_FILTER_FIELDS,
     parse_explorer_query,
 )
 from mem0_sidecar.store.models import (
+    Base,
     Category,
     EventStatus,
     ExportStatus,
@@ -976,6 +980,154 @@ def test_memory_index_repository_stale_compare_and_set_is_scoped_and_cutoff_safe
     assert eligible.deleted_at is not None
     assert updated_during_scan.deleted_at is None
     assert other_app.deleted_at is None
+
+
+def test_memory_index_repository_identical_upsert_touches_timestamp_and_beats_cutoff(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = MemoryIndexRepository(db_session)
+    memory = repository.upsert_memory(
+        project_id="alpha",
+        mem0_memory_id="same-values",
+        user_id="alice",
+        agent_id="codex",
+        app_id="app-a",
+        run_id="run-1",
+        category="note",
+        metadata={"type": "note"},
+    )
+    memory.updated_at = datetime(2026, 7, 1, tzinfo=UTC)
+    db_session.flush()
+    cutoff = memory.updated_at
+
+    refreshed = repository.upsert_memory(
+        project_id="alpha",
+        mem0_memory_id="same-values",
+        user_id="alice",
+        agent_id="codex",
+        app_id="app-a",
+        run_id="run-1",
+        category="note",
+        metadata={"type": "note"},
+    )
+
+    assert refreshed.updated_at > cutoff
+    changed = repository.mark_stale_if_unchanged(
+        project_id="alpha",
+        app_id="app-a",
+        mem0_memory_ids=["same-values"],
+        updated_at_lte=cutoff,
+    )
+    assert changed == 0
+    assert refreshed.deleted_at is None
+
+
+def test_memory_index_repository_claims_missing_or_same_app_but_rejects_other_app(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = MemoryIndexRepository(db_session)
+
+    created = repository.claim_memory(
+        project_id="alpha",
+        mem0_memory_id="claimable",
+        user_id="alice",
+        agent_id=None,
+        app_id="app-a",
+        run_id=None,
+        category=None,
+        metadata={"version": 1},
+    )
+    same_app = repository.claim_memory(
+        project_id="alpha",
+        mem0_memory_id="claimable",
+        user_id="alice",
+        agent_id=None,
+        app_id="app-a",
+        run_id=None,
+        category="note",
+        metadata={"version": 2},
+    )
+    other_app = repository.claim_memory(
+        project_id="alpha",
+        mem0_memory_id="claimable",
+        user_id="mallory",
+        agent_id=None,
+        app_id="app-b",
+        run_id=None,
+        category="stolen",
+        metadata={"version": 3},
+    )
+
+    assert created.status == "claimed"
+    assert same_app.status == "claimed"
+    assert other_app.status == "conflict"
+    projection = repository.get_memory(
+        project_id="alpha",
+        mem0_memory_id="claimable",
+    )
+    assert projection is not None
+    assert projection.app_id == "app-a"
+    assert projection.category == "note"
+    assert projection.metadata_projection_json == '{"version": 2}'
+
+
+def test_memory_index_repository_concurrent_claim_has_exactly_one_app_winner(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "claim-race.sqlite3"
+    engine = create_engine(
+        f"sqlite+pysqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+        future=True,
+    )
+    Base.metadata.create_all(engine)
+    with Session(engine) as setup_session:
+        ProjectRepository(setup_session).upsert_default_project(
+            project_id="alpha",
+            name="alpha",
+            mem0_base_url="http://mem0:8000",
+        )
+        setup_session.commit()
+
+    barrier = Barrier(2)
+
+    def claim(app_id: str) -> str:
+        with Session(engine) as session:
+            barrier.wait()
+            result = MemoryIndexRepository(session).claim_memory(
+                project_id="alpha",
+                mem0_memory_id="raced",
+                user_id="alice",
+                agent_id=None,
+                app_id=app_id,
+                run_id=None,
+                category=None,
+                metadata={},
+            )
+            session.commit()
+            return result.status
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = list(executor.map(claim, ("app-a", "app-b")))
+
+    assert sorted(statuses) == ["claimed", "conflict"]
+    with Session(engine) as verification_session:
+        projection = MemoryIndexRepository(verification_session).get_memory(
+            project_id="alpha",
+            mem0_memory_id="raced",
+        )
+        assert projection is not None
+        assert projection.app_id in {"app-a", "app-b"}
 
 
 def test_project_repository_preserves_existing_defaults_on_routed_upsert(
