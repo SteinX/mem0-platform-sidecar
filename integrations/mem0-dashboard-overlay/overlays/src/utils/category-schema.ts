@@ -143,14 +143,15 @@ export function editorToSchema(fields: CategoryField[]): SchemaObject {
   const required: string[] = [];
 
   for (const field of fields) {
-    Object.defineProperty(properties, field.key, {
+    const key = field.key.trim();
+    Object.defineProperty(properties, key, {
       value: fieldToSchema(field),
       enumerable: true,
       configurable: true,
       writable: true,
     });
     if (field.required) {
-      required.push(field.key);
+      required.push(key);
     }
   }
 

@@ -143,6 +143,24 @@ function testChildScopesRemainIndependent(schema) {
   assert.equal(schema.validateCategoryFields([root, left, right]).valid, true);
 }
 
+function testFieldKeysAreTrimmedDuringSerialization(schema) {
+  const root = emptyField(schema, " user_id ", "string");
+  root.required = true;
+  const child = emptyField(schema, " display_name ", "string");
+  child.required = true;
+  const profile = emptyField(schema, " profile ", "object");
+  profile.children = [child];
+
+  const result = schema.editorToSchema([root, profile]);
+
+  assert.deepEqual(Object.keys(result.properties), ["user_id", "profile"]);
+  assert.deepEqual(result.required, ["user_id"]);
+  assert.deepEqual(Object.keys(result.properties.profile.properties), [
+    "display_name",
+  ]);
+  assert.deepEqual(result.properties.profile.required, ["display_name"]);
+}
+
 function testMalformedRequiredUsesAdvancedMode(schema) {
   const duplicate = schema.schemaToEditor({
     type: "object",
@@ -238,12 +256,13 @@ function main() {
   testDirectEnumDefaultMustMatchOption(schema);
   testDuplicateKeysMarkEverySibling(schema);
   testChildScopesRemainIndependent(schema);
+  testFieldKeysAreTrimmedDuringSerialization(schema);
   testMalformedRequiredUsesAdvancedMode(schema);
   testAdvancedSchemasStillCountProperties(schema);
   testUnsupportedPathsUseBracketNotation(schema);
   testProtoKeySurvivesAtRoot(schema);
   testProtoKeySurvivesInObjectChild(schema);
-  console.log("category schema harness: 11 contracts passed");
+  console.log("category schema harness: 12 contracts passed");
 }
 
 try {
