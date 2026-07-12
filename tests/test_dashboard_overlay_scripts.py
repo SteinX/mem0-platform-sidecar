@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OVERLAY = ROOT / "integrations" / "mem0-dashboard-overlay"
 UPSTREAM_DASHBOARD = ROOT.parents[2] / "upstream" / "server" / "dashboard"
 DASHBOARD_TYPESCRIPT = UPSTREAM_DASHBOARD / "node_modules" / "typescript"
+VERIFY_DASHBOARD_OVERLAY = OVERLAY / "scripts" / "verify-dashboard-overlay"
 NULL_PAGE = "export default function Page() { return null; }\n"
 
 
@@ -91,6 +94,56 @@ if (result.diagnostics?.length) {
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def assert_unmasked_category_field_row_is_accepted(content: str) -> None:
+    verifier = runpy.run_path(str(VERIFY_DASHBOARD_OVERLAY))
+    component_body = verifier["extract_named_component_body"](
+        content, "CategoryFieldEditor"
+    )
+    assert component_body is not None
+    field_maps = list(
+        re.finditer(
+            r"\bfields\.map\(\s*\(\s*field\s*,\s*index\s*\)\s*=>\s*\{",
+            component_body,
+        )
+    )
+    assert len(field_maps) >= 2
+    callback_start = field_maps[0].end() - 1
+    callback_body = verifier["extract_balanced"](
+        component_body, callback_start, "{", "}"
+    )
+    assert callback_body is not None
+    return_match = re.search(r"\breturn\s*\(", callback_body)
+    assert return_match is not None
+    field_row = verifier["extract_balanced"](
+        callback_body, return_match.end() - 1, "(", ")"
+    )
+    assert field_row is not None
+
+    group_tags = [
+        tag
+        for tag in verifier["extract_jsx_component_tags"](field_row, "div")
+        if re.search(r'\bkey\s*=\s*\{\s*field\.id\s*\}', tag) is not None
+        and re.search(r'\brole\s*=\s*"group"', tag) is not None
+    ]
+    assert len(group_tags) == 1
+    assert re.search(r"\baria-invalid(?:\s*=|(?=\s|/|>))", group_tags[0]) is None
+    assert verifier["has_field_error_description"](group_tags[0])
+
+    field_key_inputs = [
+        tag
+        for tag in verifier["extract_jsx_component_tags"](field_row, "Input")
+        if re.search(r"\bid\s*=\s*\{\s*`\$\{field\.id\}-key`\s*\}", tag)
+        is not None
+    ]
+    assert len(field_key_inputs) == 1
+    assert re.search(
+        r"\baria-invalid\s*=\s*\{\s*Boolean\(errors\[field\.id\]\)\s*\}",
+        field_key_inputs[0],
+    )
+    assert verifier["has_field_error_description"](field_key_inputs[0])
+    assert verifier["has_rendered_category_field_error"](field_row)
 
 
 def write_verify_fixture(dashboard: Path) -> None:
@@ -589,34 +642,15 @@ def test_verify_rejects_category_field_editor_template_string_map_decoy(tmp_path
         "                  aria-invalid={Boolean(errors[field.id])}\n"
     )
     category_field_editor_return = '  return (\n    <div className="space-y-3">\n'
-    map_decoy = r"""
-  const categoryFieldEditorMapDecoy = `
-    {fields.map((field, index) => {
-      const errorId = field.id;
-      return (
-        <div
-          key={field.id}
-          role="group"
-          aria-describedby={errors[field.id] ? errorId : undefined}
-        >
-          <Input
-            id={\`\${field.id}-key\`}
-            aria-invalid={Boolean(errors[field.id])}
-            aria-describedby={errors[field.id] ? errorId : undefined}
-          />
-          <SelectTrigger
-            id={\`\${field.id}-type\`}
-            aria-label={\`Type for \${field.key || \`field \${index + 1}\`}\`}
-          />
-          {errors[field.id] ? (
-            <p id={errorId}>{errors[field.id]}</p>
-          ) : null}
-        </div>
-      );
-    })}
-  `;
-
-"""
+    map_decoy = (
+        '  const categoryFieldEditorMapDecoy = \'{fields.map((field, index) => {'
+        ' const errorId = field.id; return (<div key={field.id} role="group"'
+        ' aria-describedby={errors[field.id] ? errorId : undefined}><Input'
+        ' id={`${field.id}-key`} aria-invalid={Boolean(errors[field.id])}'
+        ' aria-describedby={errors[field.id] ? errorId : undefined}/>'
+        '{errors[field.id] ? (<p id={errorId}>{errors[field.id]}</p>) : null}'
+        '</div>); })}\';\n\n'
+    )
 
     assert input_invalid_attribute in content
     assert category_field_editor_return in content
@@ -632,6 +666,7 @@ def test_verify_rejects_category_field_editor_template_string_map_decoy(tmp_path
     assert first_map < second_map
     field_editor.write_text(mutated_content)
     assert_dashboard_tsx_transpiles(field_editor)
+    assert_unmasked_category_field_row_is_accepted(mutated_content)
 
     result = run_verify_without_typecheck(dashboard)
 
