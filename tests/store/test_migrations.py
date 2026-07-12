@@ -10,6 +10,14 @@ from alembic.config import Config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+MEMORY_EXPLORER_INDEXES = {
+    "ix_memories_index_project_active_created",
+    "ix_memories_index_project_app_user",
+    "ix_memories_index_project_app_agent",
+    "ix_memories_index_project_app_run",
+    "ix_memories_index_project_category",
+}
+
 
 def _alembic_config(database_url: str) -> Config:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
@@ -310,3 +318,25 @@ def test_category_name_uniqueness_migration_uses_batch_operations(monkeypatch) -
         ("create", "uq_categories_project_id_name", ("project_id", "name")),
         ("drop:unique", "uq_categories_project_id_name", ()),
     ]
+
+
+def test_memory_explorer_indexes_migration_upgrades_and_downgrades(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'memory-explorer-indexes.sqlite3'}"
+    config = _alembic_config(database_url)
+
+    command.upgrade(config, "head")
+
+    engine = sa.create_engine(database_url, future=True)
+    upgraded_indexes = {
+        index["name"] for index in sa.inspect(engine).get_indexes("memories_index")
+    }
+    assert MEMORY_EXPLORER_INDEXES <= upgraded_indexes
+
+    command.downgrade(config, "0003_category_name_uniqueness")
+
+    downgraded_indexes = {
+        index["name"] for index in sa.inspect(engine).get_indexes("memories_index")
+    }
+    assert MEMORY_EXPLORER_INDEXES.isdisjoint(downgraded_indexes)
