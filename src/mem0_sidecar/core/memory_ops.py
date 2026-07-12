@@ -1,8 +1,11 @@
+import asyncio
+from dataclasses import replace
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.categories import extract_category
+from mem0_sidecar.core.explorer_filters import ExplorerDateRange, ExplorerQuery
 from mem0_sidecar.core.scope import Scope, normalize_scope
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
@@ -16,6 +19,11 @@ from mem0_sidecar.store.repositories import (
 
 SIDECAR_PROJECT_ID_METADATA_KEY = "_mem0_sidecar_project_id"
 SIDECAR_APP_ID_METADATA_KEY = "_mem0_sidecar_app_id"
+_MEMORY_PATCH_FIELDS = frozenset({"text", "metadata", "expiration_date"})
+_RECONCILE_SCAN_LIMIT = 5000
+_HYDRATION_BUFFER = 20
+_HYDRATION_CONCURRENCY = 8
+
 
 def _append_memory_id(memory_ids: list[str], candidate: Any) -> None:
     if isinstance(candidate, str) and candidate and candidate not in memory_ids:
@@ -99,6 +107,126 @@ def _result_memory_id(record: Any) -> str | None:
     if isinstance(memory_id, str) and memory_id:
         return memory_id
     return None
+
+
+def _memory_record_from_response(
+    response: Any,
+    *,
+    expected_id: str,
+) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        raise ValueError("Upstream memory response must be an object")
+    if _result_memory_id(response) == expected_id:
+        return response
+    results = response.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if _result_memory_id(item) == expected_id:
+                return item
+    raise ValueError(f"Upstream memory response does not contain {expected_id!r}")
+
+
+def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    metadata = record.get("metadata")
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _append_categories(categories: list[str], value: Any) -> None:
+    values = value if isinstance(value, (list, tuple)) else [value]
+    for candidate in values:
+        if (
+            isinstance(candidate, str)
+            and candidate
+            and candidate not in categories
+        ):
+            categories.append(candidate)
+
+
+def _record_categories(record: dict[str, Any]) -> list[str]:
+    metadata = _record_metadata(record)
+    categories: list[str] = []
+    _append_categories(categories, record.get("categories"))
+    _append_categories(categories, metadata.get("categories"))
+    for key in ("category", "custom_category", "type"):
+        _append_categories(categories, metadata.get(key))
+    return categories
+
+
+def _normalize_memory_record(
+    record: dict[str, Any],
+    *,
+    projection: MemoryIndex | None = None,
+) -> dict[str, Any]:
+    memory_id = _result_memory_id(record)
+    if memory_id is None:
+        raise ValueError("Upstream memory record is missing an id")
+
+    metadata = _record_metadata(record)
+    categories = _record_categories(record)
+    if projection is not None and projection.category:
+        _append_categories(categories, projection.category)
+
+    normalized: dict[str, Any] = {
+        "id": memory_id,
+        "memory": record.get("memory", record.get("text")),
+        "metadata": metadata,
+        "categories": categories,
+    }
+    for field in ("user_id", "agent_id", "app_id", "run_id"):
+        value = record.get(field)
+        if value is None and projection is not None:
+            value = getattr(projection, field)
+        normalized[field] = value
+    for field in ("created_at", "updated_at", "expiration_date"):
+        value = record.get(field)
+        if value is None and projection is not None and field != "expiration_date":
+            projection_value = getattr(projection, field)
+            value = projection_value.isoformat() if projection_value else None
+        normalized[field] = value
+    return normalized
+
+
+def _validate_memory_patch(payload: dict[str, Any]) -> dict[str, Any]:
+    if not payload:
+        raise ValueError("Memory update payload must not be empty")
+    unknown_fields = sorted(set(payload) - _MEMORY_PATCH_FIELDS)
+    if unknown_fields:
+        raise ValueError(
+            f"Unsupported memory update fields: {', '.join(unknown_fields)}"
+        )
+    if "text" in payload and (
+        not isinstance(payload["text"], str) or not payload["text"].strip()
+    ):
+        raise ValueError("text must be a non-empty string")
+    if "metadata" in payload and payload["metadata"] is not None and not isinstance(
+        payload["metadata"], dict
+    ):
+        raise ValueError("metadata must be an object or null")
+    return {key: payload[key] for key in _MEMORY_PATCH_FIELDS if key in payload}
+
+
+def _history_results(response: Any) -> list[Any]:
+    if isinstance(response, list):
+        return response
+    if not isinstance(response, dict):
+        return []
+    for key in ("results", "history"):
+        value = response.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _list_results(response: Any) -> list[Any]:
+    if isinstance(response, list):
+        return response
+    if not isinstance(response, dict):
+        return []
+    for key in ("results", "memories"):
+        value = response.get(key)
+        if isinstance(value, list):
+            return value
+    return []
 
 
 def _filter_search_results(
@@ -327,6 +455,104 @@ class MemoryService:
             scope=scope,
         )
 
+    async def query_memories(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        query: ExplorerQuery,
+    ) -> dict[str, Any]:
+        memory_repo = MemoryIndexRepository(self.session)
+        offset = (query.page - 1) * query.page_size
+        candidate_limit = query.page_size + _HYDRATION_BUFFER
+        hydrated: dict[str, dict[str, Any]] = {}
+        stale_skipped = 0
+
+        def candidate_page() -> tuple[Any, list[MemoryIndex]]:
+            window_query = replace(
+                query,
+                page=1,
+                page_size=offset + candidate_limit,
+            )
+            page = memory_repo.query_project_memories(
+                project_id,
+                app_id,
+                window_query,
+            )
+            return page, page.items[offset : offset + candidate_limit]
+
+        async def hydrate(memory: MemoryIndex) -> tuple[str, dict[str, Any] | None]:
+            try:
+                response = await self.mem0.get_memory(memory.mem0_memory_id)
+                record = _memory_record_from_response(
+                    response,
+                    expected_id=memory.mem0_memory_id,
+                )
+                return (
+                    memory.mem0_memory_id,
+                    _normalize_memory_record(record, projection=memory),
+                )
+            except Exception as exc:
+                if _is_upstream_not_found(exc) or isinstance(
+                    exc, (KeyError, ValueError, TypeError)
+                ):
+                    return memory.mem0_memory_id, None
+                raise
+
+        while True:
+            _, candidates = candidate_page()
+            pending = [
+                memory
+                for memory in candidates
+                if memory.mem0_memory_id not in hydrated
+            ]
+            if not pending:
+                break
+
+            semaphore = asyncio.Semaphore(_HYDRATION_CONCURRENCY)
+
+            async def bounded_hydrate(
+                memory: MemoryIndex,
+                limiter: asyncio.Semaphore,
+            ) -> tuple[str, dict[str, Any] | None]:
+                async with limiter:
+                    return await hydrate(memory)
+
+            hydration_results = await asyncio.gather(
+                *(bounded_hydrate(memory, semaphore) for memory in pending)
+            )
+            stale_ids: list[str] = []
+            for memory_id, normalized in hydration_results:
+                if normalized is None:
+                    stale_ids.append(memory_id)
+                else:
+                    hydrated[memory_id] = normalized
+
+            stale_skipped += memory_repo.mark_stale(project_id, stale_ids)
+            _, current_candidates = candidate_page()
+            valid_count = sum(
+                memory.mem0_memory_id in hydrated for memory in current_candidates
+            )
+            if valid_count >= query.page_size:
+                break
+            if not stale_ids and len(current_candidates) < candidate_limit:
+                break
+
+        final_page, final_candidates = candidate_page()
+        results = [
+            hydrated[memory.mem0_memory_id]
+            for memory in final_candidates
+            if memory.mem0_memory_id in hydrated
+        ][: query.page_size]
+        return {
+            "results": results,
+            "total": final_page.total,
+            "page": query.page,
+            "page_size": query.page_size,
+            "scan_count": final_page.scan_count,
+            "stale_skipped": stale_skipped,
+        }
+
     async def get_memory(
         self,
         *,
@@ -355,6 +581,221 @@ class MemoryService:
                 raise KeyError(memory_id) from exc
             raise
         return _validate_get_response(memory_id, response)
+
+    async def update_memory(
+        self,
+        *,
+        project_id: str,
+        memory_id: str,
+        request_app_id: str | None,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        patch = _validate_memory_patch(payload)
+        effective_app_id = _effective_request_app_id(
+            self.session,
+            project_id=project_id,
+            request_app_id=request_app_id,
+        )
+        memory_repo = MemoryIndexRepository(self.session)
+        memory = memory_repo.get_memory(
+            project_id=project_id,
+            mem0_memory_id=memory_id,
+            app_id=effective_app_id,
+        )
+        if memory is None:
+            raise KeyError(memory_id)
+
+        if "metadata" in patch:
+            scope = normalize_scope(
+                project_id=project_id,
+                user_id=memory.user_id,
+                app_id=memory.app_id,
+                agent_id=memory.agent_id,
+                run_id=memory.run_id,
+            )
+            patch["metadata"] = _metadata_with_sidecar_scope(
+                patch["metadata"] if isinstance(patch["metadata"], dict) else None,
+                scope=scope,
+            )
+
+        event_repo = EventRepository(self.session)
+        event = event_repo.create_event(
+            project_id=project_id,
+            operation="memory.update",
+            request=patch,
+            subject_type="memory",
+            subject_id=memory_id,
+        )
+        try:
+            update_response = await self.mem0.update_memory(memory_id, patch)
+            refresh_response = await self.mem0.get_memory(memory_id)
+            record = _memory_record_from_response(
+                refresh_response,
+                expected_id=memory_id,
+            )
+            normalized = _normalize_memory_record(record, projection=memory)
+            metadata = normalized["metadata"]
+            categories = normalized["categories"]
+            memory_repo.upsert_memory(
+                project_id=project_id,
+                mem0_memory_id=memory_id,
+                user_id=normalized["user_id"],
+                agent_id=normalized["agent_id"],
+                app_id=effective_app_id,
+                run_id=normalized["run_id"],
+                category=categories[0] if categories else None,
+                metadata=metadata,
+            )
+            event_repo.mark_succeeded(event.id, response=update_response)
+            return {"memory": normalized, "event": _event_payload(event)}
+        except Exception as exc:
+            if _is_upstream_not_found(exc) or isinstance(
+                exc, (KeyError, ValueError, TypeError)
+            ):
+                memory_repo.mark_stale(project_id, [memory_id])
+            event_repo.mark_failed(event.id, error=_error_payload(exc))
+            self.session.commit()
+            if _is_upstream_not_found(exc) or isinstance(
+                exc, (KeyError, ValueError, TypeError)
+            ):
+                raise KeyError(memory_id) from exc
+            raise
+
+    async def get_memory_history(
+        self,
+        *,
+        project_id: str,
+        memory_id: str,
+        request_app_id: str | None,
+    ) -> dict[str, Any]:
+        effective_app_id = _effective_request_app_id(
+            self.session,
+            project_id=project_id,
+            request_app_id=request_app_id,
+        )
+        memory = MemoryIndexRepository(self.session).get_memory(
+            project_id=project_id,
+            mem0_memory_id=memory_id,
+            app_id=effective_app_id,
+        )
+        if memory is None:
+            raise KeyError(memory_id)
+        try:
+            response = await self.mem0.get_memory_history(memory_id)
+        except Exception as exc:
+            if _is_upstream_not_found(exc):
+                raise KeyError(memory_id) from exc
+            raise
+        return {"results": _history_results(response)}
+
+    async def reconcile_memories(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        adopt_unscoped: bool,
+        allow_adopt_unscoped: bool,
+        default_project_id: str,
+    ) -> dict[str, int]:
+        if adopt_unscoped and not allow_adopt_unscoped:
+            raise ValueError("Unscoped memory adoption is disabled at runtime")
+        if adopt_unscoped and project_id != default_project_id:
+            raise ValueError(
+                "Unscoped memories may only be adopted by the default project"
+            )
+
+        response = await self.mem0.list_memories(
+            {"top_k": _RECONCILE_SCAN_LIMIT, "show_expired": True}
+        )
+        records = _list_results(response)
+        memory_repo = MemoryIndexRepository(self.session)
+        accepted_ids: set[str] = set()
+        indexed = 0
+        skipped_unscoped = 0
+        skipped_other_scope = 0
+
+        for item in records:
+            if not isinstance(item, dict):
+                skipped_other_scope += 1
+                continue
+            try:
+                normalized = _normalize_memory_record(item)
+            except ValueError:
+                skipped_other_scope += 1
+                continue
+
+            metadata = normalized["metadata"]
+            scoped_project_id = metadata.get(SIDECAR_PROJECT_ID_METADATA_KEY)
+            scoped_app_id = metadata.get(SIDECAR_APP_ID_METADATA_KEY)
+            has_project_scope = isinstance(scoped_project_id, str)
+            has_app_scope = isinstance(scoped_app_id, str)
+            is_unscoped = not has_project_scope and not has_app_scope
+            is_matching_scope = (
+                scoped_project_id == project_id and scoped_app_id == app_id
+            )
+
+            if is_unscoped:
+                if not adopt_unscoped:
+                    skipped_unscoped += 1
+                    continue
+            elif not is_matching_scope:
+                skipped_other_scope += 1
+                continue
+
+            categories = normalized["categories"]
+            memory_id = normalized["id"]
+            memory_repo.upsert_memory(
+                project_id=project_id,
+                mem0_memory_id=memory_id,
+                user_id=normalized["user_id"],
+                agent_id=normalized["agent_id"],
+                app_id=app_id,
+                run_id=normalized["run_id"],
+                category=categories[0] if categories else None,
+                metadata=metadata,
+            )
+            accepted_ids.add(memory_id)
+            indexed += 1
+
+        response_total = response.get("total") if isinstance(response, dict) else None
+        truncated = len(records) >= _RECONCILE_SCAN_LIMIT or (
+            isinstance(response_total, int) and response_total > len(records)
+        )
+        stale_marked = 0
+        if not truncated:
+            active_ids: set[str] = set()
+            page_number = 1
+            while True:
+                active_page = memory_repo.query_project_memories(
+                    project_id,
+                    app_id,
+                    ExplorerQuery(
+                        match="all",
+                        filters=(),
+                        date_range=ExplorerDateRange(from_at=None, to_at=None),
+                        page=page_number,
+                        page_size=100,
+                        sort="created_at_asc",
+                    ),
+                )
+                active_ids.update(
+                    memory.mem0_memory_id for memory in active_page.items
+                )
+                if page_number * 100 >= active_page.total:
+                    break
+                page_number += 1
+            stale_marked = memory_repo.mark_stale(
+                project_id,
+                active_ids - accepted_ids,
+            )
+
+        return {
+            "scanned": len(records),
+            "indexed": indexed,
+            "skipped_unscoped": skipped_unscoped,
+            "skipped_other_scope": skipped_other_scope,
+            "stale_marked": stale_marked,
+        }
 
     async def delete_memory(
         self,
