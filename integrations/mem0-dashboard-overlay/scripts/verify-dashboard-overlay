@@ -497,6 +497,39 @@ def mask_string_character(character: str) -> str:
     return character if character in "\r\n" else " "
 
 
+def mask_jsx_expression_literals(content: str) -> str:
+    code = strip_comments(content)
+    masked = list(code)
+    expression_depth = 0
+    index = 0
+    while index < len(code):
+        character = code[index]
+        if character == "<" and re.match(r"</?[A-Za-z][\w.:-]*(?=\s|/?>)", code[index:]):
+            opening_tag = extract_jsx_opening_tag(code[index:])
+            if opening_tag is not None:
+                index += len(opening_tag)
+                continue
+        if character == "{":
+            expression_depth += 1
+        elif character == "}" and expression_depth > 0:
+            expression_depth -= 1
+        elif expression_depth > 0 and character in ('"', "'", "`"):
+            quote = character
+            masked[index] = mask_string_character(character)
+            index += 1
+            while index < len(code):
+                character = code[index]
+                masked[index] = mask_string_character(character)
+                if character == "\\" and index + 1 < len(code):
+                    index += 1
+                    masked[index] = mask_string_character(code[index])
+                elif character == quote:
+                    break
+                index += 1
+        index += 1
+    return "".join(masked)
+
+
 def has_rendered_category_field_error(field_row: str) -> bool:
     return (
         re.search(
@@ -735,14 +768,22 @@ def extract_jsx_ancestor_opening_tag(
     marker_index = content.find(marker)
     if marker_index == -1:
         return None
+    return_matches = list(
+        re.finditer(r"\breturn\s*\(\s*(?=<)", content[:marker_index])
+    )
+    if not return_matches:
+        return None
+    scan_start = return_matches[-1].end()
+    scan_content = mask_jsx_expression_literals(content[scan_start:marker_index])
     component_pattern = re.compile(rf"</?{re.escape(component)}(?=\s|/?>)")
     ancestors: list[str] = []
-    for match in component_pattern.finditer(content, 0, marker_index):
-        if content.startswith("</", match.start()):
+    for match in component_pattern.finditer(scan_content):
+        original_start = scan_start + match.start()
+        if content.startswith("</", original_start):
             if ancestors:
                 ancestors.pop()
             continue
-        opening_tag = extract_jsx_opening_tag(content[match.start() :])
+        opening_tag = extract_jsx_opening_tag(content[original_start:])
         if opening_tag is None:
             return None
         if not opening_tag.rstrip().endswith("/>"):

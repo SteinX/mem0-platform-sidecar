@@ -1049,6 +1049,23 @@ def test_verify_rejects_export_input_wrapper_sibling_class_decoy(tmp_path):
     assert "app input grid child" in result.stderr
 
 
+def test_verify_accepts_export_input_wrapper_string_expression_decoy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text().replace(
+        '<Input className="w-full min-w-0" id="export-app-id"',
+        '{"<div>"}\n'
+        '              <Input className="w-full min-w-0" id="export-app-id"',
+        1,
+    )
+    page.write_text(content)
+    assert_dashboard_tsx_transpiles(page)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_verify_rejects_export_format_label_descendant_class_decoy(tmp_path):
     dashboard = applied_overlay(tmp_path)
     page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
