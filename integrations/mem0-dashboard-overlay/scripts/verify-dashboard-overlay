@@ -406,10 +406,17 @@ def verify_categories_page(dashboard_dir: Path) -> str | None:
 
 
 def verify_category_field_editor_accessibility(field_editor_content: str) -> str | None:
+    field_row = extract_category_field_editor_field_row(field_editor_content)
+    if field_row is None:
+        return "Category field editor missing rendered fields.map field row"
+    if not has_rendered_category_field_error(field_row):
+        return "Category field editor field row must render its field error"
+
     group_tags = [
         tag
-        for tag in extract_jsx_component_tags(field_editor_content, "div")
-        if re.search(r'\brole\s*=\s*"group"', tag) is not None
+        for tag in extract_jsx_component_tags(field_row, "div")
+        if re.search(r'\bkey\s*=\s*\{\s*field\.id\s*\}', tag) is not None
+        and re.search(r'\brole\s*=\s*"group"', tag) is not None
     ]
     if len(group_tags) != 1:
         return "Category field editor must render one field group"
@@ -421,7 +428,7 @@ def verify_category_field_editor_accessibility(field_editor_content: str) -> str
 
     field_key_inputs = [
         tag
-        for tag in extract_jsx_component_tags(field_editor_content, "Input")
+        for tag in extract_jsx_component_tags(field_row, "Input")
         if re.search(r"\bid\s*=\s*\{\s*`\$\{field\.id\}-key`\s*\}", tag)
         is not None
     ]
@@ -439,6 +446,37 @@ def verify_category_field_editor_accessibility(field_editor_content: str) -> str
     if not has_field_error_description(field_key_input):
         return "Category field editor Field key Input must describe its field error"
     return None
+
+
+def extract_category_field_editor_field_row(content: str) -> str | None:
+    component_body = extract_named_component_body(content, "CategoryFieldEditor")
+    if component_body is None:
+        return None
+    field_map = re.search(
+        r"\bfields\.map\(\s*\(\s*field\s*,\s*index\s*\)\s*=>\s*\{",
+        component_body,
+    )
+    if field_map is None:
+        return None
+    callback_start = field_map.end() - 1
+    callback_body = extract_balanced(component_body, callback_start, "{", "}")
+    if callback_body is None:
+        return None
+    return_match = re.search(r"\breturn\s*\(", callback_body)
+    if return_match is None:
+        return None
+    markup_start = return_match.end() - 1
+    return extract_balanced(callback_body, markup_start, "(", ")")
+
+
+def has_rendered_category_field_error(field_row: str) -> bool:
+    return (
+        re.search(
+            r"\{errors\[field\.id\]\s*\?\s*\(\s*<p\s+id\s*=\s*\{\s*errorId\s*\}[^>]*>\s*\{errors\[field\.id\]\}\s*</p>\s*\)\s*:\s*null\s*\}",
+            field_row,
+        )
+        is not None
+    )
 
 
 def has_field_error_description(tag: str) -> bool:

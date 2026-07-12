@@ -423,9 +423,7 @@ def test_verify_requires_responsive_sidebar_collapse(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
-def test_verify_rejects_category_field_editor_group_invalid_and_input_missing_state(
-    tmp_path,
-):
+def test_verify_rejects_category_field_editor_group_aria_invalid(tmp_path):
     dashboard = applied_overlay(tmp_path)
     field_editor = (
         dashboard
@@ -433,24 +431,115 @@ def test_verify_rejects_category_field_editor_group_invalid_and_input_missing_st
     )
     content = field_editor.read_text()
     group_invalid_attribute = "            aria-invalid={Boolean(errors[field.id])}\n"
-    input_invalid_attribute = (
-        "                  aria-invalid={Boolean(errors[field.id])}\n"
-    )
 
     assert '            role="group"\n' + group_invalid_attribute not in content
-    assert input_invalid_attribute in content
 
-    mutated_content = content.replace(input_invalid_attribute, "", 1).replace(
+    field_editor.write_text(content.replace(
         '            role="group"\n',
         '            role="group"\n' + group_invalid_attribute,
         1,
-    )
-    field_editor.write_text(mutated_content)
+    ))
 
     result = run_verify_without_typecheck(dashboard)
 
     assert result.returncode == 1
     assert "Category field editor group must not use aria-invalid" in result.stderr
+
+
+def test_verify_rejects_category_field_editor_input_without_aria_invalid(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    input_invalid_attribute = (
+        "                  aria-invalid={Boolean(errors[field.id])}\n"
+    )
+    content = field_editor.read_text()
+
+    assert input_invalid_attribute in content
+    field_editor.write_text(content.replace(input_invalid_attribute, "", 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert (
+        "Category field editor Field key Input must use aria-invalid" in result.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "",
+        "                  aria-describedby={errors[field.id] ? "
+        "`${errorId}-mismatch` : undefined}\n",
+    ),
+)
+def test_verify_rejects_category_field_editor_input_without_matching_error_description(
+    tmp_path,
+    replacement,
+):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    input_description = (
+        "                  aria-describedby={errors[field.id] ? errorId : undefined}\n"
+    )
+    content = field_editor.read_text()
+
+    assert input_description in content
+    field_editor.write_text(content.replace(input_description, replacement, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert (
+        "Category field editor Field key Input must describe its field error"
+        in result.stderr
+    )
+
+
+def test_verify_rejects_category_field_editor_aria_decoy_outside_fields_map(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    content = field_editor.read_text()
+    input_id = "                  id={`${field.id}-key`}\n"
+    input_invalid_attribute = (
+        "                  aria-invalid={Boolean(errors[field.id])}\n"
+    )
+    input_description = (
+        "                  aria-describedby={errors[field.id] ? errorId : undefined}\n"
+    )
+
+    assert input_id in content
+    assert input_invalid_attribute in content
+    assert input_description in content
+    field_editor.write_text(
+        content.replace(input_id, '                  id="decoy-field-key"\n', 1)
+        .replace(input_invalid_attribute, "", 1)
+        .replace(input_description, "", 1)
+        + """
+
+const CATEGORY_FIELD_EDITOR_ACCESSIBILITY_DECOY = `
+  <Input
+    id={`${field.id}-key`}
+    aria-invalid={Boolean(errors[field.id])}
+    aria-describedby={errors[field.id] ? errorId : undefined}
+  />
+`;
+"""
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Category field editor Field key Input is missing" in result.stderr
 
 
 def test_verify_accepts_escaped_quote_string_inside_main_nav(tmp_path):
