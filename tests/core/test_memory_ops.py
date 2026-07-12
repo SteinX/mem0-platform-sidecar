@@ -1,6 +1,5 @@
 import asyncio
 import json
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -1407,17 +1406,30 @@ async def test_reconcile_does_not_stale_projection_updated_during_scan(
 ) -> None:
     _create_project(db_session)
     projection = _index_memory(db_session, "concurrent-update")
+    original_updated_at = projection.updated_at
 
-    class TouchingListClient(ExplorerMem0Client):
+    class UpdatingListClient(ExplorerMem0Client):
         async def list_memories(self, params: dict[str, Any]) -> Any:
             self.list_calls.append(params)
-            projection.updated_at = datetime.now(UTC) + timedelta(days=1)
-            db_session.flush()
+            await MemoryService(session=db_session, mem0=self).update_memory(
+                project_id="repo-a",
+                memory_id="concurrent-update",
+                request_app_id="app-a",
+                payload={"text": "updated during reconcile"},
+            )
             return {"results": []}
 
     result = await MemoryService(
         session=db_session,
-        mem0=TouchingListClient(),
+        mem0=UpdatingListClient(
+            {
+                "concurrent-update": {
+                    "id": "concurrent-update",
+                    "memory": "before",
+                    "metadata": {},
+                }
+            }
+        ),
     ).reconcile_memories(
         project_id="repo-a",
         app_id="app-a",
@@ -1428,6 +1440,7 @@ async def test_reconcile_does_not_stale_projection_updated_during_scan(
 
     assert result["stale_marked"] == 0
     assert projection.deleted_at is None
+    assert projection.updated_at > original_updated_at
 
 
 @pytest.mark.asyncio
@@ -1465,6 +1478,55 @@ async def test_reconcile_does_not_reassign_active_projection_during_adoption(
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_uses_atomic_claim_when_competing_projection_appears(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [{"id": "raced", "memory": "unscoped", "metadata": {}}]
+    }
+    original_claim = MemoryIndexRepository.claim_memory
+    claim_calls = 0
+
+    def competing_claim(self, **kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        self.upsert_memory(
+            project_id="repo-a",
+            mem0_memory_id="raced",
+            user_id="alice",
+            agent_id=None,
+            app_id="app-a",
+            run_id=None,
+            category=None,
+            metadata={},
+        )
+        return original_claim(self, **kwargs)
+
+    monkeypatch.setattr(MemoryIndexRepository, "claim_memory", competing_claim)
+
+    result = await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+        project_id="repo-a",
+        app_id="app-b",
+        adopt_unscoped=True,
+        allow_adopt_unscoped=True,
+        default_project_id="repo-a",
+    )
+
+    assert claim_calls == 1
+    assert result["indexed"] == 0
+    assert result["skipped_other_scope"] == 1
+    projection = MemoryIndexRepository(db_session).get_memory(
+        project_id="repo-a",
+        mem0_memory_id="raced",
+    )
+    assert projection is not None
+    assert projection.app_id == "app-a"
 
 
 @pytest.mark.asyncio

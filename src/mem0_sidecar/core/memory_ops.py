@@ -731,29 +731,37 @@ class MemoryService:
                 if not adopt_unscoped:
                     skipped_unscoped += 1
                     continue
-                existing = memory_repo.get_memory(
-                    project_id=project_id,
-                    mem0_memory_id=normalized["id"],
-                )
-                if existing is not None and existing.app_id != app_id:
-                    skipped_other_scope += 1
-                    continue
             elif not is_matching_scope:
                 skipped_other_scope += 1
                 continue
 
             categories = normalized["categories"]
             memory_id = normalized["id"]
-            memory_repo.upsert_memory(
-                project_id=project_id,
-                mem0_memory_id=memory_id,
-                user_id=normalized["user_id"],
-                agent_id=normalized["agent_id"],
-                app_id=app_id,
-                run_id=normalized["run_id"],
-                category=categories[0] if categories else None,
-                metadata=metadata,
-            )
+            if is_unscoped:
+                claim = memory_repo.claim_memory(
+                    project_id=project_id,
+                    mem0_memory_id=memory_id,
+                    user_id=normalized["user_id"],
+                    agent_id=normalized["agent_id"],
+                    app_id=app_id,
+                    run_id=normalized["run_id"],
+                    category=categories[0] if categories else None,
+                    metadata=metadata,
+                )
+                if claim.status == "conflict":
+                    skipped_other_scope += 1
+                    continue
+            else:
+                memory_repo.upsert_memory(
+                    project_id=project_id,
+                    mem0_memory_id=memory_id,
+                    user_id=normalized["user_id"],
+                    agent_id=normalized["agent_id"],
+                    app_id=app_id,
+                    run_id=normalized["run_id"],
+                    category=categories[0] if categories else None,
+                    metadata=metadata,
+                )
             accepted_ids.add(memory_id)
             indexed += 1
 
