@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -107,6 +108,7 @@ def _index_memory(
     project_id: str = "repo-a",
     app_id: str = "app-a",
     metadata: dict[str, Any] | None = None,
+    category: str | None = None,
 ) -> MemoryIndex:
     return MemoryIndexRepository(db_session).upsert_memory(
         project_id=project_id,
@@ -115,7 +117,7 @@ def _index_memory(
         agent_id="codex",
         app_id=app_id,
         run_id="run-1",
-        category=None,
+        category=category,
         metadata=metadata or {},
     )
 
@@ -1240,3 +1242,383 @@ async def test_reconcile_does_not_mark_absent_stale_when_scan_hits_limit(
         )
         is not None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "envelope",
+    [{}, {"results": {}}, {"unexpected": []}],
+)
+async def test_reconcile_rejects_malformed_envelope_without_stale_cleanup(
+    db_session,
+    envelope: dict[str, Any],
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "must-remain-active")
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = envelope
+
+    with pytest.raises(ValueError, match="list response"):
+        await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+            project_id="repo-a",
+            app_id="app-a",
+            adopt_unscoped=False,
+            allow_adopt_unscoped=False,
+            default_project_id="repo-a",
+        )
+
+    assert (
+        MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="must-remain-active",
+            app_id="app-a",
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {"results": [], "total": "unknown"},
+        {"results": [{"id": "one", "metadata": {}}], "total": 0},
+    ],
+)
+async def test_reconcile_rejects_untrustworthy_total_without_stale_cleanup(
+    db_session,
+    envelope: dict[str, Any],
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "must-remain-active")
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = envelope
+
+    with pytest.raises(ValueError, match="total"):
+        await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+            project_id="repo-a",
+            app_id="app-a",
+            adopt_unscoped=False,
+            allow_adopt_unscoped=False,
+            default_project_id="repo-a",
+        )
+
+    assert (
+        MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="must-remain-active",
+            app_id="app-a",
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "record",
+    [None, {"memory": "missing id"}, {"id": "bad", "metadata": []}],
+)
+async def test_reconcile_rejects_malformed_record_without_stale_cleanup(
+    db_session,
+    record: Any,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "must-remain-active")
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {"results": [record]}
+
+    with pytest.raises(ValueError, match="record"):
+        await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+            project_id="repo-a",
+            app_id="app-a",
+            adopt_unscoped=False,
+            allow_adopt_unscoped=False,
+            default_project_id="repo-a",
+        )
+
+    assert (
+        MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="must-remain-active",
+            app_id="app-a",
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_memory_history_rejects_unknown_response_shape(db_session) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-1")
+    mem0 = ExplorerMem0Client()
+    mem0.history_response = {"unexpected": []}
+
+    with pytest.raises(ValueError, match="history response"):
+        await MemoryService(session=db_session, mem0=mem0).get_memory_history(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [{}, None])
+async def test_update_memory_can_clear_projection_category(
+    db_session,
+    metadata: dict[str, Any] | None,
+) -> None:
+    _create_project(db_session)
+    _index_memory(
+        db_session,
+        "mem-1",
+        metadata={"type": "old-category"},
+        category="old-category",
+    )
+    mem0 = ExplorerMem0Client(
+        {
+            "mem-1": {
+                "id": "mem-1",
+                "memory": "before",
+                "metadata": {"type": "old-category"},
+            }
+        }
+    )
+
+    result = await MemoryService(session=db_session, mem0=mem0).update_memory(
+        project_id="repo-a",
+        memory_id="mem-1",
+        request_app_id="app-a",
+        payload={"metadata": metadata},
+    )
+
+    projection = MemoryIndexRepository(db_session).get_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-1",
+        app_id="app-a",
+    )
+    assert projection is not None
+    assert projection.category is None
+    assert result["memory"]["categories"] == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_stale_projection_updated_during_scan(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    projection = _index_memory(db_session, "concurrent-update")
+
+    class TouchingListClient(ExplorerMem0Client):
+        async def list_memories(self, params: dict[str, Any]) -> Any:
+            self.list_calls.append(params)
+            projection.updated_at = datetime.now(UTC) + timedelta(days=1)
+            db_session.flush()
+            return {"results": []}
+
+    result = await MemoryService(
+        session=db_session,
+        mem0=TouchingListClient(),
+    ).reconcile_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        adopt_unscoped=False,
+        allow_adopt_unscoped=False,
+        default_project_id="repo-a",
+    )
+
+    assert result["stale_marked"] == 0
+    assert projection.deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_reassign_active_projection_during_adoption(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    existing = _index_memory(db_session, "shared", app_id="app-a")
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [{"id": "shared", "memory": "unscoped", "metadata": {}}]
+    }
+
+    result = await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+        project_id="repo-a",
+        app_id="app-b",
+        adopt_unscoped=True,
+        allow_adopt_unscoped=True,
+        default_project_id="repo-a",
+    )
+
+    assert result == {
+        "scanned": 1,
+        "indexed": 0,
+        "skipped_unscoped": 0,
+        "skipped_other_scope": 1,
+        "stale_marked": 0,
+    }
+    assert existing.app_id == "app-a"
+    assert (
+        MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="shared",
+            app_id="app-b",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_memories_never_gets_beyond_single_bounded_candidate_buffer(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    records: dict[str, Any] = {}
+    candidate_limit = 3 + 20
+    for index in range(candidate_limit + 5):
+        memory_id = f"mem-{index:02d}"
+        _index_memory(db_session, memory_id)
+        if index < candidate_limit:
+            records[memory_id] = Mem0UpstreamError(
+                method="GET",
+                path=f"/memories/{memory_id}",
+                status_code=404,
+                message="missing",
+            )
+        else:
+            records[memory_id] = {"id": memory_id, "memory": "valid"}
+    mem0 = ExplorerMem0Client(records)
+
+    result = await MemoryService(session=db_session, mem0=mem0).query_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        query=_explorer_query(page_size=3),
+    )
+
+    assert len(mem0.get_memory_ids) == candidate_limit
+    assert mem0.get_memory_ids == [
+        f"mem-{index:02d}" for index in range(candidate_limit)
+    ]
+    assert result["results"] == []
+    assert result["stale_skipped"] == candidate_limit
+    assert result["total"] == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [ValueError("bad update"), TypeError("bad update")])
+async def test_update_memory_preserves_non_http_update_errors_without_stale(
+    db_session,
+    error: Exception,
+) -> None:
+    _create_project(db_session)
+    projection = _index_memory(db_session, "mem-1")
+
+    class FailingUpdateClient(ExplorerMem0Client):
+        async def update_memory(
+            self,
+            memory_id: str,
+            payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            self.update_calls.append((memory_id, payload))
+            raise error
+
+    with pytest.raises(type(error), match="bad update"):
+        await MemoryService(
+            session=db_session,
+            mem0=FailingUpdateClient(),
+        ).update_memory(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+            payload={"text": "after"},
+        )
+
+    assert projection.deleted_at is None
+    event = EventRepository(db_session).list_project_events("repo-a")[-1]
+    assert event.status is EventStatus.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refresh_response",
+    [{"id": "different-id", "memory": "wrong"}, {"results": ["malformed"]}],
+)
+async def test_update_memory_preserves_refresh_protocol_errors_without_stale(
+    db_session,
+    refresh_response: Any,
+) -> None:
+    _create_project(db_session)
+    projection = _index_memory(db_session, "mem-1")
+
+    class MalformedRefreshClient(ExplorerMem0Client):
+        async def update_memory(
+            self,
+            memory_id: str,
+            payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            self.update_calls.append((memory_id, payload))
+            return {"message": "updated"}
+
+        async def get_memory(self, memory_id: str) -> Any:
+            self.get_memory_ids.append(memory_id)
+            return refresh_response
+
+    with pytest.raises(ValueError, match="does not contain"):
+        await MemoryService(
+            session=db_session,
+            mem0=MalformedRefreshClient(),
+        ).update_memory(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+            payload={"text": "after"},
+        )
+
+    assert projection.deleted_at is None
+    event = EventRepository(db_session).list_project_events("repo-a")[-1]
+    assert event.status is EventStatus.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["update", "refresh"])
+async def test_update_memory_maps_only_upstream_404_to_stale_not_found(
+    db_session,
+    failure_stage: str,
+) -> None:
+    _create_project(db_session)
+    projection = _index_memory(db_session, "mem-1")
+    missing = Mem0UpstreamError(
+        method="PUT" if failure_stage == "update" else "GET",
+        path="/memories/mem-1",
+        status_code=404,
+        message="missing",
+    )
+
+    class MissingDuringUpdateClient(ExplorerMem0Client):
+        async def update_memory(
+            self,
+            memory_id: str,
+            payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            self.update_calls.append((memory_id, payload))
+            if failure_stage == "update":
+                raise missing
+            return {"message": "updated"}
+
+        async def get_memory(self, memory_id: str) -> Any:
+            self.get_memory_ids.append(memory_id)
+            raise missing
+
+    with pytest.raises(KeyError):
+        await MemoryService(
+            session=db_session,
+            mem0=MissingDuringUpdateClient(),
+        ).update_memory(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+            payload={"text": "after"},
+        )
+
+    assert projection.deleted_at is not None
+    event = EventRepository(db_session).list_project_events("repo-a")[-1]
+    assert event.status is EventStatus.FAILED

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.explorer_filters import ExplorerFilter, ExplorerQuery
@@ -482,6 +482,33 @@ class MemoryIndexRepository:
             memory.deleted_at = stale_at
         self.session.flush()
         return len(memories)
+
+    def mark_stale_if_unchanged(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        mem0_memory_ids: Iterable[str],
+        updated_at_lte: datetime,
+    ) -> int:
+        memory_ids = set(mem0_memory_ids)
+        if not memory_ids:
+            return 0
+
+        result = self.session.execute(
+            update(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.mem0_memory_id.in_(memory_ids),
+                MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.updated_at <= updated_at_lte,
+            )
+            .values(deleted_at=_utc_now())
+            .execution_options(synchronize_session="fetch")
+        )
+        self.session.flush()
+        return result.rowcount or 0
 
     def upsert_memory(
         self,

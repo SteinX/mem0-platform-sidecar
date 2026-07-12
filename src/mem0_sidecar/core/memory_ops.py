@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -128,7 +129,11 @@ def _memory_record_from_response(
 
 def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
     metadata = record.get("metadata")
-    return dict(metadata) if isinstance(metadata, dict) else {}
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        raise ValueError("Upstream memory record metadata must be an object or null")
+    return dict(metadata)
 
 
 def _append_categories(categories: list[str], value: Any) -> None:
@@ -163,8 +168,6 @@ def _normalize_memory_record(
 
     metadata = _record_metadata(record)
     categories = _record_categories(record)
-    if projection is not None and projection.category:
-        _append_categories(categories, projection.category)
 
     normalized: dict[str, Any] = {
         "id": memory_id,
@@ -209,24 +212,26 @@ def _history_results(response: Any) -> list[Any]:
     if isinstance(response, list):
         return response
     if not isinstance(response, dict):
-        return []
+        raise ValueError("Upstream history response must be an object or list")
     for key in ("results", "history"):
-        value = response.get(key)
-        if isinstance(value, list):
+        if key in response:
+            value = response[key]
+            if not isinstance(value, list):
+                raise ValueError(f"Upstream history response {key!r} must be a list")
             return value
-    return []
+    raise ValueError("Upstream history response has no recognized result container")
 
 
 def _list_results(response: Any) -> list[Any]:
-    if isinstance(response, list):
-        return response
     if not isinstance(response, dict):
-        return []
+        raise ValueError("Upstream list response must be an object")
     for key in ("results", "memories"):
-        value = response.get(key)
-        if isinstance(value, list):
+        if key in response:
+            value = response[key]
+            if not isinstance(value, list):
+                raise ValueError(f"Upstream list response {key!r} must be a list")
             return value
-    return []
+    raise ValueError("Upstream list response has no recognized result container")
 
 
 def _filter_search_results(
@@ -499,44 +504,26 @@ class MemoryService:
                     return memory.mem0_memory_id, None
                 raise
 
-        while True:
-            _, candidates = candidate_page()
-            pending = [
-                memory
-                for memory in candidates
-                if memory.mem0_memory_id not in hydrated
-            ]
-            if not pending:
-                break
+        _, candidates = candidate_page()
+        semaphore = asyncio.Semaphore(_HYDRATION_CONCURRENCY)
 
-            semaphore = asyncio.Semaphore(_HYDRATION_CONCURRENCY)
+        async def bounded_hydrate(
+            memory: MemoryIndex,
+        ) -> tuple[str, dict[str, Any] | None]:
+            async with semaphore:
+                return await hydrate(memory)
 
-            async def bounded_hydrate(
-                memory: MemoryIndex,
-                limiter: asyncio.Semaphore,
-            ) -> tuple[str, dict[str, Any] | None]:
-                async with limiter:
-                    return await hydrate(memory)
+        hydration_results = await asyncio.gather(
+            *(bounded_hydrate(memory) for memory in candidates)
+        )
+        stale_ids: list[str] = []
+        for memory_id, normalized in hydration_results:
+            if normalized is None:
+                stale_ids.append(memory_id)
+            else:
+                hydrated[memory_id] = normalized
 
-            hydration_results = await asyncio.gather(
-                *(bounded_hydrate(memory, semaphore) for memory in pending)
-            )
-            stale_ids: list[str] = []
-            for memory_id, normalized in hydration_results:
-                if normalized is None:
-                    stale_ids.append(memory_id)
-                else:
-                    hydrated[memory_id] = normalized
-
-            stale_skipped += memory_repo.mark_stale(project_id, stale_ids)
-            _, current_candidates = candidate_page()
-            valid_count = sum(
-                memory.mem0_memory_id in hydrated for memory in current_candidates
-            )
-            if valid_count >= query.page_size:
-                break
-            if not stale_ids and len(current_candidates) < candidate_limit:
-                break
+        stale_skipped = memory_repo.mark_stale(project_id, stale_ids)
 
         final_page, final_candidates = candidate_page()
         results = [
@@ -649,15 +636,11 @@ class MemoryService:
             event_repo.mark_succeeded(event.id, response=update_response)
             return {"memory": normalized, "event": _event_payload(event)}
         except Exception as exc:
-            if _is_upstream_not_found(exc) or isinstance(
-                exc, (KeyError, ValueError, TypeError)
-            ):
+            if _is_upstream_not_found(exc):
                 memory_repo.mark_stale(project_id, [memory_id])
             event_repo.mark_failed(event.id, error=_error_payload(exc))
             self.session.commit()
-            if _is_upstream_not_found(exc) or isinstance(
-                exc, (KeyError, ValueError, TypeError)
-            ):
+            if _is_upstream_not_found(exc):
                 raise KeyError(memory_id) from exc
             raise
 
@@ -704,26 +687,36 @@ class MemoryService:
                 "Unscoped memories may only be adopted by the default project"
             )
 
+        scan_cutoff = datetime.now(UTC)
         response = await self.mem0.list_memories(
             {"top_k": _RECONCILE_SCAN_LIMIT, "show_expired": True}
         )
         records = _list_results(response)
+        response_total = response.get("total")
+        if "total" in response and (
+            isinstance(response_total, bool)
+            or not isinstance(response_total, int)
+            or response_total < len(records)
+        ):
+            raise ValueError("Upstream list response total is invalid")
         memory_repo = MemoryIndexRepository(self.session)
+        normalized_records: list[dict[str, Any]] = []
+        for index, item in enumerate(records):
+            if not isinstance(item, dict):
+                raise ValueError(f"Upstream memory record {index} must be an object")
+            try:
+                normalized_records.append(_normalize_memory_record(item))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Upstream memory record {index} is malformed"
+                ) from exc
+
         accepted_ids: set[str] = set()
         indexed = 0
         skipped_unscoped = 0
         skipped_other_scope = 0
 
-        for item in records:
-            if not isinstance(item, dict):
-                skipped_other_scope += 1
-                continue
-            try:
-                normalized = _normalize_memory_record(item)
-            except ValueError:
-                skipped_other_scope += 1
-                continue
-
+        for normalized in normalized_records:
             metadata = normalized["metadata"]
             scoped_project_id = metadata.get(SIDECAR_PROJECT_ID_METADATA_KEY)
             scoped_app_id = metadata.get(SIDECAR_APP_ID_METADATA_KEY)
@@ -737,6 +730,13 @@ class MemoryService:
             if is_unscoped:
                 if not adopt_unscoped:
                     skipped_unscoped += 1
+                    continue
+                existing = memory_repo.get_memory(
+                    project_id=project_id,
+                    mem0_memory_id=normalized["id"],
+                )
+                if existing is not None and existing.app_id != app_id:
+                    skipped_other_scope += 1
                     continue
             elif not is_matching_scope:
                 skipped_other_scope += 1
@@ -757,7 +757,6 @@ class MemoryService:
             accepted_ids.add(memory_id)
             indexed += 1
 
-        response_total = response.get("total") if isinstance(response, dict) else None
         truncated = len(records) >= _RECONCILE_SCAN_LIMIT or (
             isinstance(response_total, int) and response_total > len(records)
         )
@@ -784,9 +783,11 @@ class MemoryService:
                 if page_number * 100 >= active_page.total:
                     break
                 page_number += 1
-            stale_marked = memory_repo.mark_stale(
-                project_id,
-                active_ids - accepted_ids,
+            stale_marked = memory_repo.mark_stale_if_unchanged(
+                project_id=project_id,
+                app_id=app_id,
+                mem0_memory_ids=active_ids - accepted_ids,
+                updated_at_lte=scan_cutoff,
             )
 
         return {
