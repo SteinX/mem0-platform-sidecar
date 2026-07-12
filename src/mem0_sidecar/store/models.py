@@ -5,6 +5,7 @@ from uuid import uuid4
 from sqlalchemy import (
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -120,6 +121,35 @@ class MemoryIndex(Base):
             "project_id",
             "mem0_memory_id",
             name="uq_memories_index_project_mem0_memory_id",
+        ),
+        Index(
+            "ix_memories_index_project_active_created",
+            "project_id",
+            "deleted_at",
+            "created_at",
+        ),
+        Index(
+            "ix_memories_index_project_app_user",
+            "project_id",
+            "app_id",
+            "user_id",
+        ),
+        Index(
+            "ix_memories_index_project_app_agent",
+            "project_id",
+            "app_id",
+            "agent_id",
+        ),
+        Index(
+            "ix_memories_index_project_app_run",
+            "project_id",
+            "app_id",
+            "run_id",
+        ),
+        Index(
+            "ix_memories_index_project_category",
+            "project_id",
+            "category",
         ),
     )
 
