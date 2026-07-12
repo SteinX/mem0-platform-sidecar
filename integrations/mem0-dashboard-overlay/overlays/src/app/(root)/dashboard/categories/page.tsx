@@ -44,14 +44,13 @@ export default function CategoriesPage() {
     setLoadError(null);
     try {
       const resolvedProjectId = await getSidecarProjectId();
+      setProjectId(resolvedProjectId);
       const response = await sidecarGet<SidecarCategoryResponse>(
         `/v1/projects/${resolvedProjectId}/categories`,
       );
-      setProjectId(resolvedProjectId);
       setCategories(response.categories);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setProjectId(null);
       setLoadError(message);
       toast({
         title: "Failed to load categories",
@@ -100,10 +99,14 @@ export default function CategoriesPage() {
           </p>
           <div className="flex min-w-0 flex-wrap gap-x-4 gap-y-1 text-xs text-onSurface-default-tertiary">
             <span className="min-w-0">
-              Project <span className="break-all font-mono">{projectId ?? "Loading..."}</span>
+              Project <span className="break-all font-mono">
+                {projectId ?? (isLoading ? "Loading..." : "Unavailable")}
+              </span>
             </span>
             <span>
-              {isLoading
+              {loadError
+                ? "Category total unavailable"
+                : isLoading
                 ? "Loading categories..."
                 : `${categories.length} ${categories.length === 1 ? "category" : "categories"}`}
             </span>

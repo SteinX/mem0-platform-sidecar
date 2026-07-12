@@ -179,6 +179,41 @@ function testBasicsOnlyEditPreservesOriginalEmptySchema(schema, state) {
   );
 }
 
+function testLosslessBuilderEditsAreNotMistakenForUnchanged(schema, state) {
+  const originalSchema = {
+    type: "object",
+    properties: {
+      status: {
+        type: "string",
+        title: "   ",
+        enum: ["open", ""],
+      },
+    },
+  };
+  const initialDraft = state.createCategoryDraft(category(originalSchema));
+  assert.equal(initialDraft.mode, "builder");
+  const editedField = {
+    ...initialDraft.fields[0],
+    title: "",
+    enumValues: ["open"],
+  };
+  const editedDraft = { ...initialDraft, fields: [editedField] };
+
+  assert.deepEqual(
+    state.resolveCategorySchemaForSave(
+      editedDraft,
+      initialDraft,
+      originalSchema,
+    ),
+    {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["open"] },
+      },
+    },
+  );
+}
+
 function testDirtyDisableRequiresConfirmation(state) {
   assert.equal(state.planCategoryDisable(false), "disable");
   assert.equal(state.planCategoryDisable(true), "confirm");
@@ -221,9 +256,10 @@ function main() {
   testInvalidAdvancedEditBecomesDirty(state);
   testEnumDefaultMembership(schema);
   testBasicsOnlyEditPreservesOriginalEmptySchema(schema, state);
+  testLosslessBuilderEditsAreNotMistakenForUnchanged(schema, state);
   testDirtyDisableRequiresConfirmation(state);
   testBooleanDefaultTogglePersistsDisplayedFalse(schema);
-  console.log("category editor state harness: 8 contracts passed");
+  console.log("category editor state harness: 9 contracts passed");
 }
 
 try {

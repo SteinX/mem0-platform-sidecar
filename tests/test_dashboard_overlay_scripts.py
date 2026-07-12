@@ -1547,6 +1547,9 @@ def test_apply_dashboard_overlay_wires_category_safety_and_context(tmp_path):
     assert "Project" in page
     assert "projectId ??" in page
     assert "categories.length" in page
+    assert "setProjectId(resolvedProjectId);" in page
+    assert "setProjectId(null);" not in page
+    assert "Category total unavailable" in page
 
 
 @pytest.mark.parametrize(
@@ -1588,6 +1591,18 @@ def test_apply_dashboard_overlay_wires_category_safety_and_context(tmp_path):
             "`${0} ${categories.length === 1",
             "category totals",
         ),
+        (
+            "src/app/(root)/dashboard/categories/page.tsx",
+            "setProjectId(resolvedProjectId);",
+            "setProjectId(null);",
+            "retain resolved project context",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/page.tsx",
+            '"Category total unavailable"',
+            '"Loading categories..."',
+            "unavailable total state",
+        ),
     ],
 )
 def test_verify_rejects_removed_category_safety_wiring_with_string_decoy(
@@ -1604,7 +1619,8 @@ def test_verify_rejects_removed_category_safety_wiring_with_string_decoy(
         'const categorySafetyDecoy = '
         '"resolveCategorySchemaForSave( planCategoryDisable(isDirty) '
         'setFieldDefaultEnabled(field, hasDefault) setFieldType(field, value) '
-        'Project categories.length";',
+        'Project categories.length setProjectId(resolvedProjectId); '
+        'Category total unavailable";',
         1,
     )
     target.write_text(content)

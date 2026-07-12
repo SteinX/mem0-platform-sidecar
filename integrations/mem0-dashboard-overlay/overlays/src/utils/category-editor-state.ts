@@ -70,12 +70,32 @@ export function resolveCategorySchemaForSave(
   if (
     originalSchema !== undefined
     && initialDraft.mode === "builder"
-    && JSON.stringify(canonicalize(generatedSchema))
-      === JSON.stringify(canonicalize(editorToSchema(initialDraft.fields)))
+    && fieldStateFingerprint(draft.fields)
+      === fieldStateFingerprint(initialDraft.fields)
   ) {
     return originalSchema;
   }
   return generatedSchema;
+}
+
+function fieldStateFingerprint(fields: CategoryField[]): string {
+  return JSON.stringify(fieldStateSnapshot(fields));
+}
+
+function fieldStateSnapshot(fields: CategoryField[]): unknown[] {
+  return fields.map((field) => ({
+    key: field.key,
+    title: field.title,
+    description: field.description,
+    type: field.type,
+    required: field.required,
+    hasDefault: field.hasDefault,
+    defaultValue: field.defaultValue,
+    enumValues: field.enumValues,
+    arrayItemType: field.arrayItemType,
+    arrayEnumValues: field.arrayEnumValues,
+    children: fieldStateSnapshot(field.children),
+  }));
 }
 
 export function planCategoryDisable(isDirty: boolean): "confirm" | "disable" {

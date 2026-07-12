@@ -437,6 +437,19 @@ def verify_categories_page(dashboard_dir: Path) -> str | None:
         for span in page_spans
     ):
         return "Categories header missing category totals"
+    if "setProjectId(null);" in page_body:
+        return "Categories page must retain resolved project context after load errors"
+    if (
+        re.search(
+            r"const\s+resolvedProjectId\s*=\s*await\s+getSidecarProjectId\(\)\s*;"
+            r"\s*setProjectId\(resolvedProjectId\)\s*;",
+            page_body,
+        )
+        is None
+    ):
+        return "Categories page must retain resolved project context before loading data"
+    if "Category total unavailable" not in page_body:
+        return "Categories header missing unavailable total state"
 
     categories_table = extract_categories_table_markup(page_content)
     if categories_table is None:
