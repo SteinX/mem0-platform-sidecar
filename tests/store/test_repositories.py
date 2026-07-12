@@ -931,6 +931,53 @@ def test_memory_index_repository_mark_stale_never_crosses_projects(db_session):
     assert alpha_deleted.deleted_at == old_deleted_at
 
 
+def test_memory_index_repository_stale_compare_and_set_is_scoped_and_cutoff_safe(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    cutoff = datetime(2026, 7, 2, tzinfo=UTC)
+    before_cutoff = datetime(2026, 7, 1, tzinfo=UTC)
+    after_cutoff = datetime(2026, 7, 3, tzinfo=UTC)
+    eligible = _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="eligible",
+        app_id="app-a",
+    )
+    updated_during_scan = _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="updated",
+        app_id="app-a",
+    )
+    other_app = _add_explorer_memory(
+        db_session,
+        project_id="alpha",
+        mem0_memory_id="other-app",
+        app_id="app-b",
+    )
+    eligible.updated_at = before_cutoff
+    updated_during_scan.updated_at = after_cutoff
+    other_app.updated_at = before_cutoff
+    db_session.flush()
+
+    changed = MemoryIndexRepository(db_session).mark_stale_if_unchanged(
+        project_id="alpha",
+        app_id="app-a",
+        mem0_memory_ids=["eligible", "updated", "other-app"],
+        updated_at_lte=cutoff,
+    )
+
+    assert changed == 1
+    assert eligible.deleted_at is not None
+    assert updated_during_scan.deleted_at is None
+    assert other_app.deleted_at is None
+
+
 def test_project_repository_preserves_existing_defaults_on_routed_upsert(
     db_session,
 ) -> None:
