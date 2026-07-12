@@ -698,6 +698,211 @@ def verify_disabled_export_format(export_content: str, format_name: str) -> str 
     return None
 
 
+def extract_nearest_jsx_tag_before(
+    content: str, component: str, marker: str
+) -> str | None:
+    marker_index = content.find(marker)
+    if marker_index == -1:
+        return None
+    start = content.rfind(f"<{component}", 0, marker_index)
+    if start == -1:
+        return None
+    return extract_balanced(content, start, "<", ">")
+
+
+def verify_export_page_mobile_layout(export_content: str) -> str | None:
+    page_body = extract_named_component_body(export_content, "ExportPage")
+    job_body = extract_named_component_body(export_content, "ExportJobRow")
+    if page_body is None or job_body is None:
+        return "mobile Export layout requires ExportPage and ExportJobRow"
+
+    page_divs = extract_jsx_component_tags(page_body, "div")
+    if not page_divs or not tag_has_classes(page_divs[0], "w-full", "min-w-0"):
+        return "mobile Export root must constrain its width"
+    if len(page_divs) < 2 or not tag_has_classes(
+        page_divs[1], "min-w-0", "flex-col", "sm:flex-row"
+    ):
+        return "mobile Export header must stack without forcing width"
+
+    page_cards = extract_jsx_component_tags(page_body, "Card")
+    page_card_contents = extract_jsx_component_tags(page_body, "CardContent")
+    if not page_cards or any(
+        not tag_has_classes(tag, "w-full", "min-w-0") for tag in page_cards
+    ):
+        return "mobile Export cards must constrain their width"
+    if not page_card_contents or any(
+        not tag_has_classes(tag, "w-full", "min-w-0")
+        for tag in page_card_contents
+    ):
+        return "mobile Export card contents must allow children to shrink"
+
+    supporting_copy = [
+        element
+        for element in extract_jsx_component_elements(page_body, "p")
+        if "Export scoped memories from project" in element
+    ]
+    if len(supporting_copy) != 1 or not tag_has_classes(
+        supporting_copy[0], "break-words"
+    ):
+        return "mobile Export supporting copy must wrap"
+
+    project_values = [
+        element
+        for element in extract_jsx_component_elements(page_body, "p")
+        if 'projectId ?? "Loading project..."' in element
+    ]
+    if len(project_values) != 1 or not tag_has_classes(
+        project_values[0], "break-all", "sm:truncate"
+    ):
+        return "mobile Export project ID must wrap before desktop truncation"
+    project_wrapper = extract_nearest_jsx_tag_before(
+        page_body, "div", 'projectId ?? "Loading project..."'
+    )
+    if project_wrapper is None or not tag_has_classes(
+        project_wrapper, "w-full", "min-w-0", "sm:w-auto"
+    ):
+        return "mobile Export project container must allow shrinking"
+
+    fieldsets = extract_jsx_component_tags(page_body, "fieldset")
+    if len(fieldsets) != 1 or not tag_has_classes(
+        fieldsets[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export format fieldset must constrain its width"
+
+    format_groups = [
+        tag
+        for tag in extract_jsx_component_tags(page_body, "RadioGroup")
+        if re.search(r'\baria-label\s*=\s*"Export format"', tag)
+    ]
+    if len(format_groups) != 1 or not tag_has_classes(
+        format_groups[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export format grid must constrain its width"
+
+    for format_name in ("json", "csv", "pydantic"):
+        labels = [
+            element
+            for element in extract_jsx_component_elements(page_body, "Label")
+            if re.search(
+                rf'\bhtmlFor\s*=\s*"export-format-{re.escape(format_name)}"',
+                element,
+            )
+        ]
+        if len(labels) != 1 or not tag_has_classes(
+            labels[0], "w-full", "min-w-0"
+        ):
+            return f"mobile Export {format_name.upper()} option must allow shrinking"
+        option_content = extract_jsx_component_tags(labels[0], "span")
+        if not option_content or not tag_has_classes(option_content[0], "min-w-0"):
+            return (
+                f"mobile Export {format_name.upper()} option content must allow shrinking"
+            )
+
+    input_grid = [
+        tag
+        for tag in page_divs
+        if tag_has_classes(tag, "sm:grid-cols-2", "xl:grid-cols-4")
+    ]
+    if len(input_grid) != 1 or not tag_has_classes(
+        input_grid[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export filter input grid must constrain its width"
+    for input_name in ("app", "user", "agent", "run"):
+        input_marker = f'id="export-{input_name}-id"'
+        input_tags = [
+            tag
+            for tag in extract_jsx_component_tags(page_body, "Input")
+            if input_marker in tag
+        ]
+        wrapper = extract_nearest_jsx_tag_before(page_body, "div", input_marker)
+        if len(input_tags) != 1 or not tag_has_classes(
+            input_tags[0], "w-full", "min-w-0"
+        ):
+            return f"mobile Export {input_name} input must constrain its width"
+        if wrapper is None or not tag_has_classes(wrapper, "min-w-0"):
+            return f"mobile Export {input_name} input grid child must allow shrinking"
+
+    sections = [
+        tag
+        for tag in extract_jsx_component_tags(page_body, "section")
+        if 'aria-labelledby="recent-export-jobs"' in tag
+    ]
+    if len(sections) != 1 or not tag_has_classes(
+        sections[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export jobs section must constrain its width"
+
+    load_errors = [
+        element
+        for element in extract_jsx_component_elements(page_body, "p")
+        if "{loadError}" in element
+    ]
+    if len(load_errors) != 1 or not tag_has_classes(load_errors[0], "break-all"):
+        return "mobile Export load error must wrap"
+
+    job_cards = extract_jsx_component_tags(job_body, "Card")
+    job_card_contents = extract_jsx_component_tags(job_body, "CardContent")
+    if len(job_cards) != 1 or not tag_has_classes(
+        job_cards[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export job card must constrain its width"
+    if len(job_card_contents) != 1 or not tag_has_classes(
+        job_card_contents[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export job content must allow shrinking"
+
+    job_ids = [
+        element
+        for element in extract_jsx_component_elements(job_body, "span")
+        if "title={job.id}" in element and "{job.id}" in element
+    ]
+    if len(job_ids) != 1 or not tag_has_classes(
+        job_ids[0], "min-w-0", "break-all"
+    ):
+        return "mobile Export job ID must wrap"
+
+    filter_badges = [
+        element
+        for element in extract_jsx_component_elements(job_body, "Badge")
+        if "key={filter}" in element and "{filter}" in element
+    ]
+    if len(filter_badges) != 1 or not tag_has_classes(
+        filter_badges[0], "max-w-full", "whitespace-normal", "break-all"
+    ):
+        return "mobile Export filter badges must wrap"
+
+    job_lists = extract_jsx_component_tags(job_body, "dl")
+    if len(job_lists) != 1 or not tag_has_classes(job_lists[0], "min-w-0"):
+        return "mobile Export job details must allow shrinking"
+    for time_name in ("created_at", "completed_at"):
+        time_values = [
+            element
+            for element in extract_jsx_component_elements(job_body, "dd")
+            if f"formatTime(job.{time_name})" in element
+        ]
+        if len(time_values) != 1 or not tag_has_classes(time_values[0], "break-all"):
+            return f"mobile Export {time_name} value must wrap"
+
+    job_errors = [
+        element
+        for element in extract_jsx_component_elements(job_body, "p")
+        if "{errorSummary}" in element
+    ]
+    if len(job_errors) != 1 or not tag_has_classes(job_errors[0], "break-all"):
+        return "mobile Export job error must wrap"
+
+    download_buttons = [
+        tag
+        for tag in extract_jsx_component_tags(job_body, "Button")
+        if 'disabled={job.status !== "SUCCEEDED"}' in tag
+    ]
+    if len(download_buttons) != 1 or not tag_has_classes(
+        download_buttons[0], "w-full", "sm:w-auto"
+    ):
+        return "mobile Export Download button must remain usable"
+    return None
+
+
 def verify_export_page(dashboard_dir: Path) -> str | None:
     export_content = (dashboard_dir / EXPORT_PAGE).read_text()
     if 'value="json"' not in export_content or 'format: "json"' not in export_content:
@@ -710,7 +915,7 @@ def verify_export_page(dashboard_dir: Path) -> str | None:
         return "Export page missing Coming soon labels for future formats"
     if "SELF-HOSTED" in export_content:
         return "Export page must not contain SELF-HOSTED copy"
-    return None
+    return verify_export_page_mobile_layout(export_content)
 
 
 def verify_proxy_contract(dashboard_dir: Path) -> str | None:

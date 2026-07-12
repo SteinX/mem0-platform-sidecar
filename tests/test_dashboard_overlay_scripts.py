@@ -878,6 +878,152 @@ def test_verify_rejects_invalid_future_format_disabled_attribute(
     assert format_name.upper() in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("required", "weakened"),
+    [
+        (
+            '<div className="w-full min-w-0 space-y-6">',
+            '<div className="w-full space-y-6">',
+        ),
+        (
+            '<div className="flex min-w-0 flex-col items-start gap-4 '
+            'sm:flex-row sm:justify-between">',
+            '<div className="flex items-start justify-between gap-4">',
+        ),
+        (
+            '<p className="break-words text-sm text-onSurface-default-secondary">\n'
+            '            Export scoped memories from project {projectId ?? "..."}.',
+            '<p className="text-sm text-onSurface-default-secondary">\n'
+            '            Export scoped memories from project {projectId ?? "..."}.',
+        ),
+        (
+            '<p className="break-all font-mono text-sm sm:truncate" '
+            'title={projectId ?? undefined}>',
+            '<p className="truncate font-mono text-sm" title={projectId ?? undefined}>',
+        ),
+        (
+            '<Card className="w-full min-w-0 border-memBorder-primary">',
+            '<Card className="border-memBorder-primary">',
+        ),
+        (
+            '<CardContent className="w-full min-w-0 space-y-5 p-5">',
+            '<CardContent className="space-y-5 p-5">',
+        ),
+        (
+            '<div className="w-full min-w-0 space-y-1 sm:w-auto sm:min-w-44">',
+            '<div className="min-w-44 space-y-1">',
+        ),
+        (
+            '<fieldset className="w-full min-w-0 space-y-3">',
+            '<fieldset className="space-y-3">',
+        ),
+        (
+            'className="grid w-full min-w-0 gap-2 sm:grid-cols-3"',
+            'className="grid gap-2 sm:grid-cols-3"',
+        ),
+        (
+            'className="flex min-h-16 w-full min-w-0 cursor-pointer '
+            'items-center gap-3 rounded-md border border-memBorder-primary '
+            'px-3 py-2"',
+            'className="flex min-h-16 cursor-pointer items-center gap-3 '
+            'rounded-md border border-memBorder-primary px-3 py-2"',
+        ),
+        (
+            '<span className="min-w-0 space-y-0.5">',
+            '<span className="space-y-0.5">',
+        ),
+        (
+            'className="grid w-full min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4"',
+            'className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"',
+        ),
+        (
+            '<div className="min-w-0 space-y-2">\n'
+            '              <Label htmlFor="export-app-id">',
+            '<div className="space-y-2">\n'
+            '              <Label htmlFor="export-app-id">',
+        ),
+        (
+            '<Input className="w-full min-w-0" id="export-app-id"',
+            '<Input id="export-app-id"',
+        ),
+        (
+            '<section className="w-full min-w-0 space-y-3" '
+            'aria-labelledby="recent-export-jobs">',
+            '<section className="space-y-3" '
+            'aria-labelledby="recent-export-jobs">',
+        ),
+        (
+            '<p className="break-all text-xs '
+            'text-onSurface-default-tertiary">{loadError}</p>',
+            '<p className="text-xs '
+            'text-onSurface-default-tertiary">{loadError}</p>',
+        ),
+        (
+            '<CardContent className="grid w-full min-w-0 gap-4 p-4 '
+            'lg:grid-cols-[minmax(0,1fr)_auto]">',
+            '<CardContent className="grid gap-4 p-4 '
+            'lg:grid-cols-[minmax(0,1fr)_auto]">',
+        ),
+        (
+            '<span className="min-w-0 break-all font-mono text-xs" '
+            'title={job.id}>{job.id}</span>',
+            '<span className="truncate font-mono text-xs" '
+            'title={job.id}>{job.id}</span>',
+        ),
+        (
+            '<Badge className="max-w-full whitespace-normal break-all '
+            'text-left" key={filter} variant="outline">{filter}</Badge>',
+            '<Badge key={filter} variant="outline">{filter}</Badge>',
+        ),
+        (
+            '<dl className="grid min-w-0 gap-x-5 gap-y-2 text-sm '
+            'sm:grid-cols-2 xl:grid-cols-4">',
+            '<dl className="grid gap-x-5 gap-y-2 text-sm '
+            'sm:grid-cols-2 xl:grid-cols-4">',
+        ),
+        (
+            '<dd className="break-all">{formatTime(job.created_at)}</dd>',
+            '<dd>{formatTime(job.created_at)}</dd>',
+        ),
+        (
+            '<dd className="break-all">{formatTime(job.completed_at)}</dd>',
+            '<dd>{formatTime(job.completed_at)}</dd>',
+        ),
+        (
+            '<p className="break-all text-sm '
+            'text-onSurface-danger-primary">{errorSummary}</p>',
+            '<p className="text-sm text-onSurface-danger-primary">{errorSummary}</p>',
+        ),
+        (
+            'className="w-full sm:w-auto lg:self-start"\n'
+            '          disabled={job.status !== "SUCCEEDED"}',
+            'disabled={job.status !== "SUCCEEDED"}',
+        ),
+    ],
+)
+def test_verify_rejects_removed_mobile_export_layout_protection(
+    tmp_path, required, weakened
+):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text()
+    assert required in content
+    content = content.replace(required, weakened, 1)
+    content = content.replace(
+        '"use client";',
+        '"use client";\n\n'
+        'const mobileExportLayoutDecoy = '
+        '"w-full min-w-0 break-words break-all whitespace-normal sm:truncate";',
+        1,
+    )
+    page.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "mobile Export" in result.stderr
+
+
 def test_verify_rejects_self_hosted_export_badge(tmp_path):
     dashboard = applied_overlay(tmp_path)
     nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
