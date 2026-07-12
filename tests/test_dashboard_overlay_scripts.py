@@ -8,6 +8,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 OVERLAY = ROOT / "integrations" / "mem0-dashboard-overlay"
+UPSTREAM_DASHBOARD = ROOT.parents[2] / "upstream" / "server" / "dashboard"
+DASHBOARD_TYPESCRIPT = UPSTREAM_DASHBOARD / "node_modules" / "typescript"
 NULL_PAGE = "export default function Page() { return null; }\n"
 
 
@@ -55,6 +57,40 @@ def run_verify_without_typecheck(dashboard: Path) -> subprocess.CompletedProcess
         check=False,
         env={**os.environ, "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1"},
     )
+
+
+def assert_dashboard_tsx_transpiles(source_path: Path) -> None:
+    result = subprocess.run(
+        [
+            "node",
+            "-e",
+            """
+const fs = require("fs");
+const ts = require(process.argv[1]);
+const source = fs.readFileSync(process.argv[2], "utf8");
+const result = ts.transpileModule(source, {
+  compilerOptions: { jsx: ts.JsxEmit.Preserve, target: ts.ScriptTarget.ESNext },
+  fileName: process.argv[2],
+  reportDiagnostics: true,
+});
+if (result.diagnostics?.length) {
+  process.stderr.write(ts.formatDiagnosticsWithColorAndContext(result.diagnostics, {
+    getCanonicalFileName: (fileName) => fileName,
+    getCurrentDirectory: () => process.cwd(),
+    getNewLine: () => "\\n",
+  }));
+  process.exit(1);
+}
+""",
+            str(DASHBOARD_TYPESCRIPT),
+            str(source_path),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def write_verify_fixture(dashboard: Path) -> None:
@@ -553,7 +589,7 @@ def test_verify_rejects_category_field_editor_template_string_map_decoy(tmp_path
         "                  aria-invalid={Boolean(errors[field.id])}\n"
     )
     category_field_editor_return = '  return (\n    <div className="space-y-3">\n'
-    map_decoy = """
+    map_decoy = r"""
   const categoryFieldEditorMapDecoy = `
     {fields.map((field, index) => {
       const errorId = field.id;
@@ -564,9 +600,13 @@ def test_verify_rejects_category_field_editor_template_string_map_decoy(tmp_path
           aria-describedby={errors[field.id] ? errorId : undefined}
         >
           <Input
-            id={`${field.id}-key`}
+            id={\`\${field.id}-key\`}
             aria-invalid={Boolean(errors[field.id])}
             aria-describedby={errors[field.id] ? errorId : undefined}
+          />
+          <SelectTrigger
+            id={\`\${field.id}-type\`}
+            aria-label={\`Type for \${field.key || \`field \${index + 1}\`}\`}
           />
           {errors[field.id] ? (
             <p id={errorId}>{errors[field.id]}</p>
@@ -580,13 +620,18 @@ def test_verify_rejects_category_field_editor_template_string_map_decoy(tmp_path
 
     assert input_invalid_attribute in content
     assert category_field_editor_return in content
-    field_editor.write_text(
+    mutated_content = (
         content.replace(input_invalid_attribute, "", 1).replace(
             category_field_editor_return,
             map_decoy + category_field_editor_return,
             1,
         )
     )
+    first_map = mutated_content.index("fields.map((field, index) => {")
+    second_map = mutated_content.index("fields.map((field, index) => {", first_map + 1)
+    assert first_map < second_map
+    field_editor.write_text(mutated_content)
+    assert_dashboard_tsx_transpiles(field_editor)
 
     result = run_verify_without_typecheck(dashboard)
 
