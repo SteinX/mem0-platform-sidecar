@@ -542,6 +542,60 @@ const CATEGORY_FIELD_EDITOR_ACCESSIBILITY_DECOY = `
     assert "Category field editor Field key Input is missing" in result.stderr
 
 
+def test_verify_rejects_category_field_editor_template_string_map_decoy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    content = field_editor.read_text()
+    input_invalid_attribute = (
+        "                  aria-invalid={Boolean(errors[field.id])}\n"
+    )
+    category_field_editor_return = '  return (\n    <div className="space-y-3">\n'
+    map_decoy = """
+  const categoryFieldEditorMapDecoy = `
+    {fields.map((field, index) => {
+      const errorId = field.id;
+      return (
+        <div
+          key={field.id}
+          role="group"
+          aria-describedby={errors[field.id] ? errorId : undefined}
+        >
+          <Input
+            id={`${field.id}-key`}
+            aria-invalid={Boolean(errors[field.id])}
+            aria-describedby={errors[field.id] ? errorId : undefined}
+          />
+          {errors[field.id] ? (
+            <p id={errorId}>{errors[field.id]}</p>
+          ) : null}
+        </div>
+      );
+    })}
+  `;
+
+"""
+
+    assert input_invalid_attribute in content
+    assert category_field_editor_return in content
+    field_editor.write_text(
+        content.replace(input_invalid_attribute, "", 1).replace(
+            category_field_editor_return,
+            map_decoy + category_field_editor_return,
+            1,
+        )
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert (
+        "Category field editor Field key Input must use aria-invalid" in result.stderr
+    )
+
+
 def test_verify_accepts_escaped_quote_string_inside_main_nav(tmp_path):
     dashboard = applied_overlay(tmp_path)
     nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"

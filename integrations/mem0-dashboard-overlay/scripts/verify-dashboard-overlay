@@ -452,9 +452,10 @@ def extract_category_field_editor_field_row(content: str) -> str | None:
     component_body = extract_named_component_body(content, "CategoryFieldEditor")
     if component_body is None:
         return None
+    masked_component_body = mask_string_literals(component_body)
     field_map = re.search(
         r"\bfields\.map\(\s*\(\s*field\s*,\s*index\s*\)\s*=>\s*\{",
-        component_body,
+        masked_component_body,
     )
     if field_map is None:
         return None
@@ -467,6 +468,33 @@ def extract_category_field_editor_field_row(content: str) -> str | None:
         return None
     markup_start = return_match.end() - 1
     return extract_balanced(callback_body, markup_start, "(", ")")
+
+
+def mask_string_literals(content: str) -> str:
+    masked = list(content)
+    quote: str | None = None
+    index = 0
+    while index < len(content):
+        character = content[index]
+        if quote is None:
+            if character in ('"', "'", "`"):
+                quote = character
+                masked[index] = mask_string_character(character)
+            index += 1
+            continue
+
+        masked[index] = mask_string_character(character)
+        if character == "\\" and index + 1 < len(content):
+            index += 1
+            masked[index] = mask_string_character(content[index])
+        elif character == quote:
+            quote = None
+        index += 1
+    return "".join(masked)
+
+
+def mask_string_character(character: str) -> str:
+    return character if character in "\r\n" else " "
 
 
 def has_rendered_category_field_error(field_row: str) -> bool:
