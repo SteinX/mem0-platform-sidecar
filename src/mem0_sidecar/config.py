@@ -19,6 +19,10 @@ class SidecarSettings(BaseSettings):
     mem0_memories_path: str = Field(default="/memories")
     mem0_search_path: str = Field(default="/search")
     default_project_id: str = Field(default="default")
+    allow_adopt_unscoped_memories: bool = Field(
+        default=False,
+        validation_alias="MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED",
+    )
     worker_poll_interval_seconds: float = Field(default=1.0, ge=0.1)
     log_level: str = Field(default="INFO")
     log_format: Literal["text", "json"] = Field(default="text")

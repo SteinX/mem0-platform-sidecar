@@ -10,6 +10,7 @@ def test_settings_defaults_use_local_development_values(monkeypatch) -> None:
     assert settings.database_url == "sqlite:///./mem0_sidecar.sqlite3"
     assert settings.mem0_base_url == "http://127.0.0.1:8000"
     assert settings.default_project_id == "default"
+    assert settings.allow_adopt_unscoped_memories is False
 
 
 def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
@@ -29,6 +30,7 @@ def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("MEM0_SIDECAR_LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("MEM0_SIDECAR_LOG_FORMAT", "json")
     monkeypatch.setenv("MEM0_SIDECAR_REQUEST_ID_HEADER", "X-Correlation-ID")
+    monkeypatch.setenv("MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED", "true")
 
     settings = SidecarSettings()
 
@@ -48,3 +50,4 @@ def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
     assert settings.log_level == "DEBUG"
     assert settings.log_format == "json"
     assert settings.request_id_header == "X-Correlation-ID"
+    assert settings.allow_adopt_unscoped_memories is True
