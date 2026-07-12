@@ -149,6 +149,66 @@ function testEnumDefaultMembership(schema) {
   );
 }
 
+function testBasicsOnlyEditPreservesOriginalEmptySchema(schema, state) {
+  const originalSchema = {};
+  const initialDraft = state.createCategoryDraft(category(originalSchema));
+  const renamedDraft = { ...initialDraft, name: "Renamed status" };
+
+  assert.deepEqual(
+    state.resolveCategorySchemaForSave(
+      renamedDraft,
+      initialDraft,
+      originalSchema,
+    ),
+    originalSchema,
+  );
+
+  const field = schema.createEmptyField();
+  Object.assign(field, { key: "status", type: "string" });
+  const schemaEditedDraft = { ...renamedDraft, fields: [field] };
+  assert.deepEqual(
+    state.resolveCategorySchemaForSave(
+      schemaEditedDraft,
+      initialDraft,
+      originalSchema,
+    ),
+    {
+      type: "object",
+      properties: { status: { type: "string" } },
+    },
+  );
+}
+
+function testDirtyDisableRequiresConfirmation(state) {
+  assert.equal(state.planCategoryDisable(false), "disable");
+  assert.equal(state.planCategoryDisable(true), "confirm");
+}
+
+function testBooleanDefaultTogglePersistsDisplayedFalse(schema) {
+  const field = schema.createEmptyField();
+  Object.assign(field, { key: "active", type: "boolean" });
+
+  const enabled = schema.setFieldDefaultEnabled(field, true);
+  assert.equal(enabled.hasDefault, true);
+  assert.equal(enabled.defaultValue, "false");
+  assert.equal(schema.validateCategoryFields([enabled]).valid, true);
+
+  const disabled = schema.setFieldDefaultEnabled(enabled, false);
+  assert.equal(disabled.hasDefault, false);
+  assert.equal(disabled.defaultValue, "false");
+
+  const textWithEmptyDefault = schema.createEmptyField();
+  Object.assign(textWithEmptyDefault, {
+    key: "active",
+    type: "string",
+    hasDefault: true,
+  });
+  const changedType = schema.setFieldType(textWithEmptyDefault, "boolean");
+  assert.equal(changedType.type, "boolean");
+  assert.equal(changedType.defaultValue, "false");
+  assert.equal(schema.validateCategoryFields([changedType]).valid, true);
+}
+
 function main() {
   if (process.argv.length !== 3) {
     throw new Error("usage: test-category-editor-state.cjs <dashboard-dir>");
@@ -160,7 +220,10 @@ function main() {
   testPersistedChangesBecomeDirty(state);
   testInvalidAdvancedEditBecomesDirty(state);
   testEnumDefaultMembership(schema);
-  console.log("category editor state harness: 5 contracts passed");
+  testBasicsOnlyEditPreservesOriginalEmptySchema(schema, state);
+  testDirtyDisableRequiresConfirmation(state);
+  testBooleanDefaultTogglePersistsDisplayedFalse(schema);
+  console.log("category editor state harness: 8 contracts passed");
 }
 
 try {

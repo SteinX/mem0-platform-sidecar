@@ -57,6 +57,31 @@ export function categoryDraftFingerprint(draft: CategoryDraft): string {
   });
 }
 
+export function resolveCategorySchemaForSave(
+  draft: CategoryDraft,
+  initialDraft: CategoryDraft,
+  originalSchema?: Record<string, unknown>,
+): Record<string, unknown> {
+  if (draft.mode === "advanced") {
+    return parseAdvancedSchema(draft.rawSchemaText);
+  }
+
+  const generatedSchema = editorToSchema(draft.fields);
+  if (
+    originalSchema !== undefined
+    && initialDraft.mode === "builder"
+    && JSON.stringify(canonicalize(generatedSchema))
+      === JSON.stringify(canonicalize(editorToSchema(initialDraft.fields)))
+  ) {
+    return originalSchema;
+  }
+  return generatedSchema;
+}
+
+export function planCategoryDisable(isDirty: boolean): "confirm" | "disable" {
+  return isDirty ? "confirm" : "disable";
+}
+
 export function activateAdvancedMode(draft: CategoryDraft): CategoryDraft {
   if (draft.mode === "advanced") {
     return draft;

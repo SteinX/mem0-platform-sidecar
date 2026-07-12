@@ -29,6 +29,8 @@ import {
   CategoryFieldType,
   CategoryScalarType,
   createEmptyField,
+  setFieldDefaultEnabled,
+  setFieldType,
 } from "@/utils/category-schema";
 
 type CategoryFieldEditorProps = {
@@ -188,7 +190,9 @@ export function CategoryFieldEditor({
                 <Select
                   value={field.type}
                   disabled={disabled}
-                  onValueChange={(value: CategoryFieldType) => updateField(index, { type: value })}
+                  onValueChange={(value: CategoryFieldType) =>
+                    updateField(index, setFieldType(field, value))
+                  }
                 >
                   <SelectTrigger
                     id={`${field.id}-type`}
@@ -247,7 +251,9 @@ export function CategoryFieldEditor({
                 <Switch
                   checked={field.hasDefault}
                   disabled={disabled}
-                  onCheckedChange={(hasDefault) => updateField(index, { hasDefault })}
+                  onCheckedChange={(hasDefault) =>
+                    updateField(index, setFieldDefaultEnabled(field, hasDefault))
+                  }
                 />
                 Default value
               </label>

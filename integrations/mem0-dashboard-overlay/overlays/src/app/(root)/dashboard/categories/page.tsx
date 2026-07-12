@@ -98,6 +98,16 @@ export default function CategoriesPage() {
           <p className="text-sm text-onSurface-default-secondary">
             Define structured metadata for organizing and retrieving memories.
           </p>
+          <div className="flex min-w-0 flex-wrap gap-x-4 gap-y-1 text-xs text-onSurface-default-tertiary">
+            <span className="min-w-0">
+              Project <span className="break-all font-mono">{projectId ?? "Loading..."}</span>
+            </span>
+            <span>
+              {isLoading
+                ? "Loading categories..."
+                : `${categories.length} ${categories.length === 1 ? "category" : "categories"}`}
+            </span>
+          </div>
         </div>
         <Button onClick={openCreateDrawer} disabled={!projectId || isLoading}>
           <Plus className="mr-2 size-4" />

@@ -1526,6 +1526,95 @@ def test_apply_dashboard_overlay_replaces_categories_with_productized_editor(
     )
 
 
+def test_apply_dashboard_overlay_wires_category_safety_and_context(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    drawer = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-editor-drawer.tsx"
+    ).read_text()
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    ).read_text()
+    page = (
+        dashboard / "src/app/(root)/dashboard/categories/page.tsx"
+    ).read_text()
+
+    assert "resolveCategorySchemaForSave(" in drawer
+    assert "planCategoryDisable(isDirty)" in drawer
+    assert "setFieldDefaultEnabled(field, hasDefault)" in field_editor
+    assert "setFieldType(field, value)" in field_editor
+    assert "Project" in page
+    assert "projectId ??" in page
+    assert "categories.length" in page
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "required", "replacement", "expected_error"),
+    [
+        (
+            "src/app/(root)/dashboard/categories/category-editor-drawer.tsx",
+            "schema = resolveCategorySchemaForSave(",
+            "schema = editorToSchema(",
+            "preserve an untouched stored schema",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/category-editor-drawer.tsx",
+            "planCategoryDisable(isDirty)",
+            '"disable"',
+            "dirty Disable confirmation",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/category-field-editor.tsx",
+            "setFieldDefaultEnabled(field, hasDefault)",
+            "{ ...field, hasDefault }",
+            "Boolean default state",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/category-field-editor.tsx",
+            "setFieldType(field, value)",
+            "{ ...field, type: value }",
+            "Boolean default state",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/page.tsx",
+            'Project <span className="break-all font-mono">',
+            'Scope <span className="break-all font-mono">',
+            "read-only project context",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/page.tsx",
+            "`${categories.length} ${categories.length === 1",
+            "`${0} ${categories.length === 1",
+            "category totals",
+        ),
+    ],
+)
+def test_verify_rejects_removed_category_safety_wiring_with_string_decoy(
+    tmp_path, relative_path, required, replacement, expected_error
+):
+    dashboard = applied_overlay(tmp_path)
+    target = dashboard / relative_path
+    content = target.read_text()
+    assert required in content
+    content = content.replace(required, replacement, 1)
+    content = content.replace(
+        '"use client";',
+        '"use client";\n\n'
+        'const categorySafetyDecoy = '
+        '"resolveCategorySchemaForSave( planCategoryDisable(isDirty) '
+        'setFieldDefaultEnabled(field, hasDefault) setFieldType(field, value) '
+        'Project categories.length";',
+        1,
+    )
+    target.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr
+
+
 def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_path):
     dashboard = tmp_path / "dashboard"
     write_dashboard_package(dashboard)

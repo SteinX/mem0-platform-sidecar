@@ -51,8 +51,9 @@ import {
   activateAdvancedMode,
   categoryDraftFingerprint,
   createCategoryDraft,
-  parseAdvancedSchema,
+  planCategoryDisable,
   planBuilderTransition,
+  resolveCategorySchemaForSave,
   resetToEmptyBuilder,
 } from "@/utils/category-editor-state";
 import { sidecarDelete, sidecarPatch, sidecarPost } from "@/utils/sidecar-api";
@@ -81,6 +82,9 @@ export function CategoryEditorDrawer({
   onDeleted,
 }: CategoryEditorDrawerProps) {
   const [draft, setDraft] = useState<CategoryDraft>(() => createCategoryDraft(category));
+  const [initialDraft, setInitialDraft] = useState<CategoryDraft>(() =>
+    createCategoryDraft(category),
+  );
   const [initialFingerprint, setInitialFingerprint] = useState(() =>
     categoryDraftFingerprint(createCategoryDraft(category)),
   );
@@ -90,6 +94,7 @@ export function CategoryEditorDrawer({
   const [isDeleting, setIsDeleting] = useState(false);
   const [showDiscardDialog, setShowDiscardDialog] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [showDisableDialog, setShowDisableDialog] = useState(false);
   const [showBuilderResetDialog, setShowBuilderResetDialog] = useState(false);
 
   useEffect(() => {
@@ -98,11 +103,13 @@ export function CategoryEditorDrawer({
     }
     const nextDraft = createCategoryDraft(category);
     setDraft(nextDraft);
+    setInitialDraft(nextDraft);
     setInitialFingerprint(categoryDraftFingerprint(nextDraft));
     setFieldErrors({});
     setFormError(null);
     setShowDiscardDialog(false);
     setShowDeleteDialog(false);
+    setShowDisableDialog(false);
     setShowBuilderResetDialog(false);
   }, [category, open]);
 
@@ -167,14 +174,16 @@ export function CategoryEditorDrawer({
         setFormError(validation.formError);
         return;
       }
-      schema = editorToSchema(draft.fields);
-    } else {
-      try {
-        schema = parseAdvancedSchema(draft.rawSchemaText);
-      } catch (error) {
-        setFormError(errorMessage(error));
-        return;
-      }
+    }
+    try {
+      schema = resolveCategorySchemaForSave(
+        draft,
+        initialDraft,
+        category?.schema,
+      );
+    } catch (error) {
+      setFormError(errorMessage(error));
+      return;
     }
 
     const payload: SidecarCategoryInput = {
@@ -232,7 +241,16 @@ export function CategoryEditorDrawer({
       });
     } finally {
       setIsSaving(false);
+      setShowDisableDialog(false);
     }
+  };
+
+  const requestDisable = () => {
+    if (planCategoryDisable(isDirty) === "confirm") {
+      setShowDisableDialog(true);
+      return;
+    }
+    void disableCategory();
   };
 
   const deleteCategory = async () => {
@@ -403,7 +421,7 @@ export function CategoryEditorDrawer({
                     size="sm"
                     variant="outline"
                     disabled={isBusy || !category.enabled}
-                    onClick={() => void disableCategory()}
+                    onClick={requestDisable}
                   >
                     <Ban className="mr-2 size-4" />
                     Disable
@@ -469,6 +487,23 @@ export function CategoryEditorDrawer({
               onClick={() => void deleteCategory()}
             >
               Delete category
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={showDisableDialog} onOpenChange={setShowDisableDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Discard changes and disable?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Unsaved category changes will be lost before this category is disabled.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep editing</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void disableCategory()}>
+              Discard and disable
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

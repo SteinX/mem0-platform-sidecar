@@ -56,6 +56,27 @@ export function createEmptyField(): CategoryField {
   };
 }
 
+export function setFieldDefaultEnabled(
+  field: CategoryField,
+  hasDefault: boolean,
+): CategoryField {
+  return {
+    ...field,
+    hasDefault,
+    defaultValue:
+      hasDefault && field.type === "boolean" && !field.defaultValue
+        ? "false"
+        : field.defaultValue,
+  };
+}
+
+export function setFieldType(
+  field: CategoryField,
+  type: CategoryFieldType,
+): CategoryField {
+  return setFieldDefaultEnabled({ ...field, type }, field.hasDefault);
+}
+
 export function schemaToEditor(schema: unknown): CategorySchemaEditor {
   const rawSchemaText = JSON.stringify(schema, null, 2) ?? "";
   const unsupportedPaths: string[] = [];

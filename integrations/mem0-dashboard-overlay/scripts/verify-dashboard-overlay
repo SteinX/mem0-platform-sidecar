@@ -181,6 +181,22 @@ def extract_named_function_body(content: str, name: str) -> str | None:
     return extract_balanced(code, start, "{", "}")
 
 
+def extract_named_arrow_function_body(content: str, name: str) -> str | None:
+    code = strip_comments(content)
+    masked = mask_string_literals(code)
+    match = re.search(
+        rf"\bconst\s+{re.escape(name)}\s*=\s*(?:async\s*)?"
+        r"\([^)]*\)\s*=>\s*\{",
+        masked,
+    )
+    if match is None:
+        return None
+    start = masked.find("{", match.start())
+    if start == -1:
+        return None
+    return extract_balanced(code, start, "{", "}")
+
+
 def extract_named_component_body(content: str, name: str) -> str | None:
     code = strip_comments(content)
     match = re.search(rf"\bfunction\s+{re.escape(name)}\s*\(", code)
@@ -358,6 +374,22 @@ def verify_categories_page(dashboard_dir: Path) -> str | None:
     if "Advanced schema" not in drawer_content:
         return "Categories editor missing Advanced schema fallback"
 
+    save_body = extract_named_arrow_function_body(drawer_content, "saveCategory")
+    if (
+        save_body is None
+        or re.search(r"\bschema\s*=\s*resolveCategorySchemaForSave\s*\(", save_body)
+        is None
+    ):
+        return "Categories editor must preserve an untouched stored schema"
+    disable_body = extract_named_arrow_function_body(drawer_content, "requestDisable")
+    if (
+        disable_body is None
+        or re.search(r"\bplanCategoryDisable\s*\(\s*isDirty\s*\)", disable_body)
+        is None
+        or "setShowDisableDialog(true)" not in disable_body
+    ):
+        return "Categories editor missing dirty Disable confirmation"
+
     categories_content = page_content + drawer_content
     if "Schema JSON" in categories_content:
         return "Categories must not present Schema JSON as the primary editor"
@@ -369,6 +401,42 @@ def verify_categories_page(dashboard_dir: Path) -> str | None:
     )
     if field_editor_accessibility_error is not None:
         return field_editor_accessibility_error
+
+    field_row = extract_category_field_editor_field_row(field_editor_content)
+    if (
+        field_row is None
+        or re.search(
+            r"\bsetFieldDefaultEnabled\s*\(\s*field\s*,\s*hasDefault\s*\)",
+            field_row,
+        )
+        is None
+        or re.search(
+            r"\bsetFieldType\s*\(\s*field\s*,\s*value\s*\)",
+            field_row,
+        )
+        is None
+    ):
+        return "Category field editor must persist Boolean default state"
+
+    page_body = extract_named_component_body(page_content, "CategoriesPage")
+    page_spans = (
+        extract_jsx_component_elements(page_body, "span")
+        if page_body is not None
+        else []
+    )
+    if not any(
+        re.search(
+            r"Project\s*<span[^>]*>\s*\{\s*projectId\s*\?\?",
+            span,
+        )
+        for span in page_spans
+    ):
+        return "Categories header missing read-only project context"
+    if not any(
+        re.search(r"\$\{\s*categories\.length\s*\}", span)
+        for span in page_spans
+    ):
+        return "Categories header missing category totals"
 
     categories_table = extract_categories_table_markup(page_content)
     if categories_table is None:
