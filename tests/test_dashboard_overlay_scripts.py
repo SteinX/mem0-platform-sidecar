@@ -1,11 +1,18 @@
 import json
 import os
+import re
+import runpy
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 OVERLAY = ROOT / "integrations" / "mem0-dashboard-overlay"
+UPSTREAM_DASHBOARD = ROOT.parents[2] / "upstream" / "server" / "dashboard"
+DASHBOARD_TYPESCRIPT = UPSTREAM_DASHBOARD / "node_modules" / "typescript"
+VERIFY_DASHBOARD_OVERLAY = OVERLAY / "scripts" / "verify-dashboard-overlay"
 NULL_PAGE = "export default function Page() { return null; }\n"
 
 
@@ -22,14 +29,136 @@ def write_dashboard_package(dashboard: Path) -> None:
     )
 
 
+def applied_overlay(tmp_path: Path) -> Path:
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return dashboard
+
+
+def run_verify_without_typecheck(dashboard: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1"},
+    )
+
+
+def assert_dashboard_tsx_transpiles(source_path: Path) -> None:
+    result = subprocess.run(
+        [
+            "node",
+            "-e",
+            """
+const fs = require("fs");
+const ts = require(process.argv[1]);
+const source = fs.readFileSync(process.argv[2], "utf8");
+const result = ts.transpileModule(source, {
+  compilerOptions: { jsx: ts.JsxEmit.Preserve, target: ts.ScriptTarget.ESNext },
+  fileName: process.argv[2],
+  reportDiagnostics: true,
+});
+if (result.diagnostics?.length) {
+  process.stderr.write(ts.formatDiagnosticsWithColorAndContext(result.diagnostics, {
+    getCanonicalFileName: (fileName) => fileName,
+    getCurrentDirectory: () => process.cwd(),
+    getNewLine: () => "\\n",
+  }));
+  process.exit(1);
+}
+""",
+            str(DASHBOARD_TYPESCRIPT),
+            str(source_path),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def assert_unmasked_category_field_row_is_accepted(content: str) -> None:
+    verifier = runpy.run_path(str(VERIFY_DASHBOARD_OVERLAY))
+    component_body = verifier["extract_named_component_body"](
+        content, "CategoryFieldEditor"
+    )
+    assert component_body is not None
+    field_maps = list(
+        re.finditer(
+            r"\bfields\.map\(\s*\(\s*field\s*,\s*index\s*\)\s*=>\s*\{",
+            component_body,
+        )
+    )
+    assert len(field_maps) >= 2
+    callback_start = field_maps[0].end() - 1
+    callback_body = verifier["extract_balanced"](
+        component_body, callback_start, "{", "}"
+    )
+    assert callback_body is not None
+    return_match = re.search(r"\breturn\s*\(", callback_body)
+    assert return_match is not None
+    field_row = verifier["extract_balanced"](
+        callback_body, return_match.end() - 1, "(", ")"
+    )
+    assert field_row is not None
+
+    group_tags = [
+        tag
+        for tag in verifier["extract_jsx_component_tags"](field_row, "div")
+        if re.search(r'\bkey\s*=\s*\{\s*field\.id\s*\}', tag) is not None
+        and re.search(r'\brole\s*=\s*"group"', tag) is not None
+    ]
+    assert len(group_tags) == 1
+    assert re.search(r"\baria-invalid(?:\s*=|(?=\s|/|>))", group_tags[0]) is None
+    assert verifier["has_field_error_description"](group_tags[0])
+
+    field_key_inputs = [
+        tag
+        for tag in verifier["extract_jsx_component_tags"](field_row, "Input")
+        if re.search(r"\bid\s*=\s*\{\s*`\$\{field\.id\}-key`\s*\}", tag)
+        is not None
+    ]
+    assert len(field_key_inputs) == 1
+    assert re.search(
+        r"\baria-invalid\s*=\s*\{\s*Boolean\(errors\[field\.id\]\)\s*\}",
+        field_key_inputs[0],
+    )
+    assert verifier["has_field_error_description"](field_key_inputs[0])
+    assert verifier["has_rendered_category_field_error"](field_row)
+
+
 def write_verify_fixture(dashboard: Path) -> None:
     for relative in [
         "src/app/(root)/dashboard/categories/page.tsx",
+        "src/app/(root)/dashboard/categories/category-field-editor.tsx",
+        "src/app/(root)/dashboard/categories/category-editor-drawer.tsx",
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/config/route.ts",
         "src/app/api/sidecar/[...path]/route.ts",
         "src/utils/sidecar-project.ts",
         "src/utils/sidecar-api.ts",
+        "src/utils/sidecar-proxy.ts",
+        "src/utils/category-schema.ts",
+        "src/utils/category-editor-state.ts",
         "src/types/sidecar.ts",
         "src/app/(root)/dashboard/components/main-nav.tsx",
     ]:
@@ -47,6 +176,51 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
     assert "src/app/api/sidecar/config/route.ts" in manifest["files"]
     assert "src/app/api/sidecar/[...path]/route.ts" in manifest["files"]
     assert "src/utils/sidecar-project.ts" in manifest["files"]
+    assert "src/utils/sidecar-proxy.ts" in manifest["files"]
+    assert "src/utils/category-editor-state.ts" in manifest["files"]
+
+
+def test_dashboard_overlay_includes_category_schema_builder_contract():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    schema_path = "src/utils/category-schema.ts"
+
+    assert schema_path in manifest["files"]
+
+    dashboard = OVERLAY / "overlays"
+    schema_content = (dashboard / schema_path).read_text()
+    for symbol in (
+        "export type CategoryFieldType",
+        "export type CategoryField",
+        "export function createEmptyField",
+        "export function schemaToEditor",
+        "export function editorToSchema",
+        "export function validateCategoryFields",
+        "export function countSchemaFields",
+    ):
+        assert symbol in schema_content
+    assert 'mode: "advanced"' in schema_content
+    assert 'format: "date"' in schema_content
+
+
+def test_dashboard_overlay_includes_category_editor_state_contract():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    state_path = "src/utils/category-editor-state.ts"
+
+    assert state_path in manifest["files"]
+
+    state_content = (OVERLAY / "overlays" / state_path).read_text()
+    for symbol in (
+        "export type CategoryDraft",
+        "export function createCategoryDraft",
+        "export function categoryDraftFingerprint",
+        "export function activateAdvancedMode",
+        "export function planBuilderTransition",
+        "export function resetToEmptyBuilder",
+    ):
+        assert symbol in state_content
+
+    harness = OVERLAY / "scripts" / "test-category-editor-state.cjs"
+    assert harness.exists()
 
 
 def test_apply_dashboard_overlay_copies_files(tmp_path):
@@ -115,6 +289,7 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
         dashboard / "src/app/api/sidecar/config/route.ts"
     ).read_text()
     helper_content = (dashboard / "src/utils/sidecar-api.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
     project_helper_content = (dashboard / "src/utils/sidecar-project.ts").read_text()
     type_content = (dashboard / "src/types/sidecar.ts").read_text()
 
@@ -125,6 +300,7 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
     assert "export async function sidecarGet<T>" in helper_content
     assert "export async function sidecarPut<T>" in helper_content
     assert "export async function sidecarPost<T>" in helper_content
+    assert "export async function proxySidecarRequest(" in proxy_content
     assert "export async function getSidecarProjectId()" in project_helper_content
     assert 'fetch("/api/sidecar/config"' in project_helper_content
     assert "NEXT_PUBLIC_MEM0_SIDECAR_PROJECT_ID" not in project_helper_content
@@ -154,11 +330,18 @@ def test_apply_dashboard_overlay_normalizes_sidecar_paths_and_removes_patch_foot
 
     route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
     helper_content = (dashboard / "src/utils/sidecar-api.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
 
     assert "function normalizeSidecarPath(path: string): string" in helper_content
     assert "return path.startsWith(\"/\") ? path : `/${path}`;" in helper_content
-    assert "METHODS_WITH_BODY = new Set([\"POST\", \"PUT\"]);" in route_content
-    assert "export const PATCH = proxy;" not in route_content
+    assert "export async function sidecarPatch<T>" in helper_content
+    assert "export async function sidecarDelete(" in helper_content
+    assert (
+        'const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);'
+        in proxy_content
+    )
+    assert "export const PATCH = proxy;" in route_content
+    assert "export const DELETE = proxy;" in route_content
 
 
 def test_apply_dashboard_overlay_route_restricts_sidecar_paths(tmp_path):
@@ -180,18 +363,24 @@ def test_apply_dashboard_overlay_route_restricts_sidecar_paths(tmp_path):
     assert result.returncode == 0, result.stderr
 
     route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
 
-    assert "function isAllowedSidecarRequest(" in route_content
+    assert "function isAllowedSidecarRequest(" in proxy_content
     assert "function getConfiguredProjectId()" in route_content
-    assert "function scopedSidecarPath(" in route_content
-    assert "function scopedExportBody(" in route_content
-    assert 'key !== "project_id"' in route_content
-    assert 'url.searchParams.set("project_id", configuredProjectId);' in route_content
-    assert "project_id: configuredProjectId" in route_content
-    assert 'return jsonError("Sidecar route is not allowed", 403);' in route_content
-    assert "isProjectCategoriesPath" in route_content
-    assert "isExportPath" in route_content
-    assert "export const DELETE = proxy;" not in route_content
+    assert "function scopedSidecarPath(" in proxy_content
+    assert "function scopedExportBody(" in proxy_content
+    assert 'key !== "project_id"' in proxy_content
+    assert 'url.searchParams.set("project_id", configuredProjectId);' in proxy_content
+    assert "project_id: configuredProjectId" in proxy_content
+    assert 'return jsonError("Sidecar route is not allowed", 403);' in proxy_content
+    assert "isProjectCategoriesPath" in proxy_content
+    assert "isProjectCategoryItemPath" in proxy_content
+    assert "categoryItemMatch" in proxy_content
+    assert "isExportPath" in proxy_content
+    assert (
+        'method === "DELETE" && /^\\/v1\\/exports\\/[^/]+$/.test(path)'
+        not in proxy_content
+    )
 
 
 def test_apply_dashboard_overlay_route_handles_proxy_errors_explicitly(tmp_path):
@@ -212,17 +401,17 @@ def test_apply_dashboard_overlay_route_handles_proxy_errors_explicitly(tmp_path)
 
     assert result.returncode == 0, result.stderr
 
-    route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
 
     assert (
         "function jsonError(message: string, status: number): Response"
-        in route_content
+        in proxy_content
     )
     assert (
         'return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);'
-        in route_content
+        in proxy_content
     )
-    assert 'return jsonError("Sidecar upstream request failed", 502);' in route_content
+    assert 'return jsonError("Sidecar upstream request failed", 502);' in proxy_content
 
 
 def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
@@ -244,13 +433,14 @@ def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
     assert result.returncode == 0, result.stderr
 
     route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
 
     assert 'const COOKIE_NAME = "mem0_refresh_token";' in route_content
     assert "async function validateDashboardSession()" in route_content
     assert "function isAuthDisabled()" in route_content
     assert 'process.env.AUTH_DISABLED?.toLowerCase()' in route_content
     assert "if (isAuthDisabled()) {" in route_content
-    assert 'return jsonError("Unauthorized", 401);' in route_content
+    assert 'return jsonError("Unauthorized", 401);' in proxy_content
     assert "AUTH_ENDPOINTS.REFRESH" in route_content
     assert "getServerApiUrl()" in route_content
 
@@ -294,39 +484,743 @@ def test_verify_dashboard_overlay_rejects_locked_pages(tmp_path):
     assert "still imports or renders LockedPage" in result.stderr
 
 
-def test_verify_dashboard_overlay_rejects_incorrect_navigation_badges(tmp_path):
-    dashboard = tmp_path / "dashboard"
-    write_verify_fixture(dashboard)
-    main_nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
-    main_nav.write_text(
-        'title: "Categories"\n'
-        'badge: "PRO"\n'
-        'title: "Webhooks"\n'
-        'badge: "PRO"\n'
-        'title: "Analytics"\n'
-        'badge: "PRO"\n'
-        'title: "Export"\n'
-        'badge: "SELF-HOSTED"\n'
+def test_verify_rejects_categories_outside_memory_tools(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    memory_start = content.index("const MEMORY_TOOL_ITEMS")
+    cloud_start = content.index("const CLOUD_FEATURE_ITEMS")
+    memory_items = content[memory_start:cloud_start].replace(
+        'title: "Categories"', 'title: "Webhooks"', 1
     )
+    cloud_items = content[cloud_start:].replace(
+        'title: "Webhooks"', 'title: "Categories"', 1
+    )
+    nav.write_text(content[:memory_start] + memory_items + cloud_items)
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
-            str(dashboard),
-        ],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-        env={
-            **os.environ,
-            "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1",
-        },
-    )
+    result = run_verify_without_typecheck(dashboard)
 
     assert result.returncode == 1
-    assert 'Categories badge mismatch: expected "SELF-HOSTED"' in result.stderr
+    assert "MEMORY_TOOL_ITEMS" in result.stderr
+
+
+def test_verify_requires_responsive_sidebar_collapse(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_verify_rejects_category_field_editor_group_aria_invalid(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    content = field_editor.read_text()
+    group_invalid_attribute = "            aria-invalid={Boolean(errors[field.id])}\n"
+
+    assert '            role="group"\n' + group_invalid_attribute not in content
+
+    field_editor.write_text(content.replace(
+        '            role="group"\n',
+        '            role="group"\n' + group_invalid_attribute,
+        1,
+    ))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Category field editor group must not use aria-invalid" in result.stderr
+
+
+def test_verify_rejects_category_field_editor_input_without_aria_invalid(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    input_invalid_attribute = (
+        "                  aria-invalid={Boolean(errors[field.id])}\n"
+    )
+    content = field_editor.read_text()
+
+    assert input_invalid_attribute in content
+    field_editor.write_text(content.replace(input_invalid_attribute, "", 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert (
+        "Category field editor Field key Input must use aria-invalid" in result.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "",
+        "                  aria-describedby={errors[field.id] ? "
+        "`${errorId}-mismatch` : undefined}\n",
+    ),
+)
+def test_verify_rejects_category_field_editor_input_without_matching_error_description(
+    tmp_path,
+    replacement,
+):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    input_description = (
+        "                  aria-describedby={errors[field.id] ? errorId : undefined}\n"
+    )
+    content = field_editor.read_text()
+
+    assert input_description in content
+    field_editor.write_text(content.replace(input_description, replacement, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert (
+        "Category field editor Field key Input must describe its field error"
+        in result.stderr
+    )
+
+
+def test_verify_rejects_category_field_editor_aria_decoy_outside_fields_map(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    content = field_editor.read_text()
+    input_id = "                  id={`${field.id}-key`}\n"
+    input_invalid_attribute = (
+        "                  aria-invalid={Boolean(errors[field.id])}\n"
+    )
+    input_description = (
+        "                  aria-describedby={errors[field.id] ? errorId : undefined}\n"
+    )
+
+    assert input_id in content
+    assert input_invalid_attribute in content
+    assert input_description in content
+    field_editor.write_text(
+        content.replace(input_id, '                  id="decoy-field-key"\n', 1)
+        .replace(input_invalid_attribute, "", 1)
+        .replace(input_description, "", 1)
+        + """
+
+const CATEGORY_FIELD_EDITOR_ACCESSIBILITY_DECOY = `
+  <Input
+    id={`${field.id}-key`}
+    aria-invalid={Boolean(errors[field.id])}
+    aria-describedby={errors[field.id] ? errorId : undefined}
+  />
+`;
+"""
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Category field editor Field key Input is missing" in result.stderr
+
+
+def test_verify_rejects_category_field_editor_template_string_map_decoy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    )
+    content = field_editor.read_text()
+    input_invalid_attribute = (
+        "                  aria-invalid={Boolean(errors[field.id])}\n"
+    )
+    category_field_editor_return = '  return (\n    <div className="space-y-3">\n'
+    map_decoy = (
+        '  const categoryFieldEditorMapDecoy = \'{fields.map((field, index) => {'
+        ' const errorId = field.id; return (<div key={field.id} role="group"'
+        ' aria-describedby={errors[field.id] ? errorId : undefined}><Input'
+        ' id={`${field.id}-key`} aria-invalid={Boolean(errors[field.id])}'
+        ' aria-describedby={errors[field.id] ? errorId : undefined}/>'
+        '{errors[field.id] ? (<p id={errorId}>{errors[field.id]}</p>) : null}'
+        '</div>); })}\';\n\n'
+    )
+
+    assert input_invalid_attribute in content
+    assert category_field_editor_return in content
+    mutated_content = (
+        content.replace(input_invalid_attribute, "", 1).replace(
+            category_field_editor_return,
+            map_decoy + category_field_editor_return,
+            1,
+        )
+    )
+    first_map = mutated_content.index("fields.map((field, index) => {")
+    second_map = mutated_content.index("fields.map((field, index) => {", first_map + 1)
+    assert first_map < second_map
+    field_editor.write_text(mutated_content)
+    assert_dashboard_tsx_transpiles(field_editor)
+    assert_unmasked_category_field_row_is_accepted(mutated_content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert (
+        "Category field editor Field key Input must use aria-invalid" in result.stderr
+    )
+
+
+def test_verify_accepts_escaped_quote_string_inside_main_nav(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    effect_start = "  React.useEffect(() => {"
+    escaped_quote = '  const escapedQuote = "value: \\"}";\n'
+    assert effect_start in content
+    nav.write_text(content.replace(effect_start, escaped_quote + effect_start, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
+
+
+RESPONSIVE_SIDEBAR_DECOY = """
+function ResponsiveSidebarDecoy() {
+  React.useEffect(() => {
+    const sidebarMediaQuery = window.matchMedia("(max-width: 767px)");
+    const collapseSidebarOnNarrowViewport = () => {
+      if (
+        sidebarMediaQuery.matches &&
+        !store.getState().layout.isSidebarCollapsed
+      ) {
+        dispatch(toggleSidebar());
+      }
+    };
+    collapseSidebarOnNarrowViewport();
+    sidebarMediaQuery.addEventListener("change", collapseSidebarOnNarrowViewport);
+    return () => {
+      sidebarMediaQuery.removeEventListener(
+        "change",
+        collapseSidebarOnNarrowViewport,
+      );
+    };
+  }, [dispatch, store]);
+}
+"""
+
+
+def test_verify_rejects_responsive_effect_decoy_outside_main_nav(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    assert '  React.useEffect(() => {' in content
+    nav.write_text(
+        content.replace('  React.useEffect(() => {', '  React.useMemo(() => {', 1)
+        + RESPONSIVE_SIDEBAR_DECOY
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "MainNav" in result.stderr
+
+
+def test_verify_rejects_missing_live_responsive_collapse_invocation(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    active_invocation = "    collapseSidebarOnNarrowViewport();\n"
+    assert active_invocation in content
+    nav.write_text(content.replace(active_invocation, "", 1) + RESPONSIVE_SIDEBAR_DECOY)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "invoke" in result.stderr
+
+
+def test_verify_rejects_missing_live_responsive_change_listener(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    active_listener = (
+        '    sidebarMediaQuery.addEventListener("change", '
+        "collapseSidebarOnNarrowViewport);\n"
+    )
+    assert active_listener in content
+    nav.write_text(content.replace(active_listener, "", 1) + RESPONSIVE_SIDEBAR_DECOY)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "listener" in result.stderr
+
+
+def test_verify_rejects_json_first_categories_regression(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    drawer = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-editor-drawer.tsx"
+    )
+    drawer.write_text(drawer.read_text().replace("Generated schema", "Schema JSON", 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Schema JSON" in result.stderr
+
+
+def test_verify_rejects_missing_category_patch_proxy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    route = dashboard / "src/app/api/sidecar/[...path]/route.ts"
+    route.write_text(route.read_text().replace("export const PATCH = proxy;", ""))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "PATCH" in result.stderr
+
+
+def test_verify_rejects_categories_table_without_mobile_fixed_layout(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/categories/page.tsx"
+    content = page.read_text().replace(
+        '<Table className="table-fixed sm:table-auto">', "<Table>", 1
+    )
+    page.write_text(
+        (
+            'const mobileTableDecoy = '
+            '"<Table className=\\"table-fixed sm:table-auto\\">";\n'
+        )
+        + content
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "fixed mobile table layout" in result.stderr
+
+
+def test_verify_rejects_categories_table_without_mobile_wrapping_and_status(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/categories/page.tsx"
+    content = page.read_text().replace(
+        "<Table>", '<Table className="table-fixed sm:table-auto">', 1
+    )
+    content = content.replace('className="break-words"', 'className=""', 1)
+    content = content.replace(
+        (
+            'className="whitespace-normal break-words text-xs '
+            'text-onSurface-default-secondary sm:max-w-xl sm:truncate"'
+        ),
+        'className="max-w-xl truncate text-xs text-onSurface-default-secondary"',
+        1,
+    )
+    content = content.replace('className="sm:hidden"', 'className="hidden"', 1)
+    content = content.replace(
+        '<TableHead className="hidden sm:table-cell">Status</TableHead>',
+        "<TableHead>Status</TableHead>",
+        1,
+    )
+    content = content.replace(
+        '<TableCell className="hidden sm:table-cell">\n                      <span',
+        '<TableCell>\n                      <span',
+        1,
+    )
+    page.write_text(
+        (
+            'const mobileCategoryDecoy = '
+            '"break-words whitespace-normal sm:hidden hidden sm:table-cell";\n'
+        )
+        + content
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "mobile Category cell" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("format_name", "replacement"),
+    [
+        ("csv", ""),
+        ("csv", "disabled={false}"),
+        ("csv", "disabled={futureFormatsDisabled}"),
+        ("csv", "data-disabled"),
+        ("pydantic", ""),
+        ("pydantic", "disabled={false}"),
+        ("pydantic", "disabled={futureFormatsDisabled}"),
+        ("pydantic", "data-disabled"),
+    ],
+)
+def test_verify_rejects_invalid_future_format_disabled_attribute(
+    tmp_path, format_name, replacement
+):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    page.write_text(
+        page.read_text().replace(
+            f'value="{format_name}" id="export-format-{format_name}" disabled',
+            f'value="{format_name}" id="export-format-{format_name}" {replacement}',
+        )
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert format_name.upper() in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("required", "weakened"),
+    [
+        (
+            '<div className="w-full min-w-0 space-y-6">',
+            '<div className="w-full space-y-6">',
+        ),
+        (
+            '<div className="flex min-w-0 flex-col items-start gap-4 '
+            'sm:flex-row sm:justify-between">',
+            '<div className="flex items-start justify-between gap-4">',
+        ),
+        (
+            '<p className="break-words text-sm text-onSurface-default-secondary">\n'
+            '            Export scoped memories from project {projectId ?? "..."}.',
+            '<p className="text-sm text-onSurface-default-secondary">\n'
+            '            Export scoped memories from project {projectId ?? "..."}.',
+        ),
+        (
+            '<p className="break-all font-mono text-sm sm:truncate" '
+            'title={projectId ?? undefined}>',
+            '<p className="truncate font-mono text-sm" title={projectId ?? undefined}>',
+        ),
+        (
+            '<Card className="w-full min-w-0 border-memBorder-primary">',
+            '<Card className="border-memBorder-primary">',
+        ),
+        (
+            '<CardContent className="w-full min-w-0 space-y-5 p-5">',
+            '<CardContent className="space-y-5 p-5">',
+        ),
+        (
+            '<div className="w-full min-w-0 space-y-1 sm:w-auto sm:min-w-44">',
+            '<div className="min-w-44 space-y-1">',
+        ),
+        (
+            '<fieldset className="w-full min-w-0 space-y-3">',
+            '<fieldset className="space-y-3">',
+        ),
+        (
+            'className="grid w-full min-w-0 gap-2 sm:grid-cols-3"',
+            'className="grid gap-2 sm:grid-cols-3"',
+        ),
+        (
+            'className="flex min-h-16 w-full min-w-0 cursor-pointer '
+            'items-center gap-3 rounded-md border border-memBorder-primary '
+            'px-3 py-2"',
+            'className="flex min-h-16 cursor-pointer items-center gap-3 '
+            'rounded-md border border-memBorder-primary px-3 py-2"',
+        ),
+        (
+            '<span className="min-w-0 space-y-0.5">',
+            '<span className="space-y-0.5">',
+        ),
+        (
+            'className="grid w-full min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4"',
+            'className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"',
+        ),
+        (
+            '<div className="min-w-0 space-y-2">\n'
+            '              <Label htmlFor="export-app-id">',
+            '<div className="space-y-2">\n'
+            '              <Label htmlFor="export-app-id">',
+        ),
+        (
+            '<Input className="w-full min-w-0" id="export-app-id"',
+            '<Input id="export-app-id"',
+        ),
+        (
+            '<section className="w-full min-w-0 space-y-3" '
+            'aria-labelledby="recent-export-jobs">',
+            '<section className="space-y-3" '
+            'aria-labelledby="recent-export-jobs">',
+        ),
+        (
+            '<p className="break-all text-xs '
+            'text-onSurface-default-tertiary">{loadError}</p>',
+            '<p className="text-xs '
+            'text-onSurface-default-tertiary">{loadError}</p>',
+        ),
+        (
+            '<CardContent className="grid w-full min-w-0 gap-4 p-4 '
+            'lg:grid-cols-[minmax(0,1fr)_auto]">',
+            '<CardContent className="grid gap-4 p-4 '
+            'lg:grid-cols-[minmax(0,1fr)_auto]">',
+        ),
+        (
+            '<span className="min-w-0 break-all font-mono text-xs" '
+            'title={job.id}>{job.id}</span>',
+            '<span className="truncate font-mono text-xs" '
+            'title={job.id}>{job.id}</span>',
+        ),
+        (
+            '<Badge className="max-w-full whitespace-normal break-all '
+            'text-left" key={filter} variant="outline">{filter}</Badge>',
+            '<Badge key={filter} variant="outline">{filter}</Badge>',
+        ),
+        (
+            '<dl className="grid min-w-0 gap-x-5 gap-y-2 text-sm '
+            'sm:grid-cols-2 xl:grid-cols-4">',
+            '<dl className="grid gap-x-5 gap-y-2 text-sm '
+            'sm:grid-cols-2 xl:grid-cols-4">',
+        ),
+        (
+            '<dd className="break-words">{formatTime(job.created_at)}</dd>',
+            '<dd>{formatTime(job.created_at)}</dd>',
+        ),
+        (
+            '<dd className="break-words">{formatTime(job.completed_at)}</dd>',
+            '<dd>{formatTime(job.completed_at)}</dd>',
+        ),
+        (
+            '<p className="break-all text-sm '
+            'text-onSurface-danger-primary">{errorSummary}</p>',
+            '<p className="text-sm text-onSurface-danger-primary">{errorSummary}</p>',
+        ),
+        (
+            'className="w-full sm:w-auto lg:self-start"\n'
+            '          disabled={job.status !== "SUCCEEDED"}',
+            'disabled={job.status !== "SUCCEEDED"}',
+        ),
+    ],
+)
+def test_verify_rejects_removed_mobile_export_layout_protection(
+    tmp_path, required, weakened
+):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text()
+    assert required in content
+    content = content.replace(required, weakened, 1)
+    content = content.replace(
+        '"use client";',
+        '"use client";\n\n'
+        'const mobileExportLayoutDecoy = '
+        '"w-full min-w-0 break-words break-all whitespace-normal sm:truncate";',
+        1,
+    )
+    page.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "mobile Export" in result.stderr
+
+
+def test_verify_rejects_export_input_wrapper_sibling_class_decoy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text()
+    content = content.replace(
+        '<div className="min-w-0 space-y-2">\n'
+        '              <Label htmlFor="export-app-id">',
+        '<div className="space-y-2">\n'
+        '              <Label htmlFor="export-app-id">',
+        1,
+    )
+    content = content.replace(
+        '<Input className="w-full min-w-0" id="export-app-id"',
+        '<div className="min-w-0" />\n'
+        '              <Input className="w-full min-w-0" id="export-app-id"',
+        1,
+    )
+    page.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "app input grid child" in result.stderr
+
+
+def test_verify_accepts_export_input_wrapper_string_expression_decoy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text().replace(
+        '<Input className="w-full min-w-0" id="export-app-id"',
+        '{"<div>"}\n'
+        '              <Input className="w-full min-w-0" id="export-app-id"',
+        1,
+    )
+    page.write_text(content)
+    assert_dashboard_tsx_transpiles(page)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_verify_rejects_export_format_label_descendant_class_decoy(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text()
+    content = content.replace(
+        '                className="flex min-h-16 w-full min-w-0 '
+        'cursor-pointer items-center gap-3 rounded-md border '
+        'border-memBorder-primary px-3 py-2"\n',
+        "",
+        1,
+    )
+    content = content.replace(
+        '<span className="min-w-0 space-y-0.5">',
+        '<span className="w-full min-w-0 space-y-0.5">',
+        1,
+    )
+    page.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "JSON option must allow shrinking" in result.stderr
+
+
+def test_verify_accepts_mobile_export_timestamps_with_word_wrapping(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/export/page.tsx"
+    content = page.read_text()
+    assert '<dd className="break-words">{formatTime(job.created_at)}</dd>' in content
+    assert '<dd className="break-words">{formatTime(job.completed_at)}</dd>' in content
+    assert '<dd className="break-all">{formatTime(' not in content
+    page.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_verify_rejects_self_hosted_export_badge(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    nav.write_text(
+        nav.read_text().replace(
+            'title: "Export",',
+            'title: "Export",\n                      badge: "SELF-HOSTED",',
+            1,
+        )
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "SELF-HOSTED" in result.stderr
+
+
+def test_verify_rejects_badge_before_memory_tool_title(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    assert "const MEMORY_TOOL_ITEMS" in content
+    nav.write_text(
+        content.replace(
+            '  {\n    title: "Categories",',
+            '  {\n    badge: "SELF-HOSTED",\n    title: "Categories",',
+            1,
+        )
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "SELF-HOSTED" in result.stderr
+
+
+def test_verify_ignores_comment_decoy_group_labels(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    nav.write_text(
+        "// MEMORY TOOLS\n// CLOUD FEATURES\n// ACCOUNT\n" + nav.read_text()
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_verify_rejects_swapped_rendered_navigation_item_bindings(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    assert "<NavigationItems" in content
+    assert 'group="memory-tools"' in content
+    assert 'items={MEMORY_TOOL_ITEMS}' in content
+    assert 'group="cloud-features"' in content
+    assert 'items={CLOUD_FEATURE_ITEMS}' in content
+    swapped = content.replace("items={MEMORY_TOOL_ITEMS}", "items={TEMP_ITEMS}", 1)
+    swapped = swapped.replace(
+        "items={CLOUD_FEATURE_ITEMS}", "items={MEMORY_TOOL_ITEMS}", 1
+    )
+    nav.write_text(
+        swapped.replace("items={TEMP_ITEMS}", "items={CLOUD_FEATURE_ITEMS}", 1)
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "memory-tools" in result.stderr
+
+
+def test_verify_rejects_missing_webhooks_pro_badge(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
+    content = nav.read_text()
+    webhooks_start = content.index('title: "Webhooks"')
+    analytics_start = content.index('title: "Analytics"', webhooks_start)
+    webhooks_section = content[webhooks_start:analytics_start].replace(
+        'badge: "PRO",', "", 1
+    )
+    nav.write_text(
+        content[:webhooks_start] + webhooks_section + content[analytics_start:]
+    )
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Webhooks" in result.stderr
+
+
+def test_verify_rejects_missing_category_delete_route_export(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    route = dashboard / "src/app/api/sidecar/[...path]/route.ts"
+    route.write_text(route.read_text().replace("export const DELETE = proxy;", ""))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "DELETE" in result.stderr
+
+
+@pytest.mark.parametrize("method", ("PATCH", "DELETE"))
+def test_verify_rejects_missing_category_item_method_branch(tmp_path, method):
+    dashboard = applied_overlay(tmp_path)
+    proxy = dashboard / "src/utils/sidecar-proxy.ts"
+    content = proxy.read_text()
+    function_start = content.index("function isProjectCategoryItemPath")
+    function_end = content.index("\n}\n", function_start) + 2
+    item_function = content[function_start:function_end].replace(
+        f'method === "{method}"', f'method === "{method}-MISSING"', 1
+    )
+    proxy.write_text(content[:function_start] + item_function + content[function_end:])
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert method in result.stderr
 
 
 def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
@@ -349,6 +1243,14 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     pnpm = dashboard / "pnpm"
     pnpm.write_text("#!/bin/sh\nexit 0\n")
     pnpm.chmod(0o755)
+    node_log = dashboard / "node.log"
+    node = dashboard / "node"
+    node.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {node_log}\n"
+        "exit 0\n"
+    )
+    node.chmod(0o755)
 
     result = subprocess.run(
         [
@@ -361,6 +1263,52 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
         capture_output=True,
         check=False,
         env={"PATH": f"{dashboard}:{Path('/usr/bin')}:{Path('/bin')}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    harness_args = node_log.read_text().splitlines()
+    assert any("test-sidecar-proxy.cjs" in args for args in harness_args)
+    assert any("test-category-schema.cjs" in args for args in harness_args)
+    assert any("test-category-editor-state.cjs" in args for args in harness_args)
+    assert all(args.endswith(str(dashboard)) for args in harness_args)
+
+
+def test_verify_dashboard_overlay_skip_typecheck_bypasses_node_tools(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    for command in ("pnpm", "node"):
+        executable = dashboard / command
+        executable.write_text("#!/bin/sh\nexit 99\n")
+        executable.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            "PATH": f"{dashboard}:{Path('/usr/bin')}:{Path('/bin')}",
+            "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1",
+        },
     )
 
     assert result.returncode == 0, result.stderr
@@ -399,6 +1347,9 @@ def test_verify_dashboard_overlay_uses_npm_exec_pnpm_when_global_pnpm_missing(
         "exit 0\n"
     )
     npm.chmod(0o755)
+    node = bin_dir / "node"
+    node.write_text("#!/bin/sh\nexit 0\n")
+    node.chmod(0o755)
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{Path('/usr/bin')}:{Path('/bin')}"
@@ -452,6 +1403,9 @@ def test_verify_dashboard_overlay_uses_pinned_default_when_package_manager_missi
         "exit 0\n"
     )
     npm.chmod(0o755)
+    node = bin_dir / "node"
+    node.write_text("#!/bin/sh\nexit 0\n")
+    node.chmod(0o755)
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{Path('/usr/bin')}:{Path('/bin')}"
@@ -516,7 +1470,7 @@ def test_verify_dashboard_overlay_rejects_missing_manifest_file(tmp_path):
     assert manifest["files"][2] in result.stderr
 
 
-def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
+def test_apply_dashboard_overlay_replaces_categories_with_productized_editor(
     tmp_path,
 ):
     dashboard = tmp_path / "dashboard"
@@ -536,35 +1490,145 @@ def test_apply_dashboard_overlay_replaces_categories_with_editable_sidecar_page(
 
     assert result.returncode == 0, result.stderr
 
-    content = (dashboard / "src/app/(root)/dashboard/categories/page.tsx").read_text()
+    categories = dashboard / "src/app/(root)/dashboard/categories"
+    page_content = (categories / "page.tsx").read_text()
+    drawer_content = (categories / "category-editor-drawer.tsx").read_text()
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
 
-    assert '"use client";' in content
-    assert "sidecarGet<SidecarCategoryResponse>" in content
-    assert "sidecarPut<SidecarCategoryResponse>" in content
-    assert 'import { getSidecarProjectId } from "@/utils/sidecar-project";' in content
-    assert "await getSidecarProjectId()" in content
-    assert 'const PROJECT_ID = "default";' not in content
-    assert 'toast({ title: "Categories saved", variant: "success" });' in content
-    assert "JSON.parse(category.schemaText)" in content
-    assert "type EditableCategory = {" in content
-    assert "id: string;" in content
-    assert "crypto.randomUUID()" in content
-    assert "key={category.id}" in content
-    assert 'key={`${category.name}-${index}`}' not in content
+    assert '"use client";' in page_content
+    assert "sidecarGet<SidecarCategoryResponse>" in page_content
     assert (
-        "const isEditorDisabled = isLoading || isSaving || !hasLoaded || !projectId;"
-        in content
+        'import { getSidecarProjectId } from "@/utils/sidecar-project";'
+        in page_content
     )
-    assert "disabled={isEditorDisabled}" in content
+    assert "await getSidecarProjectId()" in page_content
+    assert "sidecarPost<SidecarCategory>" in drawer_content
+    assert "sidecarPatch<SidecarCategory>" in drawer_content
+    assert "sidecarDelete(" in drawer_content
+    assert "CategoryEditorDrawer" in page_content
+    assert "CategoryFieldEditor" in drawer_content
+    assert "Create category" in page_content
+    assert "Advanced schema" in drawer_content
+    assert "Generated schema" in drawer_content
+    assert "Discard changes?" in drawer_content
+    assert "Delete category?" in drawer_content
+    assert "Schema JSON" not in page_content
+    assert "sidecarPut<SidecarCategoryResponse>" not in page_content
+    assert "SELF-HOSTED" not in page_content
+    assert "LockedPage" not in page_content
     assert (
-        "onCheckedChange={(enabled) => updateCategory(index, { enabled })}"
-        in content
+        "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+        in manifest["files"]
     )
-    assert "disabled={isEditorDisabled}" in content
-    assert 'title: "Failed to load categories"' in content
-    assert "Retry load" in content
-    assert "void loadCategories();" in content
-    assert "LockedPage" not in content
+    assert (
+        "src/app/(root)/dashboard/categories/category-editor-drawer.tsx"
+        in manifest["files"]
+    )
+
+
+def test_apply_dashboard_overlay_wires_category_safety_and_context(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    drawer = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-editor-drawer.tsx"
+    ).read_text()
+    field_editor = (
+        dashboard
+        / "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+    ).read_text()
+    page = (
+        dashboard / "src/app/(root)/dashboard/categories/page.tsx"
+    ).read_text()
+
+    assert "resolveCategorySchemaForSave(" in drawer
+    assert "planCategoryDisable(isDirty)" in drawer
+    assert "setFieldDefaultEnabled(field, hasDefault)" in field_editor
+    assert "setFieldType(field, value)" in field_editor
+    assert "Project" in page
+    assert "projectId ??" in page
+    assert "categories.length" in page
+    assert "setProjectId(resolvedProjectId);" in page
+    assert "setProjectId(null);" not in page
+    assert "Category total unavailable" in page
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "required", "replacement", "expected_error"),
+    [
+        (
+            "src/app/(root)/dashboard/categories/category-editor-drawer.tsx",
+            "schema = resolveCategorySchemaForSave(",
+            "schema = editorToSchema(",
+            "preserve an untouched stored schema",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/category-editor-drawer.tsx",
+            "planCategoryDisable(isDirty)",
+            '"disable"',
+            "dirty Disable confirmation",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/category-field-editor.tsx",
+            "setFieldDefaultEnabled(field, hasDefault)",
+            "{ ...field, hasDefault }",
+            "Boolean default state",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/category-field-editor.tsx",
+            "setFieldType(field, value)",
+            "{ ...field, type: value }",
+            "Boolean default state",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/page.tsx",
+            'Project <span className="break-all font-mono">',
+            'Scope <span className="break-all font-mono">',
+            "read-only project context",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/page.tsx",
+            "`${categories.length} ${categories.length === 1",
+            "`${0} ${categories.length === 1",
+            "category totals",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/page.tsx",
+            "setProjectId(resolvedProjectId);",
+            "setProjectId(null);",
+            "retain resolved project context",
+        ),
+        (
+            "src/app/(root)/dashboard/categories/page.tsx",
+            '"Category total unavailable"',
+            '"Loading categories..."',
+            "unavailable total state",
+        ),
+    ],
+)
+def test_verify_rejects_removed_category_safety_wiring_with_string_decoy(
+    tmp_path, relative_path, required, replacement, expected_error
+):
+    dashboard = applied_overlay(tmp_path)
+    target = dashboard / relative_path
+    content = target.read_text()
+    assert required in content
+    content = content.replace(required, replacement, 1)
+    content = content.replace(
+        '"use client";',
+        '"use client";\n\n'
+        'const categorySafetyDecoy = '
+        '"resolveCategorySchemaForSave( planCategoryDisable(isDirty) '
+        'setFieldDefaultEnabled(field, hasDefault) setFieldType(field, value) '
+        'Project categories.length setProjectId(resolvedProjectId); '
+        'Category total unavailable";',
+        1,
+    )
+    target.write_text(content)
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr
 
 
 def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_path):
@@ -605,12 +1669,20 @@ def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_pa
     assert 'title: "Failed to load exports"' in content
     assert 'title: "Failed to create export"' in content
     assert 'title: "Failed to download export"' in content
-    assert (
-        "formatDistanceToNow(new Date(job.created_at), { addSuffix: true })"
-        in content
-    )
     assert "job.status !== \"SUCCEEDED\"" in content
-    assert "Create JSON Export" in content
+    assert "Create export" in content
+    assert "Coming soon" in content
+    assert 'value="json"' in content
+    assert 'value="csv"' in content
+    assert 'value="pydantic"' in content
+    assert "disabled" in content
+    assert "formatFilterSummary" in content
+    assert "job.completed_at" in content
+    assert "job.error" in content
+    assert "exported_count" in content
+    assert "skipped_count" in content
+    assert "Create JSON Export" not in content
+    assert "SELF-HOSTED" not in content
     assert "Download" in content
     assert "LockedPage" not in content
 

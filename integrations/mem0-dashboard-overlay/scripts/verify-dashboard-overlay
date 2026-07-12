@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,12 +12,16 @@ LOCKED_TARGETS = [
     "src/app/(root)/dashboard/export/page.tsx",
 ]
 MAIN_NAV = "src/app/(root)/dashboard/components/main-nav.tsx"
-EXPECTED_BADGES = {
-    "Categories": "SELF-HOSTED",
-    "Webhooks": "PRO",
-    "Analytics": "PRO",
-    "Export": "SELF-HOSTED",
-}
+CATEGORIES_PAGE = "src/app/(root)/dashboard/categories/page.tsx"
+CATEGORY_EDITOR_DRAWER = (
+    "src/app/(root)/dashboard/categories/category-editor-drawer.tsx"
+)
+CATEGORY_FIELD_EDITOR = (
+    "src/app/(root)/dashboard/categories/category-field-editor.tsx"
+)
+EXPORT_PAGE = "src/app/(root)/dashboard/export/page.tsx"
+SIDECAR_PROXY = "src/utils/sidecar-proxy.ts"
+SIDECAR_ROUTE = "src/app/api/sidecar/[...path]/route.ts"
 DEFAULT_PNPM_PACKAGE = "pnpm@10.34.2"
 
 
@@ -47,28 +52,1066 @@ def typecheck_command(dashboard_dir: Path) -> list[str]:
     raise FileNotFoundError("Neither pnpm nor npm is available on PATH")
 
 
-def verify_main_nav_badges(main_nav_content: str) -> str | None:
-    cursor = 0
-    for title, badge in EXPECTED_BADGES.items():
-        title_marker = f'title: "{title}"'
-        title_index = main_nav_content.find(title_marker, cursor)
-        if title_index == -1:
-            return f'main-nav missing item: "{title}"'
+def proxy_harness_command(overlay_root: Path, dashboard_dir: Path) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-sidecar-proxy.cjs"),
+        str(dashboard_dir),
+    ]
 
-        badge_marker = f'badge: "{badge}"'
-        badge_index = main_nav_content.find(badge_marker, title_index)
-        next_title_index = len(main_nav_content)
-        for next_title in EXPECTED_BADGES:
-            if next_title == title:
+
+def category_schema_harness_command(
+    overlay_root: Path, dashboard_dir: Path
+) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-category-schema.cjs"),
+        str(dashboard_dir),
+    ]
+
+
+def category_editor_state_harness_command(
+    overlay_root: Path, dashboard_dir: Path
+) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-category-editor-state.cjs"),
+        str(dashboard_dir),
+    ]
+
+
+def strip_comments(content: str) -> str:
+    result: list[str] = []
+    index = 0
+    quote: str | None = None
+    while index < len(content):
+        character = content[index]
+        next_character = content[index + 1] if index + 1 < len(content) else ""
+        if quote is not None:
+            result.append(character)
+            if character == "\\" and index + 1 < len(content):
+                index += 1
+                result.append(content[index])
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in ('"', "'", "`"):
+            quote = character
+            result.append(character)
+            index += 1
+            continue
+        if character == "/" and next_character == "/":
+            while index < len(content) and content[index] != "\n":
+                result.append(" ")
+                index += 1
+            continue
+        if character == "/" and next_character == "*":
+            result.extend((" ", " "))
+            index += 2
+            while index < len(content) - 1:
+                if content[index] == "*" and content[index + 1] == "/":
+                    result.extend((" ", " "))
+                    index += 2
+                    break
+                result.append("\n" if content[index] == "\n" else " ")
+                index += 1
+            continue
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def extract_balanced(content: str, start: int, opening: str, closing: str) -> str | None:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(start, len(content)):
+        character = content[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
                 continue
-            candidate = main_nav_content.find(f'title: "{next_title}"', title_index + 1)
-            if candidate != -1:
-                next_title_index = min(next_title_index, candidate)
+            if character == "\\":
+                escaped = True
+                continue
+            if character == quote:
+                quote = None
+            continue
+        if character in ('"', "'", "`"):
+            quote = character
+        elif character == opening:
+            depth += 1
+        elif character == closing:
+            depth -= 1
+            if depth == 0:
+                return content[start : index + 1]
+    return None
 
-        if badge_index == -1 or badge_index > next_title_index:
-            return f'{title} badge mismatch: expected "{badge}"'
 
-        cursor = title_index + 1
+def extract_named_array(content: str, name: str) -> str | None:
+    code = strip_comments(content)
+    match = re.search(
+        rf"\bconst\s+{re.escape(name)}(?:\s*:\s*[^=]+)?\s*=\s*\[",
+        code,
+    )
+    if match is None:
+        return None
+    start = match.end() - 1
+    return extract_balanced(code, start, "[", "]")
+
+
+def extract_named_function_body(content: str, name: str) -> str | None:
+    code = strip_comments(content)
+    match = re.search(rf"\bfunction\s+{re.escape(name)}\s*\(", code)
+    if match is None:
+        return None
+    start = code.find("{", match.end())
+    if start == -1:
+        return None
+    return extract_balanced(code, start, "{", "}")
+
+
+def extract_named_arrow_function_body(content: str, name: str) -> str | None:
+    code = strip_comments(content)
+    masked = mask_string_literals(code)
+    match = re.search(
+        rf"\bconst\s+{re.escape(name)}\s*=\s*(?:async\s*)?"
+        r"\([^)]*\)\s*=>\s*\{",
+        masked,
+    )
+    if match is None:
+        return None
+    start = masked.find("{", match.start())
+    if start == -1:
+        return None
+    return extract_balanced(code, start, "{", "}")
+
+
+def extract_named_component_body(content: str, name: str) -> str | None:
+    code = strip_comments(content)
+    match = re.search(rf"\bfunction\s+{re.escape(name)}\s*\(", code)
+    if match is None:
+        return None
+    parameters_start = code.find("(", match.start())
+    parameters = extract_balanced(code, parameters_start, "(", ")")
+    if parameters is None:
+        return None
+    body_start = code.find("{", parameters_start + len(parameters))
+    if body_start == -1:
+        return None
+    return extract_balanced(code, body_start, "{", "}")
+
+
+def extract_react_use_effect_calls(component_body: str) -> list[str]:
+    effect_calls: list[str] = []
+    for match in re.finditer(r"\bReact\.useEffect\s*\(", component_body):
+        arguments_start = component_body.find("(", match.start())
+        arguments = extract_balanced(component_body, arguments_start, "(", ")")
+        if arguments is None:
+            return []
+        effect_calls.append(arguments)
+    return effect_calls
+
+
+def extract_object_initializers(array_content: str) -> list[str]:
+    objects: list[str] = []
+    index = 0
+    while index < len(array_content):
+        if array_content[index] == "{":
+            item = extract_balanced(array_content, index, "{", "}")
+            if item is None:
+                return []
+            objects.append(item)
+            index += len(item)
+        else:
+            index += 1
+    return objects
+
+
+def string_property(item: str, name: str) -> str | None:
+    match = re.search(rf'\b{re.escape(name)}\s*:\s*"([^"]*)"', item)
+    return match.group(1) if match is not None else None
+
+
+def verify_nav_items(
+    array_content: str | None,
+    array_name: str,
+    expected_titles: list[str],
+    expected_badge: str | None,
+) -> str | None:
+    if array_content is None:
+        return f"main-nav missing {array_name} initializer"
+    items = extract_object_initializers(array_content)
+    titles = [string_property(item, "title") for item in items]
+    if titles != expected_titles:
+        return f"main-nav {array_name} must contain only " + " and ".join(expected_titles)
+    for item, title in zip(items, expected_titles, strict=True):
+        badge = string_property(item, "badge")
+        if expected_badge is None and badge is not None:
+            if badge == "SELF-HOSTED":
+                return "main-nav must not contain SELF-HOSTED badges"
+            return f"main-nav {title} must not have a badge"
+        if expected_badge is not None and badge != expected_badge:
+            return f"main-nav {title} must have a {expected_badge} badge"
+    return None
+
+
+def verify_main_nav_groups(main_nav_content: str) -> str | None:
+    memory_tools_error = verify_nav_items(
+        extract_named_array(main_nav_content, "MEMORY_TOOL_ITEMS"),
+        "MEMORY_TOOL_ITEMS",
+        ["Categories", "Export"],
+        None,
+    )
+    if memory_tools_error is not None:
+        return memory_tools_error
+    cloud_features_error = verify_nav_items(
+        extract_named_array(main_nav_content, "CLOUD_FEATURE_ITEMS"),
+        "CLOUD_FEATURE_ITEMS",
+        ["Webhooks", "Analytics"],
+        "PRO",
+    )
+    if cloud_features_error is not None:
+        return cloud_features_error
+    for group, items in (
+        ("memory-tools", "MEMORY_TOOL_ITEMS"),
+        ("cloud-features", "CLOUD_FEATURE_ITEMS"),
+    ):
+        binding_error = verify_rendered_nav_binding(main_nav_content, group, items)
+        if binding_error is not None:
+            return binding_error
+    return None
+
+
+def verify_responsive_nav_collapse(main_nav_content: str) -> str | None:
+    main_nav_body = extract_named_component_body(main_nav_content, "MainNav")
+    if main_nav_body is None:
+        return "main-nav missing MainNav component"
+    for pattern, error in (
+        (
+            r"\bconst\s+dispatch\s*=\s*useDispatch\(\s*\)",
+            "main-nav must use Redux dispatch for responsive sidebar collapse",
+        ),
+        (
+            r"\bconst\s+store\s*=\s*useStore\s*<\s*RootState\s*>\s*\(\s*\)",
+            "main-nav must read live Redux state for responsive sidebar collapse",
+        ),
+    ):
+        if re.search(pattern, main_nav_body) is None:
+            return error
+
+    effect_calls = extract_react_use_effect_calls(main_nav_body)
+    responsive_effects = [
+        effect_call
+        for effect_call in effect_calls
+        if re.search(
+            r'window\.matchMedia\(\s*["\']\(max-width:\s*767px\)["\']\s*\)',
+            effect_call,
+        )
+        is not None
+    ]
+    if len(responsive_effects) != 1:
+        return "main-nav responsive collapse must run in React.useEffect inside MainNav"
+
+    responsive_effect = responsive_effects[0]
+    effect_arguments = responsive_effect[1:-1]
+    if (
+        re.search(r",\s*\[\s*dispatch\s*,\s*store\s*\]\s*$", effect_arguments)
+        is None
+    ):
+        return "main-nav responsive collapse effect must use stable dispatch and store dependencies"
+
+    required_patterns = (
+        (
+            r"\bconst\s+collapseSidebarOnNarrowViewport\s*=\s*\(\s*\)\s*=>",
+            "main-nav responsive collapse effect missing collapse callback",
+        ),
+        (
+            r"if\s*\(\s*sidebarMediaQuery\.matches\s*&&\s*!store\.getState\(\)\.layout\.isSidebarCollapsed\s*\)",
+            "main-nav responsive collapse must read current Redux state before toggling",
+        ),
+        (
+            r"dispatch\(\s*toggleSidebar\(\s*\)\s*\)",
+            "main-nav responsive collapse must dispatch toggleSidebar",
+        ),
+        (
+            r"\bcollapseSidebarOnNarrowViewport\(\s*\)\s*;",
+            "main-nav responsive collapse effect must invoke its collapse callback",
+        ),
+        (
+            r'sidebarMediaQuery\.addEventListener\(\s*["\']change["\']\s*,\s*collapseSidebarOnNarrowViewport\s*\)',
+            "main-nav responsive collapse effect missing its change listener",
+        ),
+        (
+            r'sidebarMediaQuery\.removeEventListener\(\s*["\']change["\']\s*,\s*collapseSidebarOnNarrowViewport\s*,?\s*\)',
+            "main-nav responsive collapse effect must remove the same change listener",
+        ),
+    )
+    for pattern, error in required_patterns:
+        if re.search(pattern, responsive_effect) is None:
+            return error
+    return None
+
+
+def verify_categories_page(dashboard_dir: Path) -> str | None:
+    page_content = (dashboard_dir / CATEGORIES_PAGE).read_text()
+    drawer_content = (dashboard_dir / CATEGORY_EDITOR_DRAWER).read_text()
+    field_editor_content = (dashboard_dir / CATEGORY_FIELD_EDITOR).read_text()
+    if "CategoryEditorDrawer" not in page_content:
+        return "Categories page missing CategoryEditorDrawer"
+    if "Create category" not in page_content:
+        return "Categories page missing Create category action"
+    if "Advanced schema" not in drawer_content:
+        return "Categories editor missing Advanced schema fallback"
+
+    save_body = extract_named_arrow_function_body(drawer_content, "saveCategory")
+    if (
+        save_body is None
+        or re.search(r"\bschema\s*=\s*resolveCategorySchemaForSave\s*\(", save_body)
+        is None
+    ):
+        return "Categories editor must preserve an untouched stored schema"
+    disable_body = extract_named_arrow_function_body(drawer_content, "requestDisable")
+    if (
+        disable_body is None
+        or re.search(r"\bplanCategoryDisable\s*\(\s*isDirty\s*\)", disable_body)
+        is None
+        or "setShowDisableDialog(true)" not in disable_body
+    ):
+        return "Categories editor missing dirty Disable confirmation"
+
+    categories_content = page_content + drawer_content
+    if "Schema JSON" in categories_content:
+        return "Categories must not present Schema JSON as the primary editor"
+    if "SELF-HOSTED" in categories_content:
+        return "Categories must not contain SELF-HOSTED copy"
+
+    field_editor_accessibility_error = verify_category_field_editor_accessibility(
+        field_editor_content
+    )
+    if field_editor_accessibility_error is not None:
+        return field_editor_accessibility_error
+
+    field_row = extract_category_field_editor_field_row(field_editor_content)
+    if (
+        field_row is None
+        or re.search(
+            r"\bsetFieldDefaultEnabled\s*\(\s*field\s*,\s*hasDefault\s*\)",
+            field_row,
+        )
+        is None
+        or re.search(
+            r"\bsetFieldType\s*\(\s*field\s*,\s*value\s*\)",
+            field_row,
+        )
+        is None
+    ):
+        return "Category field editor must persist Boolean default state"
+
+    page_body = extract_named_component_body(page_content, "CategoriesPage")
+    page_spans = (
+        extract_jsx_component_elements(page_body, "span")
+        if page_body is not None
+        else []
+    )
+    if not any(
+        re.search(
+            r"Project\s*<span[^>]*>\s*\{\s*projectId\s*\?\?",
+            span,
+        )
+        for span in page_spans
+    ):
+        return "Categories header missing read-only project context"
+    if not any(
+        re.search(r"\$\{\s*categories\.length\s*\}", span)
+        for span in page_spans
+    ):
+        return "Categories header missing category totals"
+    if "setProjectId(null);" in page_body:
+        return "Categories page must retain resolved project context after load errors"
+    if (
+        re.search(
+            r"const\s+resolvedProjectId\s*=\s*await\s+getSidecarProjectId\(\)\s*;"
+            r"\s*setProjectId\(resolvedProjectId\)\s*;",
+            page_body,
+        )
+        is None
+    ):
+        return "Categories page must retain resolved project context before loading data"
+    if "Category total unavailable" not in page_body:
+        return "Categories header missing unavailable total state"
+
+    categories_table = extract_categories_table_markup(page_content)
+    if categories_table is None:
+        return "Categories page missing rendered Categories table"
+
+    table_tag = extract_jsx_component_tags(categories_table, "Table")
+    if len(table_tag) != 1 or not tag_has_classes(
+        table_tag[0], "table-fixed", "sm:table-auto"
+    ):
+        return "Categories table missing fixed mobile table layout"
+
+    category_row = extract_category_row_markup(categories_table)
+    if category_row is None:
+        return "Categories table missing rendered keyboard row"
+
+    category_cell = extract_category_cell_markup(category_row)
+    if category_cell is None or not tag_has_classes(
+        category_cell, "break-words"
+    ):
+        return "Categories table missing a wrapping mobile Category cell"
+    description = extract_category_description_markup(category_cell)
+    if description is None or not tag_has_classes(
+        description,
+        "whitespace-normal",
+        "break-words",
+        "sm:max-w-xl",
+        "sm:truncate",
+    ):
+        return "Categories mobile Category cell must wrap its description"
+    if not has_mobile_category_status(category_cell):
+        return "Categories mobile Category cell must preserve status"
+    if not has_hidden_desktop_status_column(categories_table, category_row):
+        return "Categories table Status header and cell must be hidden below sm"
+    return None
+
+
+def verify_category_field_editor_accessibility(field_editor_content: str) -> str | None:
+    field_row = extract_category_field_editor_field_row(field_editor_content)
+    if field_row is None:
+        return "Category field editor missing rendered fields.map field row"
+    if not has_rendered_category_field_error(field_row):
+        return "Category field editor field row must render its field error"
+
+    group_tags = [
+        tag
+        for tag in extract_jsx_component_tags(field_row, "div")
+        if re.search(r'\bkey\s*=\s*\{\s*field\.id\s*\}', tag) is not None
+        and re.search(r'\brole\s*=\s*"group"', tag) is not None
+    ]
+    if len(group_tags) != 1:
+        return "Category field editor must render one field group"
+    group_tag = group_tags[0]
+    if re.search(r"\baria-invalid(?:\s*=|(?=\s|/|>))", group_tag) is not None:
+        return "Category field editor group must not use aria-invalid"
+    if not has_field_error_description(group_tag):
+        return "Category field editor group must describe its field error"
+
+    field_key_inputs = [
+        tag
+        for tag in extract_jsx_component_tags(field_row, "Input")
+        if re.search(r"\bid\s*=\s*\{\s*`\$\{field\.id\}-key`\s*\}", tag)
+        is not None
+    ]
+    if len(field_key_inputs) != 1:
+        return "Category field editor Field key Input is missing"
+    field_key_input = field_key_inputs[0]
+    if (
+        re.search(
+            r"\baria-invalid\s*=\s*\{\s*Boolean\(errors\[field\.id\]\)\s*\}",
+            field_key_input,
+        )
+        is None
+    ):
+        return "Category field editor Field key Input must use aria-invalid"
+    if not has_field_error_description(field_key_input):
+        return "Category field editor Field key Input must describe its field error"
+    return None
+
+
+def extract_category_field_editor_field_row(content: str) -> str | None:
+    component_body = extract_named_component_body(content, "CategoryFieldEditor")
+    if component_body is None:
+        return None
+    masked_component_body = mask_string_literals(component_body)
+    field_map = re.search(
+        r"\bfields\.map\(\s*\(\s*field\s*,\s*index\s*\)\s*=>\s*\{",
+        masked_component_body,
+    )
+    if field_map is None:
+        return None
+    callback_start = field_map.end() - 1
+    callback_body = extract_balanced(component_body, callback_start, "{", "}")
+    if callback_body is None:
+        return None
+    return_match = re.search(r"\breturn\s*\(", callback_body)
+    if return_match is None:
+        return None
+    markup_start = return_match.end() - 1
+    return extract_balanced(callback_body, markup_start, "(", ")")
+
+
+def mask_string_literals(content: str) -> str:
+    masked = list(content)
+    quote: str | None = None
+    index = 0
+    while index < len(content):
+        character = content[index]
+        if quote is None:
+            if character in ('"', "'", "`"):
+                quote = character
+                masked[index] = mask_string_character(character)
+            index += 1
+            continue
+
+        masked[index] = mask_string_character(character)
+        if character == "\\" and index + 1 < len(content):
+            index += 1
+            masked[index] = mask_string_character(content[index])
+        elif character == quote:
+            quote = None
+        index += 1
+    return "".join(masked)
+
+
+def mask_string_character(character: str) -> str:
+    return character if character in "\r\n" else " "
+
+
+def mask_jsx_expression_literals(content: str) -> str:
+    code = strip_comments(content)
+    masked = list(code)
+    expression_depth = 0
+    index = 0
+    while index < len(code):
+        character = code[index]
+        if character == "<" and re.match(r"</?[A-Za-z][\w.:-]*(?=\s|/?>)", code[index:]):
+            opening_tag = extract_jsx_opening_tag(code[index:])
+            if opening_tag is not None:
+                index += len(opening_tag)
+                continue
+        if character == "{":
+            expression_depth += 1
+        elif character == "}" and expression_depth > 0:
+            expression_depth -= 1
+        elif expression_depth > 0 and character in ('"', "'", "`"):
+            quote = character
+            masked[index] = mask_string_character(character)
+            index += 1
+            while index < len(code):
+                character = code[index]
+                masked[index] = mask_string_character(character)
+                if character == "\\" and index + 1 < len(code):
+                    index += 1
+                    masked[index] = mask_string_character(code[index])
+                elif character == quote:
+                    break
+                index += 1
+        index += 1
+    return "".join(masked)
+
+
+def has_rendered_category_field_error(field_row: str) -> bool:
+    return (
+        re.search(
+            r"\{errors\[field\.id\]\s*\?\s*\(\s*<p\s+id\s*=\s*\{\s*errorId\s*\}[^>]*>\s*\{errors\[field\.id\]\}\s*</p>\s*\)\s*:\s*null\s*\}",
+            field_row,
+        )
+        is not None
+    )
+
+
+def has_field_error_description(tag: str) -> bool:
+    return (
+        re.search(
+            r"\baria-describedby\s*=\s*\{\s*errors\[field\.id\]\s*\?\s*errorId\s*:\s*undefined\s*\}",
+            tag,
+        )
+        is not None
+    )
+
+
+def extract_jsx_component_elements(content: str, component: str) -> list[str]:
+    code = strip_comments(content)
+    elements: list[str] = []
+    marker = f"<{component}"
+    closing_marker = f"</{component}>"
+    index = 0
+    while True:
+        start = code.find(marker, index)
+        if start == -1:
+            return elements
+        following_index = start + len(marker)
+        if (
+            following_index < len(code)
+            and not code[following_index].isspace()
+            and code[following_index] != ">"
+        ):
+            index = following_index
+            continue
+        end = code.find(closing_marker, following_index)
+        if end == -1:
+            index = following_index
+            continue
+        elements.append(code[start : end + len(closing_marker)])
+        index = end + len(closing_marker)
+
+
+def extract_jsx_opening_tag(content: str) -> str | None:
+    start = content.find("<")
+    if start == -1:
+        return None
+    expression_depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(start + 1, len(content)):
+        character = content[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in ('"', "'", "`"):
+            quote = character
+        elif character == "{":
+            expression_depth += 1
+        elif character == "}" and expression_depth > 0:
+            expression_depth -= 1
+        elif character == ">" and expression_depth == 0:
+            return content[start : index + 1]
+    return None
+
+
+def tag_has_classes(tag: str, *classes: str) -> bool:
+    opening_tag = extract_jsx_opening_tag(tag)
+    if opening_tag is None:
+        return False
+    class_name = re.search(r'\bclassName\s*=\s*"([^"]*)"', opening_tag)
+    if class_name is None:
+        return False
+    actual_classes = set(class_name.group(1).split())
+    return all(expected in actual_classes for expected in classes)
+
+
+def extract_categories_table_markup(page_content: str) -> str | None:
+    tables = [
+        table
+        for table in extract_jsx_component_elements(page_content, "Table")
+        if "<TableHeader>" in table and "<TableBody>" in table
+    ]
+    return tables[0] if len(tables) == 1 else None
+
+
+def extract_category_row_markup(categories_table: str) -> str | None:
+    rows = [
+        row
+        for row in extract_jsx_component_elements(categories_table, "TableRow")
+        if re.search(r'\brole\s*=\s*"button"', row) is not None
+    ]
+    return rows[0] if len(rows) == 1 else None
+
+
+def extract_category_cell_markup(category_row: str) -> str | None:
+    cells = [
+        cell
+        for cell in extract_jsx_component_elements(category_row, "TableCell")
+        if "category.name" in cell
+        and "category.description" in cell
+        and "isAdvanced" in cell
+    ]
+    return cells[0] if len(cells) == 1 else None
+
+
+def extract_category_description_markup(category_cell: str) -> str | None:
+    descriptions = [
+        description
+        for description in extract_jsx_component_elements(category_cell, "p")
+        if "category.description" in description
+    ]
+    return descriptions[0] if len(descriptions) == 1 else None
+
+
+def has_mobile_category_status(category_cell: str) -> bool:
+    status_spans = [
+        span
+        for span in extract_jsx_component_elements(category_cell, "span")
+        if 'category.enabled ? "Enabled" : "Disabled"' in span
+    ]
+    return len(status_spans) == 1 and tag_has_classes(status_spans[0], "sm:hidden")
+
+
+def has_hidden_desktop_status_column(
+    categories_table: str, category_row: str
+) -> bool:
+    status_headers = [
+        header
+        for header in extract_jsx_component_elements(categories_table, "TableHead")
+        if re.search(r">\s*Status\s*</TableHead>$", header) is not None
+    ]
+    if len(status_headers) != 1 or not tag_has_classes(
+        status_headers[0], "hidden", "sm:table-cell"
+    ):
+        return False
+
+    status_cells = [
+        cell
+        for cell in extract_jsx_component_elements(category_row, "TableCell")
+        if 'category.enabled ? "Enabled" : "Disabled"' in cell
+        and "category.name" not in cell
+    ]
+    return len(status_cells) == 1 and tag_has_classes(
+        status_cells[0], "hidden", "sm:table-cell"
+    )
+
+
+def extract_export_format_tag(export_content: str, format_name: str) -> str | None:
+    marker = "<RadioGroupItem"
+    index = 0
+    while True:
+        start = export_content.find(marker, index)
+        if start == -1:
+            return None
+        tag = extract_balanced(
+            export_content,
+            start,
+            "<",
+            ">",
+        )
+        if tag is None:
+            return None
+        if re.search(rf'\bvalue\s*=\s*"{re.escape(format_name)}"', tag):
+            return tag
+        index = start + len(tag)
+
+
+def extract_jsx_component_tags(content: str, component: str) -> list[str]:
+    code = strip_comments(content)
+    marker = f"<{component}"
+    tags: list[str] = []
+    index = 0
+    while True:
+        start = code.find(marker, index)
+        if start == -1:
+            return tags
+        following_index = start + len(marker)
+        if following_index < len(code) and not code[following_index].isspace():
+            index = following_index
+            continue
+        tag = extract_jsx_opening_tag(code[start:])
+        if tag is None:
+            return tags
+        tags.append(tag)
+        index = start + len(tag)
+
+
+def verify_rendered_nav_binding(
+    main_nav_content: str, group: str, items: str
+) -> str | None:
+    tags = extract_jsx_component_tags(main_nav_content, "NavigationItems")
+    matching_tags = [
+        tag
+        for tag in tags
+        if re.search(rf'\bgroup\s*=\s*"{re.escape(group)}"', tag)
+    ]
+    if len(matching_tags) != 1:
+        return f"main-nav must render one {group} NavigationItems binding"
+    if (
+        re.search(
+            rf"\bitems\s*=\s*\{{\s*{re.escape(items)}\s*\}}",
+            matching_tags[0],
+        )
+        is None
+    ):
+        return f"main-nav {group} must render items={{{items}}}"
+    return None
+
+
+def verify_disabled_export_format(export_content: str, format_name: str) -> str | None:
+    tag = extract_export_format_tag(export_content, format_name)
+    if tag is None:
+        return f'Export page missing {format_name.upper()} format option'
+    plain_disabled = re.search(r"(?:^|\s)disabled(?=\s|/|>)", tag)
+    explicit_true = re.search(
+        r"(?:^|\s)disabled\s*=\s*\{\s*true\s*\}(?=\s|/|>)",
+        tag,
+    )
+    if plain_disabled is None and explicit_true is None:
+        return f"Export {format_name.upper()} format must use disabled or disabled={{true}}"
+    return None
+
+
+def extract_jsx_ancestor_opening_tag(
+    content: str, component: str, marker: str
+) -> str | None:
+    marker_index = content.find(marker)
+    if marker_index == -1:
+        return None
+    return_matches = list(
+        re.finditer(r"\breturn\s*\(\s*(?=<)", content[:marker_index])
+    )
+    if not return_matches:
+        return None
+    scan_start = return_matches[-1].end()
+    scan_content = mask_jsx_expression_literals(content[scan_start:marker_index])
+    component_pattern = re.compile(rf"</?{re.escape(component)}(?=\s|/?>)")
+    ancestors: list[str] = []
+    for match in component_pattern.finditer(scan_content):
+        original_start = scan_start + match.start()
+        if content.startswith("</", original_start):
+            if ancestors:
+                ancestors.pop()
+            continue
+        opening_tag = extract_jsx_opening_tag(content[original_start:])
+        if opening_tag is None:
+            return None
+        if not opening_tag.rstrip().endswith("/>"):
+            ancestors.append(opening_tag)
+    return ancestors[-1] if ancestors else None
+
+
+def verify_export_page_mobile_layout(export_content: str) -> str | None:
+    page_body = extract_named_component_body(export_content, "ExportPage")
+    job_body = extract_named_component_body(export_content, "ExportJobRow")
+    if page_body is None or job_body is None:
+        return "mobile Export layout requires ExportPage and ExportJobRow"
+
+    page_divs = extract_jsx_component_tags(page_body, "div")
+    if not page_divs or not tag_has_classes(page_divs[0], "w-full", "min-w-0"):
+        return "mobile Export root must constrain its width"
+    if len(page_divs) < 2 or not tag_has_classes(
+        page_divs[1], "min-w-0", "flex-col", "sm:flex-row"
+    ):
+        return "mobile Export header must stack without forcing width"
+
+    page_cards = extract_jsx_component_tags(page_body, "Card")
+    page_card_contents = extract_jsx_component_tags(page_body, "CardContent")
+    if not page_cards or any(
+        not tag_has_classes(tag, "w-full", "min-w-0") for tag in page_cards
+    ):
+        return "mobile Export cards must constrain their width"
+    if not page_card_contents or any(
+        not tag_has_classes(tag, "w-full", "min-w-0")
+        for tag in page_card_contents
+    ):
+        return "mobile Export card contents must allow children to shrink"
+
+    supporting_copy = [
+        element
+        for element in extract_jsx_component_elements(page_body, "p")
+        if "Export scoped memories from project" in element
+    ]
+    if len(supporting_copy) != 1 or not tag_has_classes(
+        supporting_copy[0], "break-words"
+    ):
+        return "mobile Export supporting copy must wrap"
+
+    project_values = [
+        element
+        for element in extract_jsx_component_elements(page_body, "p")
+        if 'projectId ?? "Loading project..."' in element
+    ]
+    if len(project_values) != 1 or not tag_has_classes(
+        project_values[0], "break-all", "sm:truncate"
+    ):
+        return "mobile Export project ID must wrap before desktop truncation"
+    project_wrapper = extract_jsx_ancestor_opening_tag(
+        page_body, "div", 'projectId ?? "Loading project..."'
+    )
+    if project_wrapper is None or not tag_has_classes(
+        project_wrapper, "w-full", "min-w-0", "sm:w-auto"
+    ):
+        return "mobile Export project container must allow shrinking"
+
+    fieldsets = extract_jsx_component_tags(page_body, "fieldset")
+    if len(fieldsets) != 1 or not tag_has_classes(
+        fieldsets[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export format fieldset must constrain its width"
+
+    format_groups = [
+        tag
+        for tag in extract_jsx_component_tags(page_body, "RadioGroup")
+        if re.search(r'\baria-label\s*=\s*"Export format"', tag)
+    ]
+    if len(format_groups) != 1 or not tag_has_classes(
+        format_groups[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export format grid must constrain its width"
+
+    for format_name in ("json", "csv", "pydantic"):
+        labels = [
+            element
+            for element in extract_jsx_component_elements(page_body, "Label")
+            if re.search(
+                rf'\bhtmlFor\s*=\s*"export-format-{re.escape(format_name)}"',
+                element,
+            )
+        ]
+        if len(labels) != 1 or not tag_has_classes(
+            labels[0], "w-full", "min-w-0"
+        ):
+            return f"mobile Export {format_name.upper()} option must allow shrinking"
+        option_content = extract_jsx_component_tags(labels[0], "span")
+        if not option_content or not tag_has_classes(option_content[0], "min-w-0"):
+            return (
+                f"mobile Export {format_name.upper()} option content must allow shrinking"
+            )
+
+    input_grid = [
+        tag
+        for tag in page_divs
+        if tag_has_classes(tag, "sm:grid-cols-2", "xl:grid-cols-4")
+    ]
+    if len(input_grid) != 1 or not tag_has_classes(
+        input_grid[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export filter input grid must constrain its width"
+    for input_name in ("app", "user", "agent", "run"):
+        input_marker = f'id="export-{input_name}-id"'
+        input_tags = [
+            tag
+            for tag in extract_jsx_component_tags(page_body, "Input")
+            if input_marker in tag
+        ]
+        wrapper = extract_jsx_ancestor_opening_tag(page_body, "div", input_marker)
+        if len(input_tags) != 1 or not tag_has_classes(
+            input_tags[0], "w-full", "min-w-0"
+        ):
+            return f"mobile Export {input_name} input must constrain its width"
+        if wrapper is None or not tag_has_classes(wrapper, "min-w-0"):
+            return f"mobile Export {input_name} input grid child must allow shrinking"
+
+    sections = [
+        tag
+        for tag in extract_jsx_component_tags(page_body, "section")
+        if 'aria-labelledby="recent-export-jobs"' in tag
+    ]
+    if len(sections) != 1 or not tag_has_classes(
+        sections[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export jobs section must constrain its width"
+
+    load_errors = [
+        element
+        for element in extract_jsx_component_elements(page_body, "p")
+        if "{loadError}" in element
+    ]
+    if len(load_errors) != 1 or not tag_has_classes(load_errors[0], "break-all"):
+        return "mobile Export load error must wrap"
+
+    job_cards = extract_jsx_component_tags(job_body, "Card")
+    job_card_contents = extract_jsx_component_tags(job_body, "CardContent")
+    if len(job_cards) != 1 or not tag_has_classes(
+        job_cards[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export job card must constrain its width"
+    if len(job_card_contents) != 1 or not tag_has_classes(
+        job_card_contents[0], "w-full", "min-w-0"
+    ):
+        return "mobile Export job content must allow shrinking"
+
+    job_ids = [
+        element
+        for element in extract_jsx_component_elements(job_body, "span")
+        if "title={job.id}" in element and "{job.id}" in element
+    ]
+    if len(job_ids) != 1 or not tag_has_classes(
+        job_ids[0], "min-w-0", "break-all"
+    ):
+        return "mobile Export job ID must wrap"
+
+    filter_badges = [
+        element
+        for element in extract_jsx_component_elements(job_body, "Badge")
+        if "key={filter}" in element and "{filter}" in element
+    ]
+    if len(filter_badges) != 1 or not tag_has_classes(
+        filter_badges[0], "max-w-full", "whitespace-normal", "break-all"
+    ):
+        return "mobile Export filter badges must wrap"
+
+    job_lists = extract_jsx_component_tags(job_body, "dl")
+    if len(job_lists) != 1 or not tag_has_classes(job_lists[0], "min-w-0"):
+        return "mobile Export job details must allow shrinking"
+    for time_name in ("created_at", "completed_at"):
+        time_values = [
+            element
+            for element in extract_jsx_component_elements(job_body, "dd")
+            if f"formatTime(job.{time_name})" in element
+        ]
+        if len(time_values) != 1 or not tag_has_classes(
+            time_values[0], "break-words"
+        ):
+            return f"mobile Export {time_name} value must wrap"
+
+    job_errors = [
+        element
+        for element in extract_jsx_component_elements(job_body, "p")
+        if "{errorSummary}" in element
+    ]
+    if len(job_errors) != 1 or not tag_has_classes(job_errors[0], "break-all"):
+        return "mobile Export job error must wrap"
+
+    download_buttons = [
+        tag
+        for tag in extract_jsx_component_tags(job_body, "Button")
+        if 'disabled={job.status !== "SUCCEEDED"}' in tag
+    ]
+    if len(download_buttons) != 1 or not tag_has_classes(
+        download_buttons[0], "w-full", "sm:w-auto"
+    ):
+        return "mobile Export Download button must remain usable"
+    return None
+
+
+def verify_export_page(dashboard_dir: Path) -> str | None:
+    export_content = (dashboard_dir / EXPORT_PAGE).read_text()
+    if 'value="json"' not in export_content or 'format: "json"' not in export_content:
+        return "Export page must remain JSON-only"
+    for format_name in ("csv", "pydantic"):
+        format_error = verify_disabled_export_format(export_content, format_name)
+        if format_error is not None:
+            return format_error
+    if export_content.count("Coming soon") < 2:
+        return "Export page missing Coming soon labels for future formats"
+    if "SELF-HOSTED" in export_content:
+        return "Export page must not contain SELF-HOSTED copy"
+    return verify_export_page_mobile_layout(export_content)
+
+
+def verify_proxy_contract(dashboard_dir: Path) -> str | None:
+    proxy_content = (dashboard_dir / SIDECAR_PROXY).read_text()
+    route_content = (dashboard_dir / SIDECAR_ROUTE).read_text()
+    collection_function = extract_named_function_body(
+        proxy_content, "isProjectCategoriesPath"
+    )
+    if (
+        collection_function is None
+        or re.search(r'\bmethod\s*===\s*"POST"', collection_function) is None
+    ):
+        return "sidecar proxy missing category collection POST support"
+    item_function = extract_named_function_body(
+        proxy_content, "isProjectCategoryItemPath"
+    )
+    if item_function is None:
+        return "sidecar proxy missing category item route recognition"
+    for method in ("PATCH", "DELETE"):
+        if re.search(rf'\bmethod\s*===\s*"{method}"', item_function) is None:
+            return f"sidecar proxy missing category item {method} support"
+    if 'const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);' not in proxy_content:
+        return "sidecar proxy METHODS_WITH_BODY must include PATCH"
+    for method in ("PATCH", "DELETE"):
+        if (
+            re.search(
+                rf"\bexport\s+const\s+{method}\s*=\s*proxy\s*;",
+                strip_comments(route_content),
+            )
+            is None
+        ):
+            return f"sidecar route missing {method} handler"
     return None
 
 
@@ -93,16 +1136,38 @@ def main() -> int:
             print(f"{relative} still imports or renders LockedPage", file=sys.stderr)
             return 1
 
-    badge_error = verify_main_nav_badges((dashboard_dir / MAIN_NAV).read_text())
-    if badge_error is not None:
-        print(badge_error, file=sys.stderr)
-        return 1
+    checks = (
+        verify_main_nav_groups((dashboard_dir / MAIN_NAV).read_text()),
+        verify_responsive_nav_collapse((dashboard_dir / MAIN_NAV).read_text()),
+        verify_categories_page(dashboard_dir),
+        verify_export_page(dashboard_dir),
+        verify_proxy_contract(dashboard_dir),
+    )
+    for error in checks:
+        if error is not None:
+            print(error, file=sys.stderr)
+            return 1
 
     if os.environ.get("MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK") == "1":
         return 0
 
     try:
         subprocess.run(typecheck_command(dashboard_dir), cwd=dashboard_dir, check=True)
+        subprocess.run(
+            proxy_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
+        subprocess.run(
+            category_schema_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
+        subprocess.run(
+            category_editor_state_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 1

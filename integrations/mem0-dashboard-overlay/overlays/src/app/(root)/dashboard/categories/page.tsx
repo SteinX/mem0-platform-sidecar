@@ -1,82 +1,60 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Plus, Save, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Plus, RefreshCw } from "lucide-react";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { toast } from "@/components/ui/use-toast";
 import { SidecarCategory, SidecarCategoryResponse } from "@/types/sidecar";
-import { sidecarGet, sidecarPut } from "@/utils/sidecar-api";
+import { countSchemaFields, schemaToEditor } from "@/utils/category-schema";
+import { sidecarGet } from "@/utils/sidecar-api";
 import { getSidecarProjectId } from "@/utils/sidecar-project";
 
-type EditableCategory = {
-  id: string;
-  name: string;
-  description: string;
-  schemaText: string;
-  enabled: boolean;
-  strategy: string;
-};
+import { CategoryEditorDrawer } from "./category-editor-drawer";
 
-function createCategoryId(): string {
-  return crypto.randomUUID();
-}
-
-function toEditable(category: SidecarCategory): EditableCategory {
-  return {
-    id: createCategoryId(),
-    name: category.name,
-    description: category.description,
-    schemaText: JSON.stringify(category.schema ?? {}, null, 2),
-    enabled: category.enabled,
-    strategy: category.strategy,
-  };
-}
-
-function emptyCategory(): EditableCategory {
-  return {
-    id: createCategoryId(),
-    name: "",
-    description: "",
-    schemaText: "{}",
-    enabled: true,
-    strategy: "metadata",
-  };
+function formatUpdatedAt(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(date);
 }
 
 export default function CategoriesPage() {
-  const [categories, setCategories] = useState<EditableCategory[]>([]);
+  const [categories, setCategories] = useState<SidecarCategory[]>([]);
   const [projectId, setProjectId] = useState<string | null>(null);
+  const [selectedCategory, setSelectedCategory] = useState<SidecarCategory | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
-  const [hasLoaded, setHasLoaded] = useState(false);
-
-  const enabledCount = useMemo(
-    () => categories.filter((category) => category.enabled).length,
-    [categories],
-  );
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const loadCategories = useCallback(async () => {
     setIsLoading(true);
+    setLoadError(null);
     try {
       const resolvedProjectId = await getSidecarProjectId();
       setProjectId(resolvedProjectId);
       const response = await sidecarGet<SidecarCategoryResponse>(
         `/v1/projects/${resolvedProjectId}/categories`,
       );
-      setCategories(response.categories.map(toEditable));
-      setHasLoaded(true);
+      setCategories(response.categories);
     } catch (error) {
-      setProjectId(null);
-      setHasLoaded(false);
+      const message = error instanceof Error ? error.message : String(error);
+      setLoadError(message);
       toast({
         title: "Failed to load categories",
-        description: error instanceof Error ? error.message : String(error),
+        description: message,
         variant: "destructive",
       });
     } finally {
@@ -88,154 +66,164 @@ export default function CategoriesPage() {
     void loadCategories();
   }, [loadCategories]);
 
-  const updateCategory = (
-    index: number,
-    updates: Partial<EditableCategory>,
-  ) => {
-    setCategories((current) =>
-      current.map((category, itemIndex) =>
-        itemIndex === index ? { ...category, ...updates } : category,
-      ),
-    );
+  const handleSaved = (saved: SidecarCategory) => {
+    setCategories((current) => {
+      const exists = current.some((category) => category.id === saved.id);
+      return exists
+        ? current.map((category) => (category.id === saved.id ? saved : category))
+        : [saved, ...current];
+    });
   };
 
-  const isEditorDisabled = isLoading || isSaving || !hasLoaded || !projectId;
+  const handleDeleted = (categoryId: string) => {
+    setCategories((current) => current.filter((category) => category.id !== categoryId));
+  };
 
-  const saveCategories = async () => {
-    if (!projectId) {
-      toast({
-        title: "Failed to save categories",
-        description: "Sidecar project is not loaded.",
-        variant: "destructive",
-      });
-      return;
-    }
+  const openCreateDrawer = () => {
+    setSelectedCategory(null);
+    setDrawerOpen(true);
+  };
 
-    setIsSaving(true);
-    try {
-      const payload = {
-        categories: categories.map((category) => ({
-          name: category.name.trim(),
-          description: category.description,
-          enabled: category.enabled,
-          strategy: category.strategy,
-          schema: JSON.parse(category.schemaText),
-        })),
-      };
-      const response = await sidecarPut<SidecarCategoryResponse>(
-        `/v1/projects/${projectId}/categories`,
-        payload,
-      );
-      setCategories(response.categories.map(toEditable));
-      toast({ title: "Categories saved", variant: "success" });
-    } catch (error) {
-      toast({
-        title: "Failed to save categories",
-        description: error instanceof Error ? error.message : String(error),
-        variant: "destructive",
-      });
-    } finally {
-      setIsSaving(false);
-    }
+  const openEditDrawer = (category: SidecarCategory) => {
+    setSelectedCategory(category);
+    setDrawerOpen(true);
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-start justify-between gap-4">
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="space-y-1">
           <h1 className="text-xl font-semibold font-fustat">Custom Categories</h1>
           <p className="text-sm text-onSurface-default-secondary">
-            Project {projectId ?? "..."} has {categories.length} categories,{" "}
-            {enabledCount} enabled.
+            Define structured metadata for organizing and retrieving memories.
           </p>
+          <div className="flex min-w-0 flex-wrap gap-x-4 gap-y-1 text-xs text-onSurface-default-tertiary">
+            <span className="min-w-0">
+              Project <span className="break-all font-mono">
+                {projectId ?? (isLoading ? "Loading..." : "Unavailable")}
+              </span>
+            </span>
+            <span>
+              {loadError
+                ? "Category total unavailable"
+                : isLoading
+                ? "Loading categories..."
+                : `${categories.length} ${categories.length === 1 ? "category" : "categories"}`}
+            </span>
+          </div>
         </div>
-        <div className="flex gap-2">
-          <Button
-            variant="outline"
-            onClick={() => setCategories((current) => [...current, emptyCategory()])}
-            disabled={isEditorDisabled}
-          >
-            <Plus className="mr-2 size-4" />
-            Add
-          </Button>
-          <Button onClick={saveCategories} disabled={isEditorDisabled}>
-            <Save className="mr-2 size-4" />
-            Save
-          </Button>
-        </div>
+        <Button onClick={openCreateDrawer} disabled={!projectId || isLoading}>
+          <Plus className="mr-2 size-4" />
+          Create category
+        </Button>
       </div>
 
-      {!hasLoaded ? (
-        <Card className="border-memBorder-primary">
-          <CardContent className="flex flex-col items-start gap-3 p-5">
-            <p className="text-sm text-onSurface-default-secondary">
-              Load categories before editing or saving changes.
-            </p>
-            <Button
-              variant="outline"
-              onClick={() => void loadCategories()}
-              disabled={isLoading}
-            >
-              Retry load
-            </Button>
-          </CardContent>
-        </Card>
+      {loadError ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-y border-memBorder-primary py-4">
+          <p className="text-sm text-onSurface-danger-primary">{loadError}</p>
+          <Button variant="outline" onClick={() => void loadCategories()}>
+            <RefreshCw className="mr-2 size-4" />
+            Retry
+          </Button>
+        </div>
       ) : null}
 
-      <div className="grid gap-4">
-        {categories.map((category, index) => (
-          <Card key={category.id} className="border-memBorder-primary">
-            <CardContent className="grid gap-4 p-5 md:grid-cols-[1fr_1fr_auto]">
-              <div className="space-y-2">
-                <Label>Name</Label>
-                <Input
-                  value={category.name}
-                  onChange={(event) => updateCategory(index, { name: event.target.value })}
-                  disabled={isEditorDisabled}
-                />
-                <Label>Description</Label>
-                <Input
-                  value={category.description}
-                  onChange={(event) =>
-                    updateCategory(index, { description: event.target.value })
-                  }
-                  disabled={isEditorDisabled}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>Schema JSON</Label>
-                <Textarea
-                  className="min-h-28 font-mono text-xs"
-                  value={category.schemaText}
-                  onChange={(event) =>
-                    updateCategory(index, { schemaText: event.target.value })
-                  }
-                  disabled={isEditorDisabled}
-                />
-              </div>
-              <div className="flex items-start gap-3">
-                <Switch
-                  checked={category.enabled}
-                  onCheckedChange={(enabled) => updateCategory(index, { enabled })}
-                  disabled={isEditorDisabled}
-                />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() =>
-                    setCategories((current) =>
-                      current.filter((_, itemIndex) => itemIndex !== index),
-                    )
-                  }
-                  disabled={isEditorDisabled}
-                >
-                  <Trash2 className="size-4 text-onSurface-danger-primary" />
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
+      <div className="border-y border-memBorder-primary">
+        <Table className="table-fixed sm:table-auto">
+          <TableHeader>
+            <TableRow>
+              <TableHead className="sm:min-w-52">Category</TableHead>
+              <TableHead className="hidden sm:table-cell">Status</TableHead>
+              <TableHead className="hidden md:table-cell">Strategy</TableHead>
+              <TableHead className="hidden sm:table-cell">Fields</TableHead>
+              <TableHead className="hidden lg:table-cell">Version</TableHead>
+              <TableHead className="hidden xl:table-cell">Updated</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {isLoading ? (
+              <TableRow>
+                <TableCell colSpan={6} className="h-24 text-center text-onSurface-default-secondary">
+                  Loading categories...
+                </TableCell>
+              </TableRow>
+            ) : categories.length === 0 && !loadError ? (
+              <TableRow>
+                <TableCell colSpan={6} className="h-24 text-center text-onSurface-default-secondary">
+                  No categories yet.
+                </TableCell>
+              </TableRow>
+            ) : (
+              categories.map((category) => {
+                const editor = schemaToEditor(category.schema);
+                const isAdvanced = editor.mode === "advanced";
+                return (
+                  <TableRow
+                    key={category.id}
+                    role="button"
+                    tabIndex={0}
+                    className="cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    onClick={() => openEditDrawer(category)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        openEditDrawer(category);
+                      }
+                    }}
+                  >
+                    <TableCell className="break-words">
+                      <div className="min-w-0 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="min-w-0 break-words font-medium">
+                            {category.name}
+                          </span>
+                          {isAdvanced ? <Badge variant="outline">Advanced</Badge> : null}
+                        </div>
+                        <p className="whitespace-normal break-words text-xs text-onSurface-default-secondary sm:max-w-xl sm:truncate">
+                          {category.description || "No description"}
+                        </p>
+                        <span className="sm:hidden">
+                          <span className={category.enabled
+                            ? "text-onSurface-success-primary"
+                            : "text-onSurface-default-secondary"}
+                          >
+                            {category.enabled ? "Enabled" : "Disabled"}
+                          </span>
+                        </span>
+                      </div>
+                    </TableCell>
+                    <TableCell className="hidden sm:table-cell">
+                      <span className={category.enabled
+                        ? "text-onSurface-success-primary"
+                        : "text-onSurface-default-secondary"}
+                      >
+                        {category.enabled ? "Enabled" : "Disabled"}
+                      </span>
+                    </TableCell>
+                    <TableCell className="hidden capitalize md:table-cell">{category.strategy}</TableCell>
+                    <TableCell className="hidden sm:table-cell">{countSchemaFields(category.schema)}</TableCell>
+                    <TableCell className="hidden lg:table-cell">v{category.version}</TableCell>
+                    <TableCell className="hidden whitespace-nowrap xl:table-cell">
+                      {formatUpdatedAt(category.updated_at)}
+                    </TableCell>
+                  </TableRow>
+                );
+              })
+            )}
+          </TableBody>
+        </Table>
       </div>
+
+      {projectId ? (
+        <CategoryEditorDrawer
+          projectId={projectId}
+          category={selectedCategory}
+          open={drawerOpen}
+          onOpenChange={setDrawerOpen}
+          onSaved={handleSaved}
+          onDeleted={handleDeleted}
+        />
+      ) : null}
     </div>
   );
 }

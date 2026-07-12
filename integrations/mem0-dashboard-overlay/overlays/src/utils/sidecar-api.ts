@@ -35,20 +35,36 @@ export async function sidecarGet<T>(
   return parseResponse<T>(response);
 }
 
-export async function sidecarPut<T>(path: string, body: unknown): Promise<T> {
+async function sidecarRequest<T>(
+  method: "POST" | "PUT" | "PATCH",
+  path: string,
+  body: unknown,
+): Promise<T> {
   const response = await fetch(`${SIDECAR_API_PREFIX}${normalizeSidecarPath(path)}`, {
-    method: "PUT",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   return parseResponse<T>(response);
 }
 
+export async function sidecarPut<T>(path: string, body: unknown): Promise<T> {
+  return sidecarRequest<T>("PUT", path, body);
+}
+
 export async function sidecarPost<T>(path: string, body: unknown): Promise<T> {
+  return sidecarRequest<T>("POST", path, body);
+}
+
+export async function sidecarPatch<T>(path: string, body: unknown): Promise<T> {
+  return sidecarRequest<T>("PATCH", path, body);
+}
+
+export async function sidecarDelete(path: string): Promise<void> {
   const response = await fetch(`${SIDECAR_API_PREFIX}${normalizeSidecarPath(path)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    method: "DELETE",
   });
-  return parseResponse<T>(response);
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
 }

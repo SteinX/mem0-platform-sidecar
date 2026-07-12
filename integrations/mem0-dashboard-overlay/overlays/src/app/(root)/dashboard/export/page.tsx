@@ -9,9 +9,11 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { toast } from "@/components/ui/use-toast";
 import {
   SidecarExportDownload,
+  SidecarExportFilters,
   SidecarExportJob,
   SidecarExportListResponse,
 } from "@/types/sidecar";
@@ -32,6 +34,32 @@ function downloadJson(filename: string, payload: SidecarExportDownload) {
     document.body.removeChild(anchor);
     URL.revokeObjectURL(url);
   }, 0);
+}
+
+function formatFilterSummary(filters: Record<string, string>): string[] {
+  return Object.entries(filters)
+    .filter(([, value]) => Boolean(value))
+    .map(([key, value]) => `${key}: ${value}`);
+}
+
+function formatError(error: Record<string, unknown>): string | null {
+  for (const key of ["message", "detail", "reason"]) {
+    if (typeof error[key] === "string") return error[key];
+  }
+  return Object.keys(error).length > 0 ? JSON.stringify(error) : null;
+}
+
+function formatTime(value: string | null): string | null {
+  if (!value) return null;
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  const absoluteTime = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+  return `${formatDistanceToNow(new Date(value), { addSuffix: true })} (${absoluteTime})`;
 }
 
 export default function ExportPage() {
@@ -91,15 +119,15 @@ export default function ExportPage() {
           user_id: userId.trim(),
           agent_id: agentId.trim(),
           run_id: runId.trim(),
-        }).filter(([, value]) => value),
-      );
-      await sidecarPost<SidecarExportJob>("/v1/exports", {
+        }).filter(([, value]) => Boolean(value)),
+      ) as SidecarExportFilters;
+      const created = await sidecarPost<SidecarExportJob>("/v1/exports", {
         project_id: projectId,
         format: "json",
         filters,
       });
+      setJobs((current) => [created, ...current.filter((job) => job.id !== created.id)]);
       toast({ title: "Export created", variant: "success" });
-      await loadJobs();
     } catch (error) {
       toast({
         title: "Failed to create export",
@@ -137,16 +165,17 @@ export default function ExportPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-start justify-between gap-4">
-        <div className="space-y-1">
+    <div className="w-full min-w-0 space-y-6">
+      <div className="flex min-w-0 flex-col items-start gap-4 sm:flex-row sm:justify-between">
+        <div className="min-w-0 space-y-1">
           <h1 className="font-fustat text-xl font-semibold">Export</h1>
-          <p className="text-sm text-onSurface-default-secondary">
+          <p className="break-words text-sm text-onSurface-default-secondary">
             Export scoped memories from project {projectId ?? "..."}.
           </p>
         </div>
         <Button
           variant="outline"
+          className="shrink-0"
           onClick={() => void loadJobs()}
           disabled={isLoading}
         >
@@ -155,50 +184,115 @@ export default function ExportPage() {
         </Button>
       </div>
 
-      <Card className="border-memBorder-primary">
-        <CardContent className="grid gap-4 p-5 md:grid-cols-4">
-          <div className="space-y-2">
-            <Label>App ID</Label>
-            <Input value={appId} onChange={(event) => setAppId(event.target.value)} />
+      <Card className="w-full min-w-0 border-memBorder-primary">
+        <CardContent className="w-full min-w-0 space-y-5 p-5">
+          <div className="flex w-full min-w-0 flex-wrap items-start justify-between gap-3 border-b border-memBorder-primary pb-4">
+            <div className="min-w-0 space-y-1">
+              <h2 className="font-medium">Create export</h2>
+              <p className="text-sm text-onSurface-default-secondary">
+                Export memories from this configured project.
+              </p>
+            </div>
+            <div className="w-full min-w-0 space-y-1 sm:w-auto sm:min-w-44">
+              <Label>Project</Label>
+              <p className="break-all font-mono text-sm sm:truncate" title={projectId ?? undefined}>
+                {projectId ?? "Loading project..."}
+              </p>
+            </div>
           </div>
-          <div className="space-y-2">
-            <Label>User ID</Label>
-            <Input value={userId} onChange={(event) => setUserId(event.target.value)} />
+
+          <fieldset className="w-full min-w-0 space-y-3">
+            <legend className="text-sm font-medium">Export format</legend>
+            <RadioGroup
+              defaultValue="json"
+              className="grid w-full min-w-0 gap-2 sm:grid-cols-3"
+              aria-label="Export format"
+            >
+              <Label
+                htmlFor="export-format-json"
+                className="flex min-h-16 w-full min-w-0 cursor-pointer items-center gap-3 rounded-md border border-memBorder-primary px-3 py-2"
+              >
+                <RadioGroupItem value="json" id="export-format-json" />
+                <span className="min-w-0 space-y-0.5">
+                  <span className="block font-medium">JSON</span>
+                  <span className="block break-words text-xs font-normal text-onSurface-default-secondary">
+                    Structured memory export
+                  </span>
+                </span>
+              </Label>
+              <Label
+                htmlFor="export-format-csv"
+                className="flex min-h-16 w-full min-w-0 cursor-not-allowed items-center gap-3 rounded-md border border-memBorder-primary px-3 py-2 opacity-60"
+              >
+                <RadioGroupItem value="csv" id="export-format-csv" disabled />
+                <span className="min-w-0 space-y-0.5">
+                  <span className="block font-medium">CSV</span>
+                  <span className="block text-xs font-normal text-onSurface-default-secondary">
+                    Coming soon
+                  </span>
+                </span>
+              </Label>
+              <Label
+                htmlFor="export-format-pydantic"
+                className="flex min-h-16 w-full min-w-0 cursor-not-allowed items-center gap-3 rounded-md border border-memBorder-primary px-3 py-2 opacity-60"
+              >
+                <RadioGroupItem value="pydantic" id="export-format-pydantic" disabled />
+                <span className="min-w-0 space-y-0.5">
+                  <span className="block font-medium">Pydantic</span>
+                  <span className="block text-xs font-normal text-onSurface-default-secondary">
+                    Coming soon
+                  </span>
+                </span>
+              </Label>
+            </RadioGroup>
+          </fieldset>
+
+          <div className="grid w-full min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="min-w-0 space-y-2">
+              <Label htmlFor="export-app-id">App ID</Label>
+              <Input className="w-full min-w-0" id="export-app-id" value={appId} onChange={(event) => setAppId(event.target.value)} />
+            </div>
+            <div className="min-w-0 space-y-2">
+              <Label htmlFor="export-user-id">User ID</Label>
+              <Input className="w-full min-w-0" id="export-user-id" value={userId} onChange={(event) => setUserId(event.target.value)} />
+            </div>
+            <div className="min-w-0 space-y-2">
+              <Label htmlFor="export-agent-id">Agent ID</Label>
+              <Input className="w-full min-w-0" id="export-agent-id" value={agentId} onChange={(event) => setAgentId(event.target.value)} />
+            </div>
+            <div className="min-w-0 space-y-2">
+              <Label htmlFor="export-run-id">Run ID</Label>
+              <Input className="w-full min-w-0" id="export-run-id" value={runId} onChange={(event) => setRunId(event.target.value)} />
+            </div>
           </div>
-          <div className="space-y-2">
-            <Label>Agent ID</Label>
-            <Input value={agentId} onChange={(event) => setAgentId(event.target.value)} />
-          </div>
-          <div className="space-y-2">
-            <Label>Run ID</Label>
-            <Input value={runId} onChange={(event) => setRunId(event.target.value)} />
-          </div>
-          <div className="md:col-span-4">
-            <Button onClick={createExport} disabled={isCreating || !projectId}>
-              <FolderInput className="mr-2 size-4" />
-              Create JSON Export
-            </Button>
-          </div>
+
+          <Button onClick={createExport} disabled={isCreating || !projectId}>
+            <FolderInput className="mr-2 size-4" />
+            Create export
+          </Button>
         </CardContent>
       </Card>
 
-      <div className="grid gap-3">
+      <section className="w-full min-w-0 space-y-3" aria-labelledby="recent-export-jobs">
+        <div>
+          <h2 id="recent-export-jobs" className="font-medium">Recent jobs</h2>
+        </div>
         {isLoading ? (
-          <Card className="border-memBorder-primary">
-            <CardContent className="p-5">
+          <Card className="w-full min-w-0 border-memBorder-primary">
+            <CardContent className="w-full min-w-0 p-5">
               <p className="text-sm text-onSurface-default-secondary">
                 Loading export jobs...
               </p>
             </CardContent>
           </Card>
         ) : loadError ? (
-          <Card className="border-memBorder-primary">
-            <CardContent className="flex flex-col items-start gap-3 p-5">
-              <div className="space-y-1">
+          <Card className="w-full min-w-0 border-memBorder-primary">
+            <CardContent className="flex w-full min-w-0 flex-col items-start gap-3 p-5">
+              <div className="min-w-0 space-y-1">
                 <p className="text-sm text-onSurface-default-secondary">
                   Failed to load export jobs.
                 </p>
-                <p className="text-xs text-onSurface-default-tertiary">{loadError}</p>
+                <p className="break-all text-xs text-onSurface-default-tertiary">{loadError}</p>
               </div>
               <Button
                 variant="outline"
@@ -210,8 +304,8 @@ export default function ExportPage() {
             </CardContent>
           </Card>
         ) : jobs.length === 0 ? (
-          <Card className="border-memBorder-primary">
-            <CardContent className="p-5">
+          <Card className="w-full min-w-0 border-memBorder-primary">
+            <CardContent className="w-full min-w-0 p-5">
               <p className="text-sm text-onSurface-default-secondary">
                 No exports yet.
               </p>
@@ -219,33 +313,74 @@ export default function ExportPage() {
           </Card>
         ) : (
           jobs.map((job) => (
-            <Card key={job.id} className="border-memBorder-primary">
-              <CardContent className="flex flex-wrap items-center justify-between gap-4 p-4">
-                <div className="space-y-1">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-xs">{job.id}</span>
-                    <Badge variant="outline">{job.status}</Badge>
-                  </div>
-                  <p className="text-sm text-onSurface-default-secondary">
-                    {job.exported_count} exported, {job.skipped_count} skipped
-                  </p>
-                  <p className="text-xs text-onSurface-default-tertiary">
-                    Created {formatDistanceToNow(new Date(job.created_at), { addSuffix: true })}
-                  </p>
-                </div>
-                <Button
-                  variant="outline"
-                  disabled={job.status !== "SUCCEEDED"}
-                  onClick={() => void downloadExport(job)}
-                >
-                  <Download className="mr-2 size-4" />
-                  Download
-                </Button>
-              </CardContent>
-            </Card>
+            <ExportJobRow key={job.id} job={job} onDownload={downloadExport} />
           ))
         )}
-      </div>
+      </section>
     </div>
+  );
+}
+
+function ExportJobRow({
+  job,
+  onDownload,
+}: {
+  job: SidecarExportJob;
+  onDownload: (job: SidecarExportJob) => Promise<void>;
+}) {
+  const filterSummary = formatFilterSummary(job.filters);
+  const errorSummary = formatError(job.error);
+
+  return (
+    <Card className="w-full min-w-0 border-memBorder-primary">
+      <CardContent className="grid w-full min-w-0 gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_auto]">
+        <div className="min-w-0 space-y-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <span className="min-w-0 break-all font-mono text-xs" title={job.id}>{job.id}</span>
+            <Badge variant="outline">{job.status}</Badge>
+            <Badge variant="outline">JSON</Badge>
+          </div>
+          <div className="flex min-w-0 flex-wrap gap-2">
+            {filterSummary.length > 0 ? (
+              filterSummary.map((filter) => <Badge className="max-w-full whitespace-normal break-all text-left" key={filter} variant="outline">{filter}</Badge>)
+            ) : (
+              <span className="text-sm text-onSurface-default-secondary">All scoped memories</span>
+            )}
+          </div>
+          <dl className="grid min-w-0 gap-x-5 gap-y-2 text-sm sm:grid-cols-2 xl:grid-cols-4">
+            <div className="min-w-0">
+              <dt className="text-xs text-onSurface-default-tertiary">Exported</dt>
+              <dd>{job.exported_count}</dd>
+            </div>
+            <div className="min-w-0">
+              <dt className="text-xs text-onSurface-default-tertiary">Skipped</dt>
+              <dd>{job.skipped_count}</dd>
+            </div>
+            <div className="min-w-0">
+              <dt className="text-xs text-onSurface-default-tertiary">Created</dt>
+              <dd className="break-words">{formatTime(job.created_at)}</dd>
+            </div>
+            {job.completed_at ? (
+              <div className="min-w-0">
+                <dt className="text-xs text-onSurface-default-tertiary">Completed</dt>
+                <dd className="break-words">{formatTime(job.completed_at)}</dd>
+              </div>
+            ) : null}
+          </dl>
+          {job.status === "FAILED" && errorSummary ? (
+            <p className="break-all text-sm text-onSurface-danger-primary">{errorSummary}</p>
+          ) : null}
+        </div>
+        <Button
+          variant="outline"
+          className="w-full sm:w-auto lg:self-start"
+          disabled={job.status !== "SUCCEEDED"}
+          onClick={() => void onDownload(job)}
+        >
+          <Download className="mr-2 size-4" />
+          Download
+        </Button>
+      </CardContent>
+    </Card>
   );
 }

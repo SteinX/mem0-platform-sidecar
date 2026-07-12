@@ -1,8 +1,16 @@
 import json
 
 import pytest
+from sqlalchemy import UniqueConstraint
+from sqlalchemy.exc import IntegrityError
 
-from mem0_sidecar.store.models import EventStatus, ExportStatus, JobStatus, Project
+from mem0_sidecar.store.models import (
+    Category,
+    EventStatus,
+    ExportStatus,
+    JobStatus,
+    Project,
+)
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EntityRepository,
@@ -12,6 +20,103 @@ from mem0_sidecar.store.repositories import (
     MemoryIndexRepository,
     ProjectRepository,
 )
+
+
+def test_category_model_enforces_unique_name_per_project(db_session):
+    constraints = {
+        constraint.name: tuple(column.name for column in constraint.columns)
+        for constraint in Category.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+
+    assert constraints["uq_categories_project_id_name"] == ("project_id", "name")
+
+    projects = ProjectRepository(db_session)
+    projects.upsert_default_project(
+        project_id="alpha", name="alpha", mem0_base_url="http://mem0:8000"
+    )
+    projects.upsert_default_project(
+        project_id="beta", name="beta", mem0_base_url="http://mem0:8000"
+    )
+    db_session.add_all(
+        [
+            Category(project_id="alpha", name="work"),
+            Category(project_id="beta", name="work"),
+        ]
+    )
+    db_session.flush()
+    db_session.add(Category(project_id="alpha", name="work"))
+
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_category_repository_item_lifecycle_is_project_scoped(db_session):
+    projects = ProjectRepository(db_session)
+    projects.upsert_default_project(
+        project_id="alpha", name="alpha", mem0_base_url="http://mem0:8000"
+    )
+    projects.upsert_default_project(
+        project_id="beta", name="beta", mem0_base_url="http://mem0:8000"
+    )
+    repository = CategoryRepository(db_session)
+
+    created = repository.create_project_category(
+        project_id="alpha",
+        item={
+            "name": "preferences",
+            "description": "Durable preferences",
+            "schema": {"type": "object"},
+            "enabled": True,
+            "strategy": "metadata",
+        },
+    )
+    db_session.commit()
+
+    assert repository.get_project_category("alpha", created.id).name == "preferences"
+    assert repository.find_project_category_by_name("alpha", "preferences") is not None
+    assert repository.find_project_category_by_name("beta", "preferences") is None
+
+    updated = repository.update_project_category(
+        "alpha", created.id, {"description": "Updated", "enabled": False}
+    )
+    db_session.commit()
+    assert updated.description == "Updated"
+    assert updated.enabled == 0
+    assert updated.version == 2
+
+    repository.delete_project_category("alpha", created.id)
+    db_session.commit()
+    with pytest.raises(KeyError):
+        repository.get_project_category("alpha", created.id)
+
+
+def test_category_repository_replaces_category_with_same_name(db_session):
+    projects = ProjectRepository(db_session)
+    projects.upsert_default_project(
+        project_id="alpha", name="alpha", mem0_base_url="http://mem0:8000"
+    )
+    repository = CategoryRepository(db_session)
+    original = repository.create_project_category(
+        project_id="alpha",
+        item={"name": "work", "description": "Before", "schema": {}},
+    )
+    original_id = original.id
+    db_session.commit()
+
+    replacements = repository.replace_project_categories(
+        project_id="alpha",
+        categories=[{"name": "work", "description": "After", "schema": {}}],
+    )
+    db_session.commit()
+
+    assert len(replacements) == 1
+    assert replacements[0].id != original_id
+    assert replacements[0].description == "After"
+    remaining_ids = [
+        category.id for category in repository.list_project_categories("alpha")
+    ]
+    assert remaining_ids == [replacements[0].id]
 
 
 def test_repositories_support_control_plane_flow(db_session) -> None:

@@ -12,6 +12,12 @@ Phase 1 covers:
 That means Phase 1 self-hosts those two pages only. Other Cloud-only dashboard
 pages and features remain unchanged and are not implemented by this overlay.
 
+Categories and Export appear as first-class `MEMORY TOOLS` in the dashboard
+navigation. Categories starts with a form builder, with the advanced raw schema
+editor available as a fallback. Category collection and individual mutations are
+proxied through the configured runtime project scope. Export remains JSON-only;
+CSV and Pydantic choices are visible but disabled as future formats.
+
 Apply to an upstream dashboard checkout:
 
 ```bash

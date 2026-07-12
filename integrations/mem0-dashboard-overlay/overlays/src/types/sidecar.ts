@@ -1,3 +1,13 @@
+export type SidecarCategoryInput = {
+  name: string;
+  description: string;
+  schema: Record<string, unknown>;
+  enabled: boolean;
+  strategy: string;
+};
+
+export type SidecarCategoryPatch = Partial<SidecarCategoryInput>;
+
 export type SidecarCategory = {
   id: string;
   project_id: string;
@@ -14,6 +24,9 @@ export type SidecarCategory = {
 export type SidecarCategoryResponse = {
   categories: SidecarCategory[];
 };
+
+export type SidecarExportFilterKey = "app_id" | "user_id" | "agent_id" | "run_id";
+export type SidecarExportFilters = Partial<Record<SidecarExportFilterKey, string>>;
 
 export type SidecarExportJob = {
   id: string;

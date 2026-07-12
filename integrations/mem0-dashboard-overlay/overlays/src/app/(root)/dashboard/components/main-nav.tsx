@@ -15,8 +15,9 @@ import {
   WebhookIcon,
   Wrench,
 } from "lucide-react";
-import { useSelector } from "react-redux";
+import { useDispatch, useSelector, useStore } from "react-redux";
 import { RootState } from "@/store/store";
+import { toggleSidebar } from "@/store/reducers/layoutReducer";
 import { Badge } from "@/components/ui/badge";
 import {
   Collapsible,
@@ -36,15 +37,124 @@ import {
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 
+type NavigationItem = {
+  title: string;
+  url: string;
+  icon: React.ElementType;
+  badge?: string;
+};
+
+type NavigationItemsProps = {
+  group: "memory-tools" | "cloud-features";
+  items: readonly NavigationItem[];
+  pathname: string;
+  isSidebarCollapsed: boolean;
+};
+
+const MEMORY_TOOL_ITEMS: NavigationItem[] = [
+  {
+    title: "Categories",
+    url: "/dashboard/categories",
+    icon: Tags,
+  },
+  {
+    title: "Export",
+    url: "/dashboard/export",
+    icon: FolderInput,
+  },
+];
+
+const CLOUD_FEATURE_ITEMS: NavigationItem[] = [
+  {
+    title: "Webhooks",
+    url: "/dashboard/webhooks",
+    icon: WebhookIcon,
+    badge: "PRO",
+  },
+  {
+    title: "Analytics",
+    url: "/dashboard/analytics",
+    icon: ChartLine,
+    badge: "PRO",
+  },
+];
+
+function NavigationItems({
+  items,
+  pathname,
+  isSidebarCollapsed,
+}: NavigationItemsProps) {
+  return (
+    <>
+      {items.map((item) => (
+        <SidebarMenuItem key={item.title}>
+          <SidebarMenuButton
+            asChild
+            collapsed={isSidebarCollapsed}
+            active={pathname === item.url}
+            tooltip={isSidebarCollapsed ? item.title : undefined}
+          >
+            <Link
+              href={item.url}
+              className={cn(
+                "flex items-center w-full",
+                isSidebarCollapsed ? "justify-center mx-auto" : "gap-1.5",
+              )}
+            >
+              <item.icon className="size-4 shrink-0" />
+              {!isSidebarCollapsed && (
+                <>
+                  <span>{item.title}</span>
+                  {item.badge && (
+                    <Badge
+                      variant="outline"
+                      className="ml-auto text-memGold-600 border-memGold-300 typo-caption-sm px-1.5 py-0"
+                    >
+                      {item.badge}
+                    </Badge>
+                  )}
+                </>
+              )}
+            </Link>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
+      ))}
+    </>
+  );
+}
+
 export function MainNav({
   className,
   ...props
 }: React.HTMLAttributes<HTMLElement>) {
   const pathname = usePathname();
+  const dispatch = useDispatch();
+  const store = useStore<RootState>();
   const isSidebarCollapsed = useSelector(
     (state: RootState) => state.layout.isSidebarCollapsed,
   );
   const [isCloudOpen, setIsCloudOpen] = React.useState(true);
+
+  React.useEffect(() => {
+    const sidebarMediaQuery = window.matchMedia("(max-width: 767px)");
+    const collapseSidebarOnNarrowViewport = () => {
+      if (
+        sidebarMediaQuery.matches &&
+        !store.getState().layout.isSidebarCollapsed
+      ) {
+        dispatch(toggleSidebar());
+      }
+    };
+
+    collapseSidebarOnNarrowViewport();
+    sidebarMediaQuery.addEventListener("change", collapseSidebarOnNarrowViewport);
+    return () => {
+      sidebarMediaQuery.removeEventListener(
+        "change",
+        collapseSidebarOnNarrowViewport,
+      );
+    };
+  }, [dispatch, store]);
 
   return (
     <Sidebar
@@ -110,6 +220,24 @@ export function MainNav({
                 <div className="h-[1px] w-full bg-memBorder-primary my-2" />
               )}
 
+              <div className="flex flex-col gap-0">
+                {!isSidebarCollapsed && (
+                  <SidebarGroupLabel className="mb-0">
+                    MEMORY TOOLS
+                  </SidebarGroupLabel>
+                )}
+                <NavigationItems
+                  group="memory-tools"
+                  items={MEMORY_TOOL_ITEMS}
+                  pathname={pathname}
+                  isSidebarCollapsed={isSidebarCollapsed}
+                />
+              </div>
+
+              {isSidebarCollapsed && (
+                <div className="h-[1px] w-full bg-memBorder-primary my-2" />
+              )}
+
               <Collapsible
                 open={isCloudOpen}
                 onOpenChange={setIsCloudOpen}
@@ -129,70 +257,12 @@ export function MainNav({
                   </CollapsibleTrigger>
                 )}
                 <CollapsibleContent className="flex flex-col gap-0">
-                  {[
-                    {
-                      title: "Categories",
-                      url: "/dashboard/categories",
-                      icon: Tags,
-                      badge: "SELF-HOSTED",
-                    },
-                    {
-                      title: "Webhooks",
-                      url: "/dashboard/webhooks",
-                      icon: WebhookIcon,
-                      badge: "PRO",
-                    },
-                    {
-                      title: "Analytics",
-                      url: "/dashboard/analytics",
-                      icon: ChartLine,
-                      badge: "PRO",
-                    },
-                    {
-                      title: "Export",
-                      url: "/dashboard/export",
-                      icon: FolderInput,
-                      badge: "SELF-HOSTED",
-                    },
-                  ].map((item) => (
-                    <SidebarMenuItem key={item.title}>
-                      <SidebarMenuButton
-                        asChild
-                        collapsed={isSidebarCollapsed}
-                        active={pathname === item.url}
-                        tooltip={isSidebarCollapsed ? item.title : undefined}
-                      >
-                        <Link
-                          href={item.url}
-                          className={cn(
-                            "flex items-center w-full",
-                            isSidebarCollapsed
-                              ? "justify-center mx-auto"
-                              : "gap-1.5",
-                          )}
-                        >
-                          <item.icon className="size-4 shrink-0" />
-                          {!isSidebarCollapsed && (
-                            <>
-                              <span>{item.title}</span>
-                              {item.badge && (
-                                <Badge
-                                  variant="outline"
-                                  className={
-                                    item.badge === "PRO"
-                                      ? "ml-auto text-memGold-600 border-memGold-300 typo-caption-sm px-1.5 py-0"
-                                      : "ml-auto text-emerald-600 border-emerald-300 typo-caption-sm px-1.5 py-0"
-                                  }
-                                >
-                                  {item.badge}
-                                </Badge>
-                              )}
-                            </>
-                          )}
-                        </Link>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  ))}
+                  <NavigationItems
+                    group="cloud-features"
+                    items={CLOUD_FEATURE_ITEMS}
+                    pathname={pathname}
+                    isSidebarCollapsed={isSidebarCollapsed}
+                  />
                 </CollapsibleContent>
               </Collapsible>
 
