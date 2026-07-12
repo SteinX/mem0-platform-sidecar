@@ -39,6 +39,44 @@ function proxyOptions(fetchUpstream) {
   };
 }
 
+async function testCategoryCollectionPostForcesConfiguredProject(proxy) {
+  const calls = [];
+  const payload = {
+    name: "Support request",
+    description: "Customer support request",
+    schema: { type: "object" },
+  };
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/projects/forged/categories?project_id=also-forged&trace=create",
+      {
+        method: "POST",
+        headers: { "X-Request-ID": "category-create-123" },
+        body: JSON.stringify(payload),
+      },
+    ),
+    "/v1/projects/forged/categories",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ id: "support-request", ...payload });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/projects/runtime%20project/categories?trace=create",
+  );
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers.get("Content-Type"), "application/json");
+  assert.equal(
+    calls[0].init.headers.get("X-Request-ID"),
+    "category-create-123",
+  );
+  assert.deepEqual(JSON.parse(calls[0].init.body), payload);
+}
+
 async function testPatchRewritesProjectEncodesCategoryAndForwardsBody(proxy) {
   const calls = [];
   const payload = { description: "Updated", enabled: false };
@@ -117,6 +155,76 @@ async function testExportDeleteIsRejected(proxy) {
   assert.equal(fetchCalled, false);
 }
 
+async function testExportPostForcesConfiguredProjectInBodyAndQuery(proxy) {
+  const calls = [];
+  const payload = {
+    project_id: "forged-body-project",
+    filters: { user_id: "customer-1" },
+    format: "json",
+  };
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/exports?project_id=forged-query-project&trace=export",
+      {
+        method: "POST",
+        headers: { "X-Request-ID": "export-create-123" },
+        body: JSON.stringify(payload),
+      },
+    ),
+    "/v1/exports",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ id: "export-1", status: "pending" });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/exports?trace=export&project_id=runtime+project",
+  );
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers.get("Content-Type"), "application/json");
+  assert.equal(
+    calls[0].init.headers.get("X-Request-ID"),
+    "export-create-123",
+  );
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    ...payload,
+    project_id: "runtime project",
+  });
+}
+
+async function testExportListForcesConfiguredProjectInQuery(proxy) {
+  const calls = [];
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/exports?project_id=forged-query-project&limit=25",
+      {
+        method: "GET",
+        headers: { "X-Request-ID": "export-list-123" },
+      },
+    ),
+    "/v1/exports",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ exports: [] });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/exports?limit=25&project_id=runtime+project",
+  );
+  assert.equal(calls[0].init.method, "GET");
+  assert.equal(calls[0].init.headers.get("Content-Type"), "application/json");
+  assert.equal(calls[0].init.headers.get("X-Request-ID"), "export-list-123");
+  assert.equal(calls[0].init.body, undefined);
+}
+
 async function main() {
   if (process.argv.length !== 3) {
     throw new Error("usage: test-sidecar-proxy.cjs <dashboard-dir>");
@@ -124,13 +232,20 @@ async function main() {
   const dashboardDir = path.resolve(process.argv[2]);
   const { proxySidecarRequest } = await loadProxyModule(dashboardDir);
 
+  await testCategoryCollectionPostForcesConfiguredProject(
+    proxySidecarRequest,
+  );
   await testPatchRewritesProjectEncodesCategoryAndForwardsBody(
     proxySidecarRequest,
   );
   await testDeleteForwardsNoContent(proxySidecarRequest);
   await testDeleteForwardsParsedError(proxySidecarRequest);
   await testExportDeleteIsRejected(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 5 contracts passed");
+  await testExportPostForcesConfiguredProjectInBodyAndQuery(
+    proxySidecarRequest,
+  );
+  await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
+  console.log("sidecar proxy request harness: 8 contracts passed");
 }
 
 main().catch((error) => {
