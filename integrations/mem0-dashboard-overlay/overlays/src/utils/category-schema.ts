@@ -122,7 +122,12 @@ export function editorToSchema(fields: CategoryField[]): SchemaObject {
   const required: string[] = [];
 
   for (const field of fields) {
-    properties[field.key] = fieldToSchema(field);
+    Object.defineProperty(properties, field.key, {
+      value: fieldToSchema(field),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
     if (field.required) {
       required.push(field.key);
     }

@@ -192,6 +192,40 @@ function testUnsupportedPathsUseBracketNotation(schema) {
   );
 }
 
+function assertRequiredOwnPropertySurvivesJson(schemaObject, key) {
+  assert.equal(Object.hasOwn(schemaObject.properties, key), true);
+  assert.equal(
+    Object.prototype.propertyIsEnumerable.call(schemaObject.properties, key),
+    true,
+  );
+  assert.ok(schemaObject.required.includes(key));
+
+  const parsed = JSON.parse(JSON.stringify(schemaObject));
+  assert.equal(Object.hasOwn(parsed.properties, key), true);
+  assert.deepEqual(parsed.properties[key], { type: "string" });
+  assert.ok(parsed.required.includes(key));
+}
+
+function testProtoKeySurvivesAtRoot(schema) {
+  const field = emptyField(schema, "__proto__", "string");
+  field.required = true;
+
+  assertRequiredOwnPropertySurvivesJson(
+    schema.editorToSchema([field]),
+    "__proto__",
+  );
+}
+
+function testProtoKeySurvivesInObjectChild(schema) {
+  const child = emptyField(schema, "__proto__", "string");
+  child.required = true;
+  const parent = emptyField(schema, "profile", "object");
+  parent.children = [child];
+
+  const result = schema.editorToSchema([parent]);
+  assertRequiredOwnPropertySurvivesJson(result.properties.profile, "__proto__");
+}
+
 function main() {
   if (process.argv.length !== 3) {
     throw new Error("usage: test-category-schema.cjs <dashboard-dir>");
@@ -207,7 +241,9 @@ function main() {
   testMalformedRequiredUsesAdvancedMode(schema);
   testAdvancedSchemasStillCountProperties(schema);
   testUnsupportedPathsUseBracketNotation(schema);
-  console.log("category schema harness: 9 contracts passed");
+  testProtoKeySurvivesAtRoot(schema);
+  testProtoKeySurvivesInObjectChild(schema);
+  console.log("category schema harness: 11 contracts passed");
 }
 
 try {
