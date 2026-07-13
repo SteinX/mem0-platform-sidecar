@@ -96,6 +96,7 @@ function loadModules(dashboardDir) {
     {
       ...common,
       "@/components/ui/button": { Button: ui.Button },
+      "@/components/ui/tooltip": ui.tooltip,
       "@/components/self-hosted/explorer/explorer-component-state":
         componentState,
     },
@@ -173,6 +174,23 @@ function testSingleEntityBadgePreservesExactAccessibleId(modules) {
   assert.ok(html.includes(`aria-label="Agent entity ${escapedId}"`), html);
   assert.ok(html.includes("Primary &lt;Agent&gt;"), html);
   assert.ok(html.includes('tabindex="0"'), html);
+  assert.ok(html.includes('data-tooltip-trigger="focus"'), html);
+  assert.ok(html.includes('data-tooltip-content="true"'), html);
+  assert.ok(html.includes("focus-visible:ring-2"), html);
+  assert.ok(html.includes(escapedId), html);
+}
+
+function testPassiveLegacyEntityBadgesStayOutOfTabOrder(modules) {
+  const html = modules.ReactDOMServer.renderToStaticMarkup(
+    modules.React.createElement(modules.EntityBadges, {
+      userId: "user-1",
+      agentId: "agent-1",
+    }),
+  );
+
+  assert.equal(html.includes("tabindex="), false, html);
+  assert.equal(html.includes("data-tooltip-trigger"), false, html);
+  assert.equal(html.includes("focus-visible:ring-2"), false, html);
 }
 
 function testCredentialErrorsAreFullyRedacted(state) {
@@ -191,6 +209,21 @@ function testCredentialErrorsAreFullyRedacted(state) {
       "Delete failed; proxy-authorization: Bearer proxy-secret; retry",
       "Delete failed; proxy-authorization=[redacted]; retry",
       "proxy-secret",
+    ],
+    [
+      'Authorization: Custom key="alpha beta" signature="sig value"; retry scheduled',
+      "Authorization=[redacted]; retry scheduled",
+      "sig value",
+    ],
+    [
+      'Proxy-Authorization=Digest username="Mufasa" realm="testrealm" nonce="abc", continue normally',
+      "Proxy-Authorization=[redacted], continue normally",
+      "nonce",
+    ],
+    [
+      "Authorization: Custom account=alpha signature=omega\nnormal response text",
+      "Authorization=[redacted] normal response text",
+      "signature=omega",
     ],
     ["api_key: key-secret", "api_key=[redacted]", "key-secret"],
     ["access-token = token-secret", "access-token=[redacted]", "token-secret"],
@@ -256,10 +289,39 @@ function createUiStubs(React) {
   function PopoverContent({ children, ...props }) {
     return React.createElement("div", props, children);
   }
+  function TooltipProvider({ children }) {
+    return React.createElement(React.Fragment, null, children);
+  }
+  function Tooltip({ children }) {
+    return React.createElement(React.Fragment, null, children);
+  }
+  function TooltipTrigger({ asChild, children }) {
+    if (asChild && React.isValidElement(children)) {
+      return React.cloneElement(children, { "data-tooltip-trigger": "focus" });
+    }
+    return React.createElement(
+      "button",
+      { "data-tooltip-trigger": "focus" },
+      children,
+    );
+  }
+  function TooltipContent({ children }) {
+    return React.createElement(
+      "div",
+      { "data-tooltip-content": "true" },
+      children,
+    );
+  }
   return {
     Button,
     Calendar,
     popover: { Popover, PopoverContent, PopoverTrigger },
+    tooltip: {
+      Tooltip,
+      TooltipContent,
+      TooltipProvider,
+      TooltipTrigger,
+    },
   };
 }
 
@@ -433,10 +495,11 @@ function main() {
   testFilterDraftOpenResetCancelApplyAndUniqueIds(modules.componentState);
   testFieldOperatorAndInEditorsResetCompatibleValues(modules.componentState);
   testRemoveAllAndEntityClickPayloads(modules.componentState);
-  testSingleEntityBadgePreservesExactAccessibleId(modules);
   testCredentialErrorsAreFullyRedacted(modules.componentState);
+  testSingleEntityBadgePreservesExactAccessibleId(modules);
+  testPassiveLegacyEntityBadgesStayOutOfTabOrder(modules);
   testFailedMemoryIdsRenderExactly(modules);
-  console.log("explorer components harness: 8 contracts passed");
+  console.log("explorer components harness: 9 contracts passed");
 }
 
 try {

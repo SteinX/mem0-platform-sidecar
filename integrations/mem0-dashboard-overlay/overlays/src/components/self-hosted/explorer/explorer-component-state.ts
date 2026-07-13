@@ -205,10 +205,14 @@ export function sanitizeExplorerError(
     message = error;
   }
   const sanitized = message
+    .replace(
+      /\b(proxy[-_ ]?authorization|authorization)\s*[:=]\s*[^\r\n,;]+/gi,
+      "$1=[redacted]",
+    )
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/https?:\/\/\S+/gi, "[redacted url]")
     .replace(
-      /\b(authorization|proxy[-_ ]?authorization|token|access[-_ ]?token|refresh[-_ ]?token|secret|client[-_ ]?secret|password|api[-_ ]?key)\s*[:=]\s*(?:(?:bearer|basic)\s+)?[^\s,;]+/gi,
+      /\b(token|access[-_ ]?token|refresh[-_ ]?token|secret|client[-_ ]?secret|password|api[-_ ]?key)\s*[:=]\s*(?:(?:bearer|basic)\s+)?[^\s,;]+/gi,
       "$1=[redacted]",
     )
     .replace(/\b(bearer|basic)\s+[^\s,;]+/gi, "$1 [redacted]")

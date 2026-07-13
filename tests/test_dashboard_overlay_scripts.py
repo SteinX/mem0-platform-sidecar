@@ -678,6 +678,8 @@ def test_entity_explorer_review_regression_contracts():
     assert "entity?:" in badges
     assert "tabIndex={0}" in badges
     assert "identity.value" in badges
+    assert "TooltipTrigger" in badges
+    assert "TooltipContent" in badges
 
     assert page.count("normalizeEntityExplorerFilters(") >= 3
     assert "invalidateEntityDetailForQueryTransition" in page
@@ -742,7 +744,7 @@ def test_explorer_component_harness_runs_entity_regressions(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "explorer components harness: 8 contracts passed" in result.stdout
+    assert "explorer components harness: 9 contracts passed" in result.stdout
 
 
 def test_entity_explorer_verifier_enforces_runtime_contracts(tmp_path):
