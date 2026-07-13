@@ -3,6 +3,7 @@ from sqlalchemy import text
 
 from mem0_sidecar.config import SidecarSettings, load_settings
 from mem0_sidecar.http_adapter.category_routes import category_router
+from mem0_sidecar.http_adapter.entity_routes import entity_router
 from mem0_sidecar.http_adapter.event_routes import event_router
 from mem0_sidecar.http_adapter.export_routes import export_router
 from mem0_sidecar.http_adapter.memory_routes import memory_router
@@ -60,6 +61,7 @@ def create_app(
     )
     app.include_router(memory_router)
     app.include_router(event_router)
+    app.include_router(entity_router)
     app.include_router(category_router)
     app.include_router(export_router)
 
