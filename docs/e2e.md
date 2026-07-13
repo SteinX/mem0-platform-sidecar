@@ -32,6 +32,17 @@ The deleted record no longer appears in active projection/query results; its
 deleted_at tombstone remains for audit and
 stale-index bookkeeping. Query responses also assert the `stale_skipped` count.
 
+The same live lifecycle also proves durable request traces against the real
+Mem0 OSS service: a correlated `ADD`, `SEARCH`, and `GET ALL` are queried through
+`POST /v1/events/query`; the search drawer payload is fetched through
+`GET /v1/event/{id}`; result counts and previews are checked after app-scope
+filtering; and a post-delete `GET ALL` proves the no-results trace. A synthetic
+nested credential and internal Mem0 URL are submitted with the fixture, then
+the raw sidecar `events.request_json`, `response_json`, and `error_json` columns
+are checked to ensure neither value was persisted and every document remains
+within 65,536 bytes. Fixture deletion runs before those trace assertions, so a
+trace regression does not strand the upstream memory.
+
 Reconciliation coverage imports records bearing sidecar project/app markers and
 checks the `scanned`, `indexed`, `skipped_unscoped`, `skipped_other_scope`, and
 `stale_marked` counters. The default service verifies that
@@ -83,6 +94,31 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest \
 
 Do not place API keys in this document or Compose file. If a manual backend
 requires one, provide `MEM0_E2E_API_KEY` only in the invoking process environment.
+
+## Request trace regression coverage
+
+The non-Docker integration test uses the complete FastAPI, SQLAlchemy, and
+SQLite path with a deterministic in-process Mem0 client. It covers successful
+and failed search, list results and no-results, add correlation, operation,
+status, date and page filters, app/project isolation, the public detail shape,
+20-preview capping and omission counts, nested credential keys and credential
+assignments in string values, internal URL removal, a 70 KiB payload, malformed
+legacy JSON, and direct raw-event JSON inspection.
+
+Run it together with the live module's non-live helpers (live cases skip unless
+`MEM0_E2E_BASE_URL` is configured):
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest \
+  tests/integration/test_request_trace_flow.py \
+  tests/e2e/test_live_mem0_oss.py -q -p no:cacheprovider
+```
+
+Trace redaction protects the event store, not the source memory. The real
+memory text/metadata remains internal sensitive data in Mem0 OSS. Sidecar event
+rows and all database backups must share the memory store's access and backup
+controls. Until a supported pruning job exists, trace retention and old-row
+cleanup are owned by the deployment operator.
 
 ## Acceptance commands
 
