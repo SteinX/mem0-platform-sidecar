@@ -2,6 +2,7 @@ import json
 import os
 import re
 import runpy
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -165,6 +166,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/components/self-hosted/explorer/date-range-filter.tsx",
         "src/components/self-hosted/explorer/filter-builder.tsx",
         "src/components/self-hosted/explorer/entity-badges.tsx",
+        "src/components/self-hosted/explorer/explorer-component-state.ts",
         "src/app/(root)/dashboard/components/main-nav.tsx",
     ]:
         target = dashboard / relative
@@ -276,6 +278,32 @@ def test_dashboard_overlay_includes_shared_explorer_components():
         assert component.is_file()
         assert_dashboard_tsx_transpiles(component)
 
+    state_path = (
+        "src/components/self-hosted/explorer/explorer-component-state.ts"
+    )
+    assert state_path in manifest["files"]
+    assert (OVERLAY / "overlays" / state_path).is_file()
+    assert (OVERLAY / "scripts/test-explorer-components.cjs").is_file()
+
+
+def test_dashboard_overlay_verifier_runs_explorer_component_contracts():
+    verifier = runpy.run_path(str(VERIFY_DASHBOARD_OVERLAY))
+    dashboard = Path("/tmp/upstream-dashboard")
+
+    assert verifier["explorer_components_harness_command"](
+        OVERLAY,
+        dashboard,
+    ) == [
+        shutil.which("node"),
+        str(OVERLAY / "scripts/test-explorer-components.cjs"),
+        str(dashboard),
+    ]
+    verifier_source = VERIFY_DASHBOARD_OVERLAY.read_text()
+    assert re.search(
+        r"subprocess\.run\(\s*explorer_components_harness_command\(",
+        verifier_source,
+    )
+
 
 def test_date_range_filter_has_draft_utc_and_responsive_contracts():
     component = (
@@ -302,9 +330,12 @@ def test_date_range_filter_has_draft_utc_and_responsive_contracts():
     assert re.search(r"addEventListener\(\s*\"change\"", component)
     assert re.search(r"removeEventListener\(\s*\"change\"", component)
     assert re.search(r"setDraftRange\(isoRangeToCalendarRange\(value\)\)", component)
-    assert re.search(r"onChange\(calendarRangeToUtcRange\(draftRange\)\)", component)
+    assert re.search(r"calendarRangeToUtcRange\(draftRange\)", component)
     assert re.search(r"setOpen\(false\)", component)
-    assert 'aria-label="Choose date range"' in component
+    assert re.search(
+        r"aria-label=\{`Choose date range: \$\{rangeLabel\}`\}",
+        component,
+    )
     cancel_button = (
         '<Button type="button" variant="ghost" onClick={() => setOpen(false)}>'
     )
@@ -331,15 +362,15 @@ def test_filter_builder_uses_isolated_normalized_drafts_and_accessible_editors()
         "@/utils/explorer-query-state",
     ):
         assert f'from "{import_path}"' in component
-    assert re.search(r"setDraftFilters\(cloneFilters\(filters\)\)", component)
-    assert re.search(r"setDraftMatch\(match\)", component)
+    assert re.search(r"openFilterBuilderDraft\(match,\s*filters\)", component)
+    assert re.search(r"cancelFilterBuilderDraft\(current\)", component)
     assert re.search(
-        r"onApply\(draftMatch,\s*normalizeExplorerFilters\(draftFilters\)\)",
+        r"onApply\(applied\.match,\s*applied\.filters\)",
         component,
     )
-    assert re.search(r"onRemoveAll\(\[\]\)", component)
+    assert re.search(r"onRemoveAll\(removed\.filters\)", component)
     assert re.search(
-        r"nextFilterForField\(current,\s*value as ExplorerField\)",
+        r"changeExplorerFilterField\(\s*current,\s*value as ExplorerField",
         component,
     )
     assert re.search(r"aria-label=\{`Remove filter \$\{index \+ 1\}`\}", component)
@@ -365,19 +396,20 @@ def test_entity_badges_render_only_present_accessible_identities():
         OVERLAY / "overlays/src/components/self-hosted/explorer/entity-badges.tsx"
     ).read_text()
 
+    state_component = (
+        OVERLAY
+        / "overlays/src/components/self-hosted/explorer/explorer-component-state.ts"
+    ).read_text()
     for field, label in (
         ("user_id", "User"),
         ("agent_id", "Agent"),
         ("app_id", "App"),
         ("run_id", "Run"),
     ):
-        assert f'field: "{field}"' in component
-        assert f'label: "{label}"' in component
-    assert re.search(
-        r"\.filter\(\(identity\):\s*identity is Identity\s*"
-        r"=>\s*Boolean\(identity\.value\)\)",
-        component,
-    )
+        assert f'field: "{field}"' in state_component
+        assert f'label: "{label}"' in state_component
+    assert "createEntityBadgeItems" in component
+    assert "entityBadgeClickPayload(identity)" in component
     assert re.search(r"title=\{identity\.value\}", component)
     assert re.search(r"truncateIdentity\(identity\.value\)", component)
     assert re.search(r"onBadgeClick\s*\?\s*\(", component)

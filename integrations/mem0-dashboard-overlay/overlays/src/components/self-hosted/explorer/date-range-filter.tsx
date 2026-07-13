@@ -10,6 +10,11 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import {
+  calendarRangeToUtcRange,
+  formatDateRangeLabel,
+  isoRangeToCalendarRange,
+} from "@/components/self-hosted/explorer/explorer-component-state";
 import type { ExplorerDateRange } from "@/types/dashboard-explorer";
 import { datePresetRange } from "@/utils/explorer-query-state";
 
@@ -28,6 +33,7 @@ const DATE_PRESETS: Array<{ label: string; preset: DatePreset }> = [
 ];
 
 export function DateRangeFilter({ value, onChange }: DateRangeFilterProps) {
+  const rangeLabel = formatDateRangeLabel(value);
   const [open, setOpen] = useState(false);
   const [draftRange, setDraftRange] = useState<CalendarDateRange | undefined>(
     () => isoRangeToCalendarRange(value),
@@ -56,18 +62,25 @@ export function DateRangeFilter({ value, onChange }: DateRangeFilterProps) {
   }
 
   function applyCustomRange() {
-    if (draftRange?.from === undefined || draftRange.to === undefined) {
+    const range = draftRange === undefined
+      ? null
+      : calendarRangeToUtcRange(draftRange);
+    if (range === null) {
       return;
     }
-    onChange(calendarRangeToUtcRange(draftRange));
+    onChange(range);
     setOpen(false);
   }
 
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger asChild>
-        <Button type="button" variant="outline" aria-label="Choose date range">
-          {formatRangeLabel(value)}
+        <Button
+          type="button"
+          variant="outline"
+          aria-label={`Choose date range: ${rangeLabel}`}
+        >
+          {rangeLabel}
         </Button>
       </PopoverTrigger>
       <PopoverContent align="start" className="w-auto max-w-[calc(100vw-2rem)] p-3">
@@ -107,60 +120,4 @@ export function DateRangeFilter({ value, onChange }: DateRangeFilterProps) {
       </PopoverContent>
     </Popover>
   );
-}
-
-function isoRangeToCalendarRange(
-  value: ExplorerDateRange,
-): CalendarDateRange | undefined {
-  const from = isoToCalendarDate(value.from);
-  const to = isoToCalendarDate(value.to);
-  return from === undefined && to === undefined ? undefined : { from, to };
-}
-
-function isoToCalendarDate(value: string | null): Date | undefined {
-  if (value === null) {
-    return undefined;
-  }
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) {
-    return undefined;
-  }
-  return new Date(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
-}
-
-function calendarRangeToUtcRange(range: CalendarDateRange): ExplorerDateRange {
-  if (range.from === undefined || range.to === undefined) {
-    return { from: null, to: null };
-  }
-  const from = Date.UTC(
-    range.from.getFullYear(),
-    range.from.getMonth(),
-    range.from.getDate(),
-  );
-  const to = Date.UTC(
-    range.to.getFullYear(),
-    range.to.getMonth(),
-    range.to.getDate(),
-    23,
-    59,
-    59,
-    999,
-  );
-  return { from: new Date(from).toISOString(), to: new Date(to).toISOString() };
-}
-
-function formatRangeLabel(value: ExplorerDateRange): string {
-  if (value.from === null && value.to === null) {
-    return "All time";
-  }
-  const from = value.from === null ? "Start" : formatIsoDate(value.from);
-  const to = value.to === null ? "Now" : formatIsoDate(value.to);
-  return `${from} – ${to}`;
-}
-
-function formatIsoDate(value: string): string {
-  const date = new Date(value);
-  return Number.isFinite(date.getTime())
-    ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(date)
-    : value;
 }

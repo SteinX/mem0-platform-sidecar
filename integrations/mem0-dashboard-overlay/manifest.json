@@ -19,6 +19,7 @@
     "src/components/self-hosted/explorer/date-range-filter.tsx",
     "src/components/self-hosted/explorer/filter-builder.tsx",
     "src/components/self-hosted/explorer/entity-badges.tsx",
+    "src/components/self-hosted/explorer/explorer-component-state.ts",
     "src/types/sidecar.ts"
   ]
 }
