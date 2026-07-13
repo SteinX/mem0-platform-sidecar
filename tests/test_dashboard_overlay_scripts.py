@@ -1189,7 +1189,7 @@ def test_dashboard_overlay_includes_exact_entity_types():
         "id: string;",
         'type: "user" | "agent" | "app" | "run";',
         "entity_id: string;",
-        "display_name: string;",
+        "display_name: string | null;",
         "memory_count: number;",
         "last_seen_at: string | null;",
         "updated_at: string | null;",

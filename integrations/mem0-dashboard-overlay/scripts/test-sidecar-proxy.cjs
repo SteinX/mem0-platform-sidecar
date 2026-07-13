@@ -101,33 +101,43 @@ async function testEntityQueryForcesRuntimeScope(proxy) {
 }
 
 async function testEntityItemsEncodeTypeAndIdAndForceRuntimeScope(proxy) {
-  for (const method of ["GET", "DELETE"]) {
-    const calls = [];
-    const response = await proxy(
-      new Request(
-        "http://dashboard.local/api/sidecar/v1/entities/%75ser/team%2Falice%252Farchive?project_id=forged&app_id=forged-app&trace=forged",
-        { method },
-      ),
-      "/v1/entities/user/team/alice%2Farchive",
-      proxyOptions(async (url, init) => {
-        calls.push({ url: url.toString(), init });
-        return Response.json(
-          method === "GET"
-            ? { type: "user", entity_id: "team/alice%2Farchive" }
-            : { status: "SUCCEEDED" },
-        );
-      }),
-    );
+  const scopes = [
+    [undefined, "project_id=runtime+project"],
+    ["runtime-app", "project_id=runtime+project&app_id=runtime-app"],
+  ];
+  for (const [configuredAppId, expectedScope] of scopes) {
+    for (const method of ["GET", "DELETE"]) {
+      const label = `${method} ${configuredAppId ?? "no configured app"}`;
+      const calls = [];
+      const response = await proxy(
+        new Request(
+          "http://dashboard.local/api/sidecar/v1/entities/%75ser/team%2Falice%252Farchive?project_id=forged&app_id=forged-app&trace=forged",
+          { method },
+        ),
+        "/v1/entities/user/team/alice%2Farchive",
+        proxyOptions(
+          async (url, init) => {
+            calls.push({ url: url.toString(), init });
+            return Response.json(
+              method === "GET"
+                ? { type: "user", entity_id: "team/alice%2Farchive" }
+                : { status: "SUCCEEDED" },
+            );
+          },
+          { configuredAppId },
+        ),
+      );
 
-    assert.equal(response.status, 200, method);
-    assert.equal(calls.length, 1, method);
-    assert.equal(
-      calls[0].url,
-      "http://sidecar.internal/v1/entities/user/team%2Falice%252Farchive?project_id=runtime+project",
-      method,
-    );
-    assert.equal(calls[0].init.method, method);
-    assert.equal(calls[0].init.body, undefined);
+      assert.equal(response.status, 200, label);
+      assert.equal(calls.length, 1, label);
+      assert.equal(
+        calls[0].url,
+        `http://sidecar.internal/v1/entities/user/team%2Falice%252Farchive?${expectedScope}`,
+        label,
+      );
+      assert.equal(calls[0].init.method, method);
+      assert.equal(calls[0].init.body, undefined);
+    }
   }
 }
 
