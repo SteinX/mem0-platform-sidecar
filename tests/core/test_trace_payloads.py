@@ -1,4 +1,5 @@
 import json
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 
 import pytest
@@ -62,8 +63,76 @@ def test_sanitize_trace_payload_normalizes_only_secret_key_names() -> None:
     }
 
 
+def test_sanitize_trace_payload_redacts_compound_secret_keys_without_visiting_values(
+) -> None:
+    class SecretValue:
+        def __str__(self) -> str:
+            raise AssertionError("secret values must never be stringified")
+
+    secret = SecretValue()
+    payload = {
+        "api_token": secret,
+        "secret_key": secret,
+        "openai_api_key": secret,
+        "mem0_api_key": secret,
+        "aws_secret_access_key": secret,
+        "aws_access_key_id": secret,
+        "client_secret": secret,
+        "action": "keep",
+        "token_count": 2,
+        "secret_count": 3,
+        "monkey": "banana",
+    }
+
+    sanitized = sanitize_trace_payload(payload)
+
+    assert sanitized == {
+        "action": "keep",
+        "api_token": "[REDACTED]",
+        "aws_access_key_id": "[REDACTED]",
+        "aws_secret_access_key": "[REDACTED]",
+        "client_secret": "[REDACTED]",
+        "mem0_api_key": "[REDACTED]",
+        "monkey": "banana",
+        "openai_api_key": "[REDACTED]",
+        "secret_count": 3,
+        "secret_key": "[REDACTED]",
+        "token_count": 2,
+    }
+
+
+def test_sanitize_trace_payload_detects_secret_suffix_on_a_truncated_key() -> None:
+    class SecretValue:
+        def __str__(self) -> str:
+            raise AssertionError("secret values must never be stringified")
+
+    sanitized = sanitize_trace_payload({("x" * 100_000) + "_api_key": SecretValue()})
+
+    assert isinstance(sanitized, dict)
+    assert list(sanitized.values()) == ["[REDACTED]"]
+    assert len(next(iter(sanitized)).encode("utf-8")) <= 4096
+
+
 def test_sanitize_trace_payload_bounds_unicode_strings_by_utf8_bytes() -> None:
     sanitized = sanitize_trace_payload("界" * 4096)
+
+    assert isinstance(sanitized, str)
+    assert sanitized.endswith("...[TRUNCATED]")
+    assert len(sanitized.encode("utf-8")) <= 4096
+
+
+def test_sanitize_trace_payload_bypasses_hostile_string_subclass_methods() -> None:
+    class HostileString(str):
+        def encode(self, *args: object, **kwargs: object) -> bytes:
+            raise AssertionError("overridden encode must not run")
+
+        def __len__(self) -> int:
+            raise AssertionError("overridden len must not run")
+
+        def __getitem__(self, key: object) -> str:
+            raise AssertionError("overridden slicing must not run")
+
+    sanitized = sanitize_trace_payload(HostileString("界" * 1_000_000))
 
     assert isinstance(sanitized, str)
     assert sanitized.endswith("...[TRUNCATED]")
@@ -92,6 +161,54 @@ def test_sanitize_trace_payload_limits_object_fields_deterministically() -> None
     assert "field-00" in sanitized_ascending
     assert "field-49" in sanitized_ascending
     assert "field-50" not in sanitized_ascending
+
+
+def test_sanitize_trace_payload_reads_only_a_fixed_mapping_prefix() -> None:
+    class SpyMapping(Mapping[str, int]):
+        def __init__(self) -> None:
+            self.iterated = 0
+            self.read = 0
+
+        def __iter__(self) -> Iterator[str]:
+            for index in range(1000):
+                self.iterated += 1
+                yield f"field-{index:04d}"
+
+        def __len__(self) -> int:
+            return 1_000_000
+
+        def __getitem__(self, key: str) -> int:
+            self.read += 1
+            return int(key.removeprefix("field-"))
+
+    payload = SpyMapping()
+
+    sanitized = sanitize_trace_payload(payload)
+
+    assert isinstance(sanitized, dict)
+    assert payload.iterated <= 65
+    assert payload.read <= 50
+    assert sanitized["_trace_truncated_fields"] == 999_950
+
+
+def test_sanitize_trace_payload_has_a_global_traversal_budget() -> None:
+    class CountingLeaf:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __str__(self) -> str:
+            self.calls += 1
+            return "leaf"
+
+    leaf = CountingLeaf()
+    payload: object = leaf
+    for _ in range(6):
+        payload = [payload] * 5
+
+    sanitized = sanitize_trace_payload(payload)
+
+    assert leaf.calls <= 512
+    assert "[NODE_LIMIT]" in json.dumps(sanitized)
 
 
 def test_sanitize_trace_payload_stops_at_depth_limit_and_handles_cycles() -> None:
@@ -130,6 +247,52 @@ def test_sanitize_trace_payload_bounds_and_protects_unknown_object_strings() -> 
     assert sanitized[1] == "[UNPRINTABLE]"
 
 
+def test_sanitize_trace_payload_bypasses_hostile_sequence_subclass_methods() -> None:
+    class HostileList(list[object]):
+        def __iter__(self) -> Iterator[object]:
+            raise AssertionError("overridden iteration must not run")
+
+        def __len__(self) -> int:
+            raise AssertionError("overridden len must not run")
+
+        def __getitem__(self, key: object) -> object:
+            raise AssertionError("overridden slicing must not run")
+
+    class HostileTuple(tuple[object, ...]):
+        def __iter__(self) -> Iterator[object]:
+            raise AssertionError("overridden iteration must not run")
+
+        def __len__(self) -> int:
+            raise AssertionError("overridden len must not run")
+
+        def __getitem__(self, key: object) -> object:
+            raise AssertionError("overridden slicing must not run")
+
+    assert sanitize_trace_payload(HostileList([1, 2])) == [1, 2]
+    assert sanitize_trace_payload(HostileTuple((1, 2))) == [1, 2]
+
+
+def test_sanitize_trace_payload_namespaces_non_string_keys_and_marks_collisions(
+) -> None:
+    class SameTextKey:
+        def __str__(self) -> str:
+            return "same"
+
+    first = SameTextKey()
+    second = SameTextKey()
+    forward = {first: "first", second: "second"}
+    reverse = {second: "second", first: "first"}
+
+    namespaced = sanitize_trace_payload({1: "integer", "1": "string"})
+    collided_forward = sanitize_trace_payload(forward)
+    collided_reverse = sanitize_trace_payload(reverse)
+
+    assert namespaced == {"1": "string", "[builtins.int]:1": "integer"}
+    assert collided_forward == collided_reverse
+    assert isinstance(collided_forward, dict)
+    assert list(collided_forward.values()) == [{"_trace_key_collision": 2}]
+
+
 def test_sanitize_trace_payload_produces_strict_json_native_values() -> None:
     sanitized = sanitize_trace_payload(
         {
@@ -149,6 +312,18 @@ def test_sanitize_trace_payload_produces_strict_json_native_values() -> None:
         "tuple": [1, True, None],
     }
     assert json.loads(_compact_bytes(sanitized)) == sanitized
+
+
+def test_sanitize_trace_payload_replaces_huge_integers_with_a_json_safe_marker(
+) -> None:
+    huge = 1 << 20_000
+
+    sanitized = sanitize_trace_payload({"huge": huge})
+    bounded = bounded_trace_document({"huge": huge})
+
+    assert sanitized == {"huge": "[INTEGER_TOO_LARGE:20001_BITS]"}
+    assert bounded == sanitized
+    assert json.loads(_compact_bytes(bounded)) == bounded
 
 
 def test_bounded_trace_document_envelopes_non_object_roots() -> None:
@@ -257,15 +432,12 @@ def test_trace_result_summary_uses_a_strict_sanitized_allowlist() -> None:
             "app_id": "app-1",
             "categories": [
                 "decision",
-                {"api_key": "[REDACTED]", "name": "safe"},
             ],
             "created_at": "2026-07-13T00:00:00Z",
-            "expiration_date": None,
             "id": "mem-1",
             "memory": "Remember me",
             "memory_id": "legacy-1",
             "run_id": "run-1",
-            "score": None,
             "updated_at": "2026-07-13T00:01:00Z",
             "user_id": "user-1",
         }
@@ -286,3 +458,91 @@ def test_trace_result_summary_handles_malformed_results_and_totals() -> None:
         [{"id": "mem-1"}],
     )
     assert trace_result_summary({}) == (0, [])
+
+
+def test_trace_result_summary_enforces_preview_field_types() -> None:
+    count, previews = trace_result_summary(
+        {
+            "results": [
+                {
+                    "id": 123,
+                    "memory_id": "mem-1",
+                    "memory": "safe",
+                    "user_id": True,
+                    "agent_id": "agent-1",
+                    "categories": ("one", "two"),
+                    "score": 1 << 200,
+                    "created_at": None,
+                    "updated_at": "2026-07-13T00:00:00Z",
+                },
+                {
+                    "id": "mem-2",
+                    "categories": ["safe", {"password": "secret"}],
+                    "score": 0.75,
+                },
+            ]
+        }
+    )
+
+    assert count == 2
+    assert previews == [
+        {
+            "agent_id": "agent-1",
+            "categories": ["one", "two"],
+            "memory": "safe",
+            "memory_id": "mem-1",
+            "updated_at": "2026-07-13T00:00:00Z",
+        },
+        {"categories": ["safe"], "id": "mem-2", "score": 0.75},
+    ]
+
+
+def test_trace_result_summary_bounds_scanning_and_handles_hostile_mappings() -> None:
+    accesses = 0
+
+    class EmptySpyMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            nonlocal accesses
+            accesses += 1
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+    class BrokenResponse(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise RuntimeError("unreadable")
+
+        def __iter__(self) -> Iterator[str]:
+            raise RuntimeError("unreadable")
+
+        def __len__(self) -> int:
+            raise RuntimeError("unreadable")
+
+        def get(self, key: str, default: object = None) -> object:
+            raise RuntimeError("unreadable")
+
+    class HostileResults(list[object]):
+        def __iter__(self) -> Iterator[object]:
+            raise AssertionError("overridden iteration must not run")
+
+        def __len__(self) -> int:
+            raise AssertionError("overridden len must not run")
+
+        def __getitem__(self, key: object) -> object:
+            raise AssertionError("overridden indexing must not run")
+
+    count, previews = trace_result_summary(
+        {"results": [EmptySpyMapping() for _ in range(1000)]}
+    )
+
+    assert count == 1000
+    assert previews == []
+    assert accesses <= 1200
+    assert trace_result_summary(BrokenResponse()) == (0, [])
+    assert trace_result_summary(
+        {"results": HostileResults([{"id": "mem-1"}])}
+    ) == (1, [{"id": "mem-1"}])
