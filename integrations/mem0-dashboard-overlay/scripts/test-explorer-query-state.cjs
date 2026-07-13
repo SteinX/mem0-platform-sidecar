@@ -17,8 +17,8 @@ function loadExplorerQueryStateModule(dashboardDir) {
   );
   const typescript = dashboardRequire("typescript");
   const statePath = path.join(
-    __dirname,
-    "../overlays/src/utils/explorer-query-state.ts",
+    dashboardDir,
+    "src/utils/explorer-query-state.ts",
   );
   const source = fs.readFileSync(statePath, "utf8");
   const transpiled = typescript.transpileModule(source, {
@@ -54,12 +54,63 @@ function loadExplorerQueryStateModule(dashboardDir) {
 
 function testExactRuntimeExports(state) {
   assert.deepEqual(Object.keys(state).sort(), [
+    "canApplyExplorerDetailRequest",
     "createExplorerFilter",
     "datePresetRange",
+    "normalizeEntityExplorerFilters",
     "normalizeExplorerFilters",
     "readExplorerUrlState",
     "writeExplorerUrlState",
   ]);
+}
+
+function testEntityUrlFiltersAreAllowlisted(state) {
+  const supported = [
+    { id: "type", field: "entity_type", operator: "equals", value: "agent" },
+    { id: "user", field: "user_id", operator: "equals", value: "alice" },
+    { id: "agent", field: "agent_id", operator: "not_equals", value: "bot" },
+    { id: "app", field: "app_id", operator: "in", value: ["app-a"] },
+    { id: "run", field: "run_id", operator: "equals", value: "run-1" },
+  ];
+  const rejected = [
+    { id: "memory", field: "memory_id", operator: "equals", value: "mem-1" },
+    { id: "category", field: "category", operator: "equals", value: "work" },
+    {
+      id: "metadata",
+      field: "metadata",
+      operator: "contains",
+      value: { key: "source", value: "secret" },
+    },
+  ];
+  const params = new URLSearchParams({
+    match: "any",
+    filters: JSON.stringify([...supported, ...rejected]),
+    page: "4",
+  });
+  const shared = state.readExplorerUrlState(params);
+  const filters = state.normalizeEntityExplorerFilters(shared.filters);
+  const canonical = state.writeExplorerUrlState(params, {
+    ...shared,
+    filters,
+  });
+
+  assert.deepEqual(filters, supported);
+  assert.deepEqual(JSON.parse(canonical.get("filters")), supported);
+  assert.equal(canonical.get("filters").includes("memory_id"), false);
+  assert.equal(canonical.get("filters").includes("category"), false);
+  assert.equal(canonical.get("filters").includes("metadata"), false);
+}
+
+function testDetailTargetRejectsChangedContext(state) {
+  const target = { requestGeneration: 7, contextGeneration: 3 };
+  assert.equal(state.canApplyExplorerDetailRequest(target, 7, 3, true), true);
+  assert.equal(
+    state.canApplyExplorerDetailRequest(target, 7, 4, true),
+    false,
+    "an old detail must not apply after a query context transition",
+  );
+  assert.equal(state.canApplyExplorerDetailRequest(target, 8, 3, true), false);
+  assert.equal(state.canApplyExplorerDetailRequest(target, 7, 3, false), false);
 }
 
 function testBlankRowsAreRemovedAndIdsStayStable(state) {
@@ -440,7 +491,9 @@ function main() {
   testStrictDateRangesRejectInvalidAndReversedValues(state);
   testRangeOrderingUsesBackendMicrosecondPrecision(state);
   testRoundTripRetainsDrawerAndUnknownParamsWithoutChangingPath(state);
-  console.log("explorer query state harness: 9 contracts passed");
+  testEntityUrlFiltersAreAllowlisted(state);
+  testDetailTargetRejectsChangedContext(state);
+  console.log("explorer query state harness: 11 contracts passed");
 }
 
 try {

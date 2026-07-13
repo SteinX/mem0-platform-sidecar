@@ -610,7 +610,7 @@ def test_dashboard_overlay_includes_entity_explorer_contracts():
         "No entities found",
         "Could not load entities",
         "Pagination",
-        "Tooltip",
+        "EntityBadges",
         "md:hidden",
         "aria-disabled",
         "tabIndex",
@@ -656,6 +656,93 @@ def test_dashboard_overlay_includes_entity_explorer_contracts():
         r"setPageData\([^\n]*(filter|results)",
         content,
     ), "entity deletion must not optimistically remove rows"
+
+
+def test_entity_explorer_review_regression_contracts():
+    page = (
+        OVERLAY
+        / "overlays/src/app/(root)/dashboard/entities/page.tsx"
+    ).read_text()
+    badges = (
+        OVERLAY
+        / "overlays/src/components/self-hosted/explorer/entity-badges.tsx"
+    ).read_text()
+    state = (
+        OVERLAY
+        / "overlays/src/components/self-hosted/explorer/explorer-component-state.ts"
+    ).read_text()
+
+    assert "<EntityBadges" in page
+    assert "function EntityIdentity" not in page
+    assert "Tooltip" not in page
+    assert "entity?:" in badges
+    assert "tabIndex={0}" in badges
+    assert "identity.value" in badges
+
+    assert page.count("normalizeEntityExplorerFilters(") >= 3
+    assert "invalidateEntityDetailForQueryTransition" in page
+    assert "canApplyExplorerDetailRequest(" in page
+    assert "setRowsAreAuthoritative(false)" in page
+    assert "rowsAreAuthoritative" in page
+
+    assert "{failure.id}" in page
+    assert "break-all" in page
+    assert "sanitizeDisplayedError(failure.id" not in page
+    assert "sanitizeExplorerError" in state
+
+
+def test_dashboard_overlay_verifier_runs_explorer_query_state_contracts():
+    verifier = runpy.run_path(str(VERIFY_DASHBOARD_OVERLAY))
+    dashboard = Path("/tmp/upstream-dashboard")
+
+    assert verifier["explorer_query_state_harness_command"](
+        OVERLAY,
+        dashboard,
+    )[-2:] == [
+        str(OVERLAY / "scripts/test-explorer-query-state.cjs"),
+        str(dashboard),
+    ]
+    source = VERIFY_DASHBOARD_OVERLAY.read_text()
+    assert re.search(
+        r"subprocess\.run\(\s*explorer_query_state_harness_command\(",
+        source,
+    )
+
+
+def test_explorer_query_state_harness_verifies_applied_dashboard(tmp_path):
+    dashboard = applied_upstream_overlay(tmp_path)
+    result = subprocess.run(
+        [
+            "node",
+            str(OVERLAY / "scripts/test-explorer-query-state.cjs"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "explorer query state harness: 11 contracts passed" in result.stdout
+
+
+def test_explorer_component_harness_runs_entity_regressions(tmp_path):
+    dashboard = applied_upstream_overlay(tmp_path)
+    result = subprocess.run(
+        [
+            "node",
+            str(OVERLAY / "scripts/test-explorer-components.cjs"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "explorer components harness: 8 contracts passed" in result.stdout
 
 
 def test_entity_explorer_verifier_enforces_runtime_contracts(tmp_path):

@@ -6,6 +6,8 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import { DataTable } from "@/components/shared/data-table";
 import { DateRangeFilter } from "@/components/self-hosted/explorer/date-range-filter";
+import { EntityBadges } from "@/components/self-hosted/explorer/entity-badges";
+import { sanitizeExplorerError as sanitizeDisplayedError } from "@/components/self-hosted/explorer/explorer-component-state";
 import {
   FilterBuilder,
   type ExplorerFilterFieldOption,
@@ -19,7 +21,6 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -30,12 +31,6 @@ import {
   PaginationPrevious,
 } from "@/components/ui/pagination";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import type {
   ExplorerDateRange,
   ExplorerFilter,
@@ -49,7 +44,9 @@ import type {
   SidecarEntityQuery,
 } from "@/types/sidecar";
 import {
+  canApplyExplorerDetailRequest,
   createExplorerFilter,
+  normalizeEntityExplorerFilters,
   readExplorerUrlState,
   writeExplorerUrlState,
 } from "@/utils/explorer-query-state";
@@ -88,6 +85,11 @@ const ENTITY_TYPE_TABS: Array<{ label: string; value: EntityType }> = [
 ];
 
 const FILTER_FIELDS: ExplorerFilterFieldOption[] = [
+  {
+    value: "entity_type",
+    label: "Entity type",
+    options: ENTITY_TYPE_TABS.map(({ label, value }) => ({ value, label })),
+  },
   { value: "user_id", label: "User ID" },
   { value: "run_id", label: "Run ID" },
   { value: "agent_id", label: "Agent ID" },
@@ -139,14 +141,25 @@ export default function EntitiesPage() {
   const [deleteResult, setDeleteResult] =
     useState<SidecarEntityDeleteResult | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [rowsAreAuthoritative, setRowsAreAuthoritative] = useState(false);
   const listGeneration = useRef(0);
   const detailGeneration = useRef(0);
+  const queryContextGeneration = useRef(0);
   const deleteGeneration = useRef(0);
+  const queryRef = useRef<EntityExplorerQuery>(DEFAULT_QUERY);
   const pageDataRef = useRef<SidecarEntityPage | null>(null);
   const detailControllerRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(true);
   const pageHeadingRef = useRef<HTMLHeadingElement>(null);
   const deleteOpenerRef = useRef<HTMLElement | null>(null);
+
+  const invalidateEntityDetailForQueryTransition = useCallback(() => {
+    detailControllerRef.current?.abort();
+    detailControllerRef.current = null;
+    detailGeneration.current += 1;
+    queryContextGeneration.current += 1;
+    setPreparingEntityKey(null);
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -155,6 +168,7 @@ export default function EntitiesPage() {
       detailControllerRef.current?.abort();
       listGeneration.current += 1;
       detailGeneration.current += 1;
+      queryContextGeneration.current += 1;
       deleteGeneration.current += 1;
       deleteOpenerRef.current = null;
     };
@@ -170,11 +184,14 @@ export default function EntitiesPage() {
         canonicalSearch ? `${pathname}?${canonicalSearch}` : pathname,
       );
     }
-    setQuery((current) =>
-      entityQueriesEqual(current, nextQuery) ? current : nextQuery,
-    );
+    if (!entityQueriesEqual(queryRef.current, nextQuery)) {
+      invalidateEntityDetailForQueryTransition();
+      setRowsAreAuthoritative(false);
+      queryRef.current = nextQuery;
+      setQuery(nextQuery);
+    }
     setHydrated(true);
-  }, [pathname, router, search]);
+  }, [invalidateEntityDetailForQueryTransition, pathname, router, search]);
 
   const replaceParams = useCallback(
     (next: URLSearchParams) => {
@@ -186,10 +203,15 @@ export default function EntitiesPage() {
 
   const writeQuery = useCallback(
     (next: EntityExplorerQuery) => {
-      setQuery(next);
+      if (!entityQueriesEqual(queryRef.current, next)) {
+        invalidateEntityDetailForQueryTransition();
+        setRowsAreAuthoritative(false);
+        queryRef.current = next;
+        setQuery(next);
+      }
       replaceParams(writeEntityUrlState(new URLSearchParams(search), next));
     },
-    [replaceParams, search],
+    [invalidateEntityDetailForQueryTransition, replaceParams, search],
   );
 
   useEffect(() => {
@@ -198,6 +220,7 @@ export default function EntitiesPage() {
     }
     const controller = new AbortController();
     const generation = listGeneration.current + 1;
+    const contextGeneration = queryContextGeneration.current;
     listGeneration.current = generation;
     if (pageDataRef.current === null) {
       setIsLoading(true);
@@ -215,10 +238,12 @@ export default function EntitiesPage() {
         if (
           !controller.signal.aborted &&
           mountedRef.current &&
-          generation === listGeneration.current
+          generation === listGeneration.current &&
+          contextGeneration === queryContextGeneration.current
         ) {
           pageDataRef.current = response;
           setPageData(response);
+          setRowsAreAuthoritative(true);
         }
       })
       .catch((error: unknown) => {
@@ -226,6 +251,7 @@ export default function EntitiesPage() {
           !controller.signal.aborted &&
           mountedRef.current &&
           generation === listGeneration.current &&
+          contextGeneration === queryContextGeneration.current &&
           !isAbortError(error)
         ) {
           setLoadError(
@@ -237,7 +263,8 @@ export default function EntitiesPage() {
         if (
           !controller.signal.aborted &&
           mountedRef.current &&
-          generation === listGeneration.current
+          generation === listGeneration.current &&
+          contextGeneration === queryContextGeneration.current
         ) {
           setIsLoading(false);
           setIsRefreshing(false);
@@ -292,11 +319,18 @@ export default function EntitiesPage() {
 
   const openDeleteDialog = useCallback(
     async (entity: SidecarEntity, opener: HTMLElement | null) => {
+      if (!rowsAreAuthoritative) {
+        return;
+      }
       detailControllerRef.current?.abort();
       const controller = new AbortController();
       detailControllerRef.current = controller;
       const generation = detailGeneration.current + 1;
       detailGeneration.current = generation;
+      const target = {
+        requestGeneration: generation,
+        contextGeneration: queryContextGeneration.current,
+      };
       const entityKey = `${entity.type}:${entity.id}`;
       setPreparingEntityKey(entityKey);
       setDeletePreparationError(null);
@@ -308,8 +342,12 @@ export default function EntitiesPage() {
         );
         if (
           !controller.signal.aborted &&
-          mountedRef.current &&
-          generation === detailGeneration.current
+          canApplyExplorerDetailRequest(
+            target,
+            detailGeneration.current,
+            queryContextGeneration.current,
+            mountedRef.current,
+          )
         ) {
           deleteOpenerRef.current = opener?.isConnected ? opener : null;
           setConfirmationText("");
@@ -320,8 +358,12 @@ export default function EntitiesPage() {
       } catch (error) {
         if (
           !controller.signal.aborted &&
-          mountedRef.current &&
-          generation === detailGeneration.current &&
+          canApplyExplorerDetailRequest(
+            target,
+            detailGeneration.current,
+            queryContextGeneration.current,
+            mountedRef.current,
+          ) &&
           !isAbortError(error)
         ) {
           setDeletePreparationError(
@@ -331,15 +373,19 @@ export default function EntitiesPage() {
       } finally {
         if (
           !controller.signal.aborted &&
-          mountedRef.current &&
-          generation === detailGeneration.current
+          canApplyExplorerDetailRequest(
+            target,
+            detailGeneration.current,
+            queryContextGeneration.current,
+            mountedRef.current,
+          )
         ) {
           setPreparingEntityKey(null);
           detailControllerRef.current = null;
         }
       }
     },
-    [],
+    [rowsAreAuthoritative],
   );
 
   const closeDeleteDialog = useCallback(() => {
@@ -421,7 +467,15 @@ export default function EntitiesPage() {
         key: "entity_id",
         label: "Entities",
         width: 42,
-        render: (_value, entity) => <EntityIdentity entity={entity} />,
+        render: (_value, entity) => (
+          <EntityBadges
+            entity={{
+              type: entity.type,
+              id: entity.entity_id,
+              displayName: entity.display_name,
+            }}
+          />
+        ),
       },
       {
         key: "updated_at",
@@ -449,6 +503,7 @@ export default function EntitiesPage() {
         render: (_value, entity) => (
           <EntityActions
             entity={entity}
+            canDelete={rowsAreAuthoritative}
             isPreparing={preparingEntityKey === `${entity.type}:${entity.id}`}
             onView={() => viewMemories(entity)}
             onDelete={(opener) => void openDeleteDialog(entity, opener)}
@@ -456,7 +511,7 @@ export default function EntitiesPage() {
         ),
       },
     ],
-    [openDeleteDialog, preparingEntityKey, viewMemories],
+    [openDeleteDialog, preparingEntityKey, rowsAreAuthoritative, viewMemories],
   );
 
   const rows = pageData?.results ?? [];
@@ -594,7 +649,13 @@ export default function EntitiesPage() {
                 key={entity.id}
                 className="min-w-0 space-y-4 rounded-md border border-memBorder-primary p-4"
               >
-                <EntityIdentity entity={entity} />
+                <EntityBadges
+                  entity={{
+                    type: entity.type,
+                    id: entity.entity_id,
+                    displayName: entity.display_name,
+                  }}
+                />
                 <dl className="grid grid-cols-2 gap-3 text-sm">
                   <div>
                     <dt className="text-onSurface-default-secondary">
@@ -615,6 +676,7 @@ export default function EntitiesPage() {
                 </dl>
                 <EntityActions
                   entity={entity}
+                  canDelete={rowsAreAuthoritative}
                   isPreparing={
                     preparingEntityKey === `${entity.type}:${entity.id}`
                   }
@@ -772,41 +834,15 @@ export default function EntitiesPage() {
   );
 }
 
-function EntityIdentity({ entity }: { entity: SidecarEntity }) {
-  const label =
-    entity.display_name?.trim() || truncateIdentity(entity.entity_id);
-  return (
-    <div className="flex min-w-0 items-center gap-2">
-      <Badge variant="outline" className="shrink-0 uppercase">
-        {entity.type}
-      </Badge>
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span
-              tabIndex={0}
-              className="min-w-0 truncate rounded-sm text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              aria-label={`${entity.type} entity ${entity.entity_id}`}
-            >
-              {label}
-            </span>
-          </TooltipTrigger>
-          <TooltipContent className="max-w-[min(32rem,calc(100vw-2rem))]">
-            <p className="break-all">{entity.entity_id}</p>
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-    </div>
-  );
-}
-
 function EntityActions({
   entity,
+  canDelete,
   isPreparing,
   onView,
   onDelete,
 }: {
   entity: SidecarEntity;
+  canDelete: boolean;
   isPreparing: boolean;
   onView: () => void;
   onDelete: (opener: HTMLElement) => void;
@@ -830,7 +866,7 @@ function EntityActions({
         type="button"
         size="icon"
         variant="ghost"
-        disabled={isPreparing}
+        disabled={!canDelete || isPreparing}
         aria-label={`Delete ${entity.type} entity ${entity.entity_id}`}
         onClick={(event) => {
           event.stopPropagation();
@@ -855,11 +891,12 @@ function DeleteFailureList({ result }: { result: SidecarEntityDeleteResult }) {
     <ul className="list-disc space-y-1 pl-5">
       {result.failed.map((failure, index) => (
         <li key={`${failure.id}:${index}`} className="break-words">
+          <span className="break-all font-mono">{failure.id}</span>
+          {": "}
           {sanitizeDisplayedError(
             failure.error,
             "Upstream memory deletion failed",
-          )}{" "}
-          ({sanitizeDisplayedError(failure.id, "memory")})
+          )}
         </li>
       ))}
     </ul>
@@ -888,7 +925,7 @@ function readEntityUrlState(
   return {
     entity_type: shared.entityType ?? "user",
     match: shared.match,
-    filters: shared.filters,
+    filters: normalizeEntityExplorerFilters(shared.filters),
     date_range: shared.date_range,
     page: shared.page,
     page_size: shared.page_size,
@@ -901,7 +938,7 @@ function writeEntityUrlState(
 ): URLSearchParams {
   const next = writeExplorerUrlState(current, {
     match: query.match,
-    filters: query.filters,
+    filters: normalizeEntityExplorerFilters(query.filters),
     date_range: query.date_range,
     page: query.page,
     page_size: query.page_size,
@@ -912,10 +949,11 @@ function writeEntityUrlState(
 }
 
 function entityQueryPayload(query: EntityExplorerQuery): SidecarEntityQuery {
+  const filters = normalizeEntityExplorerFilters(query.filters);
   return {
     entity_type: query.entity_type,
     match: query.match,
-    filters: query.filters.map(({ id: _id, ...filter }) => filter),
+    filters: filters.map(({ id: _id, ...filter }) => filter),
     date_range: query.date_range,
     page: query.page,
     page_size: query.page_size,
@@ -963,38 +1001,6 @@ function isEntityDeleteResult(
     Array.isArray(result.failed) &&
     typeof result.event_id === "string"
   );
-}
-
-function sanitizeDisplayedError(error: unknown, fallback: string): string {
-  let message = fallback;
-  if (error instanceof Error && error.message.trim() !== "") {
-    message = error.message;
-  } else if (
-    error !== null &&
-    typeof error === "object" &&
-    typeof (error as Record<string, unknown>).message === "string"
-  ) {
-    message = String((error as Record<string, unknown>).message);
-  } else if (typeof error === "string" && error.trim() !== "") {
-    message = error;
-  }
-  const sanitized = message
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .replace(/https?:\/\/\S+/gi, "[redacted url]")
-    .replace(
-      /\b(token|secret|authorization|api[-_ ]?key)\s*[:=]\s*\S+/gi,
-      "$1=[redacted]",
-    )
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 240);
-  return sanitized || fallback;
-}
-
-function truncateIdentity(value: string): string {
-  return value.length <= 34
-    ? value
-    : `${value.slice(0, 16)}...${value.slice(-12)}`;
 }
 
 function isAbortError(error: unknown): boolean {

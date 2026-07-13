@@ -7,11 +7,17 @@ const path = require("node:path");
 const { webcrypto } = require("node:crypto");
 const { createRequire } = require("node:module");
 
-function transpileModule(typescript, sourcePath, dependencies, jsx = false) {
+function transpileModule(
+  typescript,
+  sourcePath,
+  dependencies,
+  jsx = false,
+  transform = (source) => source,
+) {
   if (!fs.existsSync(sourcePath)) {
     throw new Error(`missing applied dashboard source: ${sourcePath}`);
   }
-  const source = fs.readFileSync(sourcePath, "utf8");
+  const source = transform(fs.readFileSync(sourcePath, "utf8"));
   const compilerOptions = {
     esModuleInterop: true,
     module: typescript.ModuleKind.CommonJS,
@@ -84,12 +90,154 @@ function loadModules(dashboardDir) {
     },
     true,
   );
+  const entityBadges = transpileModule(
+    typescript,
+    path.join(sourceRoot, "components/self-hosted/explorer/entity-badges.tsx"),
+    {
+      ...common,
+      "@/components/ui/button": { Button: ui.Button },
+      "@/components/self-hosted/explorer/explorer-component-state":
+        componentState,
+    },
+    true,
+  );
+  const inertModule = new Proxy(
+    {},
+    {
+      get() {
+        return function InertComponent({ children }) {
+          return React.createElement(React.Fragment, null, children);
+        };
+      },
+    },
+  );
+  const entityPageDependencies = {
+    ...common,
+    "lucide-react": inertModule,
+    "next/navigation": inertModule,
+    "@/components/shared/data-table": inertModule,
+    "@/components/self-hosted/explorer/date-range-filter": inertModule,
+    "@/components/self-hosted/explorer/entity-badges": inertModule,
+    "@/components/self-hosted/explorer/explorer-component-state":
+      componentState,
+    "@/components/self-hosted/explorer/filter-builder": inertModule,
+    "@/components/ui/alert-dialog": inertModule,
+    "@/components/ui/button": inertModule,
+    "@/components/ui/input": inertModule,
+    "@/components/ui/pagination": inertModule,
+    "@/components/ui/tabs": inertModule,
+    "@/utils/explorer-query-state": queryState,
+    "@/utils/sidecar-api": inertModule,
+  };
+  const entityPage = transpileModule(
+    typescript,
+    path.join(sourceRoot, "app/(root)/dashboard/entities/page.tsx"),
+    entityPageDependencies,
+    true,
+    (source) => {
+      assert.ok(source.includes("function DeleteFailureList"));
+      return source.replace(
+        "function DeleteFailureList",
+        "export function DeleteFailureList",
+      );
+    },
+  );
   return {
     componentState,
     DateRangeFilter: dateRangeFilter.DateRangeFilter,
+    EntityBadges: entityBadges.EntityBadges,
+    DeleteFailureList: entityPage.DeleteFailureList,
     React,
     ReactDOMServer: dashboardRequire("react-dom/server"),
   };
+}
+
+function escapeHtmlAttribute(value) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function testSingleEntityBadgePreservesExactAccessibleId(modules) {
+  const id = `team/<&"/${"long-id-".repeat(40)}尾`;
+  const html = modules.ReactDOMServer.renderToStaticMarkup(
+    modules.React.createElement(modules.EntityBadges, {
+      entity: { type: "agent", id, displayName: "Primary <Agent>" },
+    }),
+  );
+  const escapedId = escapeHtmlAttribute(id);
+
+  assert.ok(html.includes(`title="${escapedId}"`), html);
+  assert.ok(html.includes(`aria-label="Agent entity ${escapedId}"`), html);
+  assert.ok(html.includes("Primary &lt;Agent&gt;"), html);
+  assert.ok(html.includes('tabindex="0"'), html);
+}
+
+function testCredentialErrorsAreFullyRedacted(state) {
+  const cases = [
+    [
+      "Authorization: Bearer header.payload.signature",
+      "Authorization=[redacted]",
+      "header.payload.signature",
+    ],
+    [
+      "authorization=Basic dXNlcjpwYXNzd29yZA==",
+      "authorization=[redacted]",
+      "dXNlcjpwYXNzd29yZA==",
+    ],
+    [
+      "Delete failed; proxy-authorization: Bearer proxy-secret; retry",
+      "Delete failed; proxy-authorization=[redacted]; retry",
+      "proxy-secret",
+    ],
+    ["api_key: key-secret", "api_key=[redacted]", "key-secret"],
+    ["access-token = token-secret", "access-token=[redacted]", "token-secret"],
+  ];
+  for (const [input, expected, leaked] of cases) {
+    const sanitized = state.sanitizeExplorerError(new Error(input), "fallback");
+    assert.equal(sanitized, expected);
+    assert.equal(sanitized.includes(leaked), false, input);
+  }
+}
+
+function escapeHtmlText(value) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function testFailedMemoryIdsRenderExactly(modules) {
+  const id = `memory/<&"/${"exact-special-id-".repeat(32)}尾`;
+  const html = modules.ReactDOMServer.renderToStaticMarkup(
+    modules.React.createElement(modules.DeleteFailureList, {
+      result: {
+        status: "FAILED",
+        requested_count: 1,
+        deleted_count: 0,
+        failed_count: 1,
+        failed: [
+          {
+            id,
+            error: { message: "Authorization: Bearer page-secret" },
+          },
+        ],
+        event_id: "event-1",
+      },
+    }),
+  );
+
+  assert.ok(
+    html.includes(
+      `<span class="break-all font-mono">${escapeHtmlText(id)}</span>`,
+    ),
+    html,
+  );
+  assert.ok(html.includes("Authorization=[redacted]"), html);
+  assert.equal(html.includes("page-secret"), false, html);
 }
 
 function createUiStubs(React) {
@@ -285,7 +433,10 @@ function main() {
   testFilterDraftOpenResetCancelApplyAndUniqueIds(modules.componentState);
   testFieldOperatorAndInEditorsResetCompatibleValues(modules.componentState);
   testRemoveAllAndEntityClickPayloads(modules.componentState);
-  console.log("explorer components harness: 5 contracts passed");
+  testSingleEntityBadgePreservesExactAccessibleId(modules);
+  testCredentialErrorsAreFullyRedacted(modules.componentState);
+  testFailedMemoryIdsRenderExactly(modules);
+  console.log("explorer components harness: 8 contracts passed");
 }
 
 try {

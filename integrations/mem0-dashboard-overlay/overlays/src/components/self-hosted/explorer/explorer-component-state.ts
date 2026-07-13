@@ -188,6 +188,36 @@ export function truncateIdentity(value: string): string {
   return value.length <= 18 ? value : `${value.slice(0, 9)}…${value.slice(-6)}`;
 }
 
+export function sanitizeExplorerError(
+  error: unknown,
+  fallback: string,
+): string {
+  let message = fallback;
+  if (error instanceof Error && error.message.trim() !== "") {
+    message = error.message;
+  } else if (
+    error !== null &&
+    typeof error === "object" &&
+    typeof (error as Record<string, unknown>).message === "string"
+  ) {
+    message = String((error as Record<string, unknown>).message);
+  } else if (typeof error === "string" && error.trim() !== "") {
+    message = error;
+  }
+  const sanitized = message
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/https?:\/\/\S+/gi, "[redacted url]")
+    .replace(
+      /\b(authorization|proxy[-_ ]?authorization|token|access[-_ ]?token|refresh[-_ ]?token|secret|client[-_ ]?secret|password|api[-_ ]?key)\s*[:=]\s*(?:(?:bearer|basic)\s+)?[^\s,;]+/gi,
+      "$1=[redacted]",
+    )
+    .replace(/\b(bearer|basic)\s+[^\s,;]+/gi, "$1 [redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+  return sanitized || fallback;
+}
+
 function cloneFiltersWithUniqueIds(filters: ExplorerFilter[]): ExplorerFilter[] {
   const reserved = new Set(filters.map(({ id }) => id));
   const used = new Set<string>();
