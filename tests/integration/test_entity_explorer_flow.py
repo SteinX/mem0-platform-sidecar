@@ -520,10 +520,21 @@ def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
         app_id="app-b",
         user_id="partial-user",
     )
+    foreign_project_id = _add_memory(
+        client,
+        project_id="project-b",
+        app_id="app-a",
+        user_id="partial-user",
+    )
     foreign_projection = _exact_scope_projection_signature(
         client,
         project_id="project-a",
         app_id="app-b",
+    )
+    foreign_project_projection = _exact_scope_projection_signature(
+        client,
+        project_id="project-b",
+        app_id="app-a",
     )
     secret = "sk_entity_flow_secret"
     internal_url = "http://mem0.internal:8000/private"
@@ -560,11 +571,17 @@ def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
     assert "mem0.internal" not in serialized_partial
     assert set(mem0.deleted_ids) == target_ids
     assert foreign_id not in mem0.deleted_ids
+    assert foreign_project_id not in mem0.deleted_ids
     assert _exact_scope_projection_signature(
         client,
         project_id="project-a",
         app_id="app-b",
     ) == foreign_projection
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-b",
+        app_id="app-a",
+    ) == foreign_project_projection
 
     with client.app.state.session_factory() as session:
         event = EventRepository(session).get(partial["event_id"])
@@ -614,11 +631,17 @@ def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
     assert retry_response.json()["status"] == "SUCCEEDED"
     assert mem0.deleted_ids.count(failed_id) == 2
     assert foreign_id not in mem0.deleted_ids
+    assert foreign_project_id not in mem0.deleted_ids
     assert _exact_scope_projection_signature(
         client,
         project_id="project-a",
         app_id="app-b",
     ) == foreign_projection
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-b",
+        app_id="app-a",
+    ) == foreign_project_projection
 
     with client.app.state.session_factory() as session:
         session.add(
@@ -645,6 +668,11 @@ def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
         project_id="project-a",
         app_id="app-b",
     ) == foreign_projection
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-b",
+        app_id="app-a",
+    ) == foreign_project_projection
     assert {
         item["id"]
         for item in _query_memories(
@@ -655,3 +683,13 @@ def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
             value="partial-user",
         )["results"]
     } == {foreign_id}
+    assert {
+        item["id"]
+        for item in _query_memories(
+            client,
+            project_id="project-b",
+            app_id="app-a",
+            field="user_id",
+            value="partial-user",
+        )["results"]
+    } == {foreign_project_id}
