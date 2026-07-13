@@ -49,9 +49,10 @@ _URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = "),.;"
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _AUTHORIZATION_VALUE_PATTERN = re.compile(
-    r"(?im)(?P<prefix>\b(?P<quote>['\"]?)(?:proxy[ ._-]?)?"
+    r"(?im)(?P<prefix>(?<![A-Za-z0-9])(?P<quote>['\"]?)"
+    r"(?:proxy[ ._-]?)?"
     r"authorization(?P=quote)\s*[:=]\s*)"
-    r"(?P<value>[^;\r\n]+)"
+    r"(?P<value>[^\r\n]+(?:\r?\n[ \t]+[^\r\n]*)*)"
 )
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)(?P<prefix>(?P<quote>['\"]?)(?P<key>[a-z][a-z0-9_. -]{0,127}?)"
@@ -145,15 +146,23 @@ def _sensitive_url(url: str, internal_hosts: frozenset[str]) -> bool:
         if not address.is_global:
             return True
 
-    components = [parsed.query]
+    def fully_decode(component: str) -> str:
+        current = component
+        for _attempt in range(3):
+            decoded = unquote(current, encoding="utf-8", errors="strict")
+            if decoded == current:
+                if _INVALID_PERCENT_ESCAPE.search(decoded) is not None:
+                    raise ValueError("ambiguous percent escape")
+                return decoded
+            current = decoded
+        raise ValueError("excessive percent encoding")
+
     try:
-        decoded_fragment = unquote(
-            parsed.fragment,
-            encoding="utf-8",
-            errors="strict",
-        )
+        decoded_query = fully_decode(parsed.query)
+        decoded_fragment = fully_decode(parsed.fragment)
     except (UnicodeError, ValueError):
         return True
+    components = [decoded_query]
     if "=" in decoded_fragment or "&" in decoded_fragment:
         components.append(decoded_fragment)
     for component in components:

@@ -35,6 +35,10 @@ def test_normalize_scope_preserves_first_class_fields() -> None:
         "app\n-a",
         "app\x00-a",
         "app\u200b-a",
+        "app\u00a0id",
+        "app\u2003id",
+        "app\u2028id",
+        "e\u0301",
         "x" * 257,
     ],
 )
@@ -48,6 +52,12 @@ def test_validate_scope_id_preserves_exact_portable_boundary() -> None:
 
     assert validate_scope_id(value, field_name="app_id") == value
     assert validate_scope_id(None, field_name="user_id", required=False) is None
+
+
+def test_validate_scope_id_uses_the_project_column_boundary() -> None:
+    assert validate_scope_id("p" * 128, field_name="project_id") == "p" * 128
+    with pytest.raises(ValueError, match="^project_id must be a portable 1-128"):
+        validate_scope_id("p" * 129, field_name="project_id")
 
 
 def test_normalize_scope_reuses_portable_identifier_validation() -> None:

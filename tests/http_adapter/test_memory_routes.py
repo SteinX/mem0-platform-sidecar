@@ -580,6 +580,90 @@ def test_route_scoped_add_accepts_256_character_app_id(tmp_path) -> None:
     assert event.app_id == app_id
 
 
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("user_id", "u" * 257),
+        ("agent_id", "agent\ninvalid"),
+        ("run_id", " "),
+    ],
+)
+def test_route_scoped_add_validates_every_entity_before_project_commit(
+    tmp_path,
+    field_name: str,
+    invalid_value: str,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    with app.state.session_factory() as session:
+        ProjectRepository(session).upsert_default_project(
+            project_id="repo-a",
+            name="Repo A",
+            mem0_base_url="http://mem0.local",
+            default_app_id="app-old",
+        )
+        session.commit()
+    payload = {
+        "project_id": "repo-a",
+        "app_id": "app-new",
+        "text": "must not be sent",
+        "user_id": "user-a",
+        field_name: invalid_value,
+    }
+
+    response = TestClient(app).post("/v3/memories/add/", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith(
+        f"{field_name} must be a portable"
+    )
+    assert mem0.add_payloads == []
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        event_count = session.scalar(select(func.count()).select_from(Event))
+    assert project is not None
+    assert project.default_app_id == "app-old"
+    assert event_count == 0
+
+
+def test_route_scoped_add_rejects_project_id_over_database_limit(tmp_path) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    project_id = "p" * 129
+
+    response = TestClient(app).post(
+        "/v3/memories/add/",
+        json={
+            "project_id": project_id,
+            "app_id": "app-a",
+            "text": "must not be sent",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith(
+        "project_id must be a portable 1-128"
+    )
+    assert mem0.add_payloads == []
+    with app.state.session_factory() as session:
+        assert session.get(Project, project_id) is None
+        assert session.scalar(select(func.count()).select_from(Event)) == 0
+
+
 def test_route_scoped_search_preserves_explicit_app_id_without_bootstrapping_project(
     tmp_path,
 ) -> None:

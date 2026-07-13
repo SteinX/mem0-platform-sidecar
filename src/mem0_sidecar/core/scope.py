@@ -2,6 +2,7 @@ import unicodedata
 from dataclasses import dataclass
 
 _MAX_SCOPE_ID_CHARS = 256
+_MAX_PROJECT_ID_CHARS = 128
 
 
 def validate_scope_id(
@@ -12,21 +13,26 @@ def validate_scope_id(
 ) -> str | None:
     """Validate an identifier before it reaches a portable SQL scope column."""
 
+    maximum = (
+        _MAX_PROJECT_ID_CHARS if field_name == "project_id" else _MAX_SCOPE_ID_CHARS
+    )
     if value is None:
         if not required:
             return None
         raise ValueError(
-            f"{field_name} must be a portable 1-256 character identifier"
+            f"{field_name} must be a portable 1-{maximum} character identifier"
         )
     if (
         type(value) is not str
         or not value
         or value != value.strip()
-        or len(value) > _MAX_SCOPE_ID_CHARS
+        or len(value) > maximum
+        or unicodedata.normalize("NFC", value) != value
+        or any(character.isspace() for character in value)
         or any(unicodedata.category(character).startswith("C") for character in value)
     ):
         raise ValueError(
-            f"{field_name} must be a portable 1-256 character identifier"
+            f"{field_name} must be a portable 1-{maximum} character identifier"
         )
     return value
 

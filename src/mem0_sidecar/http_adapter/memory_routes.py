@@ -93,6 +93,12 @@ async def add_memory(
             field_name="app_id",
             required=False,
         )
+        for field_name in ("user_id", "agent_id", "run_id"):
+            validate_scope_id(
+                payload.get(field_name),
+                field_name=field_name,
+                required=False,
+            )
         ensure_project(
             session,
             request.app.state.settings,
