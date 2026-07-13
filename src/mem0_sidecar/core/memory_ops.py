@@ -38,7 +38,7 @@ class MemoryUpstreamProtocolError(RuntimeError):
 
 
 def _require_clean_trace_session(session: Session) -> None:
-    if session.new or session.dirty or session.deleted:
+    if session.in_transaction() or session.new or session.dirty or session.deleted:
         raise RuntimeError(_DIRTY_TRACE_SESSION_ERROR)
 
 

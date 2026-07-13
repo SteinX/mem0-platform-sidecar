@@ -19,6 +19,7 @@ from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.core.memory_ops import (
     SIDECAR_APP_ID_METADATA_KEY,
     SIDECAR_PROJECT_ID_METADATA_KEY,
+    MemoryService,
 )
 from mem0_sidecar.http_adapter.app import create_app
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
@@ -1065,7 +1066,10 @@ def test_route_scoped_requests_allow_different_project_and_app_scope(tmp_path) -
     assert event_response.status_code == 404
 
 
-def test_query_memories_uses_body_scope_and_returns_public_envelope(tmp_path) -> None:
+def test_query_memories_uses_body_scope_and_returns_public_envelope(
+    tmp_path,
+    monkeypatch,
+) -> None:
     expected_memory = {
         "id": "mem-1",
         "memory": "hello",
@@ -1079,6 +1083,18 @@ def test_query_memories_uses_body_scope_and_returns_public_envelope(tmp_path) ->
         "updated_at": "2026-07-02T10:00:00Z",
         "expiration_date": None,
     }
+    transaction_states: list[bool] = []
+    original_query_memories = MemoryService.query_memories
+
+    async def query_memories_with_transaction_probe(self, **kwargs):
+        transaction_states.append(self.session.in_transaction())
+        return await original_query_memories(self, **kwargs)
+
+    monkeypatch.setattr(
+        MemoryService,
+        "query_memories",
+        query_memories_with_transaction_probe,
+    )
     mem0 = ExplorerRouteMem0Client({"mem-1": dict(expected_memory)})
     app = create_app(
         settings=SidecarSettings(
@@ -1105,6 +1121,7 @@ def test_query_memories_uses_body_scope_and_returns_public_envelope(tmp_path) ->
         "stale_skipped": 0,
     }
     assert mem0.get_memory_ids == ["mem-1"]
+    assert transaction_states == [False]
 
 
 def test_query_memories_uses_existing_project_default_app_when_omitted(

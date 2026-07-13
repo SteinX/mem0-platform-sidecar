@@ -152,6 +152,10 @@ async def query_memories(
     )
     if app_id is None:
         raise HTTPException(status_code=404, detail="Project not found")
+    # Scope resolution performs a read and therefore autobegins a transaction.
+    # End that request-owned read transaction before the traced operation takes
+    # exclusive ownership of the session transaction lifecycle.
+    session.rollback()
     service = MemoryService(session=session, mem0=mem0)
     try:
         query = parse_explorer_query(payload, allowed_fields=MEMORY_FILTER_FIELDS)
