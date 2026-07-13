@@ -256,5 +256,12 @@ class EventService:
             for event in self.events.list_project_events(project_id)
         ]
 
-    def get_project_event(self, project_id: str, event_id: str) -> dict[str, Any]:
-        return _event_to_dict(self.events.get_project_event(project_id, event_id))
+    def get_project_event(
+        self,
+        project_id: str,
+        app_id: str,
+        event_id: str,
+    ) -> dict[str, Any]:
+        return _event_to_dict(
+            self.events.get_project_event(project_id, app_id, event_id)
+        )

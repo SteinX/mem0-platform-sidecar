@@ -37,11 +37,11 @@ def test_event_service_lists_and_gets_serialized_project_events(db_session) -> N
 
     first = repo.create_event(
         project_id="repo-a",
+        app_id="app-a",
         operation="memory.add",
-        request={"text": "hello"},
+        request={"app_id": "app-a", "text": "hello"},
         subject_type="memory",
         subject_id="mem-1",
-        allow_project_scope=True,
     )
     repo.mark_succeeded(first.id, response={"id": "mem-1"})
 
@@ -57,7 +57,7 @@ def test_event_service_lists_and_gets_serialized_project_events(db_session) -> N
     db_session.commit()
 
     listed = service.list_project_events("repo-a")
-    fetched = service.get_project_event("repo-a", first.id)
+    fetched = service.get_project_event("repo-a", "app-a", first.id)
 
     assert [event["id"] for event in listed] == [first.id]
     assert fetched["project_id"] == "repo-a"
@@ -213,7 +213,7 @@ def test_legacy_event_service_serialization_tolerates_non_object_json(
     )
     event = Event(
         project_id="repo-a",
-        app_id=None,
+        app_id="app-a",
         operation="memory.add",
         status=EventStatus.FAILED,
         request_json="[]",
@@ -224,7 +224,7 @@ def test_legacy_event_service_serialization_tolerates_non_object_json(
     db_session.commit()
 
     serialized = EventService(EventRepository(db_session)).get_project_event(
-        "repo-a", event.id
+        "repo-a", "app-a", event.id
     )
 
     assert serialized["project_id"] == "repo-a"

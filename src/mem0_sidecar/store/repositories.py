@@ -40,6 +40,7 @@ _MAX_RESPONSE_SCAN_FIELDS = 64
 _MAX_RESPONSE_ENVELOPE_FIELDS = 40
 _MAX_PREVIEW_SCAN_ITEMS = 100
 _MAX_CORRELATION_ID_CHARS = 256
+EVENT_SCAN_LIMIT = 5000
 _EVENT_QUERY_MAX_ATTEMPTS = 2
 _EVENT_QUERY_UNSTABLE_ERROR = (
     "event query snapshot changed; retry with narrower filters"
@@ -966,19 +967,43 @@ class EventRepository:
         return event
 
     def list_project_events(self, project_id: str) -> list[Event]:
-        return list(
+        events = list(
             self.session.scalars(
                 select(Event)
                 .where(Event.project_id == project_id)
                 .order_by(Event.created_at, Event.id)
+                .limit(EVENT_SCAN_LIMIT + 1)
             )
         )
+        if len(events) > EVENT_SCAN_LIMIT:
+            raise ValueError(
+                "event list exceeds 5000 records; use POST /v1/events/query"
+            )
+        return events
 
-    def get_project_event(self, project_id: str, event_id: str) -> Event:
+    def get_project_event(
+        self,
+        project_id: str,
+        app_id: str,
+        event_id: str,
+    ) -> Event:
+        app_id = validate_scope_id(app_id, field_name="app_id")
         event = self.session.scalar(
-            select(Event).where(Event.project_id == project_id, Event.id == event_id)
+            select(Event).where(
+                Event.project_id == project_id,
+                Event.id == event_id,
+                or_(Event.app_id == app_id, Event.app_id.is_(None)),
+            )
         )
-        if event is None:
+        if event is None or not _matches_event_scope(
+            event.request_json,
+            app_id,
+            {},
+            event.app_id,
+            event.user_id,
+            event.agent_id,
+            event.run_id,
+        ):
             raise KeyError(event_id)
         return event
 
@@ -1122,10 +1147,10 @@ class EventRepository:
                 )
                 .where(*conditions)
                 .order_by(Event.created_at.desc(), Event.id.desc())
-                .limit(5001)
+                .limit(EVENT_SCAN_LIMIT + 1)
             )
         )
-        if len(rows) > 5000:
+        if len(rows) > EVENT_SCAN_LIMIT:
             raise ValueError("entity filter scan exceeds 5000 records")
         candidates = [_EventCandidate(*row) for row in rows]
         matches = [
