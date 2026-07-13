@@ -1,7 +1,12 @@
+import re
 from typing import Annotated, Any
+from urllib.parse import unquote, unquote_to_bytes
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.routing import APIRoute
 from sqlalchemy.orm import Session
+from starlette.routing import Match
+from starlette.types import Scope
 
 from mem0_sidecar.core.explorer_filters import (
     MEMORY_FILTER_FIELDS,
@@ -13,12 +18,47 @@ from mem0_sidecar.http_adapter.project_scope import (
     ensure_project,
     normalized_payload_for_project,
     resolve_app_id,
+    resolve_project_app_id,
     resolve_project_id,
 )
 
-memory_router = APIRouter()
+
+class _SingleDecodeMemoryRoute(APIRoute):
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        raw_path = scope.get("raw_path")
+        if isinstance(raw_path, bytes):
+            try:
+                decoded_path = unquote_to_bytes(raw_path).decode("utf-8", "strict")
+            except UnicodeDecodeError:
+                decoded_path = None
+            if decoded_path is not None:
+                scope = {**scope, "path": decoded_path}
+        return super().matches(scope)
+
+
+memory_router = APIRouter(route_class=_SingleDecodeMemoryRoute)
 SessionDependency = Annotated[Session, Depends(get_session)]
 Mem0Dependency = Annotated[Any, Depends(get_mem0_client)]
+_ENCODED_OCTET = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE)
+
+
+def _decode_memory_id(memory_id: str) -> str:
+    try:
+        decoded = unquote(memory_id, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid memory ID") from exc
+
+    has_traversal_segment = any(
+        segment in {".", ".."} for segment in re.split(r"[\\/]", decoded)
+    )
+    if (
+        decoded == "query"
+        or has_traversal_segment
+        or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
+        or _ENCODED_OCTET.search(decoded)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid memory ID")
+    return decoded
 
 
 @memory_router.post("/v3/memories/add/")
@@ -74,7 +114,13 @@ async def query_memories(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request, payload)
-    app_id = resolve_app_id(request, payload) or project_id
+    app_id = resolve_project_app_id(
+        session,
+        project_id=project_id,
+        request_app_id=resolve_app_id(request, payload),
+    )
+    if app_id is None:
+        raise HTTPException(status_code=404, detail="Project not found")
     service = MemoryService(session=session, mem0=mem0)
     try:
         query = parse_explorer_query(payload, allowed_fields=MEMORY_FILTER_FIELDS)
@@ -109,8 +155,15 @@ async def get_memory(
     session: SessionDependency,
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
+    memory_id = _decode_memory_id(memory_id)
     project_id = resolve_project_id(request)
-    request_app_id = resolve_app_id(request)
+    request_app_id = resolve_project_app_id(
+        session,
+        project_id=project_id,
+        request_app_id=resolve_app_id(request),
+    )
+    if request_app_id is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
     service = MemoryService(session=session, mem0=mem0)
     try:
         return await service.get_memory(
@@ -132,8 +185,15 @@ async def update_memory(
     session: SessionDependency,
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
+    memory_id = _decode_memory_id(memory_id)
     project_id = resolve_project_id(request, payload)
-    request_app_id = resolve_app_id(request, payload)
+    request_app_id = resolve_project_app_id(
+        session,
+        project_id=project_id,
+        request_app_id=resolve_app_id(request, payload),
+    )
+    if request_app_id is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
     patch = normalized_payload_for_project(request, payload)
     patch.pop("app_id", None)
     service = MemoryService(session=session, mem0=mem0)
@@ -164,8 +224,15 @@ async def get_memory_history(
     session: SessionDependency,
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
+    memory_id = _decode_memory_id(memory_id)
     project_id = resolve_project_id(request)
-    request_app_id = resolve_app_id(request)
+    request_app_id = resolve_project_app_id(
+        session,
+        project_id=project_id,
+        request_app_id=resolve_app_id(request),
+    )
+    if request_app_id is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
     service = MemoryService(session=session, mem0=mem0)
     try:
         return await service.get_memory_history(
@@ -230,15 +297,15 @@ async def delete_memory(
     session: SessionDependency,
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
+    memory_id = _decode_memory_id(memory_id)
     project_id = resolve_project_id(request)
-    request_app_id = resolve_app_id(request)
-    ensure_project(
+    request_app_id = resolve_project_app_id(
         session,
-        request.app.state.settings,
-        project_id,
-        default_app_id=request_app_id,
+        project_id=project_id,
+        request_app_id=resolve_app_id(request),
     )
-    session.commit()
+    if request_app_id is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
     service = MemoryService(session=session, mem0=mem0)
     try:
         result = await service.delete_memory(

@@ -43,6 +43,10 @@ function getConfiguredProjectId(): string {
   );
 }
 
+function getConfiguredAppId(): string | undefined {
+  return process.env.SIDECAR_APP_ID?.trim() || undefined;
+}
+
 function isAuthDisabled() {
   const value = process.env.AUTH_DISABLED?.toLowerCase();
   return value === "1" || value === "true" || value === "yes" || value === "on";
@@ -95,6 +99,7 @@ async function proxy(
   return proxySidecarRequest(request, normalizedPath, {
     baseUrl: getSidecarBaseUrl(),
     configuredProjectId: getConfiguredProjectId(),
+    configuredAppId: getConfiguredAppId(),
     validateDashboardSession,
     fetchUpstream: fetch,
   });

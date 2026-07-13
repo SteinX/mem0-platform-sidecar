@@ -1,7 +1,16 @@
 import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
 from typing import Any
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 from sqlalchemy import insert, select
 from sqlalchemy.orm import Session
@@ -698,7 +707,7 @@ def test_get_memory_maps_upstream_404_to_not_found(tmp_path) -> None:
     assert mem0.get_memory_ids == ["mem-1"]
 
 
-def test_delete_memory_missing_index_uses_query_app_id_for_failed_event(
+def test_delete_memory_unknown_project_does_not_bootstrap_or_write_event(
     tmp_path,
 ) -> None:
     mem0 = FakeMem0Client()
@@ -730,11 +739,8 @@ def test_delete_memory_missing_index_uses_query_app_id_for_failed_event(
             )
         )
 
-    assert project_a is not None
-    assert project_a.default_app_id == "app-x"
-    assert event is not None
-    assert json.loads(event.request_json)["memory_id"] == "mem-1"
-    assert json.loads(event.request_json)["app_id"] == "app-x"
+    assert project_a is None
+    assert event is None
 
 
 def test_delete_memory_rejects_wrong_query_app_id_without_remote_delete(
@@ -904,6 +910,253 @@ def test_query_memories_uses_body_scope_and_returns_public_envelope(tmp_path) ->
     assert mem0.get_memory_ids == ["mem-1"]
 
 
+def test_query_memories_uses_existing_project_default_app_when_omitted(
+    tmp_path,
+) -> None:
+    expected_memory = {
+        "id": "mem-app-x",
+        "memory": "hello",
+        "metadata": {},
+        "categories": [],
+        "user_id": "root",
+        "agent_id": "codex",
+        "app_id": "app-x",
+        "run_id": "run-1",
+        "created_at": "2026-07-01T10:00:00Z",
+        "updated_at": "2026-07-02T10:00:00Z",
+        "expiration_date": None,
+    }
+    mem0 = ExplorerRouteMem0Client({"mem-app-x": dict(expected_memory)})
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        assert project is not None
+        project.default_app_id = "app-x"
+        session.commit()
+    _index_route_memory(app, "mem-app-x", app_id="app-x")
+
+    response = TestClient(app).post(
+        "/v1/memories/query",
+        json={"project_id": "repo-a"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"] == [expected_memory]
+    assert mem0.get_memory_ids == ["mem-app-x"]
+
+
+def test_query_memories_unknown_project_without_app_is_404_and_not_bootstrapped(
+    tmp_path,
+) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=ExplorerRouteMem0Client(),
+    )
+
+    response = TestClient(app).post(
+        "/v1/memories/query",
+        json={"project_id": "repo-z"},
+    )
+
+    assert response.status_code == 404
+    with app.state.session_factory() as session:
+        assert session.get(Project, "repo-z") is None
+
+
+@pytest.mark.parametrize("method", ["get", "patch", "history", "delete"])
+def test_memory_routes_decode_proxy_transport_id_once(tmp_path, method: str) -> None:
+    memory_id = "memory/one"
+    mem0 = ExplorerRouteMem0Client(
+        {
+            memory_id: {
+                "id": memory_id,
+                "memory": "before",
+                "metadata": {},
+            }
+        }
+    )
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / f'{method}.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, memory_id)
+    client = TestClient(app)
+    path = "/v1/memories/memory%252Fone"
+    params = {"project_id": "repo-a", "app_id": "app-a"}
+
+    if method == "get":
+        response = client.get(path, params=params)
+        observed = mem0.get_memory_ids
+    elif method == "patch":
+        response = client.patch(path, params=params, json={"text": "after"})
+        observed = [memory for memory, _ in mem0.update_calls]
+    elif method == "history":
+        response = client.get(f"{path}/history", params=params)
+        observed = mem0.history_calls
+    else:
+        response = client.delete(path, params=params)
+        observed = mem0.deleted_ids
+
+    assert response.status_code == 200
+    assert observed == [memory_id]
+
+
+def test_memory_route_once_encoded_slash_does_not_match_item_route(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=ExplorerRouteMem0Client(),
+    )
+
+    response = TestClient(app).get("/v1/memories/memory%2Fone")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "encoded_id",
+    [
+        "safe%252F..%252Fhealth",
+        "%252e%252e%255chealth",
+        "%2571uery",
+        "safe%2500name",
+        "memory%25252Fone",
+    ],
+)
+def test_memory_routes_reject_malicious_encoded_ids(
+    tmp_path,
+    encoded_id: str,
+) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+
+    response = TestClient(app).get(f"/v1/memories/{encoded_id}")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid memory ID"}
+    assert mem0.get_memory_ids == []
+
+
+def test_dashboard_proxy_round_trips_encoded_id_through_real_sidecar(
+    tmp_path,
+) -> None:
+    memory_id = "memory/one"
+    mem0 = ExplorerRouteMem0Client(
+        {memory_id: {"id": memory_id, "memory": "hello", "metadata": {}}}
+    )
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, memory_id)
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        assert project is not None
+        project.default_app_id = "app-a"
+        session.commit()
+    mem0.history_response = {"history": [{"event": "UPDATE"}]}
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, log_level="error", lifespan="off")
+    )
+    server_thread = threading.Thread(
+        target=server.run,
+        kwargs={"sockets": [listener]},
+        daemon=True,
+    )
+    server_thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started
+
+    root = Path(__file__).resolve().parents[2]
+    overlay = root / "integrations/mem0-dashboard-overlay"
+    upstream = root.parents[2] / "upstream/server/dashboard"
+    dashboard = tmp_path / "dashboard"
+    shutil.copytree(
+        upstream,
+        dashboard,
+        ignore=shutil.ignore_patterns("node_modules", ".next"),
+        symlinks=True,
+    )
+    (dashboard / "node_modules").symlink_to(
+        upstream / "node_modules",
+        target_is_directory=True,
+    )
+    apply_result = subprocess.run(
+        [
+            sys.executable,
+            str(overlay / "scripts/apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert apply_result.returncode == 0, apply_result.stderr
+
+    try:
+        result = subprocess.run(
+            [
+                "node",
+                str(overlay / "scripts/test-sidecar-proxy.cjs"),
+                str(dashboard),
+            ],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            check=False,
+            env={
+                **os.environ,
+                "SIDECAR_PROXY_INTEGRATION_URL": f"http://127.0.0.1:{port}",
+            },
+        )
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=5)
+        listener.close()
+
+    assert result.returncode == 0, result.stderr
+    assert "sidecar proxy integration: 3 contracts passed" in result.stdout
+    assert mem0.get_memory_ids == [memory_id, memory_id]
+    assert mem0.history_calls == [memory_id]
+
+
 def test_query_memories_commits_stale_cleanup(tmp_path) -> None:
     mem0 = ExplorerRouteMem0Client({"mem-stale": ValueError("malformed")})
     app = create_app(
@@ -932,7 +1185,7 @@ def test_query_memories_commits_stale_cleanup(tmp_path) -> None:
     assert stale is not None and stale.deleted_at is not None
 
 
-def test_query_memories_does_not_bootstrap_unknown_project(tmp_path) -> None:
+def test_query_memories_unknown_project_is_404_without_bootstrap(tmp_path) -> None:
     app = create_app(
         settings=SidecarSettings(
             database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
@@ -947,15 +1200,7 @@ def test_query_memories_does_not_bootstrap_unknown_project(tmp_path) -> None:
         json={"project_id": "repo-z", "app_id": "app-z"},
     )
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "results": [],
-        "page": 1,
-        "page_size": 20,
-        "total": 0,
-        "has_more": False,
-        "stale_skipped": 0,
-    }
+    assert response.status_code == 404
     with app.state.session_factory() as session:
         project = session.scalar(select(Project).where(Project.id == "repo-z"))
     assert project is None
