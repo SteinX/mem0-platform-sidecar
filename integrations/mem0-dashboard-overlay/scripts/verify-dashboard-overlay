@@ -24,6 +24,7 @@ REQUESTS_PAGE = "src/app/(root)/dashboard/requests/page.tsx"
 REQUEST_TRACE_DRAWER = (
     "src/app/(root)/dashboard/requests/request-trace-drawer.tsx"
 )
+ENTITIES_PAGE = "src/app/(root)/dashboard/entities/page.tsx"
 SIDECAR_PROXY = "src/utils/sidecar-proxy.ts"
 SIDECAR_ROUTE = "src/app/api/sidecar/[...path]/route.ts"
 DEFAULT_PNPM_PACKAGE = "pnpm@10.34.2"
@@ -1323,6 +1324,108 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
     return None
 
 
+def verify_entities_page(dashboard_dir: Path) -> str | None:
+    page_content = (dashboard_dir / ENTITIES_PAGE).read_text()
+    if (
+        "sidecarQuery<SidecarEntityPage>" not in page_content
+        or '"/v1/entities/query"' not in page_content
+    ):
+        return "Entities page must query /v1/entities/query"
+    if "project_id" in page_content:
+        return "Entities page must not select a browser project scope"
+    if "SESSION" in page_content:
+        return "Entities page must not expose unsupported SESSION entities"
+    delete_body = extract_named_function_body(
+        page_content,
+        "deleteSelectedEntity",
+    )
+    if delete_body is None:
+        return "Entities page missing scoped delete operation"
+    for status, error in (
+        ("SUCCEEDED", "Entities deletion must handle successful results"),
+        ("PARTIAL", "Entities deletion must handle partial results"),
+        ("FAILED", "Entities deletion must keep failed results visible"),
+    ):
+        if f'result.status === "{status}"' not in delete_body:
+            return error
+    for contract, error in (
+        ('entity_type: "user"', "Entities page must default to USER"),
+        ('label: "USER", value: "user"', "Entities page missing USER tab"),
+        ('label: "RUN", value: "run"', "Entities page missing RUN tab"),
+        ('label: "AGENT", value: "agent"', "Entities page missing AGENT tab"),
+        ('label: "APP", value: "app"', "Entities page missing APP tab"),
+        ("DateRangeFilter", "Entities page missing date range controls"),
+        ("FilterBuilder", "Entities page missing shared filter controls"),
+        ("query.filters.length", "Entities page missing active filter count"),
+        ("new AbortController()", "Entities page must abort stale list requests"),
+        ("controller.abort()", "Entities page must clean up stale list requests"),
+        ("listGeneration", "Entities page must ignore stale list responses"),
+        (
+            "pageDataRef.current",
+            "Entities page must preserve prior rows while refreshing",
+        ),
+        ("signal: controller.signal", "Entities page list request must be abortable"),
+        ("page: 1", "Entities page controls must reset pagination"),
+        ("Tooltip", "Entities page must expose full entity IDs"),
+        ("md:hidden", "Entities page missing responsive mobile results"),
+        ("aria-disabled", "Entities pagination missing disabled semantics"),
+        (
+            "sidecarGet<SidecarEntity>",
+            "Entities delete confirmation must refresh entity detail",
+        ),
+        (
+            "detailGeneration",
+            "Entities detail request must ignore stale responses",
+        ),
+        (
+            "deleteGeneration",
+            "Entities deletion must ignore stale completions",
+        ),
+        (
+            "confirmationText === selectedEntity.entity_id",
+            "Entities delete confirmation must require the exact case-sensitive ID",
+        ),
+        (
+            "sanitizeDisplayedError",
+            "Entities deletion must sanitize displayed errors",
+        ),
+        (
+            "new URLSearchParams()",
+            "Entities memory drill-down must start from clean query state",
+        ),
+        (
+            "field: ENTITY_MEMORY_FIELDS[entity.type]",
+            "Entities memory drill-down must map one exact identity field",
+        ),
+        (
+            'operator: "equals"',
+            "Entities memory drill-down must use an exact filter",
+        ),
+        ("router.push", "Entities memory drill-down must use router navigation"),
+        (
+            "View memories for ${entity.entity_id}",
+            "Entities row action must have an entity-specific accessible label",
+        ),
+        (
+            "onCloseAutoFocus",
+            "Entities delete dialog must restore keyboard focus",
+        ),
+        (
+            "opener?.isConnected",
+            "Entities focus restoration must reject disconnected openers",
+        ),
+        (
+            "pageHeadingRef.current",
+            "Entities focus restoration must fall back to the page heading",
+        ),
+    ):
+        if contract not in page_content:
+            return error
+    if re.search(r"setPageData\([^\n]*(?:filter|results)", page_content):
+        return "Entities deletion must not optimistically remove rows"
+    return None
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: verify-dashboard-overlay <dashboard-dir>", file=sys.stderr)
@@ -1351,6 +1454,7 @@ def main() -> int:
         verify_export_page(dashboard_dir),
         verify_proxy_contract(dashboard_dir),
         verify_requests_page(dashboard_dir),
+        verify_entities_page(dashboard_dir),
     )
     for error in checks:
         if error is not None:
