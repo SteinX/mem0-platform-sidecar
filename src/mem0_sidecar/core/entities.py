@@ -83,25 +83,24 @@ def parse_entity_query(payload: Mapping[str, object]) -> EntityQuery:
     raw_filters = normalized_payload.get("filters", [])
     if isinstance(raw_filters, list):
         filters: list[object] = []
-        for raw_filter in raw_filters:
-            if (
-                isinstance(raw_filter, Mapping)
-                and raw_filter.get("field") == "entity_type"
-            ):
+        for index, raw_filter in enumerate(raw_filters):
+            if not isinstance(raw_filter, Mapping):
+                filters.append(raw_filter)
+                continue
+            field = raw_filter.get("field")
+            if type(field) is not str:
+                raise ValueError(f"filters[{index}].field is not allowed")
+            if field == "entity_type":
                 normalized_filter = dict(raw_filter)
                 normalized_filter["value"] = _normalize_type_filter(
                     raw_filter.get("value")
                 )
                 filters.append(normalized_filter)
-            elif (
-                isinstance(raw_filter, Mapping)
-                and raw_filter.get("field") in _FILTER_ENTITY_TYPES
-            ):
+            elif field in _FILTER_ENTITY_TYPES:
                 normalized_filter = dict(raw_filter)
-                field_name = raw_filter["field"]
                 normalized_filter["value"] = _normalize_id_filter(
                     raw_filter.get("value"),
-                    field_name=field_name,
+                    field_name=field,
                 )
                 filters.append(normalized_filter)
             else:
