@@ -1540,21 +1540,42 @@ class MemoryIndexRepository:
 
 
 class EntityRepository:
+    _MEMORY_ID_COLUMNS = {
+        "user": MemoryIndex.user_id,
+        "agent": MemoryIndex.agent_id,
+        "app": MemoryIndex.app_id,
+        "run": MemoryIndex.run_id,
+    }
+
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    @classmethod
+    def _memory_id_column(cls, entity_type: str):
+        try:
+            return cls._MEMORY_ID_COLUMNS[entity_type]
+        except KeyError as exc:
+            raise ValueError("Unsupported entity type") from exc
 
     def upsert_entity(
         self,
         *,
         project_id: str,
+        app_id: str | None = None,
         entity_type: str,
         entity_id: str,
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Entity:
+        self._memory_id_column(entity_type)
+        if app_id is None:
+            if entity_type != "app":
+                raise ValueError("app_id is required")
+            app_id = entity_id
         entity = self.session.scalar(
             select(Entity).where(
                 Entity.project_id == project_id,
+                Entity.app_id == app_id,
                 Entity.entity_type == entity_type,
                 Entity.entity_id == entity_id,
             )
@@ -1562,6 +1583,7 @@ class EntityRepository:
         if entity is None:
             entity = Entity(
                 project_id=project_id,
+                app_id=app_id,
                 entity_type=entity_type,
                 entity_id=entity_id,
             )
@@ -1572,6 +1594,113 @@ class EntityRepository:
         entity.last_seen_at = _utc_now()
         self.session.flush()
         return entity
+
+    def rebuild_project_entities(
+        self,
+        project_id: str,
+        app_id: str,
+    ) -> list[Entity]:
+        with self.session.no_autoflush:
+            memories = list(
+                self.session.scalars(
+                    select(MemoryIndex).where(
+                        MemoryIndex.project_id == project_id,
+                        MemoryIndex.app_id == app_id,
+                        MemoryIndex.deleted_at.is_(None),
+                    )
+                )
+            )
+            aggregates: dict[tuple[str, str], tuple[int, datetime]] = {}
+            identity_fields = (
+                ("user", "user_id"),
+                ("agent", "agent_id"),
+                ("app", "app_id"),
+                ("run", "run_id"),
+            )
+            for memory in memories:
+                for entity_type, field_name in identity_fields:
+                    entity_id = getattr(memory, field_name)
+                    if entity_id is None:
+                        continue
+                    key = (entity_type, entity_id)
+                    updated_at = _as_utc(memory.updated_at)
+                    current = aggregates.get(key)
+                    if current is None:
+                        aggregates[key] = (1, updated_at)
+                    else:
+                        aggregates[key] = (
+                            current[0] + 1,
+                            max(current[1], updated_at),
+                        )
+
+            self.session.execute(
+                delete(Entity)
+                .where(
+                    Entity.project_id == project_id,
+                    Entity.app_id == app_id,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            entities = [
+                Entity(
+                    project_id=project_id,
+                    app_id=app_id,
+                    entity_type=entity_type,
+                    entity_id=entity_id,
+                    display_name=entity_id,
+                    memory_count=count,
+                    last_seen_at=last_seen_at,
+                )
+                for (entity_type, entity_id), (count, last_seen_at) in sorted(
+                    aggregates.items()
+                )
+            ]
+            self.session.add_all(entities)
+        self.session.flush()
+        return entities
+
+    def get_project_entity(
+        self,
+        project_id: str,
+        app_id: str,
+        entity_type: str,
+        entity_id: str,
+    ) -> Entity:
+        self._memory_id_column(entity_type)
+        entity = self.session.scalar(
+            select(Entity).where(
+                Entity.project_id == project_id,
+                Entity.app_id == app_id,
+                Entity.entity_type == entity_type,
+                Entity.entity_id == entity_id,
+            )
+        )
+        if entity is None:
+            raise KeyError(entity_id)
+        return entity
+
+    def list_entity_memory_ids(
+        self,
+        project_id: str,
+        app_id: str,
+        entity_type: str,
+        entity_id: str,
+    ) -> list[str]:
+        identity_column = self._memory_id_column(entity_type)
+        statement = (
+            select(MemoryIndex.mem0_memory_id)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.deleted_at.is_(None),
+                identity_column == entity_id,
+            )
+            .order_by(
+                MemoryIndex.updated_at.desc(),
+                MemoryIndex.mem0_memory_id.asc(),
+            )
+        )
+        return list(self.session.scalars(statement))
 
 
 class ExportJobRepository:

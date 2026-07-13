@@ -7,7 +7,15 @@ from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import BigInteger, Index, UniqueConstraint, create_engine, insert
+from sqlalchemy import (
+    BigInteger,
+    Index,
+    UniqueConstraint,
+    create_engine,
+    func,
+    insert,
+    select,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -20,6 +28,7 @@ from mem0_sidecar.core.explorer_filters import (
 from mem0_sidecar.store.models import (
     Base,
     Category,
+    Entity,
     Event,
     EventStatus,
     ExportStatus,
@@ -188,6 +197,322 @@ def test_repositories_support_control_plane_flow(db_session) -> None:
     assert entity.memory_count == 0
     assert job.status is JobStatus.PENDING
     assert job_repo.claim_next().id == job.id
+
+
+def _entity_projection_signature(entities: list[Entity]) -> list[tuple[object, ...]]:
+    return [
+        (
+            entity.project_id,
+            entity.app_id,
+            entity.entity_type,
+            entity.entity_id,
+            entity.memory_count,
+            entity.last_seen_at,
+        )
+        for entity in entities
+    ]
+
+
+def test_entity_model_has_app_scoped_identity_and_ordered_indexes(db_session) -> None:
+    constraints = {
+        constraint.name: tuple(column.name for column in constraint.columns)
+        for constraint in Entity.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    indexes = {
+        index.name: tuple(column.name for column in index.columns)
+        for index in Entity.__table__.indexes
+    }
+
+    assert Entity.__table__.c.app_id.nullable is False
+    assert constraints["uq_entities_project_app_type_id"] == (
+        "project_id",
+        "app_id",
+        "entity_type",
+        "entity_id",
+    )
+    assert indexes["ix_entities_project_app_type_updated"] == (
+        "project_id",
+        "app_id",
+        "entity_type",
+        "updated_at",
+    )
+    assert indexes["ix_entities_project_app_last_seen"] == (
+        "project_id",
+        "app_id",
+        "last_seen_at",
+    )
+
+
+def test_entity_rebuild_is_scoped_complete_and_idempotent(db_session) -> None:
+    projects = ProjectRepository(db_session)
+    for project_id in ("alpha", "beta"):
+        projects.upsert_default_project(
+            project_id=project_id,
+            name=project_id,
+            mem0_base_url="http://mem0:8000",
+        )
+    older = datetime(2026, 7, 12, 12, tzinfo=UTC)
+    newer = datetime(2026, 7, 13, 12, tzinfo=UTC)
+    deleted = datetime(2026, 7, 13, 13, tzinfo=UTC)
+    db_session.add_all(
+        [
+            MemoryIndex(
+                project_id="alpha",
+                mem0_memory_id="alpha-a-old",
+                app_id="app-a",
+                user_id="alice",
+                agent_id="agent-1",
+                run_id="run-1",
+                updated_at=older,
+            ),
+            MemoryIndex(
+                project_id="alpha",
+                mem0_memory_id="alpha-a-new",
+                app_id="app-a",
+                user_id="alice",
+                agent_id=None,
+                run_id="run-2",
+                updated_at=newer,
+            ),
+            MemoryIndex(
+                project_id="alpha",
+                mem0_memory_id="alpha-a-deleted",
+                app_id="app-a",
+                user_id="deleted-user",
+                agent_id="deleted-agent",
+                run_id="deleted-run",
+                updated_at=deleted,
+                deleted_at=deleted,
+            ),
+            MemoryIndex(
+                project_id="alpha",
+                mem0_memory_id="alpha-b",
+                app_id="app-b",
+                user_id="alice",
+                agent_id="agent-b",
+                run_id="run-b",
+                updated_at=deleted,
+            ),
+            MemoryIndex(
+                project_id="beta",
+                mem0_memory_id="beta-a",
+                app_id="app-a",
+                user_id="alice",
+                agent_id="agent-beta",
+                run_id="run-beta",
+                updated_at=deleted,
+            ),
+        ]
+    )
+    db_session.add_all(
+        [
+            Entity(
+                project_id="alpha",
+                app_id="app-a",
+                entity_type="user",
+                entity_id="stale",
+                memory_count=99,
+            ),
+            Entity(
+                project_id="alpha",
+                app_id="app-b",
+                entity_type="user",
+                entity_id="preserved-app",
+                memory_count=99,
+            ),
+            Entity(
+                project_id="beta",
+                app_id="app-a",
+                entity_type="user",
+                entity_id="preserved-project",
+                memory_count=99,
+            ),
+        ]
+    )
+    db_session.flush()
+    repository = EntityRepository(db_session)
+
+    first = repository.rebuild_project_entities("alpha", "app-a")
+    first_signature = _entity_projection_signature(first)
+    second = repository.rebuild_project_entities("alpha", "app-a")
+
+    assert first_signature == [
+        ("alpha", "app-a", "agent", "agent-1", 1, older),
+        ("alpha", "app-a", "app", "app-a", 2, newer),
+        ("alpha", "app-a", "run", "run-1", 1, older),
+        ("alpha", "app-a", "run", "run-2", 1, newer),
+        ("alpha", "app-a", "user", "alice", 2, newer),
+    ]
+    assert _entity_projection_signature(second) == first_signature
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(Entity)
+        .where(Entity.project_id == "alpha", Entity.app_id == "app-a")
+    ) == len(first_signature)
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(Entity)
+            .where(Entity.project_id == "alpha", Entity.app_id == "app-b")
+        )
+        == 1
+    )
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(Entity)
+            .where(Entity.project_id == "beta", Entity.app_id == "app-a")
+        )
+        == 1
+    )
+
+
+def test_entity_detail_and_memory_ids_are_strictly_scoped_and_ordered(
+    db_session,
+) -> None:
+    projects = ProjectRepository(db_session)
+    for project_id in ("alpha", "beta"):
+        projects.upsert_default_project(
+            project_id=project_id,
+            name=project_id,
+            mem0_base_url="http://mem0:8000",
+        )
+    newest = datetime(2026, 7, 13, 12, tzinfo=UTC)
+    older = newest - timedelta(days=1)
+    db_session.add_all(
+        [
+            MemoryIndex(
+                project_id="alpha",
+                mem0_memory_id="memory-b",
+                app_id="app-a",
+                user_id="alice",
+                agent_id="agent-1",
+                run_id="run-1",
+                updated_at=newest,
+            ),
+            MemoryIndex(
+                project_id="alpha",
+                mem0_memory_id="memory-a",
+                app_id="app-a",
+                user_id="alice",
+                agent_id="agent-2",
+                run_id="run-1",
+                updated_at=newest,
+            ),
+            MemoryIndex(
+                project_id="alpha",
+                mem0_memory_id="memory-old",
+                app_id="app-a",
+                user_id="alice",
+                agent_id="agent-1",
+                run_id="run-2",
+                updated_at=older,
+            ),
+            MemoryIndex(
+                project_id="alpha",
+                mem0_memory_id="memory-deleted",
+                app_id="app-a",
+                user_id="alice",
+                updated_at=newest,
+                deleted_at=newest,
+            ),
+            MemoryIndex(
+                project_id="alpha",
+                mem0_memory_id="memory-other-app",
+                app_id="app-b",
+                user_id="alice",
+                updated_at=newest,
+            ),
+            MemoryIndex(
+                project_id="beta",
+                mem0_memory_id="memory-other-project",
+                app_id="app-a",
+                user_id="alice",
+                updated_at=newest,
+            ),
+        ]
+    )
+    db_session.flush()
+    repository = EntityRepository(db_session)
+    repository.rebuild_project_entities("alpha", "app-a")
+
+    entity = repository.get_project_entity("alpha", "app-a", "user", "alice")
+    assert entity.memory_count == 3
+    assert repository.list_entity_memory_ids("alpha", "app-a", "user", "alice") == [
+        "memory-a",
+        "memory-b",
+        "memory-old",
+    ]
+    assert repository.list_entity_memory_ids(
+        "alpha", "app-a", "agent", "agent-1"
+    ) == ["memory-b", "memory-old"]
+    assert repository.list_entity_memory_ids(
+        "alpha", "app-a", "agent", "agent-2"
+    ) == ["memory-a"]
+    assert repository.list_entity_memory_ids(
+        "alpha", "app-a", "app", "app-a"
+    ) == ["memory-a", "memory-b", "memory-old"]
+    assert repository.list_entity_memory_ids(
+        "alpha", "app-a", "run", "run-1"
+    ) == ["memory-a", "memory-b"]
+    assert repository.list_entity_memory_ids(
+        "alpha", "app-a", "run", "run-2"
+    ) == ["memory-old"]
+    with pytest.raises(KeyError):
+        repository.get_project_entity("alpha", "app-b", "user", "alice")
+    with pytest.raises(KeyError):
+        repository.get_project_entity("beta", "app-a", "user", "alice")
+
+    for entity_type in ("session", "USER", ""):
+        with pytest.raises(ValueError, match="^Unsupported entity type$"):
+            repository.get_project_entity("alpha", "app-a", entity_type, "alice")
+        with pytest.raises(ValueError, match="^Unsupported entity type$"):
+            repository.list_entity_memory_ids("alpha", "app-a", entity_type, "alice")
+
+
+def test_entity_rebuild_uses_one_select_one_delete_and_one_flush(
+    db_session,
+    monkeypatch,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    db_session.add(
+        MemoryIndex(
+            project_id="alpha",
+            mem0_memory_id="memory-1",
+            app_id="app-a",
+            user_id="alice",
+        )
+    )
+    db_session.flush()
+    original_scalars = db_session.scalars
+    original_execute = db_session.execute
+    original_flush = db_session.flush
+    calls = {"select": 0, "delete": 0, "flush": 0}
+
+    def counted_scalars(statement, *args, **kwargs):
+        calls["select"] += 1
+        return original_scalars(statement, *args, **kwargs)
+
+    def counted_execute(statement, *args, **kwargs):
+        calls["delete"] += 1
+        return original_execute(statement, *args, **kwargs)
+
+    def counted_flush(*args, **kwargs):
+        calls["flush"] += 1
+        return original_flush(*args, **kwargs)
+
+    monkeypatch.setattr(db_session, "scalars", counted_scalars)
+    monkeypatch.setattr(db_session, "execute", counted_execute)
+    monkeypatch.setattr(db_session, "flush", counted_flush)
+
+    EntityRepository(db_session).rebuild_project_entities("alpha", "app-a")
+
+    assert calls == {"select": 1, "delete": 1, "flush": 1}
 
 
 def test_memory_index_repository_isolates_same_mem0_id_per_project(db_session) -> None:

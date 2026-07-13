@@ -51,6 +51,20 @@ REQUEST_TRACE_INDEX_COLUMNS = {
     ),
 }
 
+ENTITY_PROJECTION_INDEX_COLUMNS = {
+    "ix_entities_project_app_type_updated": (
+        "project_id",
+        "app_id",
+        "entity_type",
+        "updated_at",
+    ),
+    "ix_entities_project_app_last_seen": (
+        "project_id",
+        "app_id",
+        "last_seen_at",
+    ),
+}
+
 
 def _alembic_config(database_url: str) -> Config:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
@@ -552,3 +566,176 @@ def test_request_trace_migration_drops_entity_indexes_before_entity_columns(
                 ),
             )
         ) < operations.index(("column", f"{field_name}_id"))
+
+
+def test_entity_projection_migration_backfills_deduplicates_and_downgrades(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'entity-projections.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0005_request_trace_fields")
+    engine = sa.create_engine(database_url, future=True)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, default_app_id, mem0_base_url,
+                    created_at, updated_at
+                ) VALUES
+                    (
+                        'with-default', 'With Default', 'dashboard-app',
+                        'http://mem0:8000', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    ),
+                    (
+                        'fallback-project', 'Fallback Project', NULL,
+                        'http://mem0:8000', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO entities (
+                    id, project_id, entity_type, entity_id, display_name,
+                    metadata_json, memory_count, last_seen_at,
+                    created_at, updated_at
+                ) VALUES
+                    (
+                        'duplicate-old', 'with-default', 'user', 'alice',
+                        'Old Alice', '{}', 1, '2026-07-12 00:00:00',
+                        '2026-07-12 00:00:00', '2026-07-12 00:00:00'
+                    ),
+                    (
+                        'duplicate-new', 'with-default', 'user', 'alice',
+                        'New Alice', '{}', 2, '2026-07-13 00:00:00',
+                        '2026-07-12 00:00:00', '2026-07-13 00:00:00'
+                    ),
+                    (
+                        'fallback-row', 'fallback-project', 'run', 'run-1',
+                        NULL, '{}', 1, '2026-07-13 00:00:00',
+                        '2026-07-13 00:00:00', '2026-07-13 00:00:00'
+                    )
+                """
+            )
+        )
+
+    command.upgrade(config, "head")
+
+    inspector = sa.inspect(engine)
+    columns = {column["name"]: column for column in inspector.get_columns("entities")}
+    assert columns["app_id"]["nullable"] is False
+    constraints = {
+        constraint["name"]: tuple(constraint["column_names"])
+        for constraint in inspector.get_unique_constraints("entities")
+    }
+    assert constraints["uq_entities_project_app_type_id"] == (
+        "project_id",
+        "app_id",
+        "entity_type",
+        "entity_id",
+    )
+    indexes = {
+        index["name"]: tuple(index["column_names"])
+        for index in inspector.get_indexes("entities")
+    }
+    assert {
+        name: indexes[name] for name in ENTITY_PROJECTION_INDEX_COLUMNS
+    } == ENTITY_PROJECTION_INDEX_COLUMNS
+
+    with engine.connect() as connection:
+        rows = (
+            connection.execute(
+                sa.text(
+                    """
+                SELECT id, project_id, app_id, display_name
+                FROM entities
+                ORDER BY id
+                """
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert rows == [
+        {
+            "id": "duplicate-new",
+            "project_id": "with-default",
+            "app_id": "dashboard-app",
+            "display_name": "New Alice",
+        },
+        {
+            "id": "fallback-row",
+            "project_id": "fallback-project",
+            "app_id": "fallback-project",
+            "display_name": None,
+        },
+    ]
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO entities (
+                    id, project_id, app_id, entity_type, entity_id,
+                    metadata_json, memory_count, created_at, updated_at
+                ) VALUES (
+                    'other-app-same-id', 'with-default', 'other-app',
+                    'user', 'alice', '{}', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+    with pytest.raises(sa.exc.IntegrityError), engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO entities (
+                    id, project_id, app_id, entity_type, entity_id,
+                    metadata_json, memory_count, created_at, updated_at
+                ) VALUES (
+                    'same-app-duplicate', 'with-default', 'dashboard-app',
+                    'user', 'alice', '{}', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    command.downgrade(config, "0005_request_trace_fields")
+
+    downgraded = sa.inspect(engine)
+    assert "app_id" not in {
+        column["name"] for column in downgraded.get_columns("entities")
+    }
+    assert "uq_entities_project_app_type_id" not in {
+        constraint["name"]
+        for constraint in downgraded.get_unique_constraints("entities")
+    }
+    assert set(ENTITY_PROJECTION_INDEX_COLUMNS).isdisjoint(
+        index["name"] for index in downgraded.get_indexes("entities")
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO entities (
+                    id, project_id, entity_type, entity_id,
+                    metadata_json, memory_count, created_at, updated_at
+                ) VALUES (
+                    'legacy-after-downgrade', 'with-default', 'user', 'alice',
+                    '{}', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+
+def test_entity_projection_migration_has_exact_revision_chain() -> None:
+    migration = importlib.import_module(
+        "migrations.versions.0006_entity_projection_scope"
+    )
+
+    assert migration.revision == "0006_entity_projection_scope"
+    assert migration.down_revision == "0005_request_trace_fields"
