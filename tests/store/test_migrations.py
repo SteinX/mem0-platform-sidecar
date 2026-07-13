@@ -18,6 +18,13 @@ MEMORY_EXPLORER_INDEXES = {
     "ix_memories_index_project_category",
 }
 
+REQUEST_TRACE_INDEXES = {
+    "ix_events_project_created",
+    "ix_events_project_operation_created",
+    "ix_events_project_status_created",
+    "ix_events_project_has_results_created",
+}
+
 
 def _alembic_config(database_url: str) -> Config:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
@@ -340,3 +347,89 @@ def test_memory_explorer_indexes_migration_upgrades_and_downgrades(
         index["name"] for index in sa.inspect(engine).get_indexes("memories_index")
     }
     assert MEMORY_EXPLORER_INDEXES.isdisjoint(downgraded_indexes)
+
+
+def test_request_trace_migration_upgrades_legacy_rows_and_downgrades(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'request-traces.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0004_memory_explorer_indexes")
+    engine = sa.create_engine(database_url, future=True)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO events (
+                    id, project_id, operation, status, created_at
+                ) VALUES (
+                    'event-legacy', 'repo-a', 'memory.search', 'SUCCEEDED',
+                    CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    command.upgrade(config, "head")
+
+    inspector = sa.inspect(engine)
+    columns = {column["name"]: column for column in inspector.get_columns("events")}
+    assert {"correlation_id", "latency_ms", "result_count", "has_results"} <= set(
+        columns
+    )
+    assert columns["result_count"]["nullable"] is False
+    assert columns["has_results"]["nullable"] is False
+    assert str(columns["result_count"]["default"]).strip("'()") == "0"
+    assert str(columns["has_results"]["default"]).strip("'()") == "0"
+    assert REQUEST_TRACE_INDEXES <= {
+        index["name"] for index in inspector.get_indexes("events")
+    }
+
+    with engine.connect() as connection:
+        legacy = connection.execute(
+            sa.text(
+                """
+                SELECT correlation_id, latency_ms, result_count, has_results
+                FROM events
+                WHERE id = 'event-legacy'
+                """
+            )
+        ).mappings().one()
+    assert legacy == {
+        "correlation_id": None,
+        "latency_ms": None,
+        "result_count": 0,
+        "has_results": 0,
+    }
+
+    command.downgrade(config, "0004_memory_explorer_indexes")
+
+    downgraded = sa.inspect(engine)
+    assert {"correlation_id", "latency_ms", "result_count", "has_results"}.isdisjoint(
+        column["name"] for column in downgraded.get_columns("events")
+    )
+    assert REQUEST_TRACE_INDEXES.isdisjoint(
+        index["name"] for index in downgraded.get_indexes("events")
+    )
+
+
+def test_request_trace_migration_has_exact_revision_chain() -> None:
+    migration = importlib.import_module(
+        "migrations.versions.0005_request_trace_fields"
+    )
+
+    assert migration.revision == "0005_request_trace_fields"
+    assert migration.down_revision == "0004_memory_explorer_indexes"

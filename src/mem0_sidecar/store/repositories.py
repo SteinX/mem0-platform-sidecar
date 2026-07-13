@@ -1,7 +1,7 @@
 import json
-from collections.abc import Iterable
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import and_, delete, func, or_, select, update
@@ -9,6 +9,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.explorer_filters import ExplorerFilter, ExplorerQuery
+from mem0_sidecar.core.trace_payloads import (
+    bounded_trace_document,
+    trace_result_summary,
+)
 from mem0_sidecar.store.models import (
     Category,
     Entity,
@@ -27,6 +31,16 @@ def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True)
 
 
+def _trace_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -42,6 +56,25 @@ class MemoryIndexPage:
 class MemoryClaimResult:
     status: Literal["claimed", "conflict"]
     memory: MemoryIndex | None
+
+
+@dataclass(frozen=True)
+class EventQuery:
+    operation: str | None = None
+    statuses: tuple[EventStatus, ...] = ()
+    has_results: bool | None = None
+    from_at: datetime | None = None
+    to_at: datetime | None = None
+    entity_filters: Mapping[str, str] = field(default_factory=dict)
+    page: int = 1
+    page_size: int = 50
+
+
+@dataclass(frozen=True)
+class EventPage:
+    items: list[Event]
+    total: int
+    buckets: list[dict[str, object]]
 
 
 _MEMORY_FILTER_COLUMNS = {
@@ -119,6 +152,80 @@ def _memory_order_by(query: ExplorerQuery):
     if query.sort == "created_at_asc":
         return (MemoryIndex.created_at.asc(), MemoryIndex.mem0_memory_id.asc())
     return (MemoryIndex.created_at.desc(), MemoryIndex.mem0_memory_id.desc())
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _event_request(event: Event) -> dict[str, object] | None:
+    try:
+        request = json.loads(event.request_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return request if isinstance(request, dict) else None
+
+
+def _request_app_id(request: Mapping[str, object]) -> str | None:
+    if "app_id" in request:
+        app_id = request["app_id"]
+        return app_id if isinstance(app_id, str) and app_id else None
+    app_id = request.get("_mem0_sidecar_app_id")
+    return app_id if isinstance(app_id, str) and app_id else None
+
+
+def _matches_event_scope(
+    event: Event,
+    app_id: str,
+    entity_filters: Mapping[str, str],
+) -> bool:
+    request = _event_request(event)
+    if request is None or _request_app_id(request) != app_id:
+        return False
+
+    for field_name, expected in entity_filters.items():
+        if field_name == "app_id":
+            actual = _request_app_id(request)
+        elif field_name in {"user_id", "agent_id", "run_id"}:
+            actual = request.get(field_name)
+        else:
+            return False
+        if not isinstance(actual, str) or actual != expected:
+            return False
+    return True
+
+
+def _event_timeline_buckets(
+    events: list[Event],
+    query: EventQuery,
+) -> list[dict[str, object]]:
+    if not events:
+        return []
+
+    created_values = [_as_utc(event.created_at) for event in events]
+    range_start = _as_utc(query.from_at) if query.from_at else min(created_values)
+    range_end = _as_utc(query.to_at) if query.to_at else max(created_values)
+    use_days = range_end - range_start > timedelta(hours=48)
+
+    counts: dict[datetime, int] = {}
+    for created_at in created_values:
+        bucket = created_at.replace(
+            hour=0 if use_days else created_at.hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        counts[bucket] = counts.get(bucket, 0) + 1
+
+    return [
+        {
+            "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+            "count": counts[timestamp],
+        }
+        for timestamp in sorted(counts)
+    ]
 
 
 class ProjectRepository:
@@ -262,14 +369,18 @@ class EventRepository:
         request: dict[str, Any] | None = None,
         subject_type: str | None = None,
         subject_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> Event:
+        started_at = _utc_now()
         event = Event(
             project_id=project_id,
             operation=operation,
             status=EventStatus.PENDING,
             subject_type=subject_type,
             subject_id=subject_id,
-            request_json=_json(request or {}),
+            request_json=_trace_json(bounded_trace_document(request or {})),
+            correlation_id=correlation_id,
+            started_at=started_at,
         )
         self.session.add(event)
         self.session.flush()
@@ -300,19 +411,80 @@ class EventRepository:
 
     def mark_succeeded(self, event_id: str, *, response: dict[str, Any]) -> Event:
         event = self.get(event_id)
+        result_count, previews = trace_result_summary(response)
+        response_document = bounded_trace_document(response)
+        if previews:
+            response_document["result_previews"] = previews
         event.status = EventStatus.SUCCEEDED
-        event.response_json = _json(response)
-        event.completed_at = _utc_now()
+        event.response_json = _trace_json(bounded_trace_document(response_document))
+        event.result_count = result_count
+        event.has_results = 1 if result_count else 0
+        self._complete(event)
         self.session.flush()
         return event
 
     def mark_failed(self, event_id: str, *, error: dict[str, Any]) -> Event:
         event = self.get(event_id)
         event.status = EventStatus.FAILED
-        event.error_json = _json(error)
-        event.completed_at = _utc_now()
+        event.error_json = _trace_json(bounded_trace_document(error))
+        event.result_count = 0
+        event.has_results = 0
+        self._complete(event)
         self.session.flush()
         return event
+
+    def _complete(self, event: Event) -> None:
+        completed_at = _utc_now()
+        event.completed_at = completed_at
+        origin = event.started_at or event.created_at
+        if origin is None:
+            event.latency_ms = None
+            return
+        latency = (_as_utc(completed_at) - _as_utc(origin)).total_seconds() * 1000
+        event.latency_ms = max(latency, 0.0)
+
+    def query_project_events(
+        self,
+        project_id: str,
+        app_id: str,
+        query: EventQuery,
+    ) -> EventPage:
+        conditions = [Event.project_id == project_id]
+        if query.operation is not None:
+            conditions.append(Event.operation == query.operation)
+        if query.statuses:
+            conditions.append(Event.status.in_(query.statuses))
+        if query.has_results is not None:
+            conditions.append(Event.has_results == (1 if query.has_results else 0))
+        if query.from_at is not None:
+            conditions.append(Event.created_at >= query.from_at)
+        if query.to_at is not None:
+            conditions.append(Event.created_at <= query.to_at)
+
+        scan_count = self.session.scalar(
+            select(func.count()).select_from(Event).where(*conditions)
+        ) or 0
+        if scan_count > 5000:
+            raise ValueError("entity filter scan exceeds 5000 records")
+
+        candidates = list(
+            self.session.scalars(
+                select(Event)
+                .where(*conditions)
+                .order_by(Event.created_at.desc(), Event.id.desc())
+            )
+        )
+        matches = [
+            event
+            for event in candidates
+            if _matches_event_scope(event, app_id, query.entity_filters)
+        ]
+        offset = (query.page - 1) * query.page_size
+        return EventPage(
+            items=matches[offset : offset + query.page_size],
+            total=len(matches),
+            buckets=_event_timeline_buckets(matches, query),
+        )
 
 
 class MemoryIndexRepository:
