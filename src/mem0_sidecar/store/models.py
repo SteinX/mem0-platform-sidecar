@@ -3,6 +3,7 @@ from enum import StrEnum
 from uuid import uuid4
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     Float,
     ForeignKey,
@@ -213,7 +214,7 @@ class Event(Base):
     correlation_id: Mapped[str | None] = mapped_column(String(256))
     latency_ms: Mapped[float | None] = mapped_column(Float)
     result_count: Mapped[int] = mapped_column(
-        Integer, default=0, server_default=text("0"), nullable=False
+        BigInteger, default=0, server_default=text("0"), nullable=False
     )
     has_results: Mapped[int] = mapped_column(
         Integer, default=0, server_default=text("0"), nullable=False

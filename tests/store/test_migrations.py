@@ -7,6 +7,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
+from sqlalchemy.dialects import postgresql
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -433,3 +434,29 @@ def test_request_trace_migration_has_exact_revision_chain() -> None:
 
     assert migration.revision == "0005_request_trace_fields"
     assert migration.down_revision == "0004_memory_explorer_indexes"
+
+
+def test_request_trace_migration_uses_postgres_bigint_for_result_count(
+    monkeypatch,
+) -> None:
+    migration = importlib.import_module(
+        "migrations.versions.0005_request_trace_fields"
+    )
+    added_columns: list[sa.Column] = []
+
+    monkeypatch.setattr(
+        migration,
+        "op",
+        SimpleNamespace(
+            add_column=lambda table_name, column: added_columns.append(column),
+            create_index=lambda *args, **kwargs: None,
+        ),
+    )
+
+    migration.upgrade()
+
+    result_count = next(
+        column for column in added_columns if column.name == "result_count"
+    )
+    assert isinstance(result_count.type, sa.BigInteger)
+    assert result_count.type.compile(dialect=postgresql.dialect()) == "BIGINT"
