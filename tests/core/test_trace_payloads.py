@@ -301,13 +301,25 @@ def test_sanitize_trace_payload_keeps_credential_suffix_variants_consistent(
 def test_sanitize_trace_payload_preserves_status_and_count_fields() -> None:
     payload = {
         "requires_authorization": False,
+        "requiresAuthorization": False,
         "REQUIRESAUTHORIZATION": False,
+        "feature_requires_authorization": False,
+        "featureRequiresAuthorization": False,
         "favorite_cookie": "chocolate-chip",
         "favoriteCookie": "oatmeal",
+        "FAVORITECOOKIE": "shortbread",
+        "account_favorite_cookie": "ginger",
+        "accountFavoriteCookie": "sugar",
         "has_password": True,
         "hasPassword": True,
+        "HASPASSWORD": True,
+        "account_has_password": True,
+        "accountHasPassword": True,
         "is_secret": False,
+        "isSecret": False,
         "ISSECRET": False,
+        "account_is_secret": False,
+        "accountIsSecret": False,
         "token_count": 2,
         "TOKENCOUNT": 4,
         "secret_count": 3,
@@ -320,27 +332,46 @@ def test_sanitize_trace_payload_preserves_status_and_count_fields() -> None:
     assert sanitize_trace_payload(payload) == payload
 
 
-def test_sanitize_trace_payload_exempts_unsegmented_state_phrase_suffixes() -> None:
-    states = {
-        "ACCOUNTHASPASSWORD": True,
-        "FEATUREREQUIRESAUTHORIZATION": False,
-        "ACCOUNTFAVORITECOOKIE": "oatmeal",
-        "ACCOUNTISSECRET": False,
-    }
+def test_sanitize_trace_payload_redacts_ambiguous_collapsed_state_suffixes_by_default(
+) -> None:
+    class AmbiguousSecretMapping(Mapping[str, object]):
+        def __init__(self) -> None:
+            # Collapsing removes the boundary needed to distinguish state from secret.
+            self.keys = [
+                "ACCOUNTHASPASSWORD",
+                "accounthaspassword",
+                "FEATUREREQUIRESAUTHORIZATION",
+                "featurerequiresauthorization",
+                "ACCOUNTFAVORITECOOKIE",
+                "accountfavoritecookie",
+                "ACCOUNTISSECRET",
+                "accountissecret",
+                "REDISSECRET",
+                "redissecret",
+                "THISSECRET",
+                "PARISSECRET",
+                "redis_secret",
+                "redisSecret",
+                "REDIS_SECRET",
+            ]
+            self.value_reads = 0
 
-    sanitized = sanitize_trace_payload(
-        {
-            **states,
-            "ACCOUNT_PASSWORD": "credential",
-            "redis_secret": "credential",
-        }
-    )
+        def __iter__(self) -> Iterator[str]:
+            return iter(self.keys)
 
-    assert sanitized == {
-        **states,
-        "ACCOUNT_PASSWORD": "[REDACTED]",
-        "redis_secret": "[REDACTED]",
-    }
+        def __len__(self) -> int:
+            return len(self.keys)
+
+        def __getitem__(self, key: str) -> object:
+            self.value_reads += 1
+            raise AssertionError(f"ambiguous credential value was read for {key}")
+
+    payload = AmbiguousSecretMapping()
+
+    sanitized = sanitize_trace_payload(payload)
+
+    assert sanitized == {key: "[REDACTED]" for key in sorted(payload.keys)}
+    assert payload.value_reads == 0
 
 
 def test_sanitize_trace_payload_bounds_unicode_strings_by_utf8_bytes() -> None:
