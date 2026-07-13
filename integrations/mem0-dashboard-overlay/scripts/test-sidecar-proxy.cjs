@@ -39,6 +39,328 @@ function proxyOptions(fetchUpstream) {
   };
 }
 
+async function testMemoryQueryForcesRuntimeScopeAndPreservesQuery(proxy) {
+  const calls = [];
+  const payload = {
+    project_id: "forged-body-project",
+    app_id: "forged-body-app",
+    match: "all",
+    filters: [
+      { field: "user_id", operator: "equals", value: "alice" },
+    ],
+    date_range: { from: null, to: null },
+    page: 2,
+    page_size: 20,
+    sort: "created_at_desc",
+  };
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/query?project_id=forged-query-project&app_id=forged-query-app&trace=query",
+      {
+        method: "POST",
+        headers: { "X-Request-ID": "memory-query-123" },
+        body: JSON.stringify(payload),
+      },
+    ),
+    "/v1/memories/query",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ results: [], total: 0 });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/memories/query?trace=query",
+  );
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers.get("X-Request-ID"), "memory-query-123");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    ...payload,
+    project_id: "runtime project",
+    app_id: "runtime project",
+  });
+}
+
+async function testMemoryQueryRejectsInvalidJson(proxy) {
+  let fetchCalled = false;
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/memories/query", {
+      method: "POST",
+      body: "{not-json",
+    }),
+    "/v1/memories/query",
+    proxyOptions(async () => {
+      fetchCalled = true;
+      return Response.json({ results: [] });
+    }),
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid JSON body" });
+  assert.equal(fetchCalled, false);
+}
+
+async function testMemoryQueryRejectsArrayBody(proxy) {
+  let fetchCalled = false;
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/memories/query", {
+      method: "POST",
+      body: "[]",
+    }),
+    "/v1/memories/query",
+    proxyOptions(async () => {
+      fetchCalled = true;
+      return Response.json({ results: [] });
+    }),
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid JSON body" });
+  assert.equal(fetchCalled, false);
+}
+
+async function testMemoryDetailEncodesIdAndForcesRuntimeScope(proxy) {
+  const calls = [];
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory%2Fone?project_id=forged&app_id=forged-app&trace=detail",
+      { method: "GET" },
+    ),
+    "/v1/memories/memory/one",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ id: "memory/one" });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/memories/memory%2Fone?trace=detail&project_id=runtime+project&app_id=runtime+project",
+  );
+  assert.equal(calls[0].init.body, undefined);
+}
+
+async function testMemoryHistoryKeepsExactSuffixAndEncodedId(proxy) {
+  const calls = [];
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory%20one/history?project_id=forged&app_id=forged-app",
+      { method: "GET" },
+    ),
+    "/v1/memories/memory%20one/history",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ results: [] });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/memories/memory%20one/history?project_id=runtime+project&app_id=runtime+project",
+  );
+}
+
+async function testMemoryHistoryRecoversEncodedSlashFromRequestUrl(proxy) {
+  const calls = [];
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory%2Fone/history",
+      { method: "GET" },
+    ),
+    "/v1/memories/memory/one/history",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ results: [] });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/memories/memory%2Fone/history?project_id=runtime+project&app_id=runtime+project",
+  );
+}
+
+async function testMemoryPatchPreservesFieldsAndForcesRuntimeScope(proxy) {
+  const calls = [];
+  const payload = {
+    text: "updated",
+    metadata: { source: "dashboard" },
+    expiration_date: "2027-01-01T00:00:00Z",
+    project_id: "forged-project",
+    app_id: "forged-app",
+  };
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory-one?project_id=forged-query&app_id=forged-query-app",
+      { method: "PATCH", body: JSON.stringify(payload) },
+    ),
+    "/v1/memories/memory-one",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ memory: { id: "memory-one" } });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/memories/memory-one?project_id=runtime+project&app_id=runtime+project",
+  );
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    text: "updated",
+    metadata: { source: "dashboard" },
+    expiration_date: "2027-01-01T00:00:00Z",
+    project_id: "runtime project",
+    app_id: "runtime project",
+  });
+}
+
+async function testMemoryPatchRejectsArrayBody(proxy) {
+  let fetchCalled = false;
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/memories/memory-one", {
+      method: "PATCH",
+      body: "[]",
+    }),
+    "/v1/memories/memory-one",
+    proxyOptions(async () => {
+      fetchCalled = true;
+      return Response.json({});
+    }),
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid JSON body" });
+  assert.equal(fetchCalled, false);
+}
+
+async function testMemoryPatchRejectsInvalidJson(proxy) {
+  let fetchCalled = false;
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/memories/memory-one", {
+      method: "PATCH",
+      body: "{not-json",
+    }),
+    "/v1/memories/memory-one",
+    proxyOptions(async () => {
+      fetchCalled = true;
+      return Response.json({});
+    }),
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid JSON body" });
+  assert.equal(fetchCalled, false);
+}
+
+async function testMemoryDeleteForcesRuntimeScope(proxy) {
+  const calls = [];
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory-one?project_id=forged&app_id=forged-app",
+      { method: "DELETE" },
+    ),
+    "/v1/memories/memory-one",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return new Response(null, { status: 204 });
+    }),
+  );
+
+  assert.equal(response.status, 204);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/memories/memory-one?project_id=runtime+project&app_id=runtime+project",
+  );
+}
+
+async function testMemoryRoutesRejectTraversalDoubleEncodingAndExtraSegments(proxy) {
+  const rejected = [
+    ["GET", "/v1/memories/.."],
+    ["GET", "/v1/memories/%2E%2E"],
+    ["GET", "/v1/memories/memory%252Fone"],
+    ["GET", "/v1/memories/memory-one/history/extra"],
+    ["GET", "/v1/memories/memory-one/extra"],
+    ["GET", "/v1/memories/query"],
+    ["PATCH", "/v1/memories/query"],
+    ["DELETE", "/v1/memories/query"],
+    ["POST", "/v1/memories/memory-one"],
+    ["PATCH", "/v1/memories/memory-one/history"],
+    ["DELETE", "/v1/memories/memory-one/history"],
+  ];
+
+  for (const [method, normalizedPath] of rejected) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request(`http://dashboard.local/api/sidecar${normalizedPath}`, {
+        method,
+        body: method === "PATCH" || method === "POST" ? "{}" : undefined,
+      }),
+      normalizedPath,
+      proxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+    assert.equal(response.status, 403, `${method} ${normalizedPath}`);
+    assert.equal(fetchCalled, false, `${method} ${normalizedPath}`);
+  }
+}
+
+async function testUnauthenticatedMemoryRequestIsRejected(proxy) {
+  let fetchCalled = false;
+  const options = proxyOptions(async () => {
+    fetchCalled = true;
+    return Response.json({ results: [] });
+  });
+  options.validateDashboardSession = async () => false;
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/memories/query", {
+      method: "POST",
+      body: "{}",
+    }),
+    "/v1/memories/query",
+    options,
+  );
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: "Unauthorized" });
+  assert.equal(fetchCalled, false);
+}
+
+async function testUpstreamFailureDoesNotLeakInternalDetails(proxy) {
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/memories/memory-one", {
+      method: "GET",
+    }),
+    "/v1/memories/memory-one",
+    proxyOptions(async () => {
+      throw new Error(
+        "timeout http://user:secret@sidecar.internal/v1/memories/memory-one",
+      );
+    }),
+  );
+
+  assert.equal(response.status, 502);
+  const body = await response.text();
+  assert.equal(body.includes("sidecar.internal"), false);
+  assert.equal(body.includes("secret"), false);
+  assert.deepEqual(JSON.parse(body), {
+    error: "Sidecar upstream request failed",
+  });
+}
+
 async function testCategoryCollectionPostForcesConfiguredProject(proxy) {
   const calls = [];
   const payload = {
@@ -159,6 +481,7 @@ async function testExportPostForcesConfiguredProjectInBodyAndQuery(proxy) {
   const calls = [];
   const payload = {
     project_id: "forged-body-project",
+    app_id: "forged-body-app",
     filters: { user_id: "customer-1" },
     format: "json",
   };
@@ -191,7 +514,8 @@ async function testExportPostForcesConfiguredProjectInBodyAndQuery(proxy) {
     "export-create-123",
   );
   assert.deepEqual(JSON.parse(calls[0].init.body), {
-    ...payload,
+    filters: payload.filters,
+    format: payload.format,
     project_id: "runtime project",
   });
 }
@@ -232,6 +556,27 @@ async function main() {
   const dashboardDir = path.resolve(process.argv[2]);
   const { proxySidecarRequest } = await loadProxyModule(dashboardDir);
 
+  await testMemoryQueryForcesRuntimeScopeAndPreservesQuery(
+    proxySidecarRequest,
+  );
+  await testMemoryQueryRejectsInvalidJson(proxySidecarRequest);
+  await testMemoryQueryRejectsArrayBody(proxySidecarRequest);
+  await testMemoryDetailEncodesIdAndForcesRuntimeScope(proxySidecarRequest);
+  await testMemoryHistoryKeepsExactSuffixAndEncodedId(proxySidecarRequest);
+  await testMemoryHistoryRecoversEncodedSlashFromRequestUrl(
+    proxySidecarRequest,
+  );
+  await testMemoryPatchPreservesFieldsAndForcesRuntimeScope(
+    proxySidecarRequest,
+  );
+  await testMemoryPatchRejectsArrayBody(proxySidecarRequest);
+  await testMemoryPatchRejectsInvalidJson(proxySidecarRequest);
+  await testMemoryDeleteForcesRuntimeScope(proxySidecarRequest);
+  await testMemoryRoutesRejectTraversalDoubleEncodingAndExtraSegments(
+    proxySidecarRequest,
+  );
+  await testUnauthenticatedMemoryRequestIsRejected(proxySidecarRequest);
+  await testUpstreamFailureDoesNotLeakInternalDetails(proxySidecarRequest);
   await testCategoryCollectionPostForcesConfiguredProject(
     proxySidecarRequest,
   );
@@ -245,7 +590,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 8 contracts passed");
+  console.log("sidecar proxy request harness: 20 contracts passed");
 }
 
 main().catch((error) => {

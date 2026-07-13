@@ -32,11 +32,88 @@ function isExportPath(method: string, path: string): boolean {
   return method === "GET" && /^\/v1\/exports\/[^/]+\/download$/.test(path);
 }
 
+function isMemoryQueryPath(method: string, path: string): boolean {
+  return method === "POST" && path === "/v1/memories/query";
+}
+
+function canonicalMemoryId(encodedId: string): string | null {
+  if (!encodedId) {
+    return null;
+  }
+
+  let memoryId: string;
+  try {
+    memoryId = decodeURIComponent(encodedId);
+  } catch {
+    return null;
+  }
+
+  if (
+    memoryId === "." ||
+    memoryId === ".." ||
+    memoryId.includes("\0") ||
+    /%[0-9a-f]{2}/i.test(memoryId)
+  ) {
+    return null;
+  }
+  return encodeURIComponent(memoryId);
+}
+
+function memoryItemId(path: string): string | null {
+  const match = path.match(/^\/v1\/memories\/([^/]+)$/);
+  return match && match[1] !== "query" ? canonicalMemoryId(match[1]) : null;
+}
+
+function memoryHistoryId(path: string): string | null {
+  const match = path.match(/^\/v1\/memories\/([^/]+)\/history$/);
+  return match ? canonicalMemoryId(match[1]) : null;
+}
+
+function isMemoryItemPath(method: string, path: string): boolean {
+  return (
+    (method === "GET" || method === "PATCH" || method === "DELETE") &&
+    memoryItemId(path) !== null
+  );
+}
+
+function isMemoryHistoryPath(method: string, path: string): boolean {
+  return method === "GET" && memoryHistoryId(path) !== null;
+}
+
+function isMemoryPath(method: string, path: string): boolean {
+  return (
+    isMemoryQueryPath(method, path) ||
+    isMemoryItemPath(method, path) ||
+    isMemoryHistoryPath(method, path)
+  );
+}
+
+function memoryPathFromRequestUrl(
+  request: Request,
+  normalizedPath: string,
+): string {
+  if (!normalizedPath.startsWith("/v1/memories/")) {
+    return normalizedPath;
+  }
+
+  const pathname = new URL(request.url).pathname;
+  const proxyPrefix = "/api/sidecar";
+  const prefixIndex = pathname.lastIndexOf(proxyPrefix);
+  if (prefixIndex === -1) {
+    return normalizedPath;
+  }
+  const requestPath = pathname.slice(prefixIndex + proxyPrefix.length);
+  return requestPath.startsWith("/v1/memories/")
+    ? requestPath
+    : normalizedPath;
+}
+
 function isAllowedSidecarRequest(method: string, path: string): boolean {
   return (
     isProjectCategoriesPath(method, path) ||
     isProjectCategoryItemPath(method, path) ||
-    isExportPath(method, path)
+    isExportPath(method, path) ||
+    isMemoryPath(method, path)
   );
 }
 
@@ -58,12 +135,24 @@ function scopedSidecarPath(
     const categoryId = categoryItemMatch[1];
     return `/v1/projects/${encodeURIComponent(configuredProjectId)}/categories/${encodeURIComponent(categoryId)}`;
   }
+  if (isMemoryQueryPath(method, path)) {
+    return path;
+  }
+  const historyId = memoryHistoryId(path);
+  if (historyId !== null) {
+    return `/v1/memories/${historyId}/history`;
+  }
+  const itemId = memoryItemId(path);
+  if (itemId !== null) {
+    return `/v1/memories/${itemId}`;
+  }
   return path;
 }
 
-function scopedExportBody(
+function scopedJsonBody(
   bodyText: string,
   configuredProjectId: string,
+  configuredAppId?: string,
 ): string | Response {
   const payloadText = bodyText.trim() || "{}";
   let payload: unknown;
@@ -81,10 +170,14 @@ function scopedExportBody(
     return jsonError("Invalid JSON body", 400);
   }
 
-  return JSON.stringify({
-    ...payload,
-    project_id: configuredProjectId,
-  });
+  const scopedPayload: Record<string, unknown> = { ...payload };
+  delete scopedPayload.project_id;
+  delete scopedPayload.app_id;
+  scopedPayload.project_id = configuredProjectId;
+  if (configuredAppId !== undefined) {
+    scopedPayload.app_id = configuredAppId;
+  }
+  return JSON.stringify(scopedPayload);
 }
 
 export async function proxySidecarRequest(
@@ -96,9 +189,10 @@ export async function proxySidecarRequest(
   if (!baseUrl) {
     return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);
   }
+  const requestPath = memoryPathFromRequestUrl(request, normalizedPath);
   const scopedPath = scopedSidecarPath(
     request.method,
-    normalizedPath,
+    requestPath,
     configuredProjectId,
   );
   if (!scopedPath) {
@@ -110,12 +204,19 @@ export async function proxySidecarRequest(
 
   const url = new URL(`${baseUrl}${scopedPath}`);
   new URL(request.url).searchParams.forEach((value, key) => {
-    if (key !== "project_id") {
+    if (key !== "project_id" && key !== "app_id") {
       url.searchParams.append(key, value);
     }
   });
   if (isExportPath(request.method, scopedPath)) {
     url.searchParams.set("project_id", configuredProjectId);
+  }
+  if (
+    isMemoryItemPath(request.method, scopedPath) ||
+    isMemoryHistoryPath(request.method, scopedPath)
+  ) {
+    url.searchParams.set("project_id", configuredProjectId);
+    url.searchParams.set("app_id", configuredProjectId);
   }
 
   const headers = new Headers();
@@ -133,7 +234,20 @@ export async function proxySidecarRequest(
   if (METHODS_WITH_BODY.has(request.method)) {
     const bodyText = await request.text();
     if (request.method === "POST" && scopedPath === "/v1/exports") {
-      const scopedBody = scopedExportBody(bodyText, configuredProjectId);
+      const scopedBody = scopedJsonBody(bodyText, configuredProjectId);
+      if (scopedBody instanceof Response) {
+        return scopedBody;
+      }
+      init.body = scopedBody;
+    } else if (
+      isMemoryQueryPath(request.method, scopedPath) ||
+      isMemoryItemPath(request.method, scopedPath)
+    ) {
+      const scopedBody = scopedJsonBody(
+        bodyText,
+        configuredProjectId,
+        configuredProjectId,
+      );
       if (scopedBody instanceof Response) {
         return scopedBody;
       }

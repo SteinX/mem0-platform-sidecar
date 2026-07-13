@@ -56,7 +56,11 @@ export async function sidecarPost<T>(path: string, body: unknown): Promise<T> {
   return sidecarRequest<T>("POST", path, body);
 }
 
-export async function sidecarPatch<T>(path: string, body: unknown): Promise<T> {
+export async function sidecarQuery<T>(path: string, body: object): Promise<T> {
+  return sidecarRequest<T>("POST", path, body);
+}
+
+export async function sidecarPatch<T>(path: string, body: object): Promise<T> {
   return sidecarRequest<T>("PATCH", path, body);
 }
 

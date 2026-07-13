@@ -571,12 +571,108 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
     assert "export async function sidecarGet<T>" in helper_content
     assert "export async function sidecarPut<T>" in helper_content
     assert "export async function sidecarPost<T>" in helper_content
+    assert "export async function sidecarQuery<T>" in helper_content
+    assert "body: object" in helper_content
+    assert "export async function sidecarPatch<T>" in helper_content
+    assert 'return sidecarRequest<T>("POST", path, body);' in helper_content
+    assert 'return sidecarRequest<T>("PATCH", path, body);' in helper_content
+    assert "return parseResponse<T>(response);" in helper_content
+    assert "response.url" not in helper_content
     assert "export async function proxySidecarRequest(" in proxy_content
     assert "export async function getSidecarProjectId()" in project_helper_content
     assert 'fetch("/api/sidecar/config"' in project_helper_content
     assert "NEXT_PUBLIC_MEM0_SIDECAR_PROJECT_ID" not in project_helper_content
     assert "export type SidecarCategory =" in type_content
     assert "export type SidecarExportJob =" in type_content
+    for symbol in (
+        "export type SidecarMemory =",
+        "export type SidecarMemoryQuery =",
+        "export type SidecarMemoryPage =",
+        "export type SidecarMemoryHistoryEntry =",
+    ):
+        assert symbol in type_content
+
+    memory_query = re.search(
+        r"export type SidecarMemoryQuery\s*=\s*\{(?P<body>.*?)\n\};",
+        type_content,
+        re.S,
+    )
+    assert memory_query is not None
+    assert "project_id" not in memory_query.group("body")
+    assert "app_id" not in memory_query.group("body")
+    assert 'filters: Array<Omit<ExplorerFilter, "id">>;' in memory_query.group(
+        "body"
+    )
+
+    for field in (
+        "id: string;",
+        "memory: string | null;",
+        "metadata: Record<string, unknown>;",
+        "categories: string[];",
+        "user_id: string | null;",
+        "agent_id: string | null;",
+        "app_id: string | null;",
+        "run_id: string | null;",
+        "created_at: string | null;",
+        "updated_at: string | null;",
+        "expiration_date: string | null;",
+    ):
+        assert field in type_content
+
+    for field in (
+        "results: SidecarMemory[];",
+        "page: number;",
+        "page_size: number;",
+        "total: number;",
+        "has_more: boolean;",
+        "stale_skipped: number;",
+    ):
+        assert field in type_content
+
+
+def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
+    dashboard = applied_upstream_overlay(tmp_path)
+
+    result = subprocess.run(
+        [
+            "node",
+            str(OVERLAY / "scripts/test-sidecar-proxy.cjs"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "sidecar proxy request harness: 20 contracts passed" in result.stdout
+
+
+def test_sidecar_proxy_harness_rejects_stale_applied_target(tmp_path):
+    dashboard = applied_upstream_overlay(tmp_path)
+    proxy = dashboard / "src/utils/sidecar-proxy.ts"
+    proxy.write_text(
+        proxy.read_text().replace(
+            'return jsonError("Sidecar route is not allowed", 403);',
+            'return jsonError("BROKEN", 403);',
+        )
+    )
+
+    result = subprocess.run(
+        [
+            "node",
+            str(OVERLAY / "scripts/test-sidecar-proxy.cjs"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "BROKEN" in result.stderr
 
 
 def test_apply_dashboard_overlay_normalizes_sidecar_paths_and_removes_patch_footgun(
@@ -639,15 +735,20 @@ def test_apply_dashboard_overlay_route_restricts_sidecar_paths(tmp_path):
     assert "function isAllowedSidecarRequest(" in proxy_content
     assert "function getConfiguredProjectId()" in route_content
     assert "function scopedSidecarPath(" in proxy_content
-    assert "function scopedExportBody(" in proxy_content
+    assert "function scopedJsonBody(" in proxy_content
     assert 'key !== "project_id"' in proxy_content
     assert 'url.searchParams.set("project_id", configuredProjectId);' in proxy_content
-    assert "project_id: configuredProjectId" in proxy_content
+    assert "scopedPayload.project_id = configuredProjectId" in proxy_content
     assert 'return jsonError("Sidecar route is not allowed", 403);' in proxy_content
     assert "isProjectCategoriesPath" in proxy_content
     assert "isProjectCategoryItemPath" in proxy_content
     assert "categoryItemMatch" in proxy_content
     assert "isExportPath" in proxy_content
+    assert "isMemoryQueryPath" in proxy_content
+    assert "isMemoryItemPath" in proxy_content
+    assert "isMemoryHistoryPath" in proxy_content
+    assert "scopedPayload.project_id = configuredProjectId" in proxy_content
+    assert "scopedPayload.app_id = configuredAppId" in proxy_content
     assert (
         'method === "DELETE" && /^\\/v1\\/exports\\/[^/]+$/.test(path)'
         not in proxy_content
