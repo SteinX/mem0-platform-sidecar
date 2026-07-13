@@ -48,6 +48,33 @@ def applied_overlay(tmp_path: Path) -> Path:
     return dashboard
 
 
+def applied_upstream_overlay(tmp_path: Path) -> Path:
+    dashboard = tmp_path / "dashboard"
+    shutil.copytree(
+        UPSTREAM_DASHBOARD,
+        dashboard,
+        ignore=shutil.ignore_patterns("node_modules", ".next"),
+        symlinks=True,
+    )
+    (dashboard / "node_modules").symlink_to(
+        UPSTREAM_DASHBOARD / "node_modules",
+        target_is_directory=True,
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return dashboard
+
+
 def run_verify_without_typecheck(dashboard: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -303,6 +330,56 @@ def test_dashboard_overlay_verifier_runs_explorer_component_contracts():
         r"subprocess\.run\(\s*explorer_components_harness_command\(",
         verifier_source,
     )
+
+
+def test_explorer_component_harness_verifies_the_applied_dashboard(tmp_path):
+    dashboard = applied_upstream_overlay(tmp_path)
+    state_path = (
+        dashboard
+        / "src/components/self-hosted/explorer/explorer-component-state.ts"
+    )
+    content = state_path.read_text()
+    deterministic_format = (
+        "return Number.isFinite(date.getTime()) "
+        "? date.toISOString().slice(0, 10) : value;"
+    )
+    assert deterministic_format in content
+    state_path.write_text(content.replace(deterministic_format, 'return "BROKEN";'))
+
+    result = subprocess.run(
+        [sys.executable, str(VERIFY_DASHBOARD_OVERLAY), str(dashboard)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "explorer components harness failed" in result.stderr
+
+
+def test_explorer_component_harness_reports_missing_applied_source(tmp_path):
+    dashboard = applied_upstream_overlay(tmp_path)
+    missing = (
+        dashboard
+        / "src/components/self-hosted/explorer/date-range-filter.tsx"
+    )
+    missing.unlink()
+
+    result = subprocess.run(
+        [
+            "node",
+            str(OVERLAY / "scripts/test-explorer-components.cjs"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert f"missing applied dashboard source: {missing}" in result.stderr
 
 
 def test_date_range_filter_has_draft_utc_and_responsive_contracts():
