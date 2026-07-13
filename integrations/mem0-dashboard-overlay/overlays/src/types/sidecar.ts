@@ -114,3 +114,47 @@ export type SidecarMemoryHistoryEntry = {
 export type SidecarMemoryHistoryResponse = {
   results: unknown;
 };
+
+export type SidecarTraceTimelineBucket = {
+  timestamp: string;
+  count: number;
+};
+
+export type SidecarTrace = {
+  id: string;
+  correlation_id: string | null;
+  operation: string;
+  display_operation: "ADD" | "SEARCH" | "GET ALL";
+  status: "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
+  entities: Array<{ type: "user" | "agent" | "app" | "run"; id: string }>;
+  request: Record<string, unknown>;
+  response: Record<string, unknown>;
+  error: Record<string, unknown>;
+  result_count: number;
+  has_results: boolean;
+  latency_ms: number | null;
+  requested_at: string | null;
+  completed_at: string | null;
+  result_previews: Array<Record<string, unknown>>;
+  result_previews_omitted: number;
+  result_previews_scan_truncated: boolean;
+};
+
+export type SidecarTraceQuery = {
+  operation: "ADD" | "SEARCH" | "GET_ALL" | null;
+  statuses: Array<"PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED">;
+  has_results: boolean | null;
+  date_range: ExplorerDateRange;
+  entity_filters: Partial<Record<"user_id" | "agent_id" | "app_id" | "run_id", string>>;
+  page: number;
+  page_size: number;
+};
+
+export type SidecarTracePage = {
+  results: SidecarTrace[];
+  total: number;
+  page: number;
+  page_size: number;
+  has_more: boolean;
+  timeline: SidecarTraceTimelineBucket[];
+};

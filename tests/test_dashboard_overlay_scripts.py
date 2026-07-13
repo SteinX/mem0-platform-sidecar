@@ -892,6 +892,80 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
         assert field in type_content
 
 
+def test_dashboard_overlay_includes_exact_request_trace_types():
+    type_content = (
+        OVERLAY / "overlays/src/types/sidecar.ts"
+    ).read_text()
+
+    for symbol in (
+        "export type SidecarTrace =",
+        "export type SidecarTraceQuery =",
+        "export type SidecarTracePage =",
+        "export type SidecarTraceTimelineBucket =",
+    ):
+        assert symbol in type_content
+
+    trace = re.search(
+        r"export type SidecarTrace\s*=\s*\{(?P<body>.*?)\n\};",
+        type_content,
+        re.S,
+    )
+    assert trace is not None
+    for field in (
+        "id: string;",
+        "correlation_id: string | null;",
+        "operation: string;",
+        'display_operation: "ADD" | "SEARCH" | "GET ALL";',
+        'status: "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";',
+        'entities: Array<{ type: "user" | "agent" | "app" | "run"; id: string }>;',
+        "request: Record<string, unknown>;",
+        "response: Record<string, unknown>;",
+        "error: Record<string, unknown>;",
+        "result_count: number;",
+        "has_results: boolean;",
+        "latency_ms: number | null;",
+        "requested_at: string | null;",
+        "completed_at: string | null;",
+        "result_previews: Array<Record<string, unknown>>;",
+        "result_previews_omitted: number;",
+        "result_previews_scan_truncated: boolean;",
+    ):
+        assert field in trace.group("body")
+
+    query = re.search(
+        r"export type SidecarTraceQuery\s*=\s*\{(?P<body>.*?)\n\};",
+        type_content,
+        re.S,
+    )
+    assert query is not None
+    assert re.search(r"^\s*project_id\s*:", query.group("body"), re.M) is None
+    assert re.search(r"^\s*app_id\s*:", query.group("body"), re.M) is None
+    for field in (
+        'operation: "ADD" | "SEARCH" | "GET_ALL" | null;',
+        'statuses: Array<"PENDING" | "RUNNING" | "SUCCEEDED" | '
+        '"FAILED" | "CANCELLED">;',
+        "has_results: boolean | null;",
+        "date_range: ExplorerDateRange;",
+        'entity_filters: Partial<Record<"user_id" | "agent_id" | '
+        '"app_id" | "run_id", string>>;',
+        "page: number;",
+        "page_size: number;",
+    ):
+        assert field in query.group("body")
+
+    for field in (
+        "timestamp: string;",
+        "count: number;",
+        "results: SidecarTrace[];",
+        "total: number;",
+        "page: number;",
+        "page_size: number;",
+        "has_more: boolean;",
+        "timeline: SidecarTraceTimelineBucket[];",
+    ):
+        assert field in type_content
+
+
 def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
     dashboard = applied_upstream_overlay(tmp_path)
 
@@ -908,7 +982,7 @@ def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "sidecar proxy request harness: 21 contracts passed" in result.stdout
+    assert "sidecar proxy request harness: 27 contracts passed" in result.stdout
 
 
 def test_sidecar_proxy_harness_rejects_stale_applied_target(tmp_path):
