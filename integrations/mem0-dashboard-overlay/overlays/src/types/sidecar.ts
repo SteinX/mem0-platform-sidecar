@@ -121,6 +121,42 @@ export type SidecarMemoryHistoryResponse = {
   results: unknown;
 };
 
+export type SidecarEntity = {
+  id: string;
+  type: "user" | "agent" | "app" | "run";
+  entity_id: string;
+  display_name: string;
+  memory_count: number;
+  last_seen_at: string | null;
+  updated_at: string | null;
+};
+
+export type SidecarEntityQuery = {
+  entity_type: "user" | "agent" | "app" | "run";
+  match: ExplorerMatch;
+  filters: Array<Omit<ExplorerFilter, "id">>;
+  date_range: ExplorerDateRange;
+  page: number;
+  page_size: number;
+};
+
+export type SidecarEntityPage = {
+  results: SidecarEntity[];
+  page: number;
+  page_size: number;
+  total: number;
+  has_more: boolean;
+};
+
+export type SidecarEntityDeleteResult = {
+  status: "SUCCEEDED" | "PARTIAL" | "FAILED";
+  requested_count: number;
+  deleted_count: number;
+  failed_count: number;
+  failed: Array<{ id: string; error: Record<string, unknown> }>;
+  event_id: string;
+};
+
 export type SidecarTraceTimelineBucket = {
   timestamp: string;
   count: number;

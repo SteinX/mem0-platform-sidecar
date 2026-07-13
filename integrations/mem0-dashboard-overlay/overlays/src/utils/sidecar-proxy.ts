@@ -100,6 +100,56 @@ function isMemoryPath(method: string, path: string): boolean {
   );
 }
 
+function isEntityQueryPath(method: string, path: string): boolean {
+  return method === "POST" && path === "/v1/entities/query";
+}
+
+function canonicalEntitySegment(encodedSegment: string): string | null {
+  if (!encodedSegment) {
+    return null;
+  }
+
+  let segment: string;
+  try {
+    segment = decodeURIComponent(encodedSegment);
+  } catch {
+    return null;
+  }
+
+  const hasTraversalSegment = segment
+    .split(/[\\/]/)
+    .some((part) => part === "." || part === "..");
+  if (hasTraversalSegment || /[\u0000-\u001f\u007f]/.test(segment)) {
+    return null;
+  }
+  return encodeURIComponent(segment);
+}
+
+function entityItemSegments(
+  path: string,
+): { entityType: string; entityId: string } | null {
+  const match = path.match(/^\/v1\/entities\/([^/]+)\/([^/]+)$/);
+  if (!match) {
+    return null;
+  }
+  const entityType = canonicalEntitySegment(match[1]);
+  const entityId = canonicalEntitySegment(match[2]);
+  return entityType !== null && entityId !== null
+    ? { entityType, entityId }
+    : null;
+}
+
+function isEntityItemPath(method: string, path: string): boolean {
+  return (
+    (method === "GET" || method === "DELETE") &&
+    entityItemSegments(path) !== null
+  );
+}
+
+function isEntityPath(method: string, path: string): boolean {
+  return isEntityQueryPath(method, path) || isEntityItemPath(method, path);
+}
+
 function isEventQueryPath(method: string, path: string): boolean {
   return method === "POST" && path === "/v1/events/query";
 }
@@ -123,7 +173,8 @@ function sidecarPathFromRequestUrl(
 ): string {
   if (
     !normalizedPath.startsWith("/v1/memories/") &&
-    !normalizedPath.startsWith("/v1/event/")
+    !normalizedPath.startsWith("/v1/event/") &&
+    !normalizedPath.startsWith("/v1/entities/")
   ) {
     return normalizedPath;
   }
@@ -136,7 +187,8 @@ function sidecarPathFromRequestUrl(
   }
   const requestPath = pathname.slice(prefixIndex + proxyPrefix.length);
   return requestPath.startsWith("/v1/memories/") ||
-    requestPath.startsWith("/v1/event/")
+    requestPath.startsWith("/v1/event/") ||
+    requestPath.startsWith("/v1/entities/")
     ? requestPath
     : normalizedPath;
 }
@@ -147,6 +199,7 @@ function isAllowedSidecarRequest(method: string, path: string): boolean {
     isProjectCategoryItemPath(method, path) ||
     isExportPath(method, path) ||
     isMemoryPath(method, path) ||
+    isEntityPath(method, path) ||
     isEventPath(method, path)
   );
 }
@@ -171,6 +224,13 @@ function scopedSidecarPath(
   }
   if (isMemoryQueryPath(method, path)) {
     return path;
+  }
+  if (isEntityQueryPath(method, path)) {
+    return path;
+  }
+  const entityItem = entityItemSegments(path);
+  if (entityItem !== null) {
+    return `/v1/entities/${entityItem.entityType}/${entityItem.entityId}`;
   }
   if (isEventQueryPath(method, path)) {
     return path;
@@ -352,8 +412,9 @@ export async function proxySidecarRequest(
     requestPath,
   );
   const isMemoryRequest = isMemoryPath(request.method, requestPath);
+  const isEntityRequest = isEntityPath(request.method, requestPath);
   const url = new URL(`${baseUrl}${scopedPath}`);
-  if (!isMemoryRequest && !isEventRequest) {
+  if (!isMemoryRequest && !isEntityRequest && !isEventRequest) {
     new URL(request.url).searchParams.forEach((value, key) => {
       if (key !== "project_id" && key !== "app_id") {
         url.searchParams.append(key, value);
@@ -364,6 +425,12 @@ export async function proxySidecarRequest(
     url.searchParams.set("project_id", configuredProjectId);
   }
   if (isMemoryItemRequest || isMemoryHistoryRequest) {
+    url.searchParams.set("project_id", configuredProjectId);
+    if (configuredAppId !== undefined) {
+      url.searchParams.set("app_id", configuredAppId);
+    }
+  }
+  if (isEntityItemPath(request.method, requestPath)) {
     url.searchParams.set("project_id", configuredProjectId);
     if (configuredAppId !== undefined) {
       url.searchParams.set("app_id", configuredAppId);
@@ -390,6 +457,7 @@ export async function proxySidecarRequest(
     const rewritesJsonBody =
       (request.method === "POST" && scopedPath === "/v1/exports") ||
       isMemoryQueryPath(request.method, scopedPath) ||
+      isEntityQueryPath(request.method, scopedPath) ||
       isEventQueryPath(request.method, scopedPath) ||
       isMemoryItemRequest;
     if (rewritesJsonBody) {
