@@ -74,7 +74,12 @@ Mem0Dependency = Annotated[Any, Depends(get_mem0_client)]
 JsonBody = Annotated[Any, Body()]
 
 
-def _decode_path_identifier(value: str, *, field_name: str) -> str:
+def _decode_path_identifier(
+    value: str,
+    *,
+    field_name: str,
+    allow_encoded_octet_literal: bool = False,
+) -> str:
     try:
         decoded = unquote(value, encoding="utf-8", errors="strict")
     except UnicodeDecodeError as exc:
@@ -88,7 +93,10 @@ def _decode_path_identifier(value: str, *, field_name: str) -> str:
     )
     if (
         has_traversal_segment
-        or _ENCODED_OCTET.search(decoded)
+        or (
+            not allow_encoded_octet_literal
+            and _ENCODED_OCTET.search(decoded)
+        )
         or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
     ):
         raise HTTPException(
@@ -246,7 +254,11 @@ def get_entity(
             entity_type,
             field_name="entity_type",
         )
-        decoded_id = _decode_path_identifier(entity_id, field_name="entity_id")
+        decoded_id = _decode_path_identifier(
+            entity_id,
+            field_name="entity_id",
+            allow_encoded_octet_literal=True,
+        )
         decoded_type, decoded_id = validate_entity_identity(
             decoded_type,
             decoded_id,
@@ -289,7 +301,11 @@ async def delete_entity(
             entity_type,
             field_name="entity_type",
         )
-        decoded_id = _decode_path_identifier(entity_id, field_name="entity_id")
+        decoded_id = _decode_path_identifier(
+            entity_id,
+            field_name="entity_id",
+            allow_encoded_octet_literal=True,
+        )
         decoded_type, decoded_id = validate_entity_identity(
             decoded_type,
             decoded_id,
