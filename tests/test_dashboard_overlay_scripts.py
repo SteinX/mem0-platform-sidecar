@@ -185,6 +185,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/app/(root)/dashboard/memories/memory-detail-drawer.tsx",
         "src/app/(root)/dashboard/requests/page.tsx",
         "src/app/(root)/dashboard/requests/request-trace-drawer.tsx",
+        "src/app/(root)/dashboard/entities/page.tsx",
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/config/route.ts",
         "src/app/api/sidecar/[...path]/route.ts",
@@ -579,6 +580,144 @@ def test_dashboard_overlay_includes_request_trace_page_and_drawer_contracts():
         assert contract in drawer_content
 
     assert (OVERLAY / "scripts/test-request-trace-state.cjs").is_file()
+
+
+def test_dashboard_overlay_includes_entity_explorer_contracts():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    page_path = "src/app/(root)/dashboard/entities/page.tsx"
+
+    assert page_path in manifest["files"]
+    page = OVERLAY / "overlays" / page_path
+    assert page.is_file()
+    assert_dashboard_tsx_transpiles(page)
+
+    content = page.read_text()
+    for contract in (
+        'label: "USER", value: "user"',
+        'label: "RUN", value: "run"',
+        'label: "AGENT", value: "agent"',
+        'label: "APP", value: "app"',
+        'entity_type: "user"',
+        "DateRangeFilter",
+        "FilterBuilder",
+        "query.filters.length",
+        "Refresh",
+        "Entities",
+        "Updated On",
+        "Memories",
+        "Action",
+        "Loading entities",
+        "No entities found",
+        "Could not load entities",
+        "Pagination",
+        "Tooltip",
+        "md:hidden",
+        "aria-disabled",
+        "tabIndex",
+        "sidecarQuery<SidecarEntityPage>",
+        '"/v1/entities/query"',
+        "signal: controller.signal",
+        "new AbortController()",
+        "controller.abort()",
+        "listGeneration",
+        "pageDataRef.current",
+        "entityType",
+        "page: 1",
+        "AlertDialogTitle",
+        "AlertDialogDescription",
+        "projected memory count",
+        "confirmationText === selectedEntity.entity_id",
+        "case-sensitive",
+        "encodeURIComponent(entity.type)",
+        "encodeURIComponent(entity.entity_id)",
+        "sidecarGet<SidecarEntity>",
+        "detailGeneration",
+        "deleteGeneration",
+        'result.status === "SUCCEEDED"',
+        'result.status === "PARTIAL"',
+        'result.status === "FAILED"',
+        "deleted_count",
+        "failed_count",
+        "sanitizeDisplayedError",
+        "onCloseAutoFocus",
+        "opener?.isConnected",
+        "pageHeadingRef.current",
+        "router.push",
+        'field: ENTITY_MEMORY_FIELDS[entity.type]',
+        'operator: "equals"',
+        "new URLSearchParams()",
+        "View memories for ${entity.entity_id}",
+    ):
+        assert contract in content
+
+    assert "SESSION" not in content
+    assert "project_id" not in content
+    assert not re.search(
+        r"setPageData\([^\n]*(filter|results)",
+        content,
+    ), "entity deletion must not optimistically remove rows"
+
+
+def test_entity_explorer_verifier_enforces_runtime_contracts(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/entities/page.tsx"
+    content = page.read_text()
+    assert '"/v1/entities/query"' in content
+    page.write_text(content.replace(
+        '"/v1/entities/query"',
+        '"/v1/entities/missing"',
+        1,
+    ))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Entities page must query /v1/entities/query" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "error"),
+    [
+        (
+            "sidecarGet<SidecarEntity>",
+            "sidecarGet<MissingSidecarEntity>",
+            "Entities delete confirmation must refresh entity detail",
+        ),
+        (
+            "confirmationText === selectedEntity.entity_id",
+            "confirmationText.toLowerCase() === selectedEntity.entity_id.toLowerCase()",
+            "Entities delete confirmation must require the exact case-sensitive ID",
+        ),
+        (
+            'result.status === "PARTIAL"',
+            'result.status === "MISSING_PARTIAL"',
+            "Entities deletion must handle partial results",
+        ),
+        (
+            "new URLSearchParams()",
+            "new URLSearchParams(search)",
+            "Entities memory drill-down must start from clean query state",
+        ),
+        (
+            "onCloseAutoFocus",
+            "onMissingCloseAutoFocus",
+            "Entities delete dialog must restore keyboard focus",
+        ),
+    ],
+)
+def test_entity_explorer_verifier_rejects_missing_safety_contracts(
+    tmp_path, before, after, error
+):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/entities/page.tsx"
+    content = page.read_text()
+    assert before in content
+    page.write_text(content.replace(before, after, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert error in result.stderr
 
 
 def test_request_trace_state_harness_executes_applied_target(tmp_path):
