@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.http_adapter.app import create_app
-from mem0_sidecar.store.models import MemoryIndex
+from mem0_sidecar.store.models import Event, MemoryIndex
 
 pytestmark = pytest.mark.e2e
 
@@ -452,6 +452,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
     settings = _live_settings(tmp_path, project_id=project_id)
     client = TestClient(create_app(settings=settings))
     marker = f"sidecar-e2e-{token}"
+    trace_secret = f"live-trace-secret-{token}"
     updated_text = f"Updated {marker}"
     memory_id: str | None = None
     category_id: str | None = None
@@ -473,6 +474,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
 
         add_response = client.post(
             "/v3/memories/add/",
+            headers={"X-Request-ID": f"live-add-{token}"},
             json={
                 "text": f"Remember {marker}",
                 "project_id": project_id,
@@ -485,6 +487,8 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
                     "category": category_name,
                     "marker": marker,
                     "revision": "before",
+                    "token": trace_secret,
+                    "internal_url": "http://mem0:8000/private",
                 },
             },
         )
@@ -495,9 +499,25 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         memory_id = memory_ids[0]
         assert add_body["event"]["status"] == "SUCCEEDED"
 
+        search_response = client.post(
+            "/v3/memories/search/",
+            headers={"X-Request-ID": f"live-search-{token}"},
+            json={
+                "query": marker,
+                "project_id": project_id,
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "app_id": app_id,
+                "run_id": run_id,
+            },
+        )
+        assert search_response.status_code == 200, search_response.text
+        assert memory_id in _extract_memory_ids(search_response.json())
+
         created_before = datetime.now(UTC) + timedelta(minutes=1)
         query_response = client.post(
             "/v1/memories/query",
+            headers={"X-Request-ID": f"live-list-present-{token}"},
             json={
                 "project_id": project_id,
                 "app_id": app_id,
@@ -592,6 +612,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
 
         deleted_query = client.post(
             "/v1/memories/query",
+            headers={"X-Request-ID": f"live-list-empty-{token}"},
             json={"project_id": project_id, "app_id": app_id},
         )
         assert deleted_query.status_code == 200, deleted_query.text
@@ -639,6 +660,61 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
     operations = [event["operation"] for event in events_response.json()["results"]]
     assert "memory.add" in operations
     assert "memory.delete" in operations
+
+    trace_query = client.post(
+        "/v1/events/query",
+        json={
+            "project_id": project_id,
+            "app_id": app_id,
+            "statuses": ["SUCCEEDED"],
+            "page_size": 100,
+        },
+    )
+    assert trace_query.status_code == 200, trace_query.text
+    traces = trace_query.json()["results"]
+    traced_operations = {
+        trace["display_operation"]
+        for trace in traces
+        if trace["display_operation"] in {"ADD", "SEARCH", "GET ALL"}
+    }
+    assert traced_operations == {"ADD", "SEARCH", "GET ALL"}
+    trace_by_correlation = {trace["correlation_id"]: trace for trace in traces}
+    assert trace_by_correlation[f"live-add-{token}"]["status"] == "SUCCEEDED"
+    assert trace_by_correlation[f"live-search-{token}"]["result_count"] >= 1
+    assert trace_by_correlation[f"live-list-present-{token}"]["has_results"] is True
+    assert trace_by_correlation[f"live-list-empty-{token}"]["has_results"] is False
+
+    search_trace = trace_by_correlation[f"live-search-{token}"]
+    detail_response = client.get(
+        f"/v1/event/{search_trace['id']}",
+        params={"project_id": project_id, "app_id": app_id},
+    )
+    assert detail_response.status_code == 200, detail_response.text
+    detail = detail_response.json()
+    assert detail["display_operation"] == "SEARCH"
+    assert detail["correlation_id"] == f"live-search-{token}"
+    assert detail["result_previews"]
+    assert {
+        preview.get("id") or preview.get("memory_id")
+        for preview in detail["result_previews"]
+    } == {memory_id}
+
+    with client.app.state.session_factory() as session:
+        raw_events = list(
+            session.scalars(select(Event).where(Event.project_id == project_id))
+        )
+    raw_trace_json = "\n".join(
+        document
+        for event in raw_events
+        for document in (event.request_json, event.response_json, event.error_json)
+    )
+    assert trace_secret not in raw_trace_json
+    assert "http://mem0:8000" not in raw_trace_json
+    assert all(
+        len(document.encode("utf-8")) <= 65_536
+        for event in raw_events
+        for document in (event.request_json, event.response_json, event.error_json)
+    )
 
 
 def test_live_reconcile_imports_only_marked_scope(tmp_path) -> None:

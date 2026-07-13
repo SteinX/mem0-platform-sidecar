@@ -8,9 +8,10 @@ The self-hosted surface currently includes:
 - Categories
 - Export (JSON only)
 - Memory Explorer at `/dashboard/memories`
+- Request Trace Explorer at `/dashboard/requests`
 
-Requests and Entities are not part of this overlay. Categories, Export, and
-Memory Explorer appear as first-class `MEMORY TOOLS` in dashboard navigation.
+Entities are not part of this overlay. Categories, Export, Memory Explorer, and
+Request Trace Explorer appear as first-class self-hosted dashboard surfaces.
 
 ## Apply and verify
 
@@ -31,7 +32,7 @@ Configure the dashboard runtime, not the browser build, with:
 ```bash
 SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
 SIDECAR_PROJECT_ID=default
-# Optional: pin Memory Explorer to one app inside the configured project.
+# Optional: pin Memory and Request Trace Explorers to one app in the project.
 SIDECAR_APP_ID=default
 # Mirror this only when the Mem0 OSS server itself is intentionally auth-disabled.
 AUTH_DISABLED=false
@@ -40,9 +41,10 @@ AUTH_DISABLED=false
 `SIDECAR_PROJECT_ID` is authoritative for every forwarded request. If it is
 unset, the overlay falls back to `MEM0_SIDECAR_DEFAULT_PROJECT_ID`, then
 `default`. `SIDECAR_APP_ID`, when set, is the authoritative app for Memory
-Explorer query/detail/history/mutation calls. When it is unset, the sidecar
-uses the existing project's `default_app_id`; read routes never create a missing
-project. Caller-supplied project/app values are removed by the same-origin proxy.
+Explorer query/detail/history/mutation calls and Request Trace query/detail
+calls. When it is unset, the sidecar uses the existing project's
+`default_app_id`; read routes never create a missing project. Caller-supplied
+project/app values are removed by the same-origin proxy.
 
 The proxy validates the dashboard refresh-token cookie by default.
 `AUTH_DISABLED=true` in the dashboard bypasses that cookie check only to mirror
@@ -100,6 +102,55 @@ The drawer uses these scoped routes:
 Open a drawer directly with
 `/dashboard/memories?memoryId=<percent-encoded-memory-id>`. Closing the drawer
 removes `memoryId` while preserving the current filters and pagination.
+
+## Request Trace Explorer API
+
+The Requests page reads durable traces for sidecar `ADD`, `SEARCH`, and
+`GET ALL` operations (`memory.add`, `memory.search`, and `memory.list`). Both
+successful and failed operations are recorded. `POST /v1/events/query` accepts
+the configured project/app scope plus operation, status, has-results, date,
+entity, and paging filters. `GET /v1/event/{id}` supplies the selected drawer.
+The same-origin proxy permits only those read routes, overwrites project/app
+scope, and rejects a scoped JSON request body larger than 65,536 bytes.
+
+Trace correlation IDs come from the configured request ID header
+(`X-Request-ID` by default), so a dashboard row can be matched to sidecar HTTP
+logs without exposing an upstream credential. Search/list result counts and
+previews are computed only after project/app filtering. At most 20 memory
+previews are persisted and returned; `result_previews_omitted` and
+`result_previews_scan_truncated` disclose additional or unscanned results.
+
+### Trace safety, retention, and backups
+
+Trace request, response, and error documents are sanitized before persistence
+and again when legacy rows are serialized. Keys are matched case-insensitively
+after removing punctuation. These credential keys are redacted:
+
+- `authorization`
+- `api_key` / `apikey`
+- `token` / `access_token` / `refresh_token`
+- `password` / `secret`
+- `cookie` / `set-cookie`
+- `x-api-key`
+
+Credential assignments embedded in strings and sidecar/upstream internal URLs
+are also removed. Individual strings are bounded to 4,096 characters; arrays,
+nesting, and trace traversal are bounded; and each persisted request, response,
+or error document is at most 65,536 bytes. Oversized values are replaced with
+explicit truncation metadata. This is a trace-storage boundary, separate from
+the same-origin proxy's 65,536-byte scoped request-body limit.
+
+Sanitized traces are still internal memory data: queries, entity IDs, memory
+text previews, categories, timestamps, and operational errors can remain
+sensitive. Do not expose the sidecar event endpoints publicly. Apply the same
+access controls, encryption, backup retention, and deletion procedures to the
+sidecar database and its backups as to the memory store itself. Redaction in
+traces does not remove the original content or metadata from Mem0 OSS.
+
+There is no automatic trace-pruning job yet. Retention is deployment-owned:
+operators must size and back up the database, define an acceptable retention
+window, and remove old event rows through their controlled database maintenance
+process until a supported pruning job is added in a later phase.
 
 ## Reconciliation and adoption
 
