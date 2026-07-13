@@ -8,7 +8,11 @@ from sqlalchemy.orm import Session
 from starlette.routing import Match
 from starlette.types import Scope
 
-from mem0_sidecar.core.entities import EntityService, parse_entity_query
+from mem0_sidecar.core.entities import (
+    EntityService,
+    parse_entity_query,
+    validate_entity_identity,
+)
 from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.http_adapter.dependencies import get_mem0_client, get_session
 from mem0_sidecar.http_adapter.project_scope import (
@@ -243,6 +247,10 @@ def get_entity(
             field_name="entity_type",
         )
         decoded_id = _decode_path_identifier(entity_id, field_name="entity_id")
+        decoded_type, decoded_id = validate_entity_identity(
+            decoded_type,
+            decoded_id,
+        )
         project_id, app_id = _resolve_entity_scope(
             request,
             session,
@@ -282,6 +290,10 @@ async def delete_entity(
             field_name="entity_type",
         )
         decoded_id = _decode_path_identifier(entity_id, field_name="entity_id")
+        decoded_type, decoded_id = validate_entity_identity(
+            decoded_type,
+            decoded_id,
+        )
         project_id, app_id = _resolve_entity_scope(
             request,
             session,
