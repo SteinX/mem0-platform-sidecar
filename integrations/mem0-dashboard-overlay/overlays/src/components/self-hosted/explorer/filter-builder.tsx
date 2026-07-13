@@ -18,16 +18,25 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  applyFilterBuilderDraft,
+  cancelFilterBuilderDraft,
+  changeExplorerFilterField,
+  changeExplorerFilterOperator,
+  createFilterBuilderDraft,
+  filterOperatorsForField,
+  openFilterBuilderDraft,
+  parseCommaSeparatedFilterValues,
+  removeAllFilterBuilderDraft,
+  toggleFilterValue,
+} from "@/components/self-hosted/explorer/explorer-component-state";
 import type {
   ExplorerField,
   ExplorerFilter,
   ExplorerMatch,
   ExplorerOperator,
 } from "@/types/dashboard-explorer";
-import {
-  createExplorerFilter,
-  normalizeExplorerFilters,
-} from "@/utils/explorer-query-state";
+import { createExplorerFilter } from "@/utils/explorer-query-state";
 
 export type ExplorerFilterFieldOption = {
   value: ExplorerField;
@@ -43,11 +52,12 @@ type FilterBuilderProps = {
   onRemoveAll: (filters: ExplorerFilter[]) => void;
 };
 
-const SCALAR_OPERATORS: Array<{ value: ExplorerOperator; label: string }> = [
-  { value: "equals", label: "Equals" },
-  { value: "not_equals", label: "Does not equal" },
-  { value: "in", label: "Is any of" },
-];
+const OPERATOR_LABELS: Record<ExplorerOperator, string> = {
+  equals: "Equals",
+  not_equals: "Does not equal",
+  in: "Is any of",
+  contains: "Contains",
+};
 
 export function FilterBuilder({
   match,
@@ -56,51 +66,59 @@ export function FilterBuilder({
   onApply,
   onRemoveAll,
 }: FilterBuilderProps) {
-  const [open, setOpen] = useState(false);
-  const [draftMatch, setDraftMatch] = useState<ExplorerMatch>(match);
-  const [draftFilters, setDraftFilters] = useState<ExplorerFilter[]>(
-    () => cloneFilters(filters),
+  const [draft, setDraft] = useState(
+    () => createFilterBuilderDraft(match, filters),
   );
+  const draftMatch = draft.match;
+  const draftFilters = draft.filters;
 
   function handleOpenChange(nextOpen: boolean) {
-    if (nextOpen) {
-      setDraftMatch(match);
-      setDraftFilters(cloneFilters(filters));
-    }
-    setOpen(nextOpen);
+    setDraft((current) => nextOpen
+      ? openFilterBuilderDraft(match, filters)
+      : cancelFilterBuilderDraft(current));
   }
 
   function updateFilter(id: string, update: (filter: ExplorerFilter) => ExplorerFilter) {
-    setDraftFilters((current) => current.map((filter) => (
-      filter.id === id ? update(filter) : filter
-    )));
+    setDraft((current) => ({
+      ...current,
+      filters: current.filters.map((filter) => (
+        filter.id === id ? update(filter) : filter
+      )),
+    }));
   }
 
   function addFilter() {
     const firstField = fields[0]?.value ?? "user_id";
-    setDraftFilters((current) => [
+    setDraft((current) => ({
       ...current,
-      nextFilterForField(createExplorerFilter(), firstField),
-    ]);
+      filters: [
+        ...current.filters,
+        changeExplorerFilterField(createExplorerFilter(), firstField),
+      ],
+    }));
   }
 
   function removeFilter(id: string) {
-    setDraftFilters((current) => current.filter((filter) => filter.id !== id));
+    setDraft((current) => ({
+      ...current,
+      filters: current.filters.filter((filter) => filter.id !== id),
+    }));
   }
 
   function applyFilters() {
-    onApply(draftMatch, normalizeExplorerFilters(draftFilters));
-    setOpen(false);
+    const applied = applyFilterBuilderDraft(draft);
+    setDraft(applied.draft);
+    onApply(applied.match, applied.filters);
   }
 
   function removeAllFilters() {
-    setDraftFilters([]);
-    onRemoveAll([]);
-    setOpen(false);
+    const removed = removeAllFilterBuilderDraft(draft);
+    setDraft(removed.draft);
+    onRemoveAll(removed.filters);
   }
 
   return (
-    <Popover open={open} onOpenChange={handleOpenChange}>
+    <Popover open={draft.open} onOpenChange={handleOpenChange}>
       <PopoverTrigger asChild>
         <Button type="button" variant="outline" aria-label="Edit filters">
           Filters{filters.length > 0 ? ` (${filters.length})` : ""}
@@ -115,7 +133,10 @@ export function FilterBuilder({
             <Label htmlFor="explorer-filter-match">Match</Label>
             <Select
               value={draftMatch}
-              onValueChange={(value) => setDraftMatch(value as ExplorerMatch)}
+              onValueChange={(value) => setDraft((current) => ({
+                ...current,
+                match: value as ExplorerMatch,
+              }))}
             >
               <SelectTrigger id="explorer-filter-match" aria-label="Filter match mode">
                 <SelectValue />
@@ -130,7 +151,7 @@ export function FilterBuilder({
           <div className="space-y-3">
             {draftFilters.map((filter, index) => {
               const field = fields.find((candidate) => candidate.value === filter.field);
-              const operators = operatorsForField(filter.field);
+              const operators = filterOperatorsForField(filter.field);
               return (
                 <div
                   key={filter.id}
@@ -144,7 +165,10 @@ export function FilterBuilder({
                       value={filter.field}
                       onValueChange={(value) => updateFilter(
                         filter.id,
-                        (current) => nextFilterForField(current, value as ExplorerField),
+                        (current) => changeExplorerFilterField(
+                          current,
+                          value as ExplorerField,
+                        ),
                       )}
                     >
                       <SelectTrigger
@@ -169,11 +193,10 @@ export function FilterBuilder({
                       value={filter.operator}
                       onValueChange={(value) => updateFilter(
                         filter.id,
-                        (current) => ({
-                          ...current,
-                          operator: value as ExplorerOperator,
-                          value: emptyValueFor(current.field, value as ExplorerOperator),
-                        }),
+                        (current) => changeExplorerFilterOperator(
+                          current,
+                          value as ExplorerOperator,
+                        ),
                       )}
                     >
                       <SelectTrigger
@@ -184,8 +207,8 @@ export function FilterBuilder({
                       </SelectTrigger>
                       <SelectContent>
                         {operators.map((operator) => (
-                          <SelectItem key={operator.value} value={operator.value}>
-                            {operator.label}
+                          <SelectItem key={operator} value={operator}>
+                            {OPERATOR_LABELS[operator]}
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -225,7 +248,11 @@ export function FilterBuilder({
               Remove filters
             </Button>
             <div className="flex gap-2">
-              <Button type="button" variant="ghost" onClick={() => setOpen(false)}>
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => setDraft(cancelFilterBuilderDraft(draft))}
+              >
                 Cancel
               </Button>
               <Button type="button" onClick={applyFilters}>Apply</Button>
@@ -283,7 +310,11 @@ function renderValueEditor(
                 checked={selected.includes(option.value)}
                 onCheckedChange={(checked) => updateFilter(filter.id, (current) => ({
                   ...current,
-                  value: toggleArrayValue(arrayValue(current.value), option.value, checked === true),
+                  value: toggleFilterValue(
+                    arrayValue(current.value),
+                    option.value,
+                    checked === true,
+                  ),
                 }))}
               />
               <Label htmlFor={id}>{option.label}</Label>
@@ -302,7 +333,7 @@ function renderValueEditor(
         value={arrayValue(filter.value).join(", ")}
         onChange={(event) => updateFilter(filter.id, (current) => ({
           ...current,
-          value: event.target.value.split(",").map((value) => value.trim()),
+          value: parseCommaSeparatedFilterValues(event.target.value),
         }))}
       />
     );
@@ -342,40 +373,6 @@ function renderValueEditor(
   );
 }
 
-function nextFilterForField(filter: ExplorerFilter, field: ExplorerField): ExplorerFilter {
-  const operator: ExplorerOperator = field === "metadata" ? "contains" : "equals";
-  return { ...filter, field, operator, value: emptyValueFor(field, operator) };
-}
-
-function operatorsForField(
-  field: ExplorerField,
-): Array<{ value: ExplorerOperator; label: string }> {
-  return field === "metadata"
-    ? [{ value: "contains", label: "Contains" }]
-    : SCALAR_OPERATORS;
-}
-
-function emptyValueFor(
-  field: ExplorerField,
-  operator: ExplorerOperator,
-): ExplorerFilter["value"] {
-  if (field === "metadata") {
-    return { key: "", value: "" };
-  }
-  return operator === "in" ? [] : "";
-}
-
-function cloneFilters(filters: ExplorerFilter[]): ExplorerFilter[] {
-  return filters.map((filter) => ({
-    ...filter,
-    value: Array.isArray(filter.value)
-      ? [...filter.value]
-      : typeof filter.value === "object"
-        ? { ...filter.value }
-        : filter.value,
-  }));
-}
-
 function metadataValue(
   value: ExplorerFilter["value"],
 ): { key: string; value: string } {
@@ -390,11 +387,4 @@ function arrayValue(value: ExplorerFilter["value"]): string[] {
 
 function scalarValue(value: ExplorerFilter["value"]): string {
   return typeof value === "string" ? value : "";
-}
-
-function toggleArrayValue(values: string[], value: string, checked: boolean): string[] {
-  if (checked) {
-    return values.includes(value) ? values : [...values, value];
-  }
-  return values.filter((candidate) => candidate !== value);
 }

@@ -89,6 +89,19 @@ def category_editor_state_harness_command(
     ]
 
 
+def explorer_components_harness_command(
+    overlay_root: Path, dashboard_dir: Path
+) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-explorer-components.cjs"),
+        str(dashboard_dir),
+    ]
+
+
 def strip_comments(content: str) -> str:
     result: list[str] = []
     index = 0
@@ -1165,6 +1178,11 @@ def main() -> int:
         )
         subprocess.run(
             category_editor_state_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
+        subprocess.run(
+            explorer_components_harness_command(overlay_root, dashboard_dir),
             cwd=dashboard_dir,
             check=True,
         )

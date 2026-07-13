@@ -1,29 +1,20 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
-
-type EntityField = "user_id" | "agent_id" | "app_id" | "run_id";
-
-type EntityBadgeClick = {
-  field: EntityField;
-  value: string;
-};
+import {
+  createEntityBadgeItems,
+  entityBadgeClickPayload,
+  truncateIdentity,
+} from "@/components/self-hosted/explorer/explorer-component-state";
+import type { EntityBadgeItem } from "@/components/self-hosted/explorer/explorer-component-state";
 
 type EntityBadgesProps = {
   userId?: string | null;
   agentId?: string | null;
   appId?: string | null;
   runId?: string | null;
-  onBadgeClick?: (identity: EntityBadgeClick) => void;
+  onBadgeClick?: (identity: Pick<EntityBadgeItem, "field" | "value">) => void;
 };
-
-type IdentityCandidate = {
-  field: EntityField;
-  label: string;
-  value: string | null | undefined;
-};
-
-type Identity = Omit<IdentityCandidate, "value"> & { value: string };
 
 export function EntityBadges({
   userId,
@@ -32,12 +23,7 @@ export function EntityBadges({
   runId,
   onBadgeClick,
 }: EntityBadgesProps) {
-  const identities: Identity[] = [
-    { field: "user_id", label: "User", value: userId },
-    { field: "agent_id", label: "Agent", value: agentId },
-    { field: "app_id", label: "App", value: appId },
-    { field: "run_id", label: "Run", value: runId },
-  ].filter((identity): identity is Identity => Boolean(identity.value));
+  const identities = createEntityBadgeItems({ userId, agentId, appId, runId });
 
   if (identities.length === 0) {
     return null;
@@ -54,7 +40,7 @@ export function EntityBadges({
           className="h-auto max-w-48 gap-1 px-2 py-1 font-mono text-xs"
           title={identity.value}
           aria-label={`Filter by ${identity.label} ${identity.value}`}
-          onClick={() => onBadgeClick({ field: identity.field, value: identity.value })}
+          onClick={() => onBadgeClick(entityBadgeClickPayload(identity))}
         >
           <span className="font-sans font-semibold">{identity.label}</span>
           <span className="truncate">{truncateIdentity(identity.value)}</span>
@@ -71,8 +57,4 @@ export function EntityBadges({
       ))}
     </div>
   );
-}
-
-function truncateIdentity(value: string): string {
-  return value.length <= 18 ? value : `${value.slice(0, 9)}…${value.slice(-6)}`;
 }
