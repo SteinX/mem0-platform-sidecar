@@ -16,6 +16,11 @@ type ExplorerUrlState = ExplorerQueryPayload & {
   entityId: string | null;
 };
 
+export type ExplorerDetailRequestTarget = {
+  requestGeneration: number;
+  contextGeneration: number;
+};
+
 const EXPLORER_FIELDS = new Set<ExplorerField>([
   "entity_type",
   "user_id",
@@ -37,6 +42,13 @@ const EXPLORER_ENTITY_TYPES = new Set<ExplorerEntityType>([
   "agent",
   "app",
   "run",
+]);
+const ENTITY_EXPLORER_FILTER_FIELDS = new Set<ExplorerField>([
+  "entity_type",
+  "user_id",
+  "agent_id",
+  "app_id",
+  "run_id",
 ]);
 const DAY_IN_MILLISECONDS = 24 * 60 * 60 * 1000;
 const ISO_DATE_TIME_PATTERN = new RegExp(
@@ -68,6 +80,27 @@ export function normalizeExplorerFilters(filters: unknown): ExplorerFilter[] {
     }
   }
   return normalized;
+}
+
+export function normalizeEntityExplorerFilters(
+  filters: unknown,
+): ExplorerFilter[] {
+  return normalizeExplorerFilters(filters).filter((filter) =>
+    ENTITY_EXPLORER_FILTER_FIELDS.has(filter.field),
+  );
+}
+
+export function canApplyExplorerDetailRequest(
+  target: ExplorerDetailRequestTarget,
+  currentRequestGeneration: number,
+  currentContextGeneration: number,
+  mounted: boolean,
+): boolean {
+  return (
+    mounted &&
+    target.requestGeneration === currentRequestGeneration &&
+    target.contextGeneration === currentContextGeneration
+  );
 }
 
 export function datePresetRange(

@@ -107,6 +107,19 @@ def explorer_components_harness_command(
     ]
 
 
+def explorer_query_state_harness_command(
+    overlay_root: Path, dashboard_dir: Path
+) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-explorer-query-state.cjs"),
+        str(dashboard_dir),
+    ]
+
+
 def memory_explorer_harness_command(
     overlay_root: Path, dashboard_dir: Path
 ) -> list[str]:
@@ -1335,6 +1348,12 @@ def verify_entities_page(dashboard_dir: Path) -> str | None:
         return "Entities page must not select a browser project scope"
     if "SESSION" in page_content:
         return "Entities page must not expose unsupported SESSION entities"
+    if page_content.count("normalizeEntityExplorerFilters(") < 3:
+        return "Entities page must allowlist filters for URL and request state"
+    if "function EntityIdentity" in page_content or "Tooltip" in page_content:
+        return "Entities page must reuse the shared EntityBadges component"
+    if "sanitizeDisplayedError(failure.id" in page_content:
+        return "Entities page must render failed memory IDs exactly"
     delete_body = extract_named_function_body(
         page_content,
         "deleteSelectedEntity",
@@ -1366,7 +1385,7 @@ def verify_entities_page(dashboard_dir: Path) -> str | None:
         ),
         ("signal: controller.signal", "Entities page list request must be abortable"),
         ("page: 1", "Entities page controls must reset pagination"),
-        ("Tooltip", "Entities page must expose full entity IDs"),
+        ("<EntityBadges", "Entities page must render shared entity identities"),
         ("md:hidden", "Entities page missing responsive mobile results"),
         ("aria-disabled", "Entities pagination missing disabled semantics"),
         (
@@ -1376,6 +1395,22 @@ def verify_entities_page(dashboard_dir: Path) -> str | None:
         (
             "detailGeneration",
             "Entities detail request must ignore stale responses",
+        ),
+        (
+            "invalidateEntityDetailForQueryTransition",
+            "Entities query changes must invalidate pending detail requests",
+        ),
+        (
+            "canApplyExplorerDetailRequest(",
+            "Entities detail responses must match the active query context",
+        ),
+        (
+            "setRowsAreAuthoritative(false)",
+            "Entities retained rows must become non-authoritative on query changes",
+        ),
+        (
+            "disabled={!canDelete || isPreparing}",
+            "Entities retained rows must disable destructive actions",
         ),
         (
             "deleteGeneration",
@@ -1389,6 +1424,7 @@ def verify_entities_page(dashboard_dir: Path) -> str | None:
             "sanitizeDisplayedError",
             "Entities deletion must sanitize displayed errors",
         ),
+        ("{failure.id}", "Entities deletion must show exact failed memory IDs"),
         (
             "new URLSearchParams()",
             "Entities memory drill-down must start from clean query state",
@@ -1478,6 +1514,11 @@ def main() -> int:
         )
         subprocess.run(
             category_editor_state_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
+        subprocess.run(
+            explorer_query_state_harness_command(overlay_root, dashboard_dir),
             cwd=dashboard_dir,
             check=True,
         )
