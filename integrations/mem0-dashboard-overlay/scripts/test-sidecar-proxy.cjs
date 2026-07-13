@@ -52,6 +52,172 @@ function jsonHeaders(extra = {}) {
   return { "Content-Type": "application/json", ...extra };
 }
 
+async function testEntityQueryForcesRuntimeScope(proxy) {
+  const calls = [];
+  const payload = {
+    project_id: "forged-body-project",
+    app_id: "forged-body-app",
+    entity_type: "user",
+    match: "all",
+    filters: [{ field: "user_id", operator: "equals", value: "alice" }],
+    date_range: { from: null, to: null },
+    page: 2,
+    page_size: 20,
+  };
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/entities/query?project_id=forged-query-project&app_id=forged-query-app&trace=forged",
+      {
+        method: "POST",
+        headers: jsonHeaders({ "X-Request-ID": "entity-query-123" }),
+        body: JSON.stringify(payload),
+      },
+    ),
+    "/v1/entities/query",
+    proxyOptions(
+      async (url, init) => {
+        calls.push({ url: url.toString(), init });
+        return Response.json({ results: [], total: 0 });
+      },
+      { configuredAppId: "runtime-app" },
+    ),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://sidecar.internal/v1/entities/query");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers.get("X-Request-ID"), "entity-query-123");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    entity_type: payload.entity_type,
+    match: payload.match,
+    filters: payload.filters,
+    date_range: payload.date_range,
+    page: payload.page,
+    page_size: payload.page_size,
+    project_id: "runtime project",
+    app_id: "runtime-app",
+  });
+}
+
+async function testEntityItemsEncodeTypeAndIdAndForceRuntimeScope(proxy) {
+  for (const method of ["GET", "DELETE"]) {
+    const calls = [];
+    const response = await proxy(
+      new Request(
+        "http://dashboard.local/api/sidecar/v1/entities/%75ser/team%2Falice%252Farchive?project_id=forged&app_id=forged-app&trace=forged",
+        { method },
+      ),
+      "/v1/entities/user/team/alice%2Farchive",
+      proxyOptions(async (url, init) => {
+        calls.push({ url: url.toString(), init });
+        return Response.json(
+          method === "GET"
+            ? { type: "user", entity_id: "team/alice%2Farchive" }
+            : { status: "SUCCEEDED" },
+        );
+      }),
+    );
+
+    assert.equal(response.status, 200, method);
+    assert.equal(calls.length, 1, method);
+    assert.equal(
+      calls[0].url,
+      "http://sidecar.internal/v1/entities/user/team%2Falice%252Farchive?project_id=runtime+project",
+      method,
+    );
+    assert.equal(calls[0].init.method, method);
+    assert.equal(calls[0].init.body, undefined);
+  }
+}
+
+async function testEntityRoutesRejectRebuildAndUnsafeItemPaths(proxy) {
+  const rejected = [
+    ["POST", "/v1/projects/runtime-project/entities/rebuild"],
+    ["GET", "/v1/entities/%2E%2E/alice"],
+    ["DELETE", "/v1/entities/safe%2F..%2Fsession/alice"],
+    ["GET", "/v1/entities/user/alice/extra"],
+    ["PATCH", "/v1/entities/user/alice"],
+    ["DELETE", "/v1/entities/query"],
+  ];
+
+  for (const [method, normalizedPath] of rejected) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request("http://dashboard.local/api/sidecar/rejected", {
+        method,
+        headers: method === "POST" ? jsonHeaders() : undefined,
+        body: method === "POST" ? "{}" : undefined,
+      }),
+      normalizedPath,
+      proxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+
+    assert.equal(response.status, 403, `${method} ${normalizedPath}`);
+    assert.equal(fetchCalled, false, `${method} ${normalizedPath}`);
+  }
+}
+
+async function testUnsupportedSafeEntityTypePassesBackendValidation(proxy) {
+  const calls = [];
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/entities/session/session-one?project_id=forged",
+      { method: "GET" },
+    ),
+    "/v1/entities/session/session-one",
+    proxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json(
+        { detail: "Unsupported entity type" },
+        { status: 422 },
+      );
+    }),
+  );
+
+  assert.equal(response.status, 422);
+  assert.deepEqual(await response.json(), {
+    detail: "Unsupported entity type",
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/entities/session/session-one?project_id=runtime+project",
+  );
+}
+
+async function testUnauthenticatedEntityRequestsAreRejected(proxy) {
+  for (const [method, path, body] of [
+    ["POST", "/v1/entities/query", "{}"],
+    ["GET", "/v1/entities/user/alice", undefined],
+    ["DELETE", "/v1/entities/user/alice", undefined],
+  ]) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request(`http://dashboard.local/api/sidecar${path}`, {
+        method,
+        headers: body === undefined ? undefined : jsonHeaders(),
+        body,
+      }),
+      path,
+      proxyOptions(
+        async () => {
+          fetchCalled = true;
+          return Response.json({});
+        },
+        { validateDashboardSession: async () => false },
+      ),
+    );
+
+    assert.equal(response.status, 401, `${method} ${path}`);
+    assert.deepEqual(await response.json(), { error: "Unauthorized" });
+    assert.equal(fetchCalled, false, `${method} ${path}`);
+  }
+}
+
 async function testEventQueryForcesRuntimeScope(proxy) {
   const calls = [];
   const payload = {
@@ -338,6 +504,7 @@ async function testUnsupportedRouteWinsBeforeAuthAndConfiguration(proxy) {
 
 async function testScopedJsonRoutesRequireJsonMediaType(proxy) {
   const requests = [
+    ["POST", "/v1/entities/query"],
     ["POST", "/v1/events/query"],
     ["POST", "/v1/memories/query"],
     ["PATCH", "/v1/memories/memory-one"],
@@ -1084,6 +1251,13 @@ async function main() {
   const dashboardDir = path.resolve(process.argv[2]);
   const { proxySidecarRequest } = await loadProxyModule(dashboardDir);
 
+  await testEntityQueryForcesRuntimeScope(proxySidecarRequest);
+  await testEntityItemsEncodeTypeAndIdAndForceRuntimeScope(proxySidecarRequest);
+  await testEntityRoutesRejectRebuildAndUnsafeItemPaths(proxySidecarRequest);
+  await testUnsupportedSafeEntityTypePassesBackendValidation(
+    proxySidecarRequest,
+  );
+  await testUnauthenticatedEntityRequestsAreRejected(proxySidecarRequest);
   await testEventQueryForcesRuntimeScope(proxySidecarRequest);
   await testEventDetailEncodesIdAndForcesRuntimeScope(proxySidecarRequest);
   await testEventRoutesRejectMutationsAndNearMatches(proxySidecarRequest);
@@ -1137,7 +1311,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 35 contracts passed");
+  console.log("sidecar proxy request harness: 40 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(

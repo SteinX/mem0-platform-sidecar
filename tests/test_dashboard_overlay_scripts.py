@@ -1130,6 +1130,10 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
         "export type SidecarMemoryQuery =",
         "export type SidecarMemoryPage =",
         "export type SidecarMemoryHistoryEntry =",
+        "export type SidecarEntity =",
+        "export type SidecarEntityQuery =",
+        "export type SidecarEntityPage =",
+        "export type SidecarEntityDeleteResult =",
     ):
         assert symbol in type_content
 
@@ -1169,6 +1173,79 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
         "stale_skipped: number;",
     ):
         assert field in type_content
+
+
+def test_dashboard_overlay_includes_exact_entity_types():
+    type_content = (OVERLAY / "overlays/src/types/sidecar.ts").read_text()
+
+    entity = re.search(
+        r"export type SidecarEntity\s*=\s*\{(?P<body>.*?)\n\};",
+        type_content,
+        re.S,
+    )
+    assert entity is not None
+    compact_entity = re.sub(r"\s+", "", entity.group("body"))
+    for field in (
+        "id: string;",
+        'type: "user" | "agent" | "app" | "run";',
+        "entity_id: string;",
+        "display_name: string;",
+        "memory_count: number;",
+        "last_seen_at: string | null;",
+        "updated_at: string | null;",
+    ):
+        assert re.sub(r"\s+", "", field) in compact_entity
+
+    query = re.search(
+        r"export type SidecarEntityQuery\s*=\s*\{(?P<body>.*?)\n\};",
+        type_content,
+        re.S,
+    )
+    assert query is not None
+    assert re.search(r"^\s*project_id\s*:", query.group("body"), re.M) is None
+    assert re.search(r"^\s*app_id\s*:", query.group("body"), re.M) is None
+    compact_query = re.sub(r"\s+", "", query.group("body"))
+    for field in (
+        'entity_type: "user" | "agent" | "app" | "run";',
+        "match: ExplorerMatch;",
+        'filters: Array<Omit<ExplorerFilter, "id">>;',
+        "date_range: ExplorerDateRange;",
+        "page: number;",
+        "page_size: number;",
+    ):
+        assert re.sub(r"\s+", "", field) in compact_query
+
+    page = re.search(
+        r"export type SidecarEntityPage\s*=\s*\{(?P<body>.*?)\n\};",
+        type_content,
+        re.S,
+    )
+    assert page is not None
+    for field in (
+        "results: SidecarEntity[];",
+        "page: number;",
+        "page_size: number;",
+        "total: number;",
+        "has_more: boolean;",
+    ):
+        assert field in page.group("body")
+
+    delete_result = re.search(
+        r"export type SidecarEntityDeleteResult\s*=\s*\{(?P<body>.*?)\n\};",
+        type_content,
+        re.S,
+    )
+    assert delete_result is not None
+    compact_delete = re.sub(r"\s+", "", delete_result.group("body"))
+    for field in (
+        'status: "SUCCEEDED" | "PARTIAL" | "FAILED";',
+        "requested_count: number;",
+        "deleted_count: number;",
+        "failed_count: number;",
+        "failed: Array<{ id: string; error: Record<string, unknown> }>;",
+        "event_id: string;",
+    ):
+        assert re.sub(r"\s+", "", field) in compact_delete
 
 
 def test_dashboard_overlay_includes_exact_request_trace_types():
@@ -1264,7 +1341,7 @@ def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "sidecar proxy request harness: 35 contracts passed" in result.stdout
+    assert "sidecar proxy request harness: 40 contracts passed" in result.stdout
 
 
 def test_sidecar_proxy_harness_rejects_stale_applied_target(tmp_path):
