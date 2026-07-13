@@ -14,11 +14,12 @@ from mem0_sidecar.core.explorer_filters import (
 from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
-from mem0_sidecar.store.models import Entity, Project
+from mem0_sidecar.store.models import Entity
 from mem0_sidecar.store.repositories import (
     EntityRepository,
     EventRepository,
     MemoryIndexRepository,
+    ProjectRepository,
 )
 
 _ENTITY_TYPES = frozenset({"user", "agent", "app", "run"})
@@ -336,14 +337,7 @@ class EntityService:
         )
         project_id = _portable_id(project_id, field_name="project_id")
         app_id = _portable_id(app_id, field_name="app_id")
-        with self.session.no_autoflush:
-            project = self.session.scalar(
-                select(Project)
-                .where(Project.id == project_id)
-                .with_for_update()
-            )
-        if project is None:
-            raise KeyError(project_id)
+        ProjectRepository(self.session).lock_for_mutation(project_id)
 
         entity_repo = EntityRepository(self.session)
         entity = entity_repo.get_project_entity(

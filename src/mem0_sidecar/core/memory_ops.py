@@ -1,5 +1,4 @@
 import asyncio
-from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -7,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.categories import extract_category
 from mem0_sidecar.core.explorer_filters import (
+    EXPLORER_RECORD_HORIZON,
     ExplorerDateRange,
     ExplorerFilter,
     ExplorerQuery,
@@ -20,6 +20,7 @@ from mem0_sidecar.store.repositories import (
     EntityRepository,
     EventRepository,
     MemoryIndexRepository,
+    ProjectRepository,
 )
 
 SIDECAR_PROJECT_ID_METADATA_KEY = "_mem0_sidecar_project_id"
@@ -575,6 +576,7 @@ class MemoryService:
                     f"Could not extract memory id from response: {memory_response!r}"
                 )
             memory_repo = MemoryIndexRepository(self.session)
+            ProjectRepository(self.session).lock_for_mutation(project_id)
             for memory_id in memory_ids:
                 memory_repo.upsert_memory(
                     project_id=project_id,
@@ -683,22 +685,22 @@ class MemoryService:
         self.session.commit()
         memory_repo = MemoryIndexRepository(self.session)
         offset = (query.page - 1) * query.page_size
-        candidate_limit = query.page_size + _HYDRATION_BUFFER
+        candidate_limit = min(
+            query.page_size + _HYDRATION_BUFFER,
+            EXPLORER_RECORD_HORIZON - offset,
+        )
         hydrated: dict[str, dict[str, Any]] = {}
         stale_skipped = 0
 
         def candidate_page() -> tuple[Any, list[MemoryIndex]]:
-            window_query = replace(
-                query,
-                page=1,
-                page_size=offset + candidate_limit,
-            )
             page = memory_repo.query_project_memories(
                 project_id,
                 app_id,
-                window_query,
+                query,
+                window_offset=offset,
+                window_limit=candidate_limit,
             )
-            return page, page.items[offset : offset + candidate_limit]
+            return page, page.items
 
         async def hydrate(memory: MemoryIndex) -> tuple[str, dict[str, Any] | None]:
             try:
@@ -748,7 +750,13 @@ class MemoryService:
                 else:
                     hydrated[memory_id] = normalized
 
-            stale_skipped = memory_repo.mark_stale(project_id, stale_ids)
+            if stale_ids:
+                ProjectRepository(self.session).lock_for_mutation(project_id)
+                stale_skipped = memory_repo.mark_stale(project_id, stale_ids)
+                EntityRepository(self.session).rebuild_project_entities(
+                    project_id,
+                    app_id,
+                )
 
             final_page, final_candidates = candidate_page()
             results = [
@@ -872,6 +880,7 @@ class MemoryService:
             normalized = _normalize_memory_record(record, projection=memory)
             metadata = normalized["metadata"]
             categories = normalized["categories"]
+            ProjectRepository(self.session).lock_for_mutation(project_id)
             memory_repo.upsert_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,
@@ -890,7 +899,12 @@ class MemoryService:
             return {"memory": normalized, "event": _event_payload(event)}
         except Exception as exc:
             if _is_upstream_not_found(exc):
+                ProjectRepository(self.session).lock_for_mutation(project_id)
                 memory_repo.mark_stale(project_id, [memory_id])
+                EntityRepository(self.session).rebuild_project_entities(
+                    project_id,
+                    effective_app_id,
+                )
             event_repo.mark_failed(event.id, error=_error_payload(exc))
             self.session.commit()
             if _is_upstream_not_found(exc):
@@ -977,6 +991,7 @@ class MemoryService:
                     f"Upstream memory record {index} is malformed"
                 ) from exc
 
+        ProjectRepository(self.session).lock_for_mutation(project_id)
         accepted_ids: set[str] = set()
         indexed = 0
         skipped_unscoped = 0
@@ -1139,6 +1154,7 @@ class MemoryService:
         )
         try:
             response = await self.mem0.delete_memory(memory_id)
+            ProjectRepository(self.session).lock_for_mutation(project_id)
             memory_repo.delete_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,

@@ -27,6 +27,7 @@ from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EntityRepository,
     EventRepository,
+    MemoryIndexPage,
     MemoryIndexRepository,
     ProjectRepository,
 )
@@ -2043,6 +2044,166 @@ async def test_query_memories_never_gets_beyond_single_bounded_candidate_buffer(
     assert result["results"] == []
     assert result["stale_skipped"] == candidate_limit
     assert result["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_query_memories_high_page_uses_only_requested_window(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    db_session.commit()
+    observed: list[tuple[int, int, int | None, int | None]] = []
+
+    def capture_window(
+        self,
+        project_id,
+        app_id,
+        query,
+        *,
+        window_offset=None,
+        window_limit=None,
+    ):
+        observed.append(
+            (query.page, query.page_size, window_offset, window_limit)
+        )
+        return MemoryIndexPage(items=[], total=5000, scan_count=0)
+
+    monkeypatch.setattr(
+        MemoryIndexRepository,
+        "query_project_memories",
+        capture_window,
+    )
+    query = parse_explorer_query(
+        {"page": 50, "page_size": 100},
+        allowed_fields={
+            "entity_type",
+            "user_id",
+            "agent_id",
+            "app_id",
+            "run_id",
+            "memory_id",
+            "category",
+            "metadata",
+        },
+    )
+
+    result = await MemoryService(
+        session=db_session,
+        mem0=ExplorerMem0Client(),
+    ).query_memories(project_id="repo-a", app_id="app-a", query=query)
+
+    assert observed == [
+        (50, 100, 4900, 100),
+        (50, 100, 4900, 100),
+    ]
+    assert result["total"] == 5000
+    assert result["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_update_locks_project_before_memory_index_and_entity_mutations(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-1")
+    db_session.commit()
+    operations: list[str] = []
+
+    monkeypatch.setattr(
+        ProjectRepository,
+        "lock_for_mutation",
+        lambda self, project_id: operations.append("project")
+        or db_session.get(Project, project_id),
+        raising=False,
+    )
+    original_upsert = MemoryIndexRepository.upsert_memory
+
+    def ordered_upsert(self, **kwargs):
+        operations.append("memory")
+        return original_upsert(self, **kwargs)
+
+    monkeypatch.setattr(MemoryIndexRepository, "upsert_memory", ordered_upsert)
+    monkeypatch.setattr(
+        EntityRepository,
+        "rebuild_project_entities",
+        lambda self, project_id, app_id: operations.append("entity") or [],
+    )
+    mem0 = ExplorerMem0Client(
+        {
+            "mem-1": {
+                "id": "mem-1",
+                "memory": "updated",
+                "user_id": "alice",
+                "app_id": "app-a",
+                "metadata": {},
+            }
+        }
+    )
+
+    await MemoryService(session=db_session, mem0=mem0).update_memory(
+        project_id="repo-a",
+        memory_id="mem-1",
+        request_app_id="app-a",
+        payload={"text": "updated"},
+    )
+
+    assert operations == ["project", "memory", "entity"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_locks_project_before_memory_index_and_entity_mutations(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    db_session.commit()
+    operations: list[str] = []
+    monkeypatch.setattr(
+        ProjectRepository,
+        "lock_for_mutation",
+        lambda self, project_id: operations.append("project")
+        or db_session.get(Project, project_id),
+        raising=False,
+    )
+    original_upsert = MemoryIndexRepository.upsert_memory
+
+    def ordered_upsert(self, **kwargs):
+        operations.append("memory")
+        return original_upsert(self, **kwargs)
+
+    monkeypatch.setattr(MemoryIndexRepository, "upsert_memory", ordered_upsert)
+    monkeypatch.setattr(
+        EntityRepository,
+        "rebuild_project_entities",
+        lambda self, project_id, app_id: operations.append("entity") or [],
+    )
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [
+            {
+                "id": "mem-1",
+                "memory": "one",
+                "app_id": "app-a",
+                "metadata": {
+                    SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+                    SIDECAR_APP_ID_METADATA_KEY: "app-a",
+                },
+            }
+        ],
+        "total": 1,
+    }
+
+    await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        adopt_unscoped=False,
+        allow_adopt_unscoped=False,
+        default_project_id="repo-a",
+    )
+
+    assert operations == ["project", "memory", "entity"]
 
 
 @pytest.mark.asyncio

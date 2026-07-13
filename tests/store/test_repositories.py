@@ -76,6 +76,29 @@ def test_category_model_enforces_unique_name_per_project(db_session):
         db_session.flush()
 
 
+def test_project_mutation_lock_is_postgresql_row_lock(db_session, monkeypatch) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    statements: list[str] = []
+    original_scalar = db_session.scalar
+
+    def capture(statement, *args, **kwargs):
+        statements.append(
+            str(statement.compile(dialect=postgresql.dialect())).upper()
+        )
+        return original_scalar(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "scalar", capture)
+
+    project = ProjectRepository(db_session).lock_for_mutation("alpha")
+
+    assert project.id == "alpha"
+    assert any(" FOR UPDATE" in statement for statement in statements)
+
+
 def test_category_repository_item_lifecycle_is_project_scoped(db_session):
     projects = ProjectRepository(db_session)
     projects.upsert_default_project(
