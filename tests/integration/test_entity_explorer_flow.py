@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -6,14 +7,16 @@ from sqlalchemy import select
 
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.http_adapter.app import create_app
-from mem0_sidecar.store.models import Entity, MemoryIndex
+from mem0_sidecar.mem0_client.client import Mem0UpstreamError
+from mem0_sidecar.store.models import Entity, EventStatus, MemoryIndex
+from mem0_sidecar.store.repositories import EventRepository
 
 
 class EntityFlowMem0Client:
     def __init__(self) -> None:
         self.records: dict[str, dict[str, Any]] = {}
         self.deleted_ids: list[str] = []
-        self.delete_failures: set[str] = set()
+        self.delete_failures: dict[str, Exception] = {}
         self._next_id = 1
 
     async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -35,8 +38,8 @@ class EntityFlowMem0Client:
 
     async def delete_memory(self, memory_id: str) -> dict[str, Any]:
         self.deleted_ids.append(memory_id)
-        if memory_id in self.delete_failures:
-            raise RuntimeError("deterministic upstream delete failure")
+        if failure := self.delete_failures.get(memory_id):
+            raise failure
         self.records.pop(memory_id, None)
         return {"id": memory_id, "message": "deleted"}
 
@@ -158,6 +161,32 @@ def _projection_signature(payload: dict[str, Any]) -> list[tuple[Any, ...]]:
     ]
 
 
+def _exact_scope_projection_signature(
+    client: TestClient,
+    *,
+    project_id: str,
+    app_id: str,
+) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        (
+            entity["id"],
+            entity["type"],
+            entity["entity_id"],
+            entity["display_name"],
+            entity["memory_count"],
+            entity["last_seen_at"],
+            entity["updated_at"],
+        )
+        for entity_type in ("user", "agent", "app", "run")
+        for entity in _query_entities(
+            client,
+            project_id=project_id,
+            app_id=app_id,
+            entity_type=entity_type,
+        )["results"]
+    )
+
+
 def test_entity_rebuild_query_and_memory_drill_down_are_exactly_scoped(
     tmp_path,
 ) -> None:
@@ -210,6 +239,18 @@ def test_entity_rebuild_query_and_memory_drill_down_are_exactly_scoped(
         agent_id="agent-foreign-project",
         run_id="run-foreign-project",
     )
+    foreign_app_projection = _exact_scope_projection_signature(
+        client,
+        project_id="project-a",
+        app_id="app-b",
+    )
+    foreign_project_projection = _exact_scope_projection_signature(
+        client,
+        project_id="project-b",
+        app_id="app-a",
+    )
+    assert len(foreign_app_projection) == 4
+    assert len(foreign_project_projection) == 4
 
     first_seen = datetime(2026, 7, 10, 10, tzinfo=UTC)
     second_seen = datetime(2026, 7, 11, 10, tzinfo=UTC)
@@ -246,6 +287,16 @@ def test_entity_rebuild_query_and_memory_drill_down_are_exactly_scoped(
         "project_id": "project-a",
         "app_id": "app-a",
     }
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-a",
+        app_id="app-b",
+    ) == foreign_app_projection
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-b",
+        app_id="app-a",
+    ) == foreign_project_projection
     users_before = _query_entities(
         client,
         project_id="project-a",
@@ -384,6 +435,16 @@ def test_entity_rebuild_query_and_memory_drill_down_are_exactly_scoped(
                 entity_type=entity_type,
             )
         ) == expected_signature
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-a",
+        app_id="app-b",
+    ) == foreign_app_projection
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-b",
+        app_id="app-a",
+    ) == foreign_project_projection
 
     delete_response = client.delete(
         "/v1/entities/user/shared-user",
@@ -421,6 +482,16 @@ def test_entity_rebuild_query_and_memory_drill_down_are_exactly_scoped(
             value="shared-user",
         )["results"]
     } == {foreign_project_id}
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-a",
+        app_id="app-b",
+    ) == foreign_app_projection
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-b",
+        app_id="app-a",
+    ) == foreign_project_projection
 
 
 def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
@@ -449,7 +520,20 @@ def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
         app_id="app-b",
         user_id="partial-user",
     )
-    mem0.delete_failures.add(failed_id)
+    foreign_projection = _exact_scope_projection_signature(
+        client,
+        project_id="project-a",
+        app_id="app-b",
+    )
+    secret = "sk_entity_flow_secret"
+    internal_url = "http://mem0.internal:8000/private"
+    mem0.delete_failures[failed_id] = Mem0UpstreamError(
+        method="DELETE",
+        path=f"{internal_url}/{failed_id}",
+        status_code=503,
+        message=f"authorization=Bearer {secret}",
+        response_text=f"token={secret}",
+    )
 
     partial_response = client.delete(
         "/v1/entities/user/partial-user",
@@ -461,9 +545,50 @@ def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
     assert partial["requested_count"] == 2
     assert partial["deleted_count"] == 1
     assert partial["failed_count"] == 1
-    assert partial["failed"][0]["id"] == failed_id
+    expected_failure = {
+        "id": failed_id,
+        "error": {
+            "error_type": "Mem0UpstreamError",
+            "message": "Upstream memory deletion failed",
+            "upstream_status_code": 503,
+        },
+    }
+    assert partial["failed"] == [expected_failure]
+    serialized_partial = json.dumps(partial, sort_keys=True)
+    assert secret not in serialized_partial
+    assert internal_url not in serialized_partial
+    assert "mem0.internal" not in serialized_partial
     assert set(mem0.deleted_ids) == target_ids
     assert foreign_id not in mem0.deleted_ids
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-a",
+        app_id="app-b",
+    ) == foreign_projection
+
+    with client.app.state.session_factory() as session:
+        event = EventRepository(session).get(partial["event_id"])
+        assert event.operation == "entity.delete"
+        assert event.status is EventStatus.FAILED
+        assert event.project_id == "project-a"
+        assert event.app_id == "app-a"
+        assert event.user_id == "partial-user"
+        assert event.subject_type == "entity"
+        assert event.subject_id == "partial-user"
+        persisted_error = json.loads(event.error_json)
+        assert persisted_error == {
+            "status": "PARTIAL",
+            "requested_count": 2,
+            "deleted_count": 1,
+            "failed_count": 1,
+            "failed": [expected_failure],
+        }
+        serialized_event = "".join(
+            (event.request_json, event.response_json, event.error_json)
+        )
+        assert secret not in serialized_event
+        assert internal_url not in serialized_event
+        assert "mem0.internal" not in serialized_event
 
     remaining = _query_memories(
         client,
@@ -489,6 +614,11 @@ def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
     assert retry_response.json()["status"] == "SUCCEEDED"
     assert mem0.deleted_ids.count(failed_id) == 2
     assert foreign_id not in mem0.deleted_ids
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-a",
+        app_id="app-b",
+    ) == foreign_projection
 
     with client.app.state.session_factory() as session:
         session.add(
@@ -510,6 +640,11 @@ def test_partial_entity_delete_keeps_failures_and_rebuild_cleans_projection(
             app_id="app-a",
             entity_type=entity_type,
         )["results"] == []
+    assert _exact_scope_projection_signature(
+        client,
+        project_id="project-a",
+        app_id="app-b",
+    ) == foreign_projection
     assert {
         item["id"]
         for item in _query_memories(
