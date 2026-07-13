@@ -26,6 +26,10 @@ _HYDRATION_BUFFER = 20
 _HYDRATION_CONCURRENCY = 8
 
 
+class MemoryUpstreamProtocolError(RuntimeError):
+    """The upstream response does not satisfy the memory service contract."""
+
+
 def _append_memory_id(memory_ids: list[str], candidate: Any) -> None:
     if isinstance(candidate, str) and candidate and candidate not in memory_ids:
         memory_ids.append(candidate)
@@ -49,7 +53,9 @@ def extract_memory_id(response: dict[str, Any]) -> str:
     memory_ids = extract_memory_ids(response)
     if memory_ids:
         return memory_ids[0]
-    raise ValueError(f"Could not extract memory id from response: {response!r}")
+    raise MemoryUpstreamProtocolError(
+        f"Could not extract memory id from response: {response!r}"
+    )
 
 
 def _sidecar_scope_metadata(scope: Scope) -> dict[str, str]:
@@ -116,7 +122,9 @@ def _memory_record_from_response(
     expected_id: str,
 ) -> dict[str, Any]:
     if not isinstance(response, dict):
-        raise ValueError("Upstream memory response must be an object")
+        raise MemoryUpstreamProtocolError(
+            "Upstream memory response must be an object"
+        )
     if _result_memory_id(response) == expected_id:
         return response
     results = response.get("results")
@@ -124,7 +132,9 @@ def _memory_record_from_response(
         for item in results:
             if _result_memory_id(item) == expected_id:
                 return item
-    raise ValueError(f"Upstream memory response does not contain {expected_id!r}")
+    raise MemoryUpstreamProtocolError(
+        f"Upstream memory response does not contain {expected_id!r}"
+    )
 
 
 def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
@@ -132,7 +142,9 @@ def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
     if metadata is None:
         return {}
     if not isinstance(metadata, dict):
-        raise ValueError("Upstream memory record metadata must be an object or null")
+        raise MemoryUpstreamProtocolError(
+            "Upstream memory record metadata must be an object or null"
+        )
     return dict(metadata)
 
 
@@ -164,7 +176,9 @@ def _normalize_memory_record(
 ) -> dict[str, Any]:
     memory_id = _result_memory_id(record)
     if memory_id is None:
-        raise ValueError("Upstream memory record is missing an id")
+        raise MemoryUpstreamProtocolError(
+            "Upstream memory record is missing an id"
+        )
 
     metadata = _record_metadata(record)
     categories = _record_categories(record)
@@ -212,26 +226,38 @@ def _history_results(response: Any) -> list[Any]:
     if isinstance(response, list):
         return response
     if not isinstance(response, dict):
-        raise ValueError("Upstream history response must be an object or list")
+        raise MemoryUpstreamProtocolError(
+            "Upstream history response must be an object or list"
+        )
     for key in ("results", "history"):
         if key in response:
             value = response[key]
             if not isinstance(value, list):
-                raise ValueError(f"Upstream history response {key!r} must be a list")
+                raise MemoryUpstreamProtocolError(
+                    f"Upstream history response {key!r} must be a list"
+                )
             return value
-    raise ValueError("Upstream history response has no recognized result container")
+    raise MemoryUpstreamProtocolError(
+        "Upstream history response has no recognized result container"
+    )
 
 
 def _list_results(response: Any) -> list[Any]:
     if not isinstance(response, dict):
-        raise ValueError("Upstream list response must be an object")
+        raise MemoryUpstreamProtocolError(
+            "Upstream list response must be an object"
+        )
     for key in ("results", "memories"):
         if key in response:
             value = response[key]
             if not isinstance(value, list):
-                raise ValueError(f"Upstream list response {key!r} must be a list")
+                raise MemoryUpstreamProtocolError(
+                    f"Upstream list response {key!r} must be a list"
+                )
             return value
-    raise ValueError("Upstream list response has no recognized result container")
+    raise MemoryUpstreamProtocolError(
+        "Upstream list response has no recognized result container"
+    )
 
 
 def _filter_search_results(
@@ -399,7 +425,7 @@ class MemoryService:
             memory_response = await self.mem0.add_memory(oss_payload)
             memory_ids = extract_memory_ids(memory_response)
             if not memory_ids:
-                raise ValueError(
+                raise MemoryUpstreamProtocolError(
                     f"Could not extract memory id from response: {memory_response!r}"
                 )
             memory_repo = MemoryIndexRepository(self.session)
@@ -499,7 +525,13 @@ class MemoryService:
                 )
             except Exception as exc:
                 if _is_upstream_not_found(exc) or isinstance(
-                    exc, (KeyError, ValueError, TypeError)
+                    exc,
+                    (
+                        KeyError,
+                        MemoryUpstreamProtocolError,
+                        TypeError,
+                        ValueError,
+                    ),
                 ):
                     return memory.mem0_memory_id, None
                 raise
@@ -698,16 +730,20 @@ class MemoryService:
             or not isinstance(response_total, int)
             or response_total < len(records)
         ):
-            raise ValueError("Upstream list response total is invalid")
+            raise MemoryUpstreamProtocolError(
+                "Upstream list response total is invalid"
+            )
         memory_repo = MemoryIndexRepository(self.session)
         normalized_records: list[dict[str, Any]] = []
         for index, item in enumerate(records):
             if not isinstance(item, dict):
-                raise ValueError(f"Upstream memory record {index} must be an object")
+                raise MemoryUpstreamProtocolError(
+                    f"Upstream memory record {index} must be an object"
+                )
             try:
                 normalized_records.append(_normalize_memory_record(item))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
+            except (MemoryUpstreamProtocolError, TypeError, ValueError) as exc:
+                raise MemoryUpstreamProtocolError(
                     f"Upstream memory record {index} is malformed"
                 ) from exc
 

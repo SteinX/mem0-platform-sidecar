@@ -10,6 +10,7 @@ from mem0_sidecar.core.memory_ops import (
     SIDECAR_APP_ID_METADATA_KEY,
     SIDECAR_PROJECT_ID_METADATA_KEY,
     MemoryService,
+    MemoryUpstreamProtocolError,
     extract_memory_id,
     extract_memory_ids,
 )
@@ -173,6 +174,11 @@ def test_extract_memory_id_accepts_common_shapes() -> None:
     assert extract_memory_id({"id": "mem-1"}) == "mem-1"
     assert extract_memory_id({"memory_id": "mem-2"}) == "mem-2"
     assert extract_memory_id({"results": [{"id": "mem-3"}]}) == "mem-3"
+
+
+def test_extract_memory_id_uses_upstream_protocol_error_for_missing_id() -> None:
+    with pytest.raises(MemoryUpstreamProtocolError, match="Could not extract"):
+        extract_memory_id({"results": [{"memory": "missing-id"}]})
 
 
 def test_extract_memory_ids_collects_top_level_and_results_ids() -> None:
@@ -1257,7 +1263,7 @@ async def test_reconcile_rejects_malformed_envelope_without_stale_cleanup(
     mem0 = ExplorerMem0Client()
     mem0.list_response = envelope
 
-    with pytest.raises(ValueError, match="list response"):
+    with pytest.raises(MemoryUpstreamProtocolError, match="list response"):
         await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
             project_id="repo-a",
             app_id="app-a",
@@ -1293,7 +1299,7 @@ async def test_reconcile_rejects_untrustworthy_total_without_stale_cleanup(
     mem0 = ExplorerMem0Client()
     mem0.list_response = envelope
 
-    with pytest.raises(ValueError, match="total"):
+    with pytest.raises(MemoryUpstreamProtocolError, match="total"):
         await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
             project_id="repo-a",
             app_id="app-a",
@@ -1326,7 +1332,7 @@ async def test_reconcile_rejects_malformed_record_without_stale_cleanup(
     mem0 = ExplorerMem0Client()
     mem0.list_response = {"results": [record]}
 
-    with pytest.raises(ValueError, match="record"):
+    with pytest.raises(MemoryUpstreamProtocolError, match="record"):
         await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
             project_id="repo-a",
             app_id="app-a",
@@ -1352,7 +1358,7 @@ async def test_get_memory_history_rejects_unknown_response_shape(db_session) -> 
     mem0 = ExplorerMem0Client()
     mem0.history_response = {"unexpected": []}
 
-    with pytest.raises(ValueError, match="history response"):
+    with pytest.raises(MemoryUpstreamProtocolError, match="history response"):
         await MemoryService(session=db_session, mem0=mem0).get_memory_history(
             project_id="repo-a",
             memory_id="mem-1",
@@ -1624,7 +1630,7 @@ async def test_update_memory_preserves_refresh_protocol_errors_without_stale(
             self.get_memory_ids.append(memory_id)
             return refresh_response
 
-    with pytest.raises(ValueError, match="does not contain"):
+    with pytest.raises(MemoryUpstreamProtocolError, match="does not contain"):
         await MemoryService(
             session=db_session,
             mem0=MalformedRefreshClient(),
