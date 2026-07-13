@@ -102,6 +102,19 @@ def explorer_components_harness_command(
     ]
 
 
+def memory_explorer_harness_command(
+    overlay_root: Path, dashboard_dir: Path
+) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-memory-explorer-state.cjs"),
+        str(dashboard_dir),
+    ]
+
+
 def strip_comments(content: str) -> str:
     result: list[str] = []
     index = 0
@@ -1183,6 +1196,11 @@ def main() -> int:
         )
         subprocess.run(
             explorer_components_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
+        subprocess.run(
+            memory_explorer_harness_command(overlay_root, dashboard_dir),
             cwd=dashboard_dir,
             check=True,
         )
