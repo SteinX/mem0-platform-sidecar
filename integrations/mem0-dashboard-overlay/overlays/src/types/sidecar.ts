@@ -31,8 +31,14 @@ export type SidecarCategoryResponse = {
   categories: SidecarCategory[];
 };
 
-export type SidecarExportFilterKey = "app_id" | "user_id" | "agent_id" | "run_id";
-export type SidecarExportFilters = Partial<Record<SidecarExportFilterKey, string>>;
+export type SidecarExportFilterKey =
+  | "app_id"
+  | "user_id"
+  | "agent_id"
+  | "run_id";
+export type SidecarExportFilters = Partial<
+  Record<SidecarExportFilterKey, string>
+>;
 
 export type SidecarExportJob = {
   id: string;
@@ -124,7 +130,13 @@ export type SidecarTrace = {
   id: string;
   correlation_id: string | null;
   operation: string;
-  display_operation: "ADD" | "SEARCH" | "GET ALL";
+  display_operation:
+    | "ADD"
+    | "SEARCH"
+    | "GET ALL"
+    | "UPDATE"
+    | "DELETE"
+    | "OTHER";
   status: "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
   entities: Array<{ type: "user" | "agent" | "app" | "run"; id: string }>;
   request: Record<string, unknown>;
@@ -145,7 +157,9 @@ export type SidecarTraceQuery = {
   statuses: Array<"PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED">;
   has_results: boolean | null;
   date_range: ExplorerDateRange;
-  entity_filters: Partial<Record<"user_id" | "agent_id" | "app_id" | "run_id", string>>;
+  entity_filters: Partial<
+    Record<"user_id" | "agent_id" | "app_id" | "run_id", string>
+  >;
   page: number;
   page_size: number;
 };

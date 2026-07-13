@@ -1,4 +1,5 @@
 const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);
+const MAX_SCOPED_JSON_BODY_BYTES = 65_536;
 
 type SidecarProxyOptions = {
   baseUrl: string | null;
@@ -105,9 +106,7 @@ function isEventQueryPath(method: string, path: string): boolean {
 
 function eventItemId(path: string): string | null {
   const match = path.match(/^\/v1\/event\/([^/]+)$/);
-  return match
-    ? canonicalResourceId(match[1], new Set(["query"]))
-    : null;
+  return match ? canonicalResourceId(match[1], new Set(["query"])) : null;
 }
 
 function isEventItemPath(method: string, path: string): boolean {
@@ -244,6 +243,72 @@ function scopedJsonBody(
   return JSON.stringify(scopedPayload);
 }
 
+function isJsonRequest(request: Request): boolean {
+  const contentType = request.headers.get("Content-Type");
+  if (contentType === null) {
+    return false;
+  }
+  return (
+    contentType.split(";", 1)[0].trim().toLowerCase() === "application/json"
+  );
+}
+
+async function readBoundedJsonBody(
+  request: Request,
+): Promise<string | Response> {
+  if (!isJsonRequest(request)) {
+    return jsonError("Content-Type must be application/json", 415);
+  }
+
+  const contentLength = request.headers.get("Content-Length")?.trim();
+  if (
+    contentLength &&
+    /^\d+$/.test(contentLength) &&
+    Number(contentLength) > MAX_SCOPED_JSON_BODY_BYTES
+  ) {
+    return jsonError("JSON body is too large", 413);
+  }
+  if (request.body === null) {
+    return "";
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_SCOPED_JSON_BODY_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The size violation remains authoritative for hostile streams.
+        }
+        return jsonError("JSON body is too large", 413);
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+}
+
 export async function proxySidecarRequest(
   request: Request,
   normalizedPath: string,
@@ -255,20 +320,15 @@ export async function proxySidecarRequest(
     configuredAppId,
     validateDashboardSession,
   } = options;
-  if (!baseUrl) {
-    return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);
-  }
   const requestPath = sidecarPathFromRequestUrl(request, normalizedPath);
-  const scopedPath = scopedSidecarPath(
-    request.method,
-    requestPath,
-    configuredProjectId,
-  );
-  if (!scopedPath) {
+  if (!isAllowedSidecarRequest(request.method, requestPath)) {
     return jsonError("Sidecar route is not allowed", 403);
   }
   if (!(await validateDashboardSession())) {
     return jsonError("Unauthorized", 401);
+  }
+  if (!baseUrl) {
+    return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);
   }
 
   const isEventRequest = isEventPath(request.method, requestPath);
@@ -277,6 +337,14 @@ export async function proxySidecarRequest(
     !hasConfiguredTraceScope(configuredProjectId, configuredAppId)
   ) {
     return jsonError("Sidecar trace scope is not configured", 500);
+  }
+  const scopedPath = scopedSidecarPath(
+    request.method,
+    requestPath,
+    configuredProjectId,
+  );
+  if (!scopedPath) {
+    return jsonError("Sidecar route is not allowed", 403);
   }
   const isMemoryItemRequest = isMemoryItemPath(request.method, requestPath);
   const isMemoryHistoryRequest = isMemoryHistoryPath(
@@ -295,10 +363,7 @@ export async function proxySidecarRequest(
   if (isExportPath(request.method, scopedPath)) {
     url.searchParams.set("project_id", configuredProjectId);
   }
-  if (
-    isMemoryItemRequest ||
-    isMemoryHistoryRequest
-  ) {
+  if (isMemoryItemRequest || isMemoryHistoryRequest) {
     url.searchParams.set("project_id", configuredProjectId);
     if (configuredAppId !== undefined) {
       url.searchParams.set("app_id", configuredAppId);
@@ -322,29 +387,26 @@ export async function proxySidecarRequest(
   };
 
   if (METHODS_WITH_BODY.has(request.method)) {
-    const bodyText = await request.text();
-    if (request.method === "POST" && scopedPath === "/v1/exports") {
-      const scopedBody = scopedJsonBody(bodyText, configuredProjectId);
-      if (scopedBody instanceof Response) {
-        return scopedBody;
-      }
-      init.body = scopedBody;
-    } else if (
+    const rewritesJsonBody =
+      (request.method === "POST" && scopedPath === "/v1/exports") ||
       isMemoryQueryPath(request.method, scopedPath) ||
       isEventQueryPath(request.method, scopedPath) ||
-      isMemoryItemRequest
-    ) {
-      const scopedBody = scopedJsonBody(
-        bodyText,
-        configuredProjectId,
-        configuredAppId,
-      );
-      if (scopedBody instanceof Response) {
-        return scopedBody;
+      isMemoryItemRequest;
+    if (rewritesJsonBody) {
+      const bodyText = await readBoundedJsonBody(request);
+      if (bodyText instanceof Response) {
+        return bodyText;
       }
-      init.body = scopedBody;
+      const rewrittenBody =
+        request.method === "POST" && scopedPath === "/v1/exports"
+          ? scopedJsonBody(bodyText, configuredProjectId)
+          : scopedJsonBody(bodyText, configuredProjectId, configuredAppId);
+      if (rewrittenBody instanceof Response) {
+        return rewrittenBody;
+      }
+      init.body = rewrittenBody;
     } else {
-      init.body = bodyText;
+      init.body = await request.text();
     }
   }
 
