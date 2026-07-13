@@ -15,7 +15,7 @@ from mem0_sidecar.core.memory_ops import (
     extract_memory_ids,
 )
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
-from mem0_sidecar.store.models import EventStatus, MemoryIndex
+from mem0_sidecar.store.models import EventStatus, MemoryIndex, Project
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EventRepository,
@@ -440,6 +440,105 @@ async def test_memory_service_search_filters_upstream_results_by_indexed_scope(
 
 
 @pytest.mark.asyncio
+async def test_search_memory_trace_is_filtered_correlated_and_durable(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-app-a", app_id="app-a")
+    _index_memory(db_session, "mem-app-b", app_id="app-b")
+    db_session.commit()
+    monkeypatch.setattr(
+        "mem0_sidecar.core.memory_ops.get_request_id",
+        lambda: "request-search",
+    )
+
+    result = await MemoryService(
+        session=db_session,
+        mem0=ScopedSearchMem0Client(),
+    ).search_memories(
+        project_id="repo-a",
+        payload={"query": "hello", "user_id": "root", "app_id": "app-a"},
+    )
+
+    assert result["results"] == [{"id": "mem-app-a", "memory": "hello app a"}]
+    assert result["total"] == 1
+    with Session(db_session.get_bind()) as verification_session:
+        stored = EventRepository(verification_session).list_project_events("repo-a")
+    assert len(stored) == 1
+    event = stored[0]
+    assert event.operation == "memory.search"
+    assert event.status is EventStatus.SUCCEEDED
+    assert event.correlation_id == "request-search"
+    assert event.app_id == "app-a"
+    assert event.user_id == "root"
+    assert event.result_count == 1
+    assert json.loads(event.response_json)["result_previews"] == [
+        {"id": "mem-app-a", "memory": "hello app a"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_memory_failure_persists_one_event_and_leaves_session_usable(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    db_session.commit()
+    monkeypatch.setattr(
+        "mem0_sidecar.core.memory_ops.get_request_id",
+        lambda: "request-search-failed",
+    )
+
+    class FailingSearchClient(FakeMem0Client):
+        async def search_memories(self, payload: dict[str, Any]) -> dict[str, Any]:
+            self.search_payloads.append(payload)
+            raise RuntimeError("search failed")
+
+    with pytest.raises(RuntimeError, match="search failed"):
+        await MemoryService(
+            session=db_session,
+            mem0=FailingSearchClient(),
+        ).search_memories(
+            project_id="repo-a",
+            payload={"query": "hello", "app_id": "app-a"},
+        )
+
+    _create_project(db_session, "repo-after-search")
+    db_session.commit()
+    with Session(db_session.get_bind()) as verification_session:
+        stored = EventRepository(verification_session).list_project_events("repo-a")
+        assert verification_session.get(Project, "repo-after-search") is not None
+    assert len(stored) == 1
+    assert stored[0].status is EventStatus.FAILED
+    assert stored[0].correlation_id == "request-search-failed"
+
+
+@pytest.mark.asyncio
+async def test_add_memory_trace_uses_request_correlation_and_creates_one_event(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    db_session.commit()
+    monkeypatch.setattr(
+        "mem0_sidecar.core.memory_ops.get_request_id",
+        lambda: "request-add",
+    )
+
+    await MemoryService(session=db_session, mem0=FakeMem0Client()).add_memory(
+        project_id="repo-a",
+        payload={"text": "remember", "user_id": "root", "app_id": "app-a"},
+    )
+    db_session.commit()
+
+    stored = EventRepository(db_session).list_project_events("repo-a")
+    assert len(stored) == 1
+    assert stored[0].operation == "memory.add"
+    assert stored[0].correlation_id == "request-add"
+
+
+@pytest.mark.asyncio
 async def test_memory_service_get_memory_uses_project_index(
     db_session,
 ) -> None:
@@ -759,11 +858,16 @@ async def test_memory_service_delete_rejects_tombstoned_memory_without_remote_de
 @pytest.mark.asyncio
 async def test_memory_service_add_persists_failed_event_before_reraising(
     db_session,
+    monkeypatch,
 ) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",
         name="Repo A",
         mem0_base_url="http://mem0:8000",
+    )
+    monkeypatch.setattr(
+        "mem0_sidecar.core.memory_ops.get_request_id",
+        lambda: "request-add-failed",
     )
 
     service = MemoryService(session=db_session, mem0=FailingAddMem0Client())
@@ -788,6 +892,7 @@ async def test_memory_service_add_persists_failed_event_before_reraising(
     assert event is None
     assert len(failed_event) == 1
     assert failed_event[0].status is EventStatus.FAILED
+    assert failed_event[0].correlation_id == "request-add-failed"
 
 
 @pytest.mark.asyncio
@@ -924,6 +1029,129 @@ async def test_query_memories_marks_bad_upstream_records_stale_and_fills_page(
             include_deleted=True,
         )
         assert stale is not None and stale.deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_query_memory_trace_uses_exact_entities_and_excludes_cross_app_preview(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-good", app_id="app-a")
+    _index_memory(db_session, "mem-conflict", app_id="app-a")
+    db_session.commit()
+    monkeypatch.setattr(
+        "mem0_sidecar.core.memory_ops.get_request_id",
+        lambda: "request-list",
+    )
+    query = parse_explorer_query(
+        {
+            "match": "all",
+            "filters": [
+                {"field": "user_id", "operator": "equals", "value": "root"}
+            ],
+            "page": 1,
+            "page_size": 20,
+            "sort": "created_at_asc",
+        },
+        allowed_fields={
+            "entity_type",
+            "user_id",
+            "agent_id",
+            "app_id",
+            "run_id",
+            "memory_id",
+            "category",
+            "metadata",
+        },
+    )
+    mem0 = ExplorerMem0Client(
+        {
+            "mem-good": {
+                "id": "mem-good",
+                "memory": "visible",
+                "app_id": "app-a",
+                "user_id": "root",
+            },
+            "mem-conflict": {
+                "id": "mem-conflict",
+                "memory": "must not leak",
+                "app_id": "app-b",
+                "user_id": "root",
+            },
+        }
+    )
+
+    result = await MemoryService(session=db_session, mem0=mem0).query_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        query=query,
+    )
+
+    assert [item["id"] for item in result["results"]] == ["mem-good"]
+    with Session(db_session.get_bind()) as verification_session:
+        stored = EventRepository(verification_session).list_project_events("repo-a")
+    assert len(stored) == 1
+    event = stored[0]
+    assert event.operation == "memory.list"
+    assert event.status is EventStatus.SUCCEEDED
+    assert event.correlation_id == "request-list"
+    assert event.app_id == "app-a"
+    assert event.user_id == "root"
+    assert event.result_count == 1
+    previews = json.loads(event.response_json)["result_previews"]
+    assert len(previews) == 1
+    assert previews[0] == {
+        **previews[0],
+        "app_id": "app-a",
+        "id": "mem-good",
+        "memory": "visible",
+        "user_id": "root",
+    }
+    assert "must not leak" not in event.response_json
+    assert "app-b" not in event.response_json
+
+
+@pytest.mark.asyncio
+async def test_query_memory_failure_persists_one_event_and_discards_partial_stale(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    projection = _index_memory(db_session, "mem-1", app_id="app-a")
+    db_session.commit()
+    monkeypatch.setattr(
+        "mem0_sidecar.core.memory_ops.get_request_id",
+        lambda: "request-list-failed",
+    )
+
+    with pytest.raises(RuntimeError, match="hydrate failed"):
+        await MemoryService(
+            session=db_session,
+            mem0=ExplorerMem0Client({"mem-1": RuntimeError("hydrate failed")}),
+        ).query_memories(
+            project_id="repo-a",
+            app_id="app-a",
+            query=_explorer_query(),
+        )
+
+    _create_project(db_session, "repo-after-list")
+    db_session.commit()
+    with Session(db_session.get_bind()) as verification_session:
+        stored = EventRepository(verification_session).list_project_events("repo-a")
+        persisted_projection = MemoryIndexRepository(verification_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="mem-1",
+            app_id="app-a",
+            include_deleted=True,
+        )
+        assert verification_session.get(Project, "repo-after-list") is not None
+    assert projection.deleted_at is None
+    assert persisted_projection is not None
+    assert persisted_projection.deleted_at is None
+    assert len(stored) == 1
+    assert stored[0].status is EventStatus.FAILED
+    assert stored[0].correlation_id == "request-list-failed"
 
 
 @pytest.mark.asyncio
