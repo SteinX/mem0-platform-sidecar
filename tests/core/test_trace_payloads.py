@@ -145,14 +145,90 @@ def test_sanitize_trace_payload_uses_credential_aware_key_segments() -> None:
     assert payload.value_reads == 0
 
 
+def test_sanitize_trace_payload_defaults_token_and_plural_credentials_to_secret(
+) -> None:
+    class SecretMapping(Mapping[str, object]):
+        def __init__(self) -> None:
+            self.keys = [
+                "huggingface_token",
+                "hf-token",
+                "npmToken",
+                "pypiToken",
+                "notion_token",
+                "api_keys",
+                "tokens",
+                "secrets",
+                "passwords",
+                "cookies",
+                "credentials",
+            ]
+            self.value_reads = 0
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self.keys)
+
+        def __len__(self) -> int:
+            return len(self.keys)
+
+        def __getitem__(self, key: str) -> object:
+            self.value_reads += 1
+            raise AssertionError(f"credential value was read for {key}")
+
+    payload = SecretMapping()
+
+    sanitized = sanitize_trace_payload(payload)
+
+    assert sanitized == {key: "[REDACTED]" for key in sorted(payload.keys)}
+    assert payload.value_reads == 0
+
+
+def test_sanitize_trace_payload_normalizes_collapsed_credential_suffixes() -> None:
+    class SecretMapping(Mapping[str, object]):
+        def __init__(self) -> None:
+            self.keys = [
+                "OpenAIAPIKey",
+                "OPENAIAPIKEY",
+                "openaiapikey",
+                "awssecretaccesskey",
+                "mem0apikey",
+            ]
+            self.value_reads = 0
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self.keys)
+
+        def __len__(self) -> int:
+            return len(self.keys)
+
+        def __getitem__(self, key: str) -> object:
+            self.value_reads += 1
+            raise AssertionError(f"credential value was read for {key}")
+
+    payload = SecretMapping()
+
+    sanitized = sanitize_trace_payload(payload)
+
+    assert sanitized == {key: "[REDACTED]" for key in sorted(payload.keys)}
+    assert payload.value_reads == 0
+
+
 def test_sanitize_trace_payload_preserves_status_and_count_fields() -> None:
     payload = {
         "requires_authorization": False,
+        "REQUIRESAUTHORIZATION": False,
         "favorite_cookie": "chocolate-chip",
+        "favoriteCookie": "oatmeal",
         "has_password": True,
+        "hasPassword": True,
         "is_secret": False,
+        "ISSECRET": False,
         "token_count": 2,
+        "TOKENCOUNT": 4,
         "secret_count": 3,
+        "SECRETCOUNT": 5,
+        "action": "search",
+        "secretary": "person",
+        "monkey": "banana",
     }
 
     assert sanitize_trace_payload(payload) == payload
