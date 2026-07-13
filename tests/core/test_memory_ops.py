@@ -3,6 +3,7 @@ import json
 from typing import Any
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.explorer_filters import parse_explorer_query
@@ -215,6 +216,7 @@ async def test_memory_service_adds_memory_indexes_projection_and_event(
         project_id="repo-a",
         categories=[{"name": "decision", "description": "Architecture decisions"}],
     )
+    db_session.commit()
     mem0 = FakeMem0Client()
     service = MemoryService(session=db_session, mem0=mem0)
 
@@ -269,6 +271,7 @@ async def test_memory_service_add_ignores_disabled_categories(db_session) -> Non
             }
         ],
     )
+    db_session.commit()
     service = MemoryService(session=db_session, mem0=FakeMem0Client())
 
     await service.add_memory(
@@ -308,6 +311,7 @@ async def test_memory_service_add_indexes_all_ids_from_results_response(
         name="Repo A",
         mem0_base_url="http://mem0:8000",
     )
+    db_session.commit()
     service = MemoryService(session=db_session, mem0=ResultsOnlyAddMem0Client())
 
     result = await service.add_memory(
@@ -344,6 +348,7 @@ async def test_memory_service_search_memories_preserves_normalized_scope(
         category=None,
         metadata={},
     )
+    db_session.commit()
     mem0 = FakeMem0Client()
     service = MemoryService(session=db_session, mem0=mem0)
 
@@ -418,6 +423,7 @@ async def test_memory_service_search_filters_upstream_results_by_indexed_scope(
         category=None,
         metadata={},
     )
+    db_session.commit()
 
     service = MemoryService(session=db_session, mem0=ScopedSearchMem0Client())
 
@@ -540,7 +546,10 @@ async def test_add_memory_trace_uses_request_correlation_and_creates_one_event(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["add", "search", "list"])
-@pytest.mark.parametrize("write_state", ["new", "dirty", "deleted"])
+@pytest.mark.parametrize(
+    "write_state",
+    ["new", "dirty", "deleted", "flushed", "core"],
+)
 async def test_traced_memory_operations_reject_unrelated_session_writes_without_commit(
     db_session,
     operation: str,
@@ -566,8 +575,23 @@ async def test_traced_memory_operations_reject_unrelated_session_writes_without_
         db_session.add(pending_category)
     elif write_state == "dirty":
         project.name = "must-not-commit"
-    else:
+    elif write_state == "deleted":
         db_session.delete(baseline_category)
+    elif write_state == "flushed":
+        pending_category = Category(
+            project_id="repo-a",
+            name="must-not-commit",
+            description="flushed",
+            schema_json="{}",
+        )
+        db_session.add(pending_category)
+        db_session.flush()
+    else:
+        db_session.execute(
+            update(Project)
+            .where(Project.id == "repo-a")
+            .values(name="must-not-commit")
+        )
 
     mem0 = ExplorerMem0Client()
     service = MemoryService(session=db_session, mem0=mem0)
@@ -600,8 +624,13 @@ async def test_traced_memory_operations_reject_unrelated_session_writes_without_
         assert pending_category in db_session.new
     elif write_state == "dirty":
         assert project in db_session.dirty
-    else:
+    elif write_state == "deleted":
         assert baseline_category in db_session.deleted
+    else:
+        assert db_session.in_transaction() is True
+        assert not db_session.new
+        assert not db_session.dirty
+        assert not db_session.deleted
 
     db_session.rollback()
     with Session(db_session.get_bind()) as verification_session:
@@ -941,6 +970,7 @@ async def test_memory_service_add_persists_failed_event_before_reraising(
         name="Repo A",
         mem0_base_url="http://mem0:8000",
     )
+    db_session.commit()
     monkeypatch.setattr(
         "mem0_sidecar.core.memory_ops.get_request_id",
         lambda: "request-add-failed",
@@ -1032,6 +1062,7 @@ async def test_query_memories_hydrates_in_repository_order_with_eight_read_limit
                 "type": "type",
             },
         }
+    db_session.commit()
     mem0 = ExplorerMem0Client(records)
 
     result = await MemoryService(session=db_session, mem0=mem0).query_memories(
@@ -1081,6 +1112,7 @@ async def test_query_memories_marks_bad_upstream_records_stale_and_fills_page(
     }
     for memory_id in records:
         _index_memory(db_session, memory_id)
+    db_session.commit()
 
     result = await MemoryService(
         session=db_session,
@@ -1957,6 +1989,7 @@ async def test_query_memories_never_gets_beyond_single_bounded_candidate_buffer(
             )
         else:
             records[memory_id] = {"id": memory_id, "memory": "valid"}
+    db_session.commit()
     mem0 = ExplorerMem0Client(records)
 
     result = await MemoryService(session=db_session, mem0=mem0).query_memories(
