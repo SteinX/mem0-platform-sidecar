@@ -16,6 +16,56 @@ from scripts.run_live_e2e_compose import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_live_runner_retains_postgres_migration_and_real_browser_smokes() -> None:
+    postgres_smoke = ROOT / "scripts" / "run_postgres_migration_smoke.py"
+    browser_smoke = (
+        ROOT
+        / "integrations"
+        / "mem0-dashboard-overlay"
+        / "scripts"
+        / "run-browser-smoke.cjs"
+    )
+
+    assert postgres_smoke.is_file()
+    assert browser_smoke.is_file()
+    assert compose_runner.postgres_smoke_command("sidecar-e2e-test")[-3:] == [
+        "python",
+        "/app/scripts/run_postgres_migration_smoke.py",
+        "--database-url=postgresql+psycopg://postgres:e2e-postgres@postgres/postgres",
+    ]
+
+
+def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
+    tmp_path,
+) -> None:
+    dashboard = tmp_path / "upstream" / "server" / "dashboard"
+    dashboard.mkdir(parents=True)
+    (dashboard / "package.json").write_text(
+        '{"name":"mem0-dashboard","scripts":{"typecheck":"tsc --noEmit"}}'
+    )
+    (dashboard / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    (dashboard / "pnpm-workspace.yaml").write_text("packages:\n  - '.'\n")
+
+    prepared = compose_runner.prepare_dashboard_context(
+        tmp_path / "upstream",
+        tmp_path / "prepared",
+    )
+
+    assert (
+        prepared / "src" / "app" / "(root)" / "dashboard" / "memories" / "page.tsx"
+    ).is_file()
+    client_layout = (
+        prepared / "src" / "app" / "(root)" / "clientLayout.tsx"
+    ).read_text()
+    assert "AuthLoadingState" not in client_layout
+    assert "TooltipProvider" in client_layout
+    assert (prepared / "Dockerfile.e2e").is_file()
+    assert compose_runner.browser_smoke_command("sidecar-e2e-test")[-2:] == [
+        "node",
+        "/app/run-browser-smoke.cjs",
+    ]
+
+
 def test_build_runner_env_points_live_e2e_at_compose_service(monkeypatch) -> None:
     monkeypatch.setenv("MEM0_E2E_BASE_URL", "http://external.example")
     monkeypatch.setenv("MEM0_E2E_API_KEY", "external-key")
@@ -58,7 +108,16 @@ def test_compose_up_command_starts_local_stack_detached() -> None:
     command = compose_up_command("sidecar-e2e-test")
 
     assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
-    assert command[-6:] == ["up", "-d", "--build", "openai-stub", "postgres", "mem0"]
+    assert command[-8:] == [
+        "up",
+        "-d",
+        "--build",
+        "openai-stub",
+        "postgres",
+        "mem0",
+        "dashboard",
+        "browser",
+    ]
 
 
 def test_compose_run_command_executes_pytest_inside_compose_network() -> None:
@@ -83,14 +142,15 @@ def test_compose_run_command_can_select_dedicated_adoption_runner() -> None:
     ]
 
 
-def test_compose_build_runner_command_builds_both_isolated_runners() -> None:
+def test_compose_build_runner_command_builds_all_isolated_runners() -> None:
     command = compose_build_runner_command("sidecar-e2e-test")
 
     assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
-    assert command[-3:] == [
+    assert command[-4:] == [
         "build",
         "e2e-runner",
         "e2e-adoption-runner",
+        "browser-smoke",
     ]
 
 
@@ -212,6 +272,12 @@ def test_compose_main_runs_default_then_dedicated_adoption_runner(
         "wait_for_mem0_ready",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        compose_runner,
+        "prepare_dashboard_context",
+        lambda upstream, target: target,
+    )
+
     def fake_subprocess_run(command, **kwargs):
         commands.append(command)
         return compose_runner.subprocess.CompletedProcess(
@@ -230,6 +296,8 @@ def test_compose_main_runs_default_then_dedicated_adoption_runner(
         if len(command) >= 4 and command[-4:-1] == ["run", "--rm", "--no-deps"]
     ]
     assert run_services == ["e2e-runner", "e2e-adoption-runner"]
+    assert compose_runner.postgres_smoke_command("unique-compose") in commands
+    assert compose_runner.browser_smoke_command("unique-compose") in commands
 
 
 def test_compose_main_reports_cleanup_failure_without_primary(monkeypatch) -> None:
@@ -241,6 +309,11 @@ def test_compose_main_reports_cleanup_failure_without_primary(monkeypatch) -> No
         compose_runner,
         "wait_for_mem0_ready",
         lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "prepare_dashboard_context",
+        lambda upstream, target: target,
     )
 
     def fail_down(command, **kwargs):
@@ -268,6 +341,11 @@ def test_compose_main_reports_resource_cleanup_failure_without_primary(
         compose_runner,
         "wait_for_mem0_ready",
         lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "prepare_dashboard_context",
+        lambda upstream, target: target,
     )
     monkeypatch.setattr(
         compose_runner.subprocess,
@@ -305,6 +383,11 @@ def test_compose_main_cleanup_does_not_mask_primary_failure(
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
     primary = PrimaryComposeFailure("primary runner failure")
+    monkeypatch.setattr(
+        compose_runner,
+        "prepare_dashboard_context",
+        lambda upstream, target: target,
+    )
     monkeypatch.setattr(
         compose_runner,
         "run",
