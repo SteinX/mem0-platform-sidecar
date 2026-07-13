@@ -232,7 +232,7 @@ def test_compose_main_runs_default_then_dedicated_adoption_runner(
     assert run_services == ["e2e-runner", "e2e-adoption-runner"]
 
 
-def test_compose_main_reports_cleanup_failure(monkeypatch) -> None:
+def test_compose_main_reports_cleanup_failure_without_primary(monkeypatch) -> None:
     monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
@@ -257,6 +257,92 @@ def test_compose_main_reports_cleanup_failure(monkeypatch) -> None:
         compose_runner.main()
 
 
+def test_compose_main_reports_resource_cleanup_failure_without_primary(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
+    monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
+    monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    monkeypatch.setattr(compose_runner, "run", lambda command, *, env: None)
+    monkeypatch.setattr(
+        compose_runner,
+        "wait_for_mem0_ready",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: compose_runner.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "verify_compose_cleanup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("resource cleanup failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="resource cleanup failed"):
+        compose_runner.main()
+
+
+class PrimaryComposeFailure(Exception):
+    pass
+
+
+@pytest.mark.parametrize("cleanup_failure", ["down", "resources"])
+def test_compose_main_cleanup_does_not_mask_primary_failure(
+    monkeypatch,
+    capsys,
+    cleanup_failure,
+) -> None:
+    monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
+    monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
+    monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    primary = PrimaryComposeFailure("primary runner failure")
+    monkeypatch.setattr(
+        compose_runner,
+        "run",
+        lambda command, *, env: (_ for _ in ()).throw(primary),
+    )
+
+    def subprocess_result(command, **kwargs):
+        down_failed = cleanup_failure == "down" and "down" in command
+        return compose_runner.subprocess.CompletedProcess(
+            command,
+            1 if down_failed else 0,
+            stdout="",
+            stderr="down cleanup failed" if down_failed else "",
+        )
+
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        subprocess_result,
+    )
+    if cleanup_failure == "resources":
+        monkeypatch.setattr(
+            compose_runner,
+            "verify_compose_cleanup",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("resource cleanup failed")
+            ),
+        )
+
+    with pytest.raises(PrimaryComposeFailure) as exc_info:
+        compose_runner.main()
+
+    assert exc_info.value is primary
+    assert f"{cleanup_failure.rstrip('s')} cleanup failed" in (
+        capsys.readouterr().err
+    )
+
+
 def test_e2e_docs_cover_explorer_reconcile_and_cleanup_contracts() -> None:
     content = (ROOT / "docs" / "e2e.md").read_text()
 
@@ -271,5 +357,7 @@ def test_e2e_docs_cover_explorer_reconcile_and_cleanup_contracts() -> None:
         "unique Compose project",
         "deadline",
         "cleanup",
+        "active projection/query results",
+        "deleted_at tombstone",
     ):
         assert contract in content

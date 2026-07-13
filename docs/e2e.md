@@ -26,9 +26,11 @@ unique project, app, user, agent, run, category, and marker IDs; every other
 fixture also uses unique identifiers for the scopes it exercises. The test
 queries with entity, category, and date filters, patches
 text/metadata/expiration, polls history with a deadline and last-response
-diagnostic, verifies wrong-app query and detail isolation, deletes through the
-scoped sidecar route, and confirms the projection disappears. Query responses
-also assert the `stale_skipped` count.
+diagnostic, verifies wrong-app query and detail isolation, and deletes through
+the scoped sidecar route.
+The deleted record no longer appears in active projection/query results; its
+deleted_at tombstone remains for audit and
+stale-index bookkeeping. Query responses also assert the `stale_skipped` count.
 
 Reconciliation coverage imports records bearing sidecar project/app markers and
 checks the `scanned`, `indexed`, `skipped_unscoped`, `skipped_other_scope`, and
