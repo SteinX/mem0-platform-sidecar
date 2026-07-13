@@ -114,6 +114,48 @@ def test_parse_entity_query_normalizes_supported_types_and_rejects_boundaries() 
             parse_entity_query(payload)
 
 
+@pytest.mark.parametrize("field", [[], object()])
+def test_parse_entity_query_rejects_non_string_filter_fields_stably(
+    field: object,
+) -> None:
+    with pytest.raises(ValueError, match=r"^filters\[0\]\.field is not allowed$"):
+        parse_entity_query(
+            {
+                "filters": [
+                    {"field": field, "operator": "equals", "value": "alice"}
+                ]
+            }
+        )
+
+
+def test_parse_entity_query_rejects_string_subclass_without_running_it() -> None:
+    effects: list[str] = []
+
+    class HostileField(str):
+        def __eq__(self, other: object) -> bool:
+            effects.append("eq")
+            raise AssertionError("hostile equality ran")
+
+        def __hash__(self) -> int:
+            effects.append("hash")
+            raise AssertionError("hostile hash ran")
+
+    with pytest.raises(ValueError, match=r"^filters\[0\]\.field is not allowed$"):
+        parse_entity_query(
+            {
+                "filters": [
+                    {
+                        "field": HostileField("user_id"),
+                        "operator": "equals",
+                        "value": "alice",
+                    }
+                ]
+            }
+        )
+
+    assert effects == []
+
+
 @pytest.mark.parametrize("field", ["user_id", "agent_id", "app_id", "run_id"])
 @pytest.mark.parametrize("operator", ["equals", "not_equals", "in"])
 @pytest.mark.parametrize(
