@@ -1,5 +1,6 @@
 import json
-from collections.abc import Iterator, Mapping
+from collections import UserList, deque
+from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
 
 import pytest
@@ -113,6 +114,50 @@ def test_sanitize_trace_payload_detects_secret_suffix_on_a_truncated_key() -> No
     assert len(next(iter(sanitized)).encode("utf-8")) <= 4096
 
 
+def test_sanitize_trace_payload_uses_credential_aware_key_segments() -> None:
+    class SecretMapping(Mapping[str, object]):
+        def __init__(self) -> None:
+            self.keys = [
+                "GitHubToken",
+                "gitlab-private-token",
+                "slackBotToken",
+                "Authorization-Code",
+                "codeVerifier",
+                "PASSPHRASE",
+            ]
+            self.value_reads = 0
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self.keys)
+
+        def __len__(self) -> int:
+            return len(self.keys)
+
+        def __getitem__(self, key: str) -> object:
+            self.value_reads += 1
+            raise AssertionError(f"credential value was read for {key}")
+
+    payload = SecretMapping()
+
+    sanitized = sanitize_trace_payload(payload)
+
+    assert sanitized == {key: "[REDACTED]" for key in sorted(payload.keys)}
+    assert payload.value_reads == 0
+
+
+def test_sanitize_trace_payload_preserves_status_and_count_fields() -> None:
+    payload = {
+        "requires_authorization": False,
+        "favorite_cookie": "chocolate-chip",
+        "has_password": True,
+        "is_secret": False,
+        "token_count": 2,
+        "secret_count": 3,
+    }
+
+    assert sanitize_trace_payload(payload) == payload
+
+
 def test_sanitize_trace_payload_bounds_unicode_strings_by_utf8_bytes() -> None:
     sanitized = sanitize_trace_payload("界" * 4096)
 
@@ -185,10 +230,19 @@ def test_sanitize_trace_payload_reads_only_a_fixed_mapping_prefix() -> None:
 
     sanitized = sanitize_trace_payload(payload)
 
-    assert isinstance(sanitized, dict)
+    assert sanitized == {"_trace_truncated": True, "original_fields": 1_000_000}
     assert payload.iterated <= 65
-    assert payload.read <= 50
-    assert sanitized["_trace_truncated_fields"] == 999_950
+    assert payload.read == 0
+
+
+def test_sanitize_trace_payload_large_mapping_marker_ignores_insertion_order() -> None:
+    ascending = {f"field-{index:03d}": index for index in range(80)}
+    descending = dict(reversed(list(ascending.items())))
+
+    assert sanitize_trace_payload(ascending) == sanitize_trace_payload(descending) == {
+        "_trace_truncated": True,
+        "original_fields": 80,
+    }
 
 
 def test_sanitize_trace_payload_has_a_global_traversal_budget() -> None:
@@ -270,6 +324,69 @@ def test_sanitize_trace_payload_bypasses_hostile_sequence_subclass_methods() -> 
 
     assert sanitize_trace_payload(HostileList([1, 2])) == [1, 2]
     assert sanitize_trace_payload(HostileTuple((1, 2))) == [1, 2]
+
+
+def test_sanitize_trace_payload_bounds_binary_containers_without_stringifying() -> None:
+    class HostileBytes(bytes):
+        def __str__(self) -> str:
+            raise AssertionError("binary data must not be stringified")
+
+        def __len__(self) -> int:
+            raise AssertionError("overridden len must not run")
+
+    raw = b"x" * (8 * 1024 * 1024)
+    values = [HostileBytes(raw), bytearray(raw), memoryview(raw)]
+
+    sanitized = [sanitize_trace_payload(value) for value in values]
+
+    assert sanitized == [
+        "[BINARY:bytes:8388608_BYTES]",
+        "[BINARY:bytearray:8388608_BYTES]",
+        "[BINARY:memoryview:8388608_BYTES]",
+    ]
+    assert all(len(_compact_bytes(value)) < 64 for value in sanitized)
+
+
+def test_sanitize_trace_payload_bounds_common_sequence_containers() -> None:
+    class HostileUserList(UserList[object]):
+        def __str__(self) -> str:
+            raise AssertionError("UserList must not be stringified")
+
+        def __len__(self) -> int:
+            raise AssertionError("overridden len must not run")
+
+        def __getitem__(self, index: object) -> object:
+            raise AssertionError("overridden indexing must not run")
+
+    class SpySequence(Sequence[object]):
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def __len__(self) -> int:
+            return 8 * 1024 * 1024
+
+        def __getitem__(self, index: int) -> object:
+            self.reads += 1
+            return index
+
+        def __str__(self) -> str:
+            raise AssertionError("Sequence must not be stringified")
+
+    user_list = HostileUserList(range(55))
+    values = [user_list, deque(range(55))]
+    spy = SpySequence()
+
+    for value in values:
+        sanitized = sanitize_trace_payload(value)
+        assert isinstance(sanitized, list)
+        assert sanitized[:50] == list(range(50))
+        assert sanitized[-1] == {"_trace_truncated_items": 5}
+
+    sanitized_spy = sanitize_trace_payload(spy)
+    assert isinstance(sanitized_spy, list)
+    assert sanitized_spy[:50] == list(range(50))
+    assert sanitized_spy[-1] == {"_trace_truncated_items": 8_388_558}
+    assert spy.reads == 50
 
 
 def test_sanitize_trace_payload_namespaces_non_string_keys_and_marks_collisions(
@@ -371,6 +488,18 @@ def test_bounded_trace_document_has_defined_minimum_size_behavior() -> None:
 
     with pytest.raises(ValueError, match="at least 2"):
         bounded_trace_document({}, max_bytes=1)
+
+
+def test_bounded_trace_document_rejects_hostile_integer_subclass_limit() -> None:
+    class HostileInt(int):
+        def __lt__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+        def __ge__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+    with pytest.raises(TypeError, match="max_bytes must be an integer"):
+        bounded_trace_document({"safe": "value"}, max_bytes=HostileInt(100))
 
 
 def test_trace_payload_functions_do_not_modify_the_input() -> None:

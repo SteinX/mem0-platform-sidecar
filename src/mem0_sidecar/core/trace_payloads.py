@@ -1,6 +1,8 @@
 import json
 import math
-from collections.abc import Iterator, Mapping
+import re
+from collections import UserList, deque
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 _MAX_STRING_BYTES = 4096
@@ -25,6 +27,10 @@ _UNPRINTABLE_MARKER = "[UNPRINTABLE]"
 _UNREADABLE_MARKER = "[UNREADABLE]"
 _MISSING = object()
 
+_CAMEL_ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
+_KEY_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
+
 _SECRET_KEYS = frozenset(
     {
         "accesstoken",
@@ -33,6 +39,7 @@ _SECRET_KEYS = frozenset(
         "apitoken",
         "authtoken",
         "authorization",
+        "authorizationcode",
         "bearertoken",
         "clientpassword",
         "clientsecret",
@@ -41,11 +48,15 @@ _SECRET_KEYS = frozenset(
         "credential",
         "credentials",
         "csrftoken",
+        "codeverifier",
         "encryptionkey",
         "idtoken",
+        "githubtoken",
+        "gitlabprivatetoken",
         "oauthaccesstoken",
         "oauthtoken",
         "password",
+        "passphrase",
         "passwd",
         "privatekey",
         "proxyauthorization",
@@ -57,35 +68,63 @@ _SECRET_KEYS = frozenset(
         "sessiontoken",
         "setcookie",
         "signingkey",
+        "slackbottoken",
         "token",
         "xapikey",
         "xauthtoken",
         "xcsrftoken",
     }
 )
-_SECRET_SUFFIXES = (
-    "accesskeyid",
-    "accesstoken",
-    "apikey",
-    "apisecret",
-    "apitoken",
-    "authorization",
-    "clientpassword",
-    "clientsecret",
-    "consumersecret",
-    "cookie",
-    "credential",
-    "credentials",
-    "encryptionkey",
-    "password",
-    "privatekey",
-    "refreshtoken",
-    "secret",
-    "secretaccesskey",
-    "secretkey",
-    "sessiontoken",
-    "setcookie",
-    "signingkey",
+_NON_CREDENTIAL_KEY_TOKENS = frozenset({"favorite", "has", "is", "require", "requires"})
+_NON_CREDENTIAL_TRAILING_TOKENS = frozenset(
+    {"configured", "count", "counts", "enabled", "present", "required", "status"}
+)
+_CREDENTIAL_TOKEN_SUFFIXES = (
+    ("access", "key", "id"),
+    ("authorization", "code"),
+    ("code", "verifier"),
+    ("secret", "access", "key"),
+    ("access", "token"),
+    ("api", "key"),
+    ("api", "secret"),
+    ("api", "token"),
+    ("client", "password"),
+    ("client", "secret"),
+    ("consumer", "secret"),
+    ("private", "key"),
+    ("refresh", "token"),
+    ("secret", "key"),
+    ("set", "cookie"),
+)
+_CREDENTIAL_FINAL_TOKENS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "credential",
+        "credentials",
+        "passphrase",
+        "passwd",
+        "password",
+        "secret",
+    }
+)
+_TOKEN_CREDENTIAL_QUALIFIERS = frozenset(
+    {
+        "access",
+        "api",
+        "auth",
+        "bearer",
+        "bot",
+        "csrf",
+        "id",
+        "oauth",
+        "private",
+        "refresh",
+        "session",
+    }
+)
+_TOKEN_CREDENTIAL_PROVIDERS = frozenset(
+    {"github", "gitlab", "mem0", "openai", "slack"}
 )
 
 _PREVIEW_STRING_FIELDS = (
@@ -144,22 +183,54 @@ def _safe_string(value: object) -> str:
     return _bounded_string(rendered)
 
 
-def _normalized_key(key: str) -> str:
+def _key_tail(key: str) -> str:
     try:
         character_count = str.__len__(key)
-        tail = str.__getitem__(
+        return str.__getitem__(
             key,
             slice(max(character_count - _MAX_SECRET_KEY_CHARS, 0), character_count),
         )
-        lowered = str.lower(tail)
-        return str.replace(str.replace(lowered, "-", ""), "_", "")
     except Exception:
         return ""
 
 
+def _key_tokens(key: str) -> tuple[str, ...]:
+    tail = _key_tail(key)
+    segmented = _CAMEL_ACRONYM_BOUNDARY.sub(r"\1_\2", tail)
+    segmented = _CAMEL_WORD_BOUNDARY.sub(r"\1_\2", segmented)
+    return tuple(
+        token.lower() for token in _KEY_SEPARATOR.split(segmented) if token
+    )
+
+
+def _tokens_end_with(tokens: tuple[str, ...], suffix: tuple[str, ...]) -> bool:
+    return len(tokens) >= len(suffix) and tokens[-len(suffix) :] == suffix
+
+
 def _is_secret_key(key: str) -> bool:
-    normalized = _normalized_key(key)
-    return normalized in _SECRET_KEYS or normalized.endswith(_SECRET_SUFFIXES)
+    tokens = _key_tokens(key)
+    if not tokens:
+        return False
+    if tokens[-1] in _NON_CREDENTIAL_TRAILING_TOKENS:
+        return False
+    if any(token in _NON_CREDENTIAL_KEY_TOKENS for token in tokens[:-1]):
+        return False
+
+    normalized = "".join(tokens)
+    if normalized in _SECRET_KEYS:
+        return True
+    if any(_tokens_end_with(tokens, suffix) for suffix in _CREDENTIAL_TOKEN_SUFFIXES):
+        return True
+    if tokens[-1] in _CREDENTIAL_FINAL_TOKENS:
+        return True
+    if tokens[-1] != "token":
+        return False
+
+    qualifiers = frozenset(tokens[:-1])
+    provider_prefix = "".join(tokens[:-1])
+    return bool(qualifiers & _TOKEN_CREDENTIAL_QUALIFIERS) or provider_prefix in (
+        _TOKEN_CREDENTIAL_PROVIDERS
+    )
 
 
 def _type_namespace(value: object) -> str:
@@ -250,6 +321,12 @@ def _sanitize_mapping(
     if scanned is None:
         return _UNPRINTABLE_MARKER
     raw_keys, iteration_complete = scanned
+    if not iteration_complete:
+        marker: dict[str, Any] = {"_trace_truncated": True}
+        reported_count = _mapping_length(value)
+        if reported_count is not None and reported_count > _MAX_MAPPING_SCAN_ITEMS:
+            marker["original_fields"] = reported_count
+        return marker
 
     grouped: dict[str, list[tuple[object, bool]]] = {}
     for raw_key in raw_keys:
@@ -289,22 +366,43 @@ def _sanitize_mapping(
     return sanitized
 
 
-def _sequence_length(value: list[object] | tuple[object, ...]) -> int:
+def _user_list_data(value: UserList[object]) -> list[object]:
+    data = object.__getattribute__(value, "data")
+    if not isinstance(data, list):
+        raise TypeError("UserList data must be a list")
+    return data
+
+
+def _sequence_length(value: object) -> int:
     if isinstance(value, list):
         return list.__len__(value)
-    return tuple.__len__(value)
+    if isinstance(value, tuple):
+        return tuple.__len__(value)
+    if isinstance(value, UserList):
+        return list.__len__(_user_list_data(value))
+    if isinstance(value, deque):
+        return deque.__len__(value)
+    if isinstance(value, Sequence):
+        return len(value)
+    raise TypeError("value is not a supported sequence")
 
 
-def _sequence_item(
-    value: list[object] | tuple[object, ...], index: int
-) -> object:
+def _sequence_item(value: object, index: int) -> object:
     if isinstance(value, list):
         return list.__getitem__(value, index)
-    return tuple.__getitem__(value, index)
+    if isinstance(value, tuple):
+        return tuple.__getitem__(value, index)
+    if isinstance(value, UserList):
+        return list.__getitem__(_user_list_data(value), index)
+    if isinstance(value, deque):
+        return deque.__getitem__(value, index)
+    if isinstance(value, Sequence):
+        return value[index]
+    raise TypeError("value is not a supported sequence")
 
 
 def _sanitize_sequence(
-    value: list[object] | tuple[object, ...],
+    value: object,
     *,
     depth: int,
     active_containers: set[int],
@@ -333,6 +431,22 @@ def _sanitize_sequence(
     if length > _MAX_ARRAY_ITEMS:
         sanitized.append({"_trace_truncated_items": length - _MAX_ARRAY_ITEMS})
     return sanitized
+
+
+def _binary_summary(value: bytes | bytearray | memoryview) -> str:
+    try:
+        if isinstance(value, bytes):
+            byte_count = bytes.__len__(value)
+            kind = "bytes"
+        elif isinstance(value, bytearray):
+            byte_count = bytearray.__len__(value)
+            kind = "bytearray"
+        else:
+            byte_count = value.nbytes
+            kind = "memoryview"
+    except Exception:
+        return _UNREADABLE_MARKER
+    return f"[BINARY:{kind}:{byte_count}_BYTES]"
 
 
 def _safe_integer(value: int) -> int | str:
@@ -374,8 +488,10 @@ def _sanitize(
         return _safe_float(value)
     if isinstance(value, str):
         return _bounded_string(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return _binary_summary(value)
 
-    if isinstance(value, (Mapping, list, tuple)):
+    if isinstance(value, (Mapping, list, tuple, UserList, deque, Sequence)):
         identity = id(value)
         if identity in active_containers:
             return _CIRCULAR_MARKER
@@ -426,7 +542,7 @@ def _compact_json_bytes(value: object) -> bytes:
 def bounded_trace_document(value: object, *, max_bytes: int = 65_536) -> dict[str, Any]:
     """Sanitize a value and return an object within ``max_bytes`` of compact JSON."""
 
-    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+    if type(max_bytes) is not int:
         raise TypeError("max_bytes must be an integer")
     if max_bytes < 2:
         raise ValueError("max_bytes must be at least 2 bytes for a JSON object")
