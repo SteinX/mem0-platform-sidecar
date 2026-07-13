@@ -3,6 +3,7 @@ const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);
 type SidecarProxyOptions = {
   baseUrl: string | null;
   configuredProjectId: string;
+  configuredAppId?: string;
   validateDashboardSession: () => Promise<boolean>;
   fetchUpstream?: typeof fetch;
 };
@@ -48,15 +49,18 @@ function canonicalMemoryId(encodedId: string): string | null {
     return null;
   }
 
+  const hasTraversalSegment = memoryId
+    .split(/[\\/]/)
+    .some((segment) => segment === "." || segment === "..");
   if (
-    memoryId === "." ||
-    memoryId === ".." ||
-    memoryId.includes("\0") ||
+    memoryId === "query" ||
+    hasTraversalSegment ||
+    /[\u0000-\u001f\u007f]/.test(memoryId) ||
     /%[0-9a-f]{2}/i.test(memoryId)
   ) {
     return null;
   }
-  return encodeURIComponent(memoryId);
+  return encodeURIComponent(encodeURIComponent(memoryId));
 }
 
 function memoryItemId(path: string): string | null {
@@ -185,7 +189,12 @@ export async function proxySidecarRequest(
   normalizedPath: string,
   options: SidecarProxyOptions,
 ): Promise<Response> {
-  const { baseUrl, configuredProjectId, validateDashboardSession } = options;
+  const {
+    baseUrl,
+    configuredProjectId,
+    configuredAppId,
+    validateDashboardSession,
+  } = options;
   if (!baseUrl) {
     return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);
   }
@@ -202,21 +211,31 @@ export async function proxySidecarRequest(
     return jsonError("Unauthorized", 401);
   }
 
+  const isMemoryItemRequest = isMemoryItemPath(request.method, requestPath);
+  const isMemoryHistoryRequest = isMemoryHistoryPath(
+    request.method,
+    requestPath,
+  );
+  const isMemoryRequest = isMemoryPath(request.method, requestPath);
   const url = new URL(`${baseUrl}${scopedPath}`);
-  new URL(request.url).searchParams.forEach((value, key) => {
-    if (key !== "project_id" && key !== "app_id") {
-      url.searchParams.append(key, value);
-    }
-  });
+  if (!isMemoryRequest) {
+    new URL(request.url).searchParams.forEach((value, key) => {
+      if (key !== "project_id" && key !== "app_id") {
+        url.searchParams.append(key, value);
+      }
+    });
+  }
   if (isExportPath(request.method, scopedPath)) {
     url.searchParams.set("project_id", configuredProjectId);
   }
   if (
-    isMemoryItemPath(request.method, scopedPath) ||
-    isMemoryHistoryPath(request.method, scopedPath)
+    isMemoryItemRequest ||
+    isMemoryHistoryRequest
   ) {
     url.searchParams.set("project_id", configuredProjectId);
-    url.searchParams.set("app_id", configuredProjectId);
+    if (configuredAppId !== undefined) {
+      url.searchParams.set("app_id", configuredAppId);
+    }
   }
 
   const headers = new Headers();
@@ -241,12 +260,12 @@ export async function proxySidecarRequest(
       init.body = scopedBody;
     } else if (
       isMemoryQueryPath(request.method, scopedPath) ||
-      isMemoryItemPath(request.method, scopedPath)
+      isMemoryItemRequest
     ) {
       const scopedBody = scopedJsonBody(
         bodyText,
         configuredProjectId,
-        configuredProjectId,
+        configuredAppId,
       );
       if (scopedBody instanceof Response) {
         return scopedBody;

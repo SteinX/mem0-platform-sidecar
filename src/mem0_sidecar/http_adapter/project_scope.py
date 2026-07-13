@@ -4,6 +4,7 @@ from fastapi import Request
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.config import SidecarSettings
+from mem0_sidecar.store.models import Project
 from mem0_sidecar.store.repositories import ProjectRepository
 
 
@@ -43,6 +44,20 @@ def resolve_project_id(request: Request, payload: dict[str, Any] | None = None) 
         return query_app_id
 
     return request.app.state.settings.default_project_id
+
+
+def resolve_project_app_id(
+    session: Session,
+    *,
+    project_id: str,
+    request_app_id: str | None,
+) -> str | None:
+    project = session.get(Project, project_id)
+    if project is None:
+        return None
+    if request_app_id:
+        return request_app_id
+    return project.default_app_id
 
 
 def normalized_payload_for_project(

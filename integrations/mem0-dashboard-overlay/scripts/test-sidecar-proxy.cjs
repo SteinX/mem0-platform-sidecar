@@ -30,12 +30,13 @@ async function loadProxyModule(dashboardDir) {
   return import(`data:text/javascript;base64,${encoded}`);
 }
 
-function proxyOptions(fetchUpstream) {
+function proxyOptions(fetchUpstream, overrides = {}) {
   return {
     baseUrl: "http://sidecar.internal",
     configuredProjectId: "runtime project",
     validateDashboardSession: async () => true,
     fetchUpstream,
+    ...overrides,
   };
 }
 
@@ -73,14 +74,48 @@ async function testMemoryQueryForcesRuntimeScopeAndPreservesQuery(proxy) {
   assert.equal(calls.length, 1);
   assert.equal(
     calls[0].url,
-    "http://sidecar.internal/v1/memories/query?trace=query",
+    "http://sidecar.internal/v1/memories/query",
   );
   assert.equal(calls[0].init.method, "POST");
   assert.equal(calls[0].init.headers.get("X-Request-ID"), "memory-query-123");
   assert.deepEqual(JSON.parse(calls[0].init.body), {
-    ...payload,
+    match: payload.match,
+    filters: payload.filters,
+    date_range: payload.date_range,
+    page: payload.page,
+    page_size: payload.page_size,
+    sort: payload.sort,
     project_id: "runtime project",
-    app_id: "runtime project",
+  });
+}
+
+async function testMemoryQueryUsesOnlyConfiguredAppScope(proxy) {
+  const calls = [];
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/query?app_id=forged-query-app",
+      {
+        method: "POST",
+        body: JSON.stringify({ app_id: "forged-body-app", match: "all" }),
+      },
+    ),
+    "/v1/memories/query",
+    proxyOptions(
+      async (url, init) => {
+        calls.push({ url: url.toString(), init });
+        return Response.json({ results: [] });
+      },
+      { configuredAppId: "app-y" },
+    ),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://sidecar.internal/v1/memories/query");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    match: "all",
+    project_id: "runtime project",
+    app_id: "app-y",
   });
 }
 
@@ -140,7 +175,7 @@ async function testMemoryDetailEncodesIdAndForcesRuntimeScope(proxy) {
   assert.equal(calls.length, 1);
   assert.equal(
     calls[0].url,
-    "http://sidecar.internal/v1/memories/memory%2Fone?trace=detail&project_id=runtime+project&app_id=runtime+project",
+    "http://sidecar.internal/v1/memories/memory%252Fone?project_id=runtime+project",
   );
   assert.equal(calls[0].init.body, undefined);
 }
@@ -163,7 +198,7 @@ async function testMemoryHistoryKeepsExactSuffixAndEncodedId(proxy) {
   assert.equal(calls.length, 1);
   assert.equal(
     calls[0].url,
-    "http://sidecar.internal/v1/memories/memory%20one/history?project_id=runtime+project&app_id=runtime+project",
+    "http://sidecar.internal/v1/memories/memory%2520one/history?project_id=runtime+project",
   );
 }
 
@@ -185,7 +220,7 @@ async function testMemoryHistoryRecoversEncodedSlashFromRequestUrl(proxy) {
   assert.equal(calls.length, 1);
   assert.equal(
     calls[0].url,
-    "http://sidecar.internal/v1/memories/memory%2Fone/history?project_id=runtime+project&app_id=runtime+project",
+    "http://sidecar.internal/v1/memories/memory%252Fone/history?project_id=runtime+project",
   );
 }
 
@@ -204,24 +239,27 @@ async function testMemoryPatchPreservesFieldsAndForcesRuntimeScope(proxy) {
       { method: "PATCH", body: JSON.stringify(payload) },
     ),
     "/v1/memories/memory-one",
-    proxyOptions(async (url, init) => {
-      calls.push({ url: url.toString(), init });
-      return Response.json({ memory: { id: "memory-one" } });
-    }),
+    proxyOptions(
+      async (url, init) => {
+        calls.push({ url: url.toString(), init });
+        return Response.json({ memory: { id: "memory-one" } });
+      },
+      { configuredAppId: "app-y" },
+    ),
   );
 
   assert.equal(response.status, 200);
   assert.equal(calls.length, 1);
   assert.equal(
     calls[0].url,
-    "http://sidecar.internal/v1/memories/memory-one?project_id=runtime+project&app_id=runtime+project",
+    "http://sidecar.internal/v1/memories/memory-one?project_id=runtime+project&app_id=app-y",
   );
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     text: "updated",
     metadata: { source: "dashboard" },
     expiration_date: "2027-01-01T00:00:00Z",
     project_id: "runtime project",
-    app_id: "runtime project",
+    app_id: "app-y",
   });
 }
 
@@ -281,7 +319,7 @@ async function testMemoryDeleteForcesRuntimeScope(proxy) {
   assert.equal(calls.length, 1);
   assert.equal(
     calls[0].url,
-    "http://sidecar.internal/v1/memories/memory-one?project_id=runtime+project&app_id=runtime+project",
+    "http://sidecar.internal/v1/memories/memory-one?project_id=runtime+project",
   );
 }
 
@@ -289,7 +327,17 @@ async function testMemoryRoutesRejectTraversalDoubleEncodingAndExtraSegments(pro
   const rejected = [
     ["GET", "/v1/memories/.."],
     ["GET", "/v1/memories/%2E%2E"],
+    ["GET", "/v1/memories/%2e%2e%2fhealth"],
+    ["GET", "/v1/memories/safe%2f..%2fhealth"],
+    ["GET", "/v1/memories/%2e%2e%5chealth"],
+    ["GET", "/v1/memories/safe%5c..%5chealth"],
+    ["GET", "/v1/memories/%71uery"],
+    ["GET", "/v1/memories/%71uery/history"],
+    ["GET", "/v1/memories/safe%00name"],
+    ["GET", "/v1/memories/safe%1fname"],
+    ["GET", "/v1/memories/safe%7fname"],
     ["GET", "/v1/memories/memory%252Fone"],
+    ["GET", "/v1/memories/%2571uery"],
     ["GET", "/v1/memories/memory-one/history/extra"],
     ["GET", "/v1/memories/memory-one/extra"],
     ["GET", "/v1/memories/query"],
@@ -359,6 +407,50 @@ async function testUpstreamFailureDoesNotLeakInternalDetails(proxy) {
   assert.deepEqual(JSON.parse(body), {
     error: "Sidecar upstream request failed",
   });
+}
+
+async function testRealSidecarEncodedIdRoundTrip(proxy, baseUrl) {
+  const options = {
+    baseUrl,
+    configuredProjectId: "repo-a",
+    validateDashboardSession: async () => true,
+    fetchUpstream: fetch,
+  };
+  const query = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/query?app_id=forged&trace=forged",
+      {
+        method: "POST",
+        body: JSON.stringify({ app_id: "forged", page_size: 20 }),
+      },
+    ),
+    "/v1/memories/query",
+    options,
+  );
+  assert.equal(query.status, 200);
+  assert.equal((await query.json()).results[0].id, "memory/one");
+
+  const detail = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory%2Fone?app_id=forged&trace=forged",
+      { method: "GET" },
+    ),
+    "/v1/memories/memory/one",
+    options,
+  );
+  assert.equal(detail.status, 200);
+  assert.equal((await detail.json()).id, "memory/one");
+
+  const history = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory%2Fone/history?app_id=forged",
+      { method: "GET" },
+    ),
+    "/v1/memories/memory/one/history",
+    options,
+  );
+  assert.equal(history.status, 200);
+  assert.deepEqual(await history.json(), { results: [{ event: "UPDATE" }] });
 }
 
 async function testCategoryCollectionPostForcesConfiguredProject(proxy) {
@@ -559,6 +651,7 @@ async function main() {
   await testMemoryQueryForcesRuntimeScopeAndPreservesQuery(
     proxySidecarRequest,
   );
+  await testMemoryQueryUsesOnlyConfiguredAppScope(proxySidecarRequest);
   await testMemoryQueryRejectsInvalidJson(proxySidecarRequest);
   await testMemoryQueryRejectsArrayBody(proxySidecarRequest);
   await testMemoryDetailEncodesIdAndForcesRuntimeScope(proxySidecarRequest);
@@ -590,7 +683,15 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 20 contracts passed");
+  console.log("sidecar proxy request harness: 21 contracts passed");
+  const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
+  if (integrationBaseUrl) {
+    await testRealSidecarEncodedIdRoundTrip(
+      proxySidecarRequest,
+      integrationBaseUrl,
+    );
+    console.log("sidecar proxy integration: 3 contracts passed");
+  }
 }
 
 main().catch((error) => {
