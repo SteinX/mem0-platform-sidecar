@@ -96,12 +96,16 @@ export type SidecarMemoryPage = {
 export type SidecarMemoryHistoryEntry = {
   id?: string;
   memory_id?: string;
-  input?: { role: string; content: string }[];
-  old_memory?: string | null;
-  new_memory?: string | null;
+  input?: unknown;
+  old_memory?: unknown;
+  new_memory?: unknown;
   user_id?: string;
   categories?: string[];
-  event?: string;
-  created_at?: string;
-  updated_at?: string;
+  event?: unknown;
+  created_at?: unknown;
+  updated_at?: unknown;
+};
+
+export type SidecarMemoryHistoryResponse = {
+  results: unknown;
 };

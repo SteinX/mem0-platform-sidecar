@@ -179,6 +179,8 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/app/(root)/dashboard/categories/page.tsx",
         "src/app/(root)/dashboard/categories/category-field-editor.tsx",
         "src/app/(root)/dashboard/categories/category-editor-drawer.tsx",
+        "src/app/(root)/dashboard/memories/page.tsx",
+        "src/app/(root)/dashboard/memories/memory-detail-drawer.tsx",
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/config/route.ts",
         "src/app/api/sidecar/[...path]/route.ts",
@@ -188,6 +190,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/utils/category-schema.ts",
         "src/utils/category-editor-state.ts",
         "src/utils/explorer-query-state.ts",
+        "src/utils/memory-explorer-state.ts",
         "src/types/dashboard-explorer.ts",
         "src/types/sidecar.ts",
         "src/components/self-hosted/explorer/date-range-filter.tsx",
@@ -311,6 +314,130 @@ def test_dashboard_overlay_includes_shared_explorer_components():
     assert state_path in manifest["files"]
     assert (OVERLAY / "overlays" / state_path).is_file()
     assert (OVERLAY / "scripts/test-explorer-components.cjs").is_file()
+
+
+def test_dashboard_overlay_includes_memory_explorer_page_and_drawer_contracts():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    page_path = "src/app/(root)/dashboard/memories/page.tsx"
+    drawer_path = (
+        "src/app/(root)/dashboard/memories/memory-detail-drawer.tsx"
+    )
+    state_path = "src/utils/memory-explorer-state.ts"
+
+    for relative in (page_path, drawer_path, state_path):
+        assert relative in manifest["files"]
+        source = OVERLAY / "overlays" / relative
+        assert source.is_file()
+        assert_dashboard_tsx_transpiles(source)
+
+    page_content = (OVERLAY / "overlays" / page_path).read_text()
+    for contract in (
+        "Time",
+        "Entities",
+        "Memory Content",
+        "Categories",
+        "Action",
+        "DateRangeFilter",
+        "FilterBuilder",
+        "DataTable",
+        "CategoriesDisplay",
+        "stale_skipped",
+        "Loading memories",
+        "No memories found",
+        "Retry",
+        "Refresh",
+        "Pagination",
+        "memoryId",
+        "line-clamp-2",
+        "md:hidden",
+        "aria-disabled",
+        "tabIndex",
+    ):
+        assert contract in page_content
+
+    drawer_content = (OVERLAY / "overlays" / drawer_path).read_text()
+    for contract in (
+        "SheetTitle",
+        "SheetDescription",
+        "Details",
+        "Source & Updates",
+        "Memory content",
+        "Metadata JSON",
+        "Expiration",
+        "Source unavailable",
+        "AlertDialog",
+        "DeleteConfirmationModal",
+        "Copy ID",
+        "overflow-x-hidden",
+        "sm:max-w-2xl",
+        "await navigator.clipboard.writeText",
+        "Failed to copy memory ID",
+    ):
+        assert contract in drawer_content
+
+    assert (OVERLAY / "scripts/test-memory-explorer-state.cjs").is_file()
+
+
+def test_dashboard_overlay_verifier_runs_memory_explorer_runtime_contracts():
+    verifier = runpy.run_path(str(VERIFY_DASHBOARD_OVERLAY))
+    dashboard = Path("/tmp/upstream-dashboard")
+
+    assert verifier["memory_explorer_harness_command"](
+        OVERLAY,
+        dashboard,
+    )[-2:] == [
+        str(OVERLAY / "scripts/test-memory-explorer-state.cjs"),
+        str(dashboard),
+    ]
+    source = VERIFY_DASHBOARD_OVERLAY.read_text()
+    assert re.search(
+        r"subprocess\.run\(\s*memory_explorer_harness_command\(",
+        source,
+    )
+
+
+def test_memory_explorer_harness_verifies_the_applied_dashboard(tmp_path):
+    dashboard = applied_upstream_overlay(tmp_path)
+    result = subprocess.run(
+        [
+            "node",
+            str(OVERLAY / "scripts/test-memory-explorer-state.cjs"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "memory explorer state harness: 8 contracts passed" in result.stdout
+
+
+def test_memory_explorer_harness_rejects_tampered_applied_source(tmp_path):
+    dashboard = applied_upstream_overlay(tmp_path)
+    state = dashboard / "src/utils/memory-explorer-state.ts"
+    state.write_text(
+        state.read_text().replace(
+            "filters: query.filters.map(({ id: _id, ...filter }) => filter)",
+            "filters: query.filters",
+            1,
+        )
+    )
+    result = subprocess.run(
+        [
+            "node",
+            str(OVERLAY / "scripts/test-memory-explorer-state.cjs"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "memory explorer state harness failed" in result.stderr
 
 
 def test_dashboard_overlay_verifier_runs_explorer_component_contracts():
@@ -1645,6 +1772,7 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     assert any("test-sidecar-proxy.cjs" in args for args in harness_args)
     assert any("test-category-schema.cjs" in args for args in harness_args)
     assert any("test-category-editor-state.cjs" in args for args in harness_args)
+    assert any("test-memory-explorer-state.cjs" in args for args in harness_args)
     assert all(args.endswith(str(dashboard)) for args in harness_args)
 
 
