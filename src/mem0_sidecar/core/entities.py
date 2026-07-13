@@ -65,6 +65,18 @@ def _portable_id(value: object, *, field_name: str) -> str:
     return normalized
 
 
+def validate_entity_identity(
+    entity_type: object,
+    entity_id: object,
+) -> tuple[str, str]:
+    normalized_type = _normalize_entity_type(entity_type)
+    normalized_id = _portable_id(
+        entity_id,
+        field_name=f"{normalized_type}_id",
+    )
+    return normalized_type, normalized_id
+
+
 def _normalize_id_filter(value: object, *, field_name: str) -> object:
     if isinstance(value, (list, tuple)):
         return [
@@ -288,13 +300,12 @@ class EntityService:
         entity_type: str,
         entity_id: str,
     ) -> dict[str, Any]:
-        normalized_type = _normalize_entity_type(entity_type)
+        normalized_type, entity_id = validate_entity_identity(
+            entity_type,
+            entity_id,
+        )
         project_id = _portable_id(project_id, field_name="project_id")
         app_id = _portable_id(app_id, field_name="app_id")
-        entity_id = _portable_id(
-            entity_id,
-            field_name=f"{normalized_type}_id",
-        )
         entity = EntityRepository(self.session).get_project_entity(
             project_id,
             app_id,
@@ -319,13 +330,12 @@ class EntityService:
         entity_type: str,
         entity_id: str,
     ) -> dict[str, Any]:
-        normalized_type = _normalize_entity_type(entity_type)
+        normalized_type, entity_id = validate_entity_identity(
+            entity_type,
+            entity_id,
+        )
         project_id = _portable_id(project_id, field_name="project_id")
         app_id = _portable_id(app_id, field_name="app_id")
-        entity_id = _portable_id(
-            entity_id,
-            field_name=f"{normalized_type}_id",
-        )
         with self.session.no_autoflush:
             project = self.session.scalar(
                 select(Project)

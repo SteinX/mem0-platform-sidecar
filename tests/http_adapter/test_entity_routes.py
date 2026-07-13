@@ -388,6 +388,59 @@ def test_entity_detail_rejects_invalid_type_or_nonportable_id(
     assert response.status_code in {400, 422}
 
 
+@pytest.mark.parametrize(
+    ("method", "entity_type", "entity_id", "expected_detail"),
+    [
+        ("GET", "session", "alice", "Unsupported entity type"),
+        (
+            "GET",
+            "user",
+            " leading",
+            "user_id must be a portable 1-256 character identifier",
+        ),
+        ("DELETE", "session", "alice", "Unsupported entity type"),
+        (
+            "DELETE",
+            "user",
+            " leading",
+            "user_id must be a portable 1-256 character identifier",
+        ),
+    ],
+)
+def test_entity_item_validation_does_not_reveal_project_existence(
+    tmp_path,
+    method: str,
+    entity_type: str,
+    entity_id: str,
+    expected_detail: str,
+) -> None:
+    app = _create_test_app(tmp_path)
+    _seed_memory(app, "one")
+    client = TestClient(app)
+    target = (
+        f"/v1/entities/{quote(entity_type, safe='')}/"
+        f"{quote(entity_id, safe='')}"
+    )
+
+    existing_project = client.request(
+        method,
+        target,
+        params={"project_id": "repo-a", "app_id": "app-a"},
+    )
+    missing_project = client.request(
+        method,
+        target,
+        params={"project_id": "repo-missing", "app_id": "app-a"},
+    )
+
+    assert existing_project.status_code == missing_project.status_code == 422
+    assert existing_project.json() == missing_project.json() == {
+        "detail": expected_detail
+    }
+    with app.state.session_factory() as session:
+        assert session.get(Project, "repo-missing") is None
+
+
 def test_entity_detail_unknown_project_and_missing_entity_are_generic_404(
     tmp_path,
 ) -> None:
