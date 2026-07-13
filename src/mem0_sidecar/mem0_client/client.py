@@ -79,6 +79,9 @@ class Mem0RestClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}/{path.lstrip('/')}"
 
+    def _memory_item_path(self, memory_id: str, *, suffix: str = "") -> str:
+        return f"{self.memories_path}/{quote(memory_id, safe='')}{suffix}"
+
     async def _request(
         self,
         method: str,
@@ -197,14 +200,13 @@ class Mem0RestClient:
         return await self._request("GET", self.memories_path, params=params)
 
     async def get_memory_history(self, memory_id: str) -> dict[str, Any]:
-        encoded = quote(memory_id, safe="")
         return await self._request(
             "GET",
-            f"{self.memories_path}/{encoded}/history",
+            self._memory_item_path(memory_id, suffix="/history"),
         )
 
     async def get_memory(self, memory_id: str) -> dict[str, Any]:
-        return await self._request("GET", f"{self.memories_path}/{memory_id}")
+        return await self._request("GET", self._memory_item_path(memory_id))
 
     async def update_memory(
         self,
@@ -213,12 +215,12 @@ class Mem0RestClient:
     ) -> dict[str, Any]:
         return await self._request(
             "PUT",
-            f"{self.memories_path}/{memory_id}",
+            self._memory_item_path(memory_id),
             payload=payload,
         )
 
     async def delete_memory(self, memory_id: str) -> dict[str, Any]:
-        return await self._request("DELETE", f"{self.memories_path}/{memory_id}")
+        return await self._request("DELETE", self._memory_item_path(memory_id))
 
     async def delete_all_memories(self, params: dict[str, Any]) -> dict[str, Any]:
         return await self._request("DELETE", self.memories_path, params=params)

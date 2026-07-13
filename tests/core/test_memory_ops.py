@@ -841,6 +841,37 @@ async def test_memory_service_delete_uses_projection_scope_for_event_request(
 
 
 @pytest.mark.asyncio
+async def test_memory_service_preserves_exact_special_id_in_projection_and_event(
+    db_session,
+) -> None:
+    memory_id = "part/what?#%é"
+    _create_project(db_session)
+    _index_memory(db_session, memory_id)
+    db_session.commit()
+    mem0 = FakeMem0Client()
+
+    result = await MemoryService(session=db_session, mem0=mem0).delete_memory(
+        project_id="repo-a",
+        memory_id=memory_id,
+        request_app_id="app-a",
+    )
+
+    assert mem0.deleted_ids == [memory_id]
+    event = EventRepository(db_session).get(result["event"]["id"])
+    assert event.subject_id == memory_id
+    assert json.loads(event.request_json)["memory_id"] == memory_id
+    projection = MemoryIndexRepository(db_session).get_memory(
+        project_id="repo-a",
+        mem0_memory_id=memory_id,
+        app_id="app-a",
+        include_deleted=True,
+    )
+    assert projection is not None
+    assert projection.mem0_memory_id == memory_id
+    assert projection.deleted_at is not None
+
+
+@pytest.mark.asyncio
 async def test_memory_service_delete_rejects_unknown_project_without_remote_delete(
     db_session,
 ) -> None:

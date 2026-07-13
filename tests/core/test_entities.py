@@ -73,6 +73,24 @@ class DeleteMem0:
         raise AssertionError(f"broad delete is forbidden: {payload!r}")
 
 
+class StatefulDeleteMem0(DeleteMem0):
+    def __init__(self, memory_ids: set[str]) -> None:
+        super().__init__()
+        self.memory_ids = set(memory_ids)
+
+    async def delete_memory(self, memory_id: str) -> dict[str, Any]:
+        self.deleted_ids.append(memory_id)
+        if memory_id not in self.memory_ids:
+            raise Mem0UpstreamError(
+                method="DELETE",
+                path=f"/memories/{memory_id}",
+                status_code=404,
+                message="not found",
+            )
+        self.memory_ids.remove(memory_id)
+        return {"message": "deleted", "id": memory_id}
+
+
 def test_parse_entity_query_normalizes_supported_types_and_rejects_boundaries() -> None:
     for value, expected in (
         ("USER", "user"),
@@ -94,6 +112,157 @@ def test_parse_entity_query_normalizes_supported_types_and_rejects_boundaries() 
     for payload in invalid_payloads:
         with pytest.raises(ValueError):
             parse_entity_query(payload)
+
+
+@pytest.mark.parametrize("field", ["user_id", "agent_id", "app_id", "run_id"])
+@pytest.mark.parametrize("operator", ["equals", "not_equals", "in"])
+@pytest.mark.parametrize(
+    "invalid_id",
+    [
+        " leading",
+        "trailing ",
+        "embedded space",
+        "nul\x00byte",
+        "e\u0301",
+        "x" * 257,
+        7,
+        None,
+    ],
+)
+def test_parse_entity_query_rejects_nonportable_filter_ids(
+    field: str,
+    operator: str,
+    invalid_id: object,
+) -> None:
+    value = [invalid_id] if operator == "in" else invalid_id
+
+    with pytest.raises(ValueError, match=field):
+        parse_entity_query(
+            {
+                "filters": [
+                    {"field": field, "operator": operator, "value": value}
+                ]
+            }
+        )
+
+
+def test_parse_entity_query_preserves_portable_id_boundaries_without_trimming() -> None:
+    entity_id = "é" + ("x" * 255)
+
+    query = parse_entity_query(
+        {
+            "entity_type": "USER",
+            "filters": [
+                {"field": "user_id", "operator": "equals", "value": entity_id},
+                {
+                    "field": "user_id",
+                    "operator": "in",
+                    "value": [entity_id],
+                },
+            ],
+        }
+    )
+
+    assert query.entity_type == "user"
+    assert query.filters[0].value == entity_id
+    assert query.filters[1].value == (entity_id,)
+    with pytest.raises(ValueError, match="Unsupported entity type"):
+        parse_entity_query({"entity_type": " USER "})
+
+
+@pytest.mark.parametrize(
+    ("operation", "project_id", "app_id", "entity_id"),
+    [
+        ("query", " leading", "app-a", "alice"),
+        ("query", "repo-a", "app-a\x00", "alice"),
+        ("get", "repo-a", "app-a", "e\u0301"),
+        ("rebuild", "x" * 129, "app-a", "alice"),
+        ("rebuild", "repo-a", "x" * 257, "alice"),
+    ],
+)
+def test_entity_service_rejects_nonportable_scope_before_database_access(
+    db_session,
+    monkeypatch,
+    operation: str,
+    project_id: str,
+    app_id: str,
+    entity_id: str,
+) -> None:
+    database_calls = 0
+
+    def reject_database_access(*args, **kwargs):
+        nonlocal database_calls
+        database_calls += 1
+        raise AssertionError("invalid scope reached database")
+
+    monkeypatch.setattr(db_session, "scalar", reject_database_access)
+    monkeypatch.setattr(db_session, "scalars", reject_database_access)
+    monkeypatch.setattr(db_session, "execute", reject_database_access)
+    service = EntityService(session=db_session, mem0=DeleteMem0())
+    query = parse_entity_query({"entity_type": "user"})
+
+    with pytest.raises(ValueError):
+        if operation == "query":
+            service.query_entities(project_id, app_id, query)
+        elif operation == "get":
+            service.get_entity(project_id, app_id, "user", entity_id)
+        else:
+            service.rebuild_entities(project_id, app_id)
+
+    assert database_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_entity_delete_rejects_nonportable_id_before_database_or_upstream(
+    db_session,
+    monkeypatch,
+) -> None:
+    database_calls = 0
+    mem0 = DeleteMem0()
+
+    def reject_database_access(*args, **kwargs):
+        nonlocal database_calls
+        database_calls += 1
+        raise AssertionError("invalid entity id reached database")
+
+    monkeypatch.setattr(db_session, "scalar", reject_database_access)
+
+    with pytest.raises(ValueError, match="user_id"):
+        await EntityService(session=db_session, mem0=mem0).delete_entity(
+            "repo-a",
+            "app-a",
+            "user",
+            "alice\nadmin",
+        )
+
+    assert database_calls == 0
+    assert mem0.deleted_ids == []
+
+
+def test_entity_service_accepts_exact_portable_scope_boundaries(db_session) -> None:
+    project_id = "p" * 128
+    app_id = "a" * 256
+    entity_id = "é" + ("x" * 255)
+    service = EntityService(session=db_session, mem0=DeleteMem0())
+
+    result = service.query_entities(
+        project_id,
+        app_id,
+        parse_entity_query(
+            {
+                "entity_type": "user",
+                "filters": [
+                    {
+                        "field": "user_id",
+                        "operator": "equals",
+                        "value": entity_id,
+                    }
+                ],
+            }
+        ),
+    )
+
+    assert result["results"] == []
 
 
 @pytest.mark.parametrize(
@@ -339,6 +508,7 @@ async def test_delete_entity_partial_failure_keeps_failed_projection_and_safe_ev
     assert result["deleted_count"] == 1
     assert result["failed_count"] == 1
     assert result["failed"][0]["id"] == "fails"
+    assert result["failed"][0]["error"]["upstream_status_code"] == 503
     serialized_result = json.dumps(result)
     assert secret not in serialized_result
     assert "mem0.internal" not in serialized_result
@@ -355,6 +525,59 @@ async def test_delete_entity_partial_failure_keeps_failed_projection_and_safe_ev
     assert error["deleted_count"] == 1
     assert error["failed_count"] == 1
     assert len(EventRepository(db_session).list_project_events("repo-a")) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_entity_retry_after_local_rollback_converges_on_upstream_404(
+    db_session,
+) -> None:
+    _create_project(db_session, "repo-a")
+    _memory(db_session, "one", user_id="alice")
+    _rebuild(db_session)
+    db_session.commit()
+    mem0 = StatefulDeleteMem0({"one"})
+    service = EntityService(session=db_session, mem0=mem0)
+
+    first = await service.delete_entity("repo-a", "app-a", "user", "alice")
+    assert first["status"] == "SUCCEEDED"
+    db_session.rollback()
+    assert EntityRepository(db_session).get_project_entity(
+        "repo-a", "app-a", "user", "alice"
+    ).memory_count == 1
+
+    retry = await service.delete_entity("repo-a", "app-a", "user", "alice")
+
+    assert retry["status"] == "SUCCEEDED"
+    assert retry["requested_count"] == 1
+    assert retry["deleted_count"] == 1
+    assert retry["failed_count"] == 0
+    assert retry["failed"] == []
+    assert mem0.deleted_ids == ["one", "one"]
+    assert EntityRepository(db_session).list_entity_memory_ids(
+        "repo-a", "app-a", "user", "alice"
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_entity_delete_converges_when_concurrent_memory_delete_returns_404(
+    db_session,
+) -> None:
+    _create_project(db_session, "repo-a")
+    _memory(db_session, "already-deleted-upstream", user_id="alice")
+    _rebuild(db_session)
+    db_session.commit()
+
+    result = await EntityService(
+        session=db_session,
+        mem0=StatefulDeleteMem0(set()),
+    ).delete_entity("repo-a", "app-a", "user", "alice")
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["deleted_count"] == 1
+    assert result["failed_count"] == 0
+    assert EntityRepository(db_session).list_entity_memory_ids(
+        "repo-a", "app-a", "user", "alice"
+    ) == []
 
 
 @pytest.mark.asyncio
@@ -476,6 +699,91 @@ async def test_delete_entity_contains_hostile_error_rendering_per_memory(
     assert result["failed_count"] == 2
     assert {item["id"] for item in result["failed"]} == {"one", "two"}
     assert render_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_entity_uses_closed_error_types_and_guarded_status_reads(
+    db_session,
+) -> None:
+    secret = "sk_dynamic_exception_secret"
+    status_reads = 0
+
+    def hostile_status_read(self, name: str):
+        nonlocal status_reads
+        if name == "status_code":
+            status_reads += 1
+            raise RuntimeError(secret)
+        return object.__getattribute__(self, name)
+
+    def hostile_dict_read(self):
+        nonlocal status_reads
+        status_reads += 1
+        raise RuntimeError(secret)
+
+    hostile_upstream_type = type(
+        f"{secret}_upstream",
+        (Mem0UpstreamError,),
+        {
+            "__getattribute__": hostile_status_read,
+            "__dict__": property(hostile_dict_read),
+        },
+    )
+    hostile_runtime_type = type(
+        f"{secret}_runtime",
+        (RuntimeError,),
+        {"__str__": lambda self: secret},
+    )
+    upstream_error = hostile_upstream_type(
+        method="DELETE",
+        path=f"http://mem0.internal/{secret}",
+        status_code=503,
+        message=secret,
+        response_text=secret,
+    )
+    runtime_error = hostile_runtime_type(secret)
+    non_integer_status = Mem0UpstreamError(
+        method="DELETE",
+        path="/memories/bool-status",
+        status_code=True,
+        message=secret,
+    )
+    _create_project(db_session, "repo-a")
+    _memory(db_session, "upstream", user_id="alice")
+    _memory(db_session, "runtime", user_id="alice")
+    _memory(db_session, "bool-status", user_id="alice")
+    _rebuild(db_session)
+    db_session.commit()
+
+    result = await EntityService(
+        session=db_session,
+        mem0=DeleteMem0(
+            {
+                "upstream": upstream_error,
+                "runtime": runtime_error,
+                "bool-status": non_integer_status,
+            }
+        ),
+    ).delete_entity("repo-a", "app-a", "user", "alice")
+
+    failures = {item["id"]: item["error"] for item in result["failed"]}
+    assert failures == {
+        "upstream": {
+            "error_type": "Mem0UpstreamError",
+            "message": "Upstream memory deletion failed",
+        },
+        "runtime": {
+            "error_type": "UpstreamDeleteError",
+            "message": "Upstream memory deletion failed",
+        },
+        "bool-status": {
+            "error_type": "Mem0UpstreamError",
+            "message": "Upstream memory deletion failed",
+        },
+    }
+    event = EventRepository(db_session).get(result["event_id"])
+    assert secret not in json.dumps(result)
+    assert secret not in event.error_json
+    assert status_reads == 0
 
 
 def test_query_uses_bounded_sql_paging_not_unbounded_entity_materialization(

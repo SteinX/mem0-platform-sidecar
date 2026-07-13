@@ -238,6 +238,41 @@ async def test_mem0_client_updates_memory_by_id() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["get", "update", "delete"])
+@pytest.mark.parametrize(
+    ("memory_id", "encoded_id"),
+    [
+        ("part/what?#%é", "part%2Fwhat%3F%23%25%C3%A9"),
+        ("literal%2Fslash", "literal%252Fslash"),
+    ],
+)
+async def test_mem0_client_exact_memory_routes_quote_id_once_as_one_path_segment(
+    operation: str,
+    memory_id: str,
+    encoded_id: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.raw_path == f"/memories/{encoded_id}".encode()
+        assert request.url.query == b""
+        assert request.url.fragment == ""
+        return httpx.Response(200, json={"id": memory_id})
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    if operation == "get":
+        result = await client.get_memory(memory_id)
+    elif operation == "update":
+        result = await client.update_memory(memory_id, {"text": "updated"})
+    else:
+        result = await client.delete_memory(memory_id)
+
+    assert result == {"id": memory_id}
+
+
+@pytest.mark.asyncio
 async def test_mem0_client_deletes_all_memories() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "DELETE"
