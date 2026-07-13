@@ -13,6 +13,7 @@ from mem0_sidecar.core.explorer_filters import (
     parse_explorer_query,
 )
 from mem0_sidecar.core.memory_ops import MemoryService
+from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.http_adapter.dependencies import get_mem0_client, get_session
 from mem0_sidecar.http_adapter.project_scope import (
     ensure_project,
@@ -82,22 +83,33 @@ async def add_memory(
     session: SessionDependency,
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
-    project_id = resolve_project_id(request, payload)
-    ensure_project(
-        session,
-        request.app.state.settings,
-        project_id,
-        default_app_id=resolve_app_id(request, payload),
-    )
-    session.commit()
-    service = MemoryService(session=session, mem0=mem0)
     try:
+        project_id = validate_scope_id(
+            resolve_project_id(request, payload),
+            field_name="project_id",
+        )
+        request_app_id = validate_scope_id(
+            resolve_app_id(request, payload),
+            field_name="app_id",
+            required=False,
+        )
+        ensure_project(
+            session,
+            request.app.state.settings,
+            project_id,
+            default_app_id=request_app_id,
+        )
+        session.commit()
+        service = MemoryService(session=session, mem0=mem0)
         result = await service.add_memory(
             project_id=project_id,
             payload=normalized_payload_for_project(request, payload),
         )
         session.commit()
         return result
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:
         session.rollback()
         raise

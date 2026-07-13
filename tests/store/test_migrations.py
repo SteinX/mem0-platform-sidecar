@@ -22,12 +22,33 @@ MEMORY_EXPLORER_INDEXES = {
 REQUEST_TRACE_INDEXES = {
     "ix_events_project_created",
     "ix_events_project_app_created",
+    "ix_events_project_app_user_created",
+    "ix_events_project_app_agent_created",
+    "ix_events_project_app_run_created",
     "ix_events_project_operation_created",
     "ix_events_project_status_created",
     "ix_events_project_has_results_created",
 }
 REQUEST_TRACE_INDEX_COLUMNS = {
     "ix_events_project_app_created": ("project_id", "app_id", "created_at"),
+    "ix_events_project_app_user_created": (
+        "project_id",
+        "app_id",
+        "user_id",
+        "created_at",
+    ),
+    "ix_events_project_app_agent_created": (
+        "project_id",
+        "app_id",
+        "agent_id",
+        "created_at",
+    ),
+    "ix_events_project_app_run_created": (
+        "project_id",
+        "app_id",
+        "run_id",
+        "created_at",
+    ),
 }
 
 
@@ -394,6 +415,9 @@ def test_request_trace_migration_upgrades_legacy_rows_and_downgrades(
     columns = {column["name"]: column for column in inspector.get_columns("events")}
     assert {
         "app_id",
+        "user_id",
+        "agent_id",
+        "run_id",
         "correlation_id",
         "latency_ms",
         "result_count",
@@ -417,7 +441,8 @@ def test_request_trace_migration_upgrades_legacy_rows_and_downgrades(
         legacy = connection.execute(
             sa.text(
                 """
-                SELECT app_id, correlation_id, latency_ms, result_count, has_results
+                SELECT app_id, user_id, agent_id, run_id,
+                       correlation_id, latency_ms, result_count, has_results
                 FROM events
                 WHERE id = 'event-legacy'
                 """
@@ -425,6 +450,9 @@ def test_request_trace_migration_upgrades_legacy_rows_and_downgrades(
         ).mappings().one()
     assert legacy == {
         "app_id": None,
+        "user_id": None,
+        "agent_id": None,
+        "run_id": None,
         "correlation_id": None,
         "latency_ms": None,
         "result_count": 0,
@@ -436,6 +464,9 @@ def test_request_trace_migration_upgrades_legacy_rows_and_downgrades(
     downgraded = sa.inspect(engine)
     assert {
         "app_id",
+        "user_id",
+        "agent_id",
+        "run_id",
         "correlation_id",
         "latency_ms",
         "result_count",
@@ -477,14 +508,22 @@ def test_request_trace_migration_uses_postgres_bigint_for_result_count(
     result_count = next(
         column for column in added_columns if column.name == "result_count"
     )
-    app_id = next(column for column in added_columns if column.name == "app_id")
+    canonical_columns = {
+        column.name: column
+        for column in added_columns
+        if column.name in {"app_id", "user_id", "agent_id", "run_id"}
+    }
     assert isinstance(result_count.type, sa.BigInteger)
     assert result_count.type.compile(dialect=postgresql.dialect()) == "BIGINT"
-    assert app_id.nullable is True
-    assert app_id.type.compile(dialect=postgresql.dialect()) == "VARCHAR(256)"
+    assert set(canonical_columns) == {"app_id", "user_id", "agent_id", "run_id"}
+    assert all(column.nullable is True for column in canonical_columns.values())
+    assert {
+        column.type.compile(dialect=postgresql.dialect())
+        for column in canonical_columns.values()
+    } == {"VARCHAR(256)"}
 
 
-def test_request_trace_migration_drops_app_index_before_app_column(
+def test_request_trace_migration_drops_entity_indexes_before_entity_columns(
     monkeypatch,
 ) -> None:
     migration = importlib.import_module(
@@ -502,6 +541,14 @@ def test_request_trace_migration_drops_app_index_before_app_column(
 
     migration.downgrade()
 
-    assert operations.index(("index", "ix_events_project_app_created")) < (
-        operations.index(("column", "app_id"))
-    )
+    for field_name in ("app", "user", "agent", "run"):
+        assert operations.index(
+            (
+                "index",
+                (
+                    "ix_events_project_app_created"
+                    if field_name == "app"
+                    else f"ix_events_project_app_{field_name}_created"
+                ),
+            )
+        ) < operations.index(("column", f"{field_name}_id"))

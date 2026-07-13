@@ -154,7 +154,11 @@ def test_repositories_support_control_plane_flow(db_session) -> None:
         project_id=project.id,
         categories=[{"name": "decision", "description": "Architecture decisions"}],
     )
-    event = event_repo.create_event(project_id=project.id, operation="memory.add")
+    event = event_repo.create_event(
+        project_id=project.id,
+        operation="memory.add",
+        allow_project_scope=True,
+    )
     memory = memory_repo.upsert_memory(
         project_id=project.id,
         mem0_memory_id="mem-1",
@@ -1227,6 +1231,7 @@ def test_event_repository_lists_and_gets_events_scoped_to_project(db_session) ->
         request={"text": "visible"},
         subject_type="memory",
         subject_id="mem-a",
+        allow_project_scope=True,
     )
     event_repo.mark_succeeded(visible.id, response={"id": "mem-a"})
 
@@ -1236,6 +1241,7 @@ def test_event_repository_lists_and_gets_events_scoped_to_project(db_session) ->
         request={"text": "hidden"},
         subject_type="memory",
         subject_id="mem-b",
+        allow_project_scope=True,
     )
     event_repo.mark_succeeded(hidden.id, response={"id": "mem-b"})
     db_session.commit()
@@ -1260,7 +1266,11 @@ def test_event_model_matches_request_trace_migration() -> None:
     }
 
     assert columns["correlation_id"].nullable is True
-    assert columns["app_id"].nullable is True
+    for field_name in ("app_id", "user_id", "agent_id", "run_id"):
+        assert columns[field_name].nullable is True
+        assert columns[field_name].type.compile(
+            dialect=postgresql.dialect()
+        ) == "VARCHAR(256)"
     assert columns["latency_ms"].nullable is True
     assert columns["result_count"].nullable is False
     assert columns["has_results"].nullable is False
@@ -1275,14 +1285,29 @@ def test_event_model_matches_request_trace_migration() -> None:
     assert columns["correlation_id"].type.compile(
         dialect=postgresql.dialect()
     ) == "VARCHAR(256)"
-    assert columns["app_id"].type.compile(
-        dialect=postgresql.dialect()
-    ) == "VARCHAR(256)"
     assert indexes == {
         "ix_events_project_created": ("project_id", "created_at"),
         "ix_events_project_app_created": (
             "project_id",
             "app_id",
+            "created_at",
+        ),
+        "ix_events_project_app_user_created": (
+            "project_id",
+            "app_id",
+            "user_id",
+            "created_at",
+        ),
+        "ix_events_project_app_agent_created": (
+            "project_id",
+            "app_id",
+            "agent_id",
+            "created_at",
+        ),
+        "ix_events_project_app_run_created": (
+            "project_id",
+            "app_id",
+            "run_id",
             "created_at",
         ),
         "ix_events_project_operation_created": (
@@ -1987,6 +2012,72 @@ def test_event_repository_scrubs_embedded_credentials_from_every_trace_field(
         assert secret not in persisted
 
 
+def test_event_repository_scrubs_structured_and_full_authorization_values(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+    secrets = (
+        "json-secret",
+        "json-bearer",
+        "multiword-secret",
+        "private-secret",
+        "prefix\\\"secret-suffix",
+        "digest-nonce",
+        "digest-response",
+        "aws-credential",
+        "aws-signature",
+        "correlation-secret",
+    )
+    event = repository.create_event(
+        project_id="repo-a",
+        app_id="app-a",
+        operation="memory.search",
+        request={
+            "json": (
+                '{"api_key":"json-secret",'
+                '"Authorization":"Bearer json-bearer"}'
+            ),
+            "multiword": (
+                "API key: multiword-secret; Private key: private-secret. keep"
+            ),
+            "escaped": 'api_key="prefix\\\"secret-suffix"; keep',
+            "digest": (
+                "Authorization: Digest username=user, nonce=digest-nonce, "
+                "response=digest-response\nkeep digest tail"
+            ),
+            "aws": (
+                "Authorization: AWS4-HMAC-SHA256 Credential=aws-credential, "
+                "Signature=aws-signature\nkeep aws tail"
+            ),
+        },
+        correlation_id='{"api_key":"correlation-secret"}',
+    )
+    repository.mark_succeeded(
+        event.id,
+        response={
+            "message": (
+                '{"Authorization":"Digest nonce=digest-nonce, '
+                'response=digest-response"}'
+            ),
+            "status": "Private key: private-secret",
+            "id": 'api_key="prefix\\\"secret-suffix"',
+        },
+    )
+
+    persisted = event.request_json + event.response_json
+    for secret in secrets:
+        assert secret not in persisted
+    assert "keep digest tail" in event.request_json
+    assert "keep aws tail" in event.request_json
+    assert event.correlation_id is not None
+    assert event.correlation_id.startswith("[SHA256:")
+
+
 def test_event_repository_uses_shared_secret_vocabulary_for_url_components(
     db_session,
 ) -> None:
@@ -2007,6 +2098,7 @@ def test_event_repository_uses_shared_secret_vocabulary_for_url_components(
         "https://example.com/?code_verifier=query-secret",
         "https://example.com/?access_key_id=query-secret",
         "https://example.com/#access_token=fragment-secret&token_type=Bearer",
+        "https://example.com/#access_token%3Dencoded-fragment-secret",
         "https://example.com/?broken",
         "https://example.com/?value=%ZZ",
     ]
@@ -2044,6 +2136,9 @@ def _add_trace_event(
     event_id: str,
     project_id: str = "repo-a",
     app_id: str | None = None,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    run_id: str | None = None,
     operation: str = "memory.search",
     status: EventStatus = EventStatus.SUCCEEDED,
     request: object = None,
@@ -2054,6 +2149,9 @@ def _add_trace_event(
         id=event_id,
         project_id=project_id,
         app_id=app_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        run_id=run_id,
         operation=operation,
         status=status,
         request_json=json.dumps(request if request is not None else {}),
@@ -2067,6 +2165,106 @@ def _add_trace_event(
     )
     db_session.add(event)
     return event
+
+
+def test_event_repository_persists_canonical_entity_filters_before_sanitizing(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+    request = {
+        **{f"00_field_{index:03d}": index for index in range(70)},
+        "app_id": "app-a",
+        "user_id": "http://private.local/alice",
+        "agent_id": "agent-a",
+        "run_id": "run-a",
+    }
+
+    event = repository.create_event(
+        project_id="repo-a",
+        operation="memory.search",
+        request=request,
+    )
+    db_session.flush()
+
+    assert event.app_id == "app-a"
+    assert event.user_id == "http://private.local/alice"
+    assert event.agent_id == "agent-a"
+    assert event.run_id == "run-a"
+    assert "private.local" not in event.request_json
+    exact = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            entity_filters={
+                "user_id": "http://private.local/alice",
+                "agent_id": "agent-a",
+                "run_id": "run-a",
+            },
+            page=1,
+            page_size=20,
+        ),
+    )
+    assert [item.id for item in exact.items] == [event.id]
+    marker = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            entity_filters={"user_id": "[REDACTED_URL]"},
+            page=1,
+            page_size=20,
+        ),
+    )
+    assert marker.items == []
+
+
+def test_event_repository_rejects_conflicting_canonical_entity_markers(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+
+    with pytest.raises(ValueError, match="canonical event user scope markers conflict"):
+        repository.create_event(
+            project_id="repo-a",
+            app_id="app-a",
+            user_id="alice",
+            operation="memory.search",
+            request={"user_id": "bob"},
+        )
+
+
+def test_event_repository_requires_explicit_project_scope_opt_in(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+
+    with pytest.raises(ValueError, match="canonical event app scope is required"):
+        repository.create_event(
+            project_id="repo-a",
+            operation="control-plane.audit",
+            request={"message": "project-only"},
+        )
+
+    event = repository.create_event(
+        project_id="repo-a",
+        operation="control-plane.audit",
+        request={"message": "project-only"},
+        allow_project_scope=True,
+    )
+
+    assert event.app_id is None
 
 
 def test_event_query_filters_and_total_are_strictly_project_app_scoped(

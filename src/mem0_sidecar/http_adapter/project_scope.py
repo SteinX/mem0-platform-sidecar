@@ -4,6 +4,7 @@ from fastapi import Request
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.config import SidecarSettings
+from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.store.models import Project
 from mem0_sidecar.store.repositories import ProjectRepository
 
@@ -77,9 +78,15 @@ def ensure_project(
     project_id: str,
     default_app_id: str | None = None,
 ) -> None:
+    validated_project_id = validate_scope_id(project_id, field_name="project_id")
+    validated_app_id = validate_scope_id(
+        default_app_id,
+        field_name="app_id",
+        required=False,
+    )
     ProjectRepository(session).upsert_default_project(
-        project_id=project_id,
-        name=project_id,
+        project_id=validated_project_id,
+        name=validated_project_id,
         mem0_base_url=settings.mem0_base_url,
-        default_app_id=default_app_id,
+        default_app_id=validated_app_id,
     )

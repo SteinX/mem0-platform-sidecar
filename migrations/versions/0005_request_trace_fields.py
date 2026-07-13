@@ -22,6 +22,18 @@ REQUEST_TRACE_INDEXES = (
         ["project_id", "app_id", "created_at"],
     ),
     (
+        "ix_events_project_app_user_created",
+        ["project_id", "app_id", "user_id", "created_at"],
+    ),
+    (
+        "ix_events_project_app_agent_created",
+        ["project_id", "app_id", "agent_id", "created_at"],
+    ),
+    (
+        "ix_events_project_app_run_created",
+        ["project_id", "app_id", "run_id", "created_at"],
+    ),
+    (
         "ix_events_project_operation_created",
         ["project_id", "operation", "created_at"],
     ),
@@ -41,6 +53,11 @@ def upgrade() -> None:
         "events",
         sa.Column("app_id", sa.String(length=256), nullable=True),
     )
+    for field_name in ("user_id", "agent_id", "run_id"):
+        op.add_column(
+            "events",
+            sa.Column(field_name, sa.String(length=256), nullable=True),
+        )
     op.add_column(
         "events",
         sa.Column("correlation_id", sa.String(length=256), nullable=True),
@@ -78,4 +95,7 @@ def downgrade() -> None:
     op.drop_column("events", "result_count")
     op.drop_column("events", "latency_ms")
     op.drop_column("events", "correlation_id")
+    op.drop_column("events", "run_id")
+    op.drop_column("events", "agent_id")
+    op.drop_column("events", "user_id")
     op.drop_column("events", "app_id")
