@@ -6,7 +6,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.categories import extract_category
-from mem0_sidecar.core.explorer_filters import ExplorerDateRange, ExplorerQuery
+from mem0_sidecar.core.explorer_filters import (
+    ExplorerDateRange,
+    ExplorerFilter,
+    ExplorerQuery,
+)
 from mem0_sidecar.core.scope import Scope, normalize_scope
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
@@ -290,7 +294,96 @@ def _filter_search_results(
     ]
     filtered_response = dict(response)
     filtered_response["results"] = filtered_results
+    filtered_response["total"] = len(filtered_results)
     return filtered_response
+
+
+def _trace_filter_value(value: object) -> object:
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
+
+
+def _query_trace_request(query: ExplorerQuery) -> dict[str, Any]:
+    return {
+        "match": query.match,
+        "filters": [
+            {
+                "field": item.field,
+                "operator": item.operator,
+                "value": _trace_filter_value(item.value),
+            }
+            for item in query.filters
+        ],
+        "date_range": {
+            "from": query.date_range.from_at.isoformat()
+            if query.date_range.from_at is not None
+            else None,
+            "to": query.date_range.to_at.isoformat()
+            if query.date_range.to_at is not None
+            else None,
+        },
+        "page": query.page,
+        "page_size": query.page_size,
+        "sort": query.sort,
+    }
+
+
+def _exact_filter_value(item: ExplorerFilter) -> str | None:
+    if item.operator == "equals" and isinstance(item.value, str):
+        return item.value
+    if (
+        item.operator == "in"
+        and isinstance(item.value, tuple)
+        and len(item.value) == 1
+        and isinstance(item.value[0], str)
+    ):
+        return item.value[0]
+    return None
+
+
+def _query_trace_entities(query: ExplorerQuery) -> dict[str, str]:
+    if query.match != "all":
+        return {}
+    candidates: dict[str, set[str]] = {
+        "user_id": set(),
+        "agent_id": set(),
+        "run_id": set(),
+    }
+    for item in query.filters:
+        values = candidates.get(item.field)
+        if values is None:
+            continue
+        if (value := _exact_filter_value(item)) is not None:
+            values.add(value)
+    return {
+        field_name: next(iter(values))
+        for field_name, values in candidates.items()
+        if len(values) == 1
+    }
+
+
+def _hydrated_record_matches_projection(
+    record: dict[str, Any],
+    projection: MemoryIndex,
+) -> bool:
+    return all(
+        record.get(field_name) == getattr(projection, field_name)
+        for field_name in ("user_id", "agent_id", "app_id", "run_id")
+    )
+
+
+def _persist_failed_trace(
+    session: Session,
+    *,
+    event_id: str,
+    error: dict[str, Any],
+) -> None:
+    session.rollback()
+    EventRepository(session).mark_failed(event_id, error=error)
+    session.commit()
 
 
 def _event_payload(event: Any) -> dict[str, Any]:
@@ -424,7 +517,9 @@ class MemoryService:
             operation="memory.add",
             request=oss_payload,
             subject_type="memory",
+            correlation_id=get_request_id(),
         )
+        self.session.commit()
         try:
             memory_response = await self.mem0.add_memory(oss_payload)
             memory_ids = extract_memory_ids(memory_response)
@@ -452,10 +547,14 @@ class MemoryService:
             )
             event.subject_id = memory_ids[0]
             event_repo.mark_succeeded(event.id, response=memory_response)
+            self.session.commit()
             return {"memory": memory_response, "event": _event_payload(event)}
         except Exception as exc:
-            event_repo.mark_failed(event.id, error=_error_payload(exc))
-            self.session.commit()
+            _persist_failed_trace(
+                self.session,
+                event_id=event.id,
+                error=_error_payload(exc),
+            )
             raise
 
     async def search_memories(
@@ -483,12 +582,36 @@ class MemoryService:
                 if value
             }
         )
-        response = await self.mem0.search_memories(oss_payload)
-        return _filter_search_results(
-            response,
-            memory_repo=MemoryIndexRepository(self.session),
-            scope=scope,
+        event_repo = EventRepository(self.session)
+        event = event_repo.create_event(
+            project_id=project_id,
+            app_id=scope.app_id,
+            user_id=scope.user_id,
+            agent_id=scope.agent_id,
+            run_id=scope.run_id,
+            operation="memory.search",
+            request=oss_payload,
+            subject_type="memory",
+            correlation_id=get_request_id(),
         )
+        self.session.commit()
+        try:
+            response = await self.mem0.search_memories(oss_payload)
+            filtered_response = _filter_search_results(
+                response,
+                memory_repo=MemoryIndexRepository(self.session),
+                scope=scope,
+            )
+            event_repo.mark_succeeded(event.id, response=filtered_response)
+            self.session.commit()
+            return filtered_response
+        except Exception as exc:
+            _persist_failed_trace(
+                self.session,
+                event_id=event.id,
+                error=_error_payload(exc),
+            )
+            raise
 
     async def query_memories(
         self,
@@ -497,6 +620,20 @@ class MemoryService:
         app_id: str,
         query: ExplorerQuery,
     ) -> dict[str, Any]:
+        trace_entities = _query_trace_entities(query)
+        event_repo = EventRepository(self.session)
+        event = event_repo.create_event(
+            project_id=project_id,
+            app_id=app_id,
+            user_id=trace_entities.get("user_id"),
+            agent_id=trace_entities.get("agent_id"),
+            run_id=trace_entities.get("run_id"),
+            operation="memory.list",
+            request=_query_trace_request(query),
+            subject_type="memory",
+            correlation_id=get_request_id(),
+        )
+        self.session.commit()
         memory_repo = MemoryIndexRepository(self.session)
         offset = (query.page - 1) * query.page_size
         candidate_limit = query.page_size + _HYDRATION_BUFFER
@@ -523,10 +660,10 @@ class MemoryService:
                     response,
                     expected_id=memory.mem0_memory_id,
                 )
-                return (
-                    memory.mem0_memory_id,
-                    _normalize_memory_record(record, projection=memory),
-                )
+                normalized = _normalize_memory_record(record, projection=memory)
+                if not _hydrated_record_matches_projection(normalized, memory):
+                    return memory.mem0_memory_id, None
+                return memory.mem0_memory_id, normalized
             except Exception as exc:
                 if _is_upstream_not_found(exc) or isinstance(
                     exc,
@@ -540,41 +677,52 @@ class MemoryService:
                     return memory.mem0_memory_id, None
                 raise
 
-        _, candidates = candidate_page()
-        semaphore = asyncio.Semaphore(_HYDRATION_CONCURRENCY)
+        try:
+            _, candidates = candidate_page()
+            semaphore = asyncio.Semaphore(_HYDRATION_CONCURRENCY)
 
-        async def bounded_hydrate(
-            memory: MemoryIndex,
-        ) -> tuple[str, dict[str, Any] | None]:
-            async with semaphore:
-                return await hydrate(memory)
+            async def bounded_hydrate(
+                memory: MemoryIndex,
+            ) -> tuple[str, dict[str, Any] | None]:
+                async with semaphore:
+                    return await hydrate(memory)
 
-        hydration_results = await asyncio.gather(
-            *(bounded_hydrate(memory) for memory in candidates)
-        )
-        stale_ids: list[str] = []
-        for memory_id, normalized in hydration_results:
-            if normalized is None:
-                stale_ids.append(memory_id)
-            else:
-                hydrated[memory_id] = normalized
+            hydration_results = await asyncio.gather(
+                *(bounded_hydrate(memory) for memory in candidates)
+            )
+            stale_ids: list[str] = []
+            for memory_id, normalized in hydration_results:
+                if normalized is None:
+                    stale_ids.append(memory_id)
+                else:
+                    hydrated[memory_id] = normalized
 
-        stale_skipped = memory_repo.mark_stale(project_id, stale_ids)
+            stale_skipped = memory_repo.mark_stale(project_id, stale_ids)
 
-        final_page, final_candidates = candidate_page()
-        results = [
-            hydrated[memory.mem0_memory_id]
-            for memory in final_candidates
-            if memory.mem0_memory_id in hydrated
-        ][: query.page_size]
-        return {
-            "results": results,
-            "total": final_page.total,
-            "page": query.page,
-            "page_size": query.page_size,
-            "scan_count": final_page.scan_count,
-            "stale_skipped": stale_skipped,
-        }
+            final_page, final_candidates = candidate_page()
+            results = [
+                hydrated[memory.mem0_memory_id]
+                for memory in final_candidates
+                if memory.mem0_memory_id in hydrated
+            ][: query.page_size]
+            response = {
+                "results": results,
+                "total": final_page.total,
+                "page": query.page,
+                "page_size": query.page_size,
+                "scan_count": final_page.scan_count,
+                "stale_skipped": stale_skipped,
+            }
+            event_repo.mark_succeeded(event.id, response=response)
+            self.session.commit()
+            return response
+        except Exception as exc:
+            _persist_failed_trace(
+                self.session,
+                event_id=event.id,
+                error=_error_payload(exc),
+            )
+            raise
 
     async def get_memory(
         self,
