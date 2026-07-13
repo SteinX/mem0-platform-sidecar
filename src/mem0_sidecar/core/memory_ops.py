@@ -569,6 +569,7 @@ class MemoryService:
         )
         self.session.commit()
         try:
+            ProjectRepository(self.session).lock_for_mutation(project_id)
             memory_response = await self.mem0.add_memory(oss_payload)
             memory_ids = extract_memory_ids(memory_response)
             if not memory_ids:
@@ -576,7 +577,6 @@ class MemoryService:
                     f"Could not extract memory id from response: {memory_response!r}"
                 )
             memory_repo = MemoryIndexRepository(self.session)
-            ProjectRepository(self.session).lock_for_mutation(project_id)
             for memory_id in memory_ids:
                 memory_repo.upsert_memory(
                     project_id=project_id,
@@ -689,6 +689,7 @@ class MemoryService:
             query.page_size + _HYDRATION_BUFFER,
             EXPLORER_RECORD_HORIZON - offset,
         )
+        hydration_cutoff = datetime.now(UTC)
         hydrated: dict[str, dict[str, Any]] = {}
         stale_skipped = 0
 
@@ -752,7 +753,12 @@ class MemoryService:
 
             if stale_ids:
                 ProjectRepository(self.session).lock_for_mutation(project_id)
-                stale_skipped = memory_repo.mark_stale(project_id, stale_ids)
+                stale_skipped = memory_repo.mark_stale_if_unchanged(
+                    project_id=project_id,
+                    app_id=app_id,
+                    mem0_memory_ids=stale_ids,
+                    updated_at_lte=hydration_cutoff,
+                )
                 EntityRepository(self.session).rebuild_project_entities(
                     project_id,
                     app_id,
@@ -826,6 +832,7 @@ class MemoryService:
             project_id=project_id,
             request_app_id=request_app_id,
         )
+        ProjectRepository(self.session).lock_for_mutation(project_id)
         memory_repo = MemoryIndexRepository(self.session)
         memory = memory_repo.get_memory(
             project_id=project_id,
@@ -880,7 +887,6 @@ class MemoryService:
             normalized = _normalize_memory_record(record, projection=memory)
             metadata = normalized["metadata"]
             categories = normalized["categories"]
-            ProjectRepository(self.session).lock_for_mutation(project_id)
             memory_repo.upsert_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,
@@ -899,7 +905,6 @@ class MemoryService:
             return {"memory": normalized, "event": _event_payload(event)}
         except Exception as exc:
             if _is_upstream_not_found(exc):
-                ProjectRepository(self.session).lock_for_mutation(project_id)
                 memory_repo.mark_stale(project_id, [memory_id])
                 EntityRepository(self.session).rebuild_project_entities(
                     project_id,
@@ -958,6 +963,7 @@ class MemoryService:
                 "Unscoped memories may only be adopted by the default project"
             )
 
+        ProjectRepository(self.session).lock_for_mutation(project_id)
         scan_cutoff = datetime.now(UTC)
         try:
             response = await self.mem0.list_memories(
@@ -991,7 +997,6 @@ class MemoryService:
                     f"Upstream memory record {index} is malformed"
                 ) from exc
 
-        ProjectRepository(self.session).lock_for_mutation(project_id)
         accepted_ids: set[str] = set()
         indexed = 0
         skipped_unscoped = 0
@@ -1104,6 +1109,7 @@ class MemoryService:
             project_id=project_id,
             request_app_id=request_app_id,
         )
+        ProjectRepository(self.session).lock_for_mutation(project_id)
         memory_repo = MemoryIndexRepository(self.session)
         memory = memory_repo.get_memory(
             project_id=project_id,
@@ -1154,7 +1160,6 @@ class MemoryService:
         )
         try:
             response = await self.mem0.delete_memory(memory_id)
-            ProjectRepository(self.session).lock_for_mutation(project_id)
             memory_repo.delete_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,

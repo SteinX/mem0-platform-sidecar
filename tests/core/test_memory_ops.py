@@ -2130,7 +2130,13 @@ async def test_update_locks_project_before_memory_index_and_entity_mutations(
         "rebuild_project_entities",
         lambda self, project_id, app_id: operations.append("entity") or [],
     )
-    mem0 = ExplorerMem0Client(
+
+    class OrderedUpdateClient(ExplorerMem0Client):
+        async def update_memory(self, memory_id, payload):
+            operations.append("upstream")
+            return await super().update_memory(memory_id, payload)
+
+    mem0 = OrderedUpdateClient(
         {
             "mem-1": {
                 "id": "mem-1",
@@ -2149,7 +2155,7 @@ async def test_update_locks_project_before_memory_index_and_entity_mutations(
         payload={"text": "updated"},
     )
 
-    assert operations == ["project", "memory", "entity"]
+    assert operations == ["project", "upstream", "memory", "entity"]
 
 
 @pytest.mark.asyncio
@@ -2179,7 +2185,12 @@ async def test_reconcile_locks_project_before_memory_index_and_entity_mutations(
         "rebuild_project_entities",
         lambda self, project_id, app_id: operations.append("entity") or [],
     )
-    mem0 = ExplorerMem0Client()
+    class OrderedReconcileClient(ExplorerMem0Client):
+        async def list_memories(self, params):
+            operations.append("upstream")
+            return await super().list_memories(params)
+
+    mem0 = OrderedReconcileClient()
     mem0.list_response = {
         "results": [
             {
@@ -2203,7 +2214,7 @@ async def test_reconcile_locks_project_before_memory_index_and_entity_mutations(
         default_project_id="repo-a",
     )
 
-    assert operations == ["project", "memory", "entity"]
+    assert operations == ["project", "upstream", "memory", "entity"]
 
 
 @pytest.mark.asyncio
