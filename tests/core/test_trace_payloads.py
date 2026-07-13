@@ -212,6 +212,92 @@ def test_sanitize_trace_payload_normalizes_collapsed_credential_suffixes() -> No
     assert payload.value_reads == 0
 
 
+def test_sanitize_trace_payload_redacts_compound_passwd_session_and_access_keys(
+) -> None:
+    class SecretMapping(Mapping[str, object]):
+        def __init__(self) -> None:
+            self.keys = [
+                "db_passwd",
+                "DBPASSWD",
+                "php_session_id",
+                "PHPSESSIONID",
+                "session_ids",
+                "aws_access_key",
+                "AWSACCESSKEY",
+            ]
+            self.value_reads = 0
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self.keys)
+
+        def __len__(self) -> int:
+            return len(self.keys)
+
+        def __getitem__(self, key: str) -> object:
+            self.value_reads += 1
+            raise AssertionError(f"credential value was read for {key}")
+
+    payload = SecretMapping()
+
+    sanitized = sanitize_trace_payload(payload)
+
+    assert sanitized == {key: "[REDACTED]" for key in sorted(payload.keys)}
+    assert payload.value_reads == 0
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "api_key",
+        "api_keys",
+        "access_key",
+        "access_keys",
+        "access_key_id",
+        "access_key_ids",
+        "secret_access_key",
+        "secret_access_keys",
+        "private_key",
+        "private_keys",
+        "signing_key",
+        "signing_keys",
+        "encryption_key",
+        "encryption_keys",
+        "token",
+        "tokens",
+        "secret",
+        "secrets",
+        "password",
+        "passwords",
+        "passwd",
+        "passwds",
+        "passphrase",
+        "passphrases",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "session_id",
+        "session_ids",
+        "authorization",
+        "authorizations",
+        "authorization_code",
+        "authorization_codes",
+        "code_verifier",
+        "code_verifiers",
+    ],
+)
+def test_sanitize_trace_payload_keeps_credential_suffix_variants_consistent(
+    suffix: str,
+) -> None:
+    class SecretValue:
+        def __str__(self) -> str:
+            raise AssertionError("credential value must never be stringified")
+
+    sanitized = sanitize_trace_payload({f"service_{suffix}": SecretValue()})
+
+    assert list(sanitized.values()) == ["[REDACTED]"]
+
+
 def test_sanitize_trace_payload_preserves_status_and_count_fields() -> None:
     payload = {
         "requires_authorization": False,
@@ -232,6 +318,29 @@ def test_sanitize_trace_payload_preserves_status_and_count_fields() -> None:
     }
 
     assert sanitize_trace_payload(payload) == payload
+
+
+def test_sanitize_trace_payload_exempts_unsegmented_state_phrase_suffixes() -> None:
+    states = {
+        "ACCOUNTHASPASSWORD": True,
+        "FEATUREREQUIRESAUTHORIZATION": False,
+        "ACCOUNTFAVORITECOOKIE": "oatmeal",
+        "ACCOUNTISSECRET": False,
+    }
+
+    sanitized = sanitize_trace_payload(
+        {
+            **states,
+            "ACCOUNT_PASSWORD": "credential",
+            "redis_secret": "credential",
+        }
+    )
+
+    assert sanitized == {
+        **states,
+        "ACCOUNT_PASSWORD": "[REDACTED]",
+        "redis_secret": "[REDACTED]",
+    }
 
 
 def test_sanitize_trace_payload_bounds_unicode_strings_by_utf8_bytes() -> None:

@@ -31,53 +31,15 @@ _CAMEL_ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_WORD_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
 _KEY_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
 
-_SECRET_KEYS = frozenset(
-    {
-        "accesstoken",
-        "apikey",
-        "apisecret",
-        "apitoken",
-        "authtoken",
-        "authorization",
-        "authorizationcode",
-        "bearertoken",
-        "clientpassword",
-        "clientsecret",
-        "consumersecret",
-        "cookie",
-        "credential",
-        "credentials",
-        "csrftoken",
-        "codeverifier",
-        "encryptionkey",
-        "idtoken",
-        "oauthaccesstoken",
-        "oauthtoken",
-        "password",
-        "passphrase",
-        "passwd",
-        "privatekey",
-        "proxyauthorization",
-        "refreshtoken",
-        "secret",
-        "secretaccesskey",
-        "secretkey",
-        "sessionid",
-        "sessiontoken",
-        "setcookie",
-        "signingkey",
-        "token",
-        "xapikey",
-        "xauthtoken",
-        "xcsrftoken",
-    }
-)
 _NON_CREDENTIAL_KEY_TOKENS = frozenset({"favorite", "has", "is", "require", "requires"})
 _NON_CREDENTIAL_TRAILING_TOKENS = frozenset(
     {"configured", "count", "counts", "enabled", "present", "required", "status"}
 )
-_NON_CREDENTIAL_NORMALIZED_KEYS = frozenset(
-    {"favoritecookie", "haspassword", "issecret", "requiresauthorization"}
+_NON_CREDENTIAL_UNSEGMENTED_SUFFIXES = (
+    "favoritecookie",
+    "haspassword",
+    "issecret",
+    "requiresauthorization",
 )
 _NON_CREDENTIAL_NORMALIZED_SUFFIXES = (
     "configured",
@@ -89,12 +51,14 @@ _NON_CREDENTIAL_NORMALIZED_SUFFIXES = (
     "status",
 )
 _CREDENTIAL_NORMALIZED_SUFFIXES = (
+    "accesskey",
     "accesskeyid",
     "accesskeyids",
     "accesskeys",
     "apikey",
     "apikeys",
     "authorization",
+    "authorizations",
     "authorizationcode",
     "authorizationcodes",
     "codeverifier",
@@ -107,6 +71,8 @@ _CREDENTIAL_NORMALIZED_SUFFIXES = (
     "encryptionkeys",
     "passphrase",
     "passphrases",
+    "passwd",
+    "passwds",
     "password",
     "passwords",
     "privatekey",
@@ -117,6 +83,8 @@ _CREDENTIAL_NORMALIZED_SUFFIXES = (
     "secretkey",
     "secretkeys",
     "secrets",
+    "sessionid",
+    "sessionids",
     "signingkey",
     "signingkeys",
     "token",
@@ -204,7 +172,9 @@ def _is_secret_key(key: str) -> bool:
     if not tokens:
         return False
     normalized = "".join(tokens)
-    if normalized in _NON_CREDENTIAL_NORMALIZED_KEYS:
+    if len(tokens) == 1 and normalized.endswith(
+        _NON_CREDENTIAL_UNSEGMENTED_SUFFIXES
+    ):
         return False
     if tokens[-1] in _NON_CREDENTIAL_TRAILING_TOKENS or normalized.endswith(
         _NON_CREDENTIAL_NORMALIZED_SUFFIXES
@@ -212,9 +182,7 @@ def _is_secret_key(key: str) -> bool:
         return False
     if any(token in _NON_CREDENTIAL_KEY_TOKENS for token in tokens[:-1]):
         return False
-    return normalized in _SECRET_KEYS or normalized.endswith(
-        _CREDENTIAL_NORMALIZED_SUFFIXES
-    )
+    return normalized.endswith(_CREDENTIAL_NORMALIZED_SUFFIXES)
 
 
 def _type_namespace(value: object) -> str:
