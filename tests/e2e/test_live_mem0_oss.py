@@ -275,6 +275,29 @@ def test_cleanup_failures_are_aggregated_before_reporting() -> None:
     assert "second failed" in str(exc_info.value)
 
 
+class PrimaryFixtureFailure(Exception):
+    pass
+
+
+@pytest.mark.parametrize("failure_type", [ValueError, PrimaryFixtureFailure])
+def test_cleanup_diagnostics_do_not_mask_active_fixture_failure(
+    failure_type,
+    capsys,
+) -> None:
+    primary = failure_type("primary fixture failure")
+
+    with pytest.raises(failure_type) as exc_info:
+        try:
+            raise primary
+        finally:
+            _report_cleanup_failures(["first cleanup failed", "second failed"])
+
+    assert exc_info.value is primary
+    assert (
+        "first cleanup failed; second failed" in capsys.readouterr().err
+    )
+
+
 def test_scoped_cleanup_reports_non_success_response() -> None:
     class FailedCleanupClient:
         def delete(self, *args, **kwargs):
@@ -639,7 +662,10 @@ def test_live_reconcile_imports_only_marked_scope(tmp_path) -> None:
     creator = TestClient(create_app(settings=creator_settings))
     target = TestClient(create_app(settings=target_settings))
     memory_id: str | None = None
+    other_scope_memory_id: str | None = None
+    unscoped_memory_id: str | None = None
     cleanup_targets: list[tuple[str, str]] = []
+    direct_cleanup_targets: list[str] = []
 
     try:
         add_response = creator.post(
@@ -671,9 +697,19 @@ def test_live_reconcile_imports_only_marked_scope(tmp_path) -> None:
             },
         )
         assert other_scope_response.status_code == 200, other_scope_response.text
-        cleanup_targets.append(
-            (other_scope_response.json()["event"]["subject_id"], other_app_id)
+        other_scope_memory_id = other_scope_response.json()["event"][
+            "subject_id"
+        ]
+        cleanup_targets.append((other_scope_memory_id, other_app_id))
+
+        unscoped_memory_id = _add_direct_upstream_memory(
+            creator_settings,
+            text=f"unscoped-{marker}",
+            user_id=f"unscoped-{user_id}",
+            run_id=f"unscoped-{run_id}",
+            metadata={"marker": f"unscoped-{marker}"},
         )
+        direct_cleanup_targets.append(unscoped_memory_id)
 
         reconcile_response = target.post(
             f"/v1/projects/{project_id}/memories/reconcile",
@@ -692,10 +728,10 @@ def test_live_reconcile_imports_only_marked_scope(tmp_path) -> None:
             "skipped_other_scope",
             "stale_marked",
         }
-        assert reconcile["scanned"] >= 1
+        assert reconcile["scanned"] == 3
         assert reconcile["indexed"] == 1
-        assert reconcile["skipped_unscoped"] >= 0
-        assert reconcile["skipped_other_scope"] >= 1
+        assert reconcile["skipped_unscoped"] == 1
+        assert reconcile["skipped_other_scope"] == 1
         assert (
             reconcile["indexed"]
             + reconcile["skipped_unscoped"]
@@ -710,6 +746,20 @@ def test_live_reconcile_imports_only_marked_scope(tmp_path) -> None:
         )
         assert detail_response.status_code == 200, detail_response.text
         assert detail_response.json()["id"] == memory_id
+
+        with target.app.state.session_factory() as session:
+            unexpected_projection_ids = set(
+                session.scalars(
+                    select(MemoryIndex.mem0_memory_id).where(
+                        MemoryIndex.project_id == project_id,
+                        MemoryIndex.mem0_memory_id.in_(
+                            [other_scope_memory_id, unscoped_memory_id]
+                        ),
+                        MemoryIndex.deleted_at.is_(None),
+                    )
+                )
+            )
+        assert unexpected_projection_ids == set()
     finally:
         cleanup_errors = []
         for cleanup_memory_id, cleanup_app_id in cleanup_targets:
@@ -721,6 +771,10 @@ def test_live_reconcile_imports_only_marked_scope(tmp_path) -> None:
                     project_id=project_id,
                     app_id=cleanup_app_id,
                 )
+            )
+        for cleanup_memory_id in direct_cleanup_targets:
+            cleanup_errors.append(
+                _cleanup_direct_fixture(creator_settings, cleanup_memory_id)
             )
         if memory_id is not None:
             cleanup_errors.append(
