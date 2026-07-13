@@ -180,6 +180,30 @@ def _track_transactions(monkeypatch) -> tuple[list[Session], list[Session]]:
     return commit_calls, rollback_calls
 
 
+def _raw_http_request(
+    port: int,
+    target: str,
+    *,
+    method: str = "GET",
+    body: bytes = b"",
+) -> tuple[int, bytes]:
+    headers = (
+        f"{method} {target} HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        "Connection: close\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode("ascii")
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
+        connection.sendall(headers + body)
+        response = bytearray()
+        while chunk := connection.recv(65536):
+            response.extend(chunk)
+    head, _, response_body = bytes(response).partition(b"\r\n\r\n")
+    status = int(head.split(b"\r\n", 1)[0].split()[1])
+    return status, response_body
+
+
 def test_memory_routes_round_trip_with_fake_upstream(tmp_path) -> None:
     mem0 = FakeMem0Client()
     app = create_app(
@@ -1155,6 +1179,112 @@ def test_dashboard_proxy_round_trips_encoded_id_through_real_sidecar(
     assert "sidecar proxy integration: 3 contracts passed" in result.stdout
     assert mem0.get_memory_ids == [memory_id, memory_id]
     assert mem0.history_calls == [memory_id]
+
+
+def test_memory_router_rejects_invalid_raw_paths_without_lossy_aliases(
+    tmp_path,
+) -> None:
+    replacement = "\ufffd"
+    double_replacement = replacement * 2
+    literal_percent = "%GG"
+    mem0 = ExplorerRouteMem0Client(
+        {
+            replacement: {"id": replacement, "memory": "replacement"},
+            double_replacement: {
+                "id": double_replacement,
+                "memory": "double replacement",
+            },
+            literal_percent: {"id": literal_percent, "memory": "percent"},
+        }
+    )
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    for memory_id in (replacement, double_replacement, literal_percent):
+        _index_route_memory(app, memory_id)
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        assert project is not None
+        project.default_app_id = "app-a"
+        project_ids_before = list(session.scalars(select(Project.id)))
+        memory_ids_before = list(
+            session.scalars(select(MemoryIndex.mem0_memory_id))
+        )
+        event_ids_before = list(session.scalars(select(Event.id)))
+        session.commit()
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, log_level="error", lifespan="off")
+    )
+    server_thread = threading.Thread(
+        target=server.run,
+        kwargs={"sockets": [listener]},
+        daemon=True,
+    )
+    server_thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started
+
+    scope = "?project_id=repo-a&app_id=app-a"
+    try:
+        for raw_id in ("%FF", "%C0%AF", "%GG"):
+            status, _ = _raw_http_request(
+                port,
+                f"/v1/memories/{raw_id}{scope}",
+            )
+            assert status == 404, raw_id
+
+        reconcile_body = json.dumps(
+            {"project_id": replacement, "app_id": "app-a"}
+        ).encode()
+        reconcile_status, _ = _raw_http_request(
+            port,
+            "/v1/projects/%FF/memories/reconcile",
+            method="POST",
+            body=reconcile_body,
+        )
+        assert reconcile_status == 404
+        assert mem0.get_memory_ids == []
+        assert mem0.list_calls == []
+
+        replacement_status, _ = _raw_http_request(
+            port,
+            f"/v1/memories/%EF%BF%BD{scope}",
+        )
+        literal_status, _ = _raw_http_request(
+            port,
+            f"/v1/memories/%25GG{scope}",
+        )
+        proxy_literal_status, _ = _raw_http_request(
+            port,
+            f"/v1/memories/%2525GG{scope}",
+        )
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=5)
+        listener.close()
+
+    assert replacement_status == 200
+    assert literal_status == 200
+    assert proxy_literal_status == 200
+    assert mem0.get_memory_ids == [replacement, literal_percent, literal_percent]
+    with app.state.session_factory() as session:
+        assert list(session.scalars(select(Project.id))) == project_ids_before
+        assert list(session.scalars(select(MemoryIndex.mem0_memory_id))) == (
+            memory_ids_before
+        )
+        assert list(session.scalars(select(Event.id))) == event_ids_before
 
 
 def test_query_memories_commits_stale_cleanup(tmp_path) -> None:

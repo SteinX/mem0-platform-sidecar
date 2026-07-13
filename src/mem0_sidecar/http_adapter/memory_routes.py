@@ -26,13 +26,26 @@ from mem0_sidecar.http_adapter.project_scope import (
 class _SingleDecodeMemoryRoute(APIRoute):
     def matches(self, scope: Scope) -> tuple[Match, Scope]:
         raw_path = scope.get("raw_path")
-        if isinstance(raw_path, bytes):
-            try:
-                decoded_path = unquote_to_bytes(raw_path).decode("utf-8", "strict")
-            except UnicodeDecodeError:
-                decoded_path = None
-            if decoded_path is not None:
-                scope = {**scope, "path": decoded_path}
+        if not isinstance(raw_path, bytes):
+            return Match.NONE, {}
+
+        index = 0
+        while index < len(raw_path):
+            if raw_path[index] != ord("%"):
+                index += 1
+                continue
+            encoded_octet = raw_path[index + 1 : index + 3]
+            if len(encoded_octet) != 2 or any(
+                byte not in b"0123456789abcdefABCDEF" for byte in encoded_octet
+            ):
+                return Match.NONE, {}
+            index += 3
+
+        try:
+            decoded_path = unquote_to_bytes(raw_path).decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            return Match.NONE, {}
+        scope = {**scope, "path": decoded_path}
         return super().matches(scope)
 
 
