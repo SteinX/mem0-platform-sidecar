@@ -137,8 +137,9 @@ def test_request_trace_flow_is_scoped_bounded_and_secret_safe(tmp_path) -> None:
     client = TestClient(app, raise_server_exceptions=False)
     started_at = datetime.now(UTC) - timedelta(minutes=1)
 
+    large_text_prefix = "bounded-trace-safe-prefix-21984:"
     large_text = (
-        "bounded trace payload "
+        large_text_prefix
         + ("x" * (70 * 1024))
         + f" password={large_secret}"
     )
@@ -180,7 +181,11 @@ def test_request_trace_flow_is_scoped_bounded_and_secret_safe(tmp_path) -> None:
         count=1,
     )
 
-    for request_id in ("trace-search-one", "trace-search-two"):
+    for request_id in (
+        "trace-search-one",
+        "trace-search-two",
+        "trace-search-outside-date",
+    ):
         response = client.post(
             "/v3/memories/search/",
             headers={"X-Request-ID": request_id},
@@ -200,6 +205,19 @@ def test_request_trace_flow_is_scoped_bounded_and_secret_safe(tmp_path) -> None:
         assert response.status_code == 200, response.text
         assert len(response.json()["results"]) == 25
         assert all(item["app_id"] == app_id for item in response.json()["results"])
+
+    with app.state.session_factory() as session:
+        outside_date_event = session.scalar(
+            select(Event).where(
+                Event.correlation_id == "trace-search-outside-date"
+            )
+        )
+        assert outside_date_event is not None
+        outside_date_event.created_at = started_at - timedelta(days=2)
+        outside_date_event.started_at = started_at - timedelta(days=2)
+        outside_date_event.completed_at = started_at - timedelta(days=2)
+        outside_date_event_id = outside_date_event.id
+        session.commit()
 
     failed_search = client.post(
         "/v3/memories/search/",
@@ -289,6 +307,23 @@ def test_request_trace_flow_is_scoped_bounded_and_secret_safe(tmp_path) -> None:
         != successful_search_page_2["results"][0]["id"]
     )
     assert successful_search_page_1["timeline"]
+    dated_search_ids = {
+        successful_search_page_1["results"][0]["id"],
+        successful_search_page_2["results"][0]["id"],
+    }
+    all_successful_searches = _query_traces(
+        client,
+        project_id=project_id,
+        app_id=app_id,
+        operation="SEARCH",
+        statuses=["SUCCEEDED"],
+        page_size=10,
+    )
+    assert all_successful_searches["total"] == 3
+    assert outside_date_event_id in {
+        trace["id"] for trace in all_successful_searches["results"]
+    }
+    assert outside_date_event_id not in dated_search_ids
 
     failed_traces = _query_traces(
         client,
@@ -309,6 +344,17 @@ def test_request_trace_flow_is_scoped_bounded_and_secret_safe(tmp_path) -> None:
     )
     assert add_traces["total"] == 1
     assert add_traces["results"][0]["correlation_id"] == "trace-add-correlation"
+    add_trace_id = add_traces["results"][0]["id"]
+    oversized_add_detail_response = client.get(
+        f"/v1/event/{add_trace_id}",
+        params={"project_id": project_id, "app_id": app_id},
+    )
+    assert oversized_add_detail_response.status_code == 200
+    oversized_add_detail = oversized_add_detail_response.json()
+    assert oversized_add_detail["correlation_id"] == "trace-add-correlation"
+    assert oversized_add_detail["request"]["text"].startswith(large_text_prefix)
+    assert oversized_add_detail["request"]["text"].endswith("...[TRUNCATED]")
+    assert len(oversized_add_detail["request"]["text"].encode("utf-8")) == 4096
 
     list_traces = _query_traces(
         client,
@@ -409,6 +455,17 @@ def test_request_trace_flow_is_scoped_bounded_and_secret_safe(tmp_path) -> None:
     with app.state.session_factory() as session:
         raw_events = list(session.scalars(select(Event)))
     assert raw_events
+    raw_oversized_add = next(
+        event
+        for event in raw_events
+        if event.correlation_id == "trace-add-correlation"
+    )
+    raw_oversized_request = json.loads(raw_oversized_add.request_json)
+    assert raw_oversized_request["text"].startswith(large_text_prefix)
+    assert raw_oversized_request["text"].endswith("...[TRUNCATED]")
+    assert len(raw_oversized_request["text"].encode("utf-8")) == 4096
+    assert len(raw_oversized_add.request_json.encode("utf-8")) <= 65_536
+    assert large_secret not in raw_oversized_add.request_json
     raw_trace_json = "\n".join(
         document
         for event in raw_events

@@ -444,6 +444,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
     token = uuid4().hex
     project_id = f"e2e-project-{token}"
     app_id = f"e2e-app-{token}"
+    foreign_app_id = f"e2e-foreign-app-{token}"
     wrong_app_id = f"e2e-wrong-app-{token}"
     user_id = f"e2e-user-{token}"
     agent_id = f"e2e-agent-{token}"
@@ -455,6 +456,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
     trace_secret = f"live-trace-secret-{token}"
     updated_text = f"Updated {marker}"
     memory_id: str | None = None
+    foreign_memory_id: str | None = None
     category_id: str | None = None
     created_after = datetime.now(UTC) - timedelta(minutes=1)
 
@@ -498,6 +500,32 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         assert len(memory_ids) == 1, add_body
         memory_id = memory_ids[0]
         assert add_body["event"]["status"] == "SUCCEEDED"
+
+        foreign_add_response = client.post(
+            "/v3/memories/add/",
+            headers={"X-Request-ID": f"live-add-foreign-{token}"},
+            json={
+                "text": f"Remember {marker}",
+                "project_id": project_id,
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "app_id": foreign_app_id,
+                "run_id": run_id,
+                "infer": False,
+                "metadata": {
+                    "category": category_name,
+                    "marker": marker,
+                    "revision": "foreign",
+                },
+            },
+        )
+        assert foreign_add_response.status_code == 200, foreign_add_response.text
+        foreign_memory_ids = _extract_memory_ids(
+            foreign_add_response.json()["memory"]
+        )
+        assert len(foreign_memory_ids) == 1, foreign_add_response.json()
+        foreign_memory_id = foreign_memory_ids[0]
+        assert foreign_memory_id != memory_id
 
         search_response = client.post(
             "/v3/memories/search/",
@@ -549,6 +577,9 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         query_body = query_response.json()
         assert query_body["stale_skipped"] == 0
         assert [item["id"] for item in query_body["results"]] == [memory_id]
+        assert foreign_memory_id not in {
+            item["id"] for item in query_body["results"]
+        }
 
         detail_response = client.get(
             f"/v1/memories/{memory_id}",
@@ -639,6 +670,16 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
                     app_id=app_id,
                 )
             )
+        if foreign_memory_id is not None:
+            cleanup_errors.append(
+                _cleanup_memory_fixture(
+                    client,
+                    settings,
+                    memory_id=foreign_memory_id,
+                    project_id=project_id,
+                    app_id=foreign_app_id,
+                )
+            )
         if category_id is not None:
             try:
                 category_cleanup = client.delete(
@@ -679,6 +720,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
     }
     assert traced_operations == {"ADD", "SEARCH", "GET ALL"}
     trace_by_correlation = {trace["correlation_id"]: trace for trace in traces}
+    assert f"live-add-foreign-{token}" not in trace_by_correlation
     assert trace_by_correlation[f"live-add-{token}"]["status"] == "SUCCEEDED"
     assert trace_by_correlation[f"live-search-{token}"]["result_count"] >= 1
     assert trace_by_correlation[f"live-list-present-{token}"]["has_results"] is True
@@ -698,6 +740,23 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         preview.get("id") or preview.get("memory_id")
         for preview in detail["result_previews"]
     } == {memory_id}
+
+    list_trace = trace_by_correlation[f"live-list-present-{token}"]
+    list_detail_response = client.get(
+        f"/v1/event/{list_trace['id']}",
+        params={"project_id": project_id, "app_id": app_id},
+    )
+    assert list_detail_response.status_code == 200, list_detail_response.text
+    list_detail = list_detail_response.json()
+    assert list_detail["display_operation"] == "GET ALL"
+    assert {
+        preview.get("id") or preview.get("memory_id")
+        for preview in list_detail["result_previews"]
+    } == {memory_id}
+    assert foreign_memory_id not in {
+        preview.get("id") or preview.get("memory_id")
+        for preview in list_detail["result_previews"]
+    }
 
     with client.app.state.session_factory() as session:
         raw_events = list(

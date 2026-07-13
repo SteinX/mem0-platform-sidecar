@@ -35,13 +35,16 @@ stale-index bookkeeping. Query responses also assert the `stale_skipped` count.
 The same live lifecycle also proves durable request traces against the real
 Mem0 OSS service: a correlated `ADD`, `SEARCH`, and `GET ALL` are queried through
 `POST /v1/events/query`; the search drawer payload is fetched through
-`GET /v1/event/{id}`; result counts and previews are checked after app-scope
-filtering; and a post-delete `GET ALL` proves the no-results trace. A synthetic
-nested credential and internal Mem0 URL are submitted with the fixture, then
-the raw sidecar `events.request_json`, `response_json`, and `error_json` columns
-are checked to ensure neither value was persisted and every document remains
-within 65,536 bytes. Fixture deletion runs before those trace assertions, so a
-trace regression does not strand the upstream memory.
+`GET /v1/event/{id}`; and a post-delete `GET ALL` proves the no-results trace.
+For deterministic app-scope evidence, the fixture creates a same-project memory
+in a foreign app with the same category and marker. The selected app's GET ALL
+query and persisted preview IDs must contain only its own memory; this check
+does not depend on semantic-search ranking. A synthetic nested credential and
+internal Mem0 URL are submitted with the fixture, then the raw sidecar
+`events.request_json`, `response_json`, and `error_json` columns are checked to
+ensure neither value was persisted and every document remains within 65,536
+bytes. Fixture deletion runs before those trace assertions, so a trace
+regression does not strand either upstream memory.
 
 Reconciliation coverage imports records bearing sidecar project/app markers and
 checks the `scanned`, `indexed`, `skipped_unscoped`, `skipped_other_scope`, and

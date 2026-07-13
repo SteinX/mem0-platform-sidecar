@@ -134,7 +134,7 @@ after removing punctuation. These credential keys are redacted:
 - `x-api-key`
 
 Credential assignments embedded in strings and sidecar/upstream internal URLs
-are also removed. Individual strings are bounded to 4,096 characters; arrays,
+are also removed. Individual strings are bounded to 4,096 UTF-8 bytes; arrays,
 nesting, and trace traversal are bounded; and each persisted request, response,
 or error document is at most 65,536 bytes. Oversized values are replaced with
 explicit truncation metadata. This is a trace-storage boundary, separate from
