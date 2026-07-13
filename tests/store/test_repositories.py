@@ -471,6 +471,117 @@ def test_entity_detail_and_memory_ids_are_strictly_scoped_and_ordered(
             repository.list_entity_memory_ids("alpha", "app-a", entity_type, "alice")
 
 
+@pytest.mark.parametrize(
+    "entity_type",
+    [None, [], {}, "unknown"],
+)
+def test_entity_detail_and_memory_ids_reject_hostile_entity_types(
+    db_session,
+    entity_type,
+) -> None:
+    repository = EntityRepository(db_session)
+
+    with pytest.raises(ValueError, match="^Unsupported entity type$"):
+        repository.get_project_entity("alpha", "app-a", entity_type, "alice")
+    with pytest.raises(ValueError, match="^Unsupported entity type$"):
+        repository.list_entity_memory_ids(
+            "alpha", "app-a", entity_type, "alice"
+        )
+
+
+def test_entity_detail_and_memory_ids_reject_string_subclass(db_session) -> None:
+    class EntityTypeSubclass(str):
+        pass
+
+    repository = EntityRepository(db_session)
+    entity_type = EntityTypeSubclass("user")
+
+    with pytest.raises(ValueError, match="^Unsupported entity type$"):
+        repository.get_project_entity("alpha", "app-a", entity_type, "alice")
+    with pytest.raises(ValueError, match="^Unsupported entity type$"):
+        repository.list_entity_memory_ids(
+            "alpha", "app-a", entity_type, "alice"
+        )
+
+
+def test_entity_rebuild_locks_project_before_snapshot_and_delete(
+    db_session,
+    monkeypatch,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    db_session.add(
+        MemoryIndex(
+            project_id="alpha",
+            mem0_memory_id="memory-1",
+            app_id="app-a",
+            user_id="alice",
+        )
+    )
+    db_session.flush()
+    original_scalar = db_session.scalar
+    original_scalars = db_session.scalars
+    original_execute = db_session.execute
+    operations: list[str] = []
+
+    def record_project_lock(statement, *args, **kwargs):
+        sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+        assert "FROM PROJECTS" in sql
+        assert "FOR UPDATE" in sql
+        operations.append("project_lock")
+        return original_scalar(statement, *args, **kwargs)
+
+    def record_memory_snapshot(statement, *args, **kwargs):
+        operations.append("memory_snapshot")
+        return original_scalars(statement, *args, **kwargs)
+
+    def record_scope_delete(statement, *args, **kwargs):
+        operations.append("scope_delete")
+        return original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "scalar", record_project_lock)
+    monkeypatch.setattr(db_session, "scalars", record_memory_snapshot)
+    monkeypatch.setattr(db_session, "execute", record_scope_delete)
+
+    EntityRepository(db_session).rebuild_project_entities("alpha", "app-a")
+
+    assert operations == ["project_lock", "memory_snapshot", "scope_delete"]
+
+
+def test_entity_rebuild_rejects_unknown_project_before_snapshot_or_delete(
+    db_session,
+    monkeypatch,
+) -> None:
+    original_scalar = db_session.scalar
+    operations: list[str] = []
+
+    def record_project_lock(statement, *args, **kwargs):
+        operations.append("project_lock")
+        return original_scalar(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "scalar", record_project_lock)
+    monkeypatch.setattr(
+        db_session,
+        "scalars",
+        lambda *args, **kwargs: operations.append("memory_snapshot"),
+    )
+    monkeypatch.setattr(
+        db_session,
+        "execute",
+        lambda *args, **kwargs: operations.append("scope_delete"),
+    )
+
+    with pytest.raises(KeyError, match="missing-project"):
+        EntityRepository(db_session).rebuild_project_entities(
+            "missing-project", "app-a"
+        )
+
+    assert operations == ["project_lock"]
+
+
 def test_entity_rebuild_uses_one_select_one_delete_and_one_flush(
     db_session,
     monkeypatch,

@@ -1552,10 +1552,9 @@ class EntityRepository:
 
     @classmethod
     def _memory_id_column(cls, entity_type: str):
-        try:
-            return cls._MEMORY_ID_COLUMNS[entity_type]
-        except KeyError as exc:
-            raise ValueError("Unsupported entity type") from exc
+        if type(entity_type) is not str or entity_type not in cls._MEMORY_ID_COLUMNS:
+            raise ValueError("Unsupported entity type")
+        return cls._MEMORY_ID_COLUMNS[entity_type]
 
     def upsert_entity(
         self,
@@ -1601,6 +1600,13 @@ class EntityRepository:
         app_id: str,
     ) -> list[Entity]:
         with self.session.no_autoflush:
+            project = self.session.scalar(
+                select(Project)
+                .where(Project.id == project_id)
+                .with_for_update()
+            )
+            if project is None:
+                raise KeyError(project_id)
             memories = list(
                 self.session.scalars(
                     select(MemoryIndex).where(
