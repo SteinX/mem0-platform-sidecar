@@ -34,6 +34,63 @@ function loadState(dashboardDir) {
   return module.exports;
 }
 
+function loadMemoryCategories(dashboardDir) {
+  const dashboardRequire = createRequire(path.join(dashboardDir, "package.json"));
+  const typescript = dashboardRequire("typescript");
+  const React = dashboardRequire("react");
+  const sourcePath = path.join(
+    dashboardDir,
+    "src/app/(root)/dashboard/memories/memory-categories.tsx",
+  );
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`missing applied dashboard source: ${sourcePath}`);
+  }
+  const transpiled = typescript.transpileModule(fs.readFileSync(sourcePath, "utf8"), {
+    compilerOptions: {
+      esModuleInterop: true,
+      jsx: typescript.JsxEmit.ReactJSX,
+      module: typescript.ModuleKind.CommonJS,
+      target: typescript.ScriptTarget.ES2022,
+    },
+    fileName: sourcePath,
+    reportDiagnostics: true,
+  });
+  const errors = (transpiled.diagnostics || []).filter(
+    (diagnostic) => diagnostic.category === typescript.DiagnosticCategory.Error,
+  );
+  assert.deepEqual(errors, [], "memory categories transpilation failed");
+  function Button({ asChild, ...props }) {
+    return React.createElement("button", props);
+  }
+  function Popover({ children }) {
+    return React.createElement(React.Fragment, null, children);
+  }
+  function PopoverTrigger({ children }) {
+    return children;
+  }
+  function PopoverContent({ children, ...props }) {
+    return React.createElement("div", props, children);
+  }
+  const module = { exports: {} };
+  const localRequire = (specifier) => {
+    if (specifier === "@/components/ui/button") return { Button };
+    if (specifier === "@/components/ui/popover") {
+      return { Popover, PopoverContent, PopoverTrigger };
+    }
+    return dashboardRequire(specifier);
+  };
+  new Function("exports", "module", "require", transpiled.outputText)(
+    module.exports,
+    module,
+    localRequire,
+  );
+  return {
+    MemoryCategories: module.exports.MemoryCategories,
+    React,
+    ReactDOMServer: dashboardRequire("react-dom/server"),
+  };
+}
+
 function queryContracts(state) {
   const query = {
     match: "all",
@@ -58,6 +115,73 @@ function requestGenerationContracts(state) {
   assert.equal(generation, 9);
   assert.equal(state.isCurrentMemoryRequest(9, generation), true);
   assert.equal(state.isCurrentMemoryRequest(8, generation), false);
+}
+
+function operationGuardContracts(state) {
+  const save = state.beginMemoryOperation(11, "mem-a");
+  assert.deepEqual(save, { generation: 12, targetId: "mem-a" });
+  assert.equal(state.canApplyMemoryOperation(save, 12, "mem-a", true), true);
+  assert.equal(
+    state.canApplyMemoryOperation(save, 12, "mem-b", true),
+    false,
+    "save completion must not update a newly selected drawer",
+  );
+  assert.equal(
+    state.canApplyMemoryOperation(save, 12, "mem-a", false),
+    false,
+    "save completion must not update an unmounted drawer",
+  );
+  assert.equal(
+    state.canApplyMemoryOperation(save, 13, "mem-a", true),
+    false,
+    "invalidated mutation generations must be ignored",
+  );
+  const deletion = state.beginMemoryOperation(save.generation, "mem-a");
+  assert.equal(
+    state.canApplyMemoryOperation(deletion, deletion.generation, "mem-b", true),
+    false,
+    "delete completion must not close a newly selected drawer",
+  );
+  assert.equal(
+    state.canApplyMemoryOperation(deletion, deletion.generation, "mem-a", false),
+    false,
+    "delete completion must not close an unmounted drawer",
+  );
+}
+
+function paginationAndMemoryIdContracts(state) {
+  assert.equal(state.normalizeMemoryId(" mem/one "), "mem/one");
+  assert.equal(state.normalizeMemoryId("   "), null);
+  assert.equal(state.normalizeMemoryId(null), null);
+  assert.equal(state.shouldShowMemoryPagination(1, false), false);
+  assert.equal(state.shouldShowMemoryPagination(1, true), true);
+  assert.equal(
+    state.shouldShowMemoryPagination(2, false),
+    true,
+    "an empty out-of-range page must still expose Previous",
+  );
+}
+
+function memoryCategoriesContracts(modules) {
+  const desktop = modules.ReactDOMServer.renderToStaticMarkup(
+    modules.React.createElement(modules.MemoryCategories, {
+      categories: ["work", "decision", "private"],
+    }),
+  );
+  assert.match(desktop, /aria-expanded="false"/);
+  assert.match(desktop, /aria-label="Show 2 more categories"/);
+  assert.match(desktop, />\+2<\/button>/);
+
+  const mobile = modules.ReactDOMServer.renderToStaticMarkup(
+    modules.React.createElement(modules.MemoryCategories, {
+      categories: ["work", "decision", "work", " "],
+      mobile: true,
+    }),
+  );
+  assert.doesNotMatch(mobile, /<button/);
+  assert.match(mobile, />work</);
+  assert.match(mobile, />decision</);
+  assert.equal((mobile.match(/>work</g) || []).length, 1);
 }
 
 function draftContracts(state) {
@@ -159,7 +283,9 @@ function deleteAndUrlContracts(state) {
 
 function exactExports(state) {
   assert.deepEqual(Object.keys(state).sort(), [
+    "beginMemoryOperation",
     "buildMemoryPatch",
+    "canApplyMemoryOperation",
     "closeMemoryUrl",
     "initializeMemoryDraft",
     "isCurrentMemoryRequest",
@@ -170,11 +296,13 @@ function exactExports(state) {
     "memoryQueriesEqual",
     "memoryQueryPayload",
     "nextMemoryRequestGeneration",
+    "normalizeMemoryId",
     "pageAfterMemoryDelete",
     "parseMemoryHistory",
     "parseMemoryMetadataObject",
     "resetMemoryQueryPage",
     "setMemoryIdInUrl",
+    "shouldShowMemoryPagination",
   ]);
 }
 
@@ -182,16 +310,21 @@ function main() {
   if (process.argv.length !== 3) {
     throw new Error("usage: test-memory-explorer-state.cjs <dashboard-dir>");
   }
-  const state = loadState(path.resolve(process.argv[2]));
+  const dashboardDir = path.resolve(process.argv[2]);
+  const state = loadState(dashboardDir);
+  const categories = loadMemoryCategories(dashboardDir);
   queryContracts(state);
   requestGenerationContracts(state);
+  operationGuardContracts(state);
+  paginationAndMemoryIdContracts(state);
   draftContracts(state);
   metadataContracts(state);
   patchContracts(state);
   historyContracts(state);
   deleteAndUrlContracts(state);
   exactExports(state);
-  console.log("memory explorer state harness: 8 contracts passed");
+  memoryCategoriesContracts(categories);
+  console.log("memory explorer state harness: 11 contracts passed");
 }
 
 try {

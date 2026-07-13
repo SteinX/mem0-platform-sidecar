@@ -31,15 +31,18 @@ import { toast } from "@/components/ui/use-toast";
 import type {
   SidecarMemory,
   SidecarMemoryHistoryResponse,
+  SidecarMemoryUpdateResponse,
 } from "@/types/sidecar";
 import {
+  beginMemoryOperation,
   buildMemoryPatch,
+  canApplyMemoryOperation,
   initializeMemoryDraft,
-  isCurrentMemoryRequest,
   isMemoryDraftDirty,
   isMemoryDraftReady,
   memoryApiPath,
   nextMemoryRequestGeneration,
+  normalizeMemoryId,
   parseMemoryHistory,
   type MemoryDraft,
 } from "@/utils/memory-explorer-state";
@@ -58,7 +61,10 @@ export function MemoryDetailDrawer({
   onRefreshList,
   onDeleted,
 }: MemoryDetailDrawerProps) {
-  const [activeMemoryId, setActiveMemoryId] = useState<string | null>(memoryId);
+  const normalizedMemoryId = normalizeMemoryId(memoryId);
+  const [activeMemoryId, setActiveMemoryId] = useState<string | null>(
+    normalizedMemoryId,
+  );
   const [detail, setDetail] = useState<SidecarMemory | null>(null);
   const [history, setHistory] = useState<unknown[]>([]);
   const [draft, setDraft] = useState<MemoryDraft | null>(null);
@@ -76,6 +82,26 @@ export function MemoryDetailDrawer({
   const [pendingMemoryId, setPendingMemoryId] = useState<string | null>(null);
   const detailGeneration = useRef(0);
   const historyGeneration = useRef(0);
+  const mutationGeneration = useRef(0);
+  const mountedRef = useRef(true);
+  const activeMemoryIdRef = useRef<string | null>(normalizedMemoryId);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      activeMemoryIdRef.current = null;
+      detailGeneration.current = nextMemoryRequestGeneration(
+        detailGeneration.current,
+      );
+      historyGeneration.current = nextMemoryRequestGeneration(
+        historyGeneration.current,
+      );
+      mutationGeneration.current = nextMemoryRequestGeneration(
+        mutationGeneration.current,
+      );
+    };
+  }, []);
 
   const isDirty = draft !== null
     && initialDraft !== null
@@ -89,13 +115,26 @@ export function MemoryDetailDrawer({
   );
 
   const loadDetail = useCallback(async (id: string, resetDraft: boolean) => {
-    const generation = nextMemoryRequestGeneration(detailGeneration.current);
-    detailGeneration.current = generation;
+    const operation = beginMemoryOperation(detailGeneration.current, id);
+    detailGeneration.current = operation.generation;
+    if (!canApplyMemoryOperation(
+      operation,
+      detailGeneration.current,
+      activeMemoryIdRef.current,
+      mountedRef.current,
+    )) {
+      return;
+    }
     setDetailLoading(true);
     setDetailError(null);
     try {
       const response = await sidecarGet<SidecarMemory>(memoryApiPath(id));
-      if (!isCurrentMemoryRequest(generation, detailGeneration.current)) {
+      if (!canApplyMemoryOperation(
+        operation,
+        detailGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
         return;
       }
       setDetail(response);
@@ -107,69 +146,120 @@ export function MemoryDetailDrawer({
         setFormError(null);
       }
     } catch (error) {
-      if (isCurrentMemoryRequest(generation, detailGeneration.current)) {
+      if (canApplyMemoryOperation(
+        operation,
+        detailGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
         setDetailError(error instanceof Error ? error.message : String(error));
       }
     } finally {
-      if (isCurrentMemoryRequest(generation, detailGeneration.current)) {
+      if (canApplyMemoryOperation(
+        operation,
+        detailGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
         setDetailLoading(false);
       }
     }
   }, [draftMemoryId]);
 
   const loadHistory = useCallback(async (id: string) => {
-    const generation = nextMemoryRequestGeneration(historyGeneration.current);
-    historyGeneration.current = generation;
+    const operation = beginMemoryOperation(historyGeneration.current, id);
+    historyGeneration.current = operation.generation;
+    if (!canApplyMemoryOperation(
+      operation,
+      historyGeneration.current,
+      activeMemoryIdRef.current,
+      mountedRef.current,
+    )) {
+      return;
+    }
     setHistoryLoading(true);
     setHistoryError(null);
     try {
       const response = await sidecarGet<SidecarMemoryHistoryResponse>(`${memoryApiPath(id)}/history`);
-      if (isCurrentMemoryRequest(generation, historyGeneration.current)) {
+      if (canApplyMemoryOperation(
+        operation,
+        historyGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
         setHistory(Array.isArray(response.results) ? response.results : []);
       }
     } catch (error) {
-      if (isCurrentMemoryRequest(generation, historyGeneration.current)) {
+      if (canApplyMemoryOperation(
+        operation,
+        historyGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
         setHistoryError(error instanceof Error ? error.message : String(error));
       }
     } finally {
-      if (isCurrentMemoryRequest(generation, historyGeneration.current)) {
+      if (canApplyMemoryOperation(
+        operation,
+        historyGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
         setHistoryLoading(false);
       }
     }
   }, []);
 
   const activateMemory = useCallback((id: string | null) => {
+    const normalizedId = normalizeMemoryId(id);
     detailGeneration.current = nextMemoryRequestGeneration(detailGeneration.current);
     historyGeneration.current = nextMemoryRequestGeneration(historyGeneration.current);
-    setActiveMemoryId(id);
+    mutationGeneration.current = nextMemoryRequestGeneration(
+      mutationGeneration.current,
+    );
+    activeMemoryIdRef.current = normalizedId;
+    setActiveMemoryId(normalizedId);
     setDraft(null);
     setInitialDraft(null);
     setDraftMemoryId(null);
     setShowDiscardDialog(false);
     setPendingMemoryId(null);
-    if (id === null) {
+    if (normalizedId === null) {
       return;
     }
     setDetail(null);
     setHistory([]);
     setDetailError(null);
     setHistoryError(null);
-    void loadDetail(id, true);
-    void loadHistory(id);
+    void loadDetail(normalizedId, true);
+    void loadHistory(normalizedId);
   }, [loadDetail, loadHistory]);
 
   useEffect(() => {
-    if (memoryId === activeMemoryId) {
+    if (normalizedMemoryId === activeMemoryId) {
+      return;
+    }
+    if (isBusy) {
+      if (activeMemoryId !== null) {
+        onMemoryIdChange(activeMemoryId);
+      }
       return;
     }
     if (activeMemoryId !== null && isDirty) {
-      setPendingMemoryId(memoryId);
+      setPendingMemoryId(normalizedMemoryId);
       setShowDiscardDialog(true);
       onMemoryIdChange(activeMemoryId);
       return;
     }
-    activateMemory(memoryId);
-  }, [activateMemory, activeMemoryId, isDirty, memoryId, onMemoryIdChange]);
+    activateMemory(normalizedMemoryId);
+  }, [
+    activateMemory,
+    activeMemoryId,
+    isBusy,
+    isDirty,
+    normalizedMemoryId,
+    onMemoryIdChange,
+  ]);
 
   useEffect(() => {
     if (activeMemoryId !== null && detail === null && !detailLoading && detailError === null) {
@@ -192,6 +282,9 @@ export function MemoryDetailDrawer({
   };
 
   const discardAndContinue = () => {
+    if (isBusy) {
+      return;
+    }
     const target = pendingMemoryId;
     setShowDiscardDialog(false);
     onMemoryIdChange(target);
@@ -199,8 +292,10 @@ export function MemoryDetailDrawer({
   };
 
   const saveMemory = async () => {
+    const targetMemoryId = activeMemoryIdRef.current;
     if (
-      activeMemoryId === null
+      targetMemoryId === null
+      || targetMemoryId !== activeMemoryId
       || draft === null
       || initialDraft === null
       || !draftReady
@@ -218,46 +313,156 @@ export function MemoryDetailDrawer({
       setFormError("No changes to save.");
       return;
     }
+    const operation = beginMemoryOperation(
+      mutationGeneration.current,
+      targetMemoryId,
+    );
+    mutationGeneration.current = operation.generation;
     setIsSaving(true);
     setFormError(null);
     try {
-      await sidecarPatch<SidecarMemory>(memoryApiPath(activeMemoryId), patch);
+      const response = await sidecarPatch<SidecarMemoryUpdateResponse>(
+        memoryApiPath(targetMemoryId),
+        patch,
+      );
+      if (!canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        return;
+      }
+      const nextDraft = initializeMemoryDraft(response.memory);
+      setDetail(response.memory);
+      setDraft(nextDraft);
+      setInitialDraft(nextDraft);
+      setDraftMemoryId(targetMemoryId);
+      setFormError(null);
+      if (!canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        return;
+      }
       toast({ title: "Memory updated", variant: "success" });
-      await Promise.all([
-        loadDetail(activeMemoryId, true),
-        loadHistory(activeMemoryId),
-      ]);
+      if (!canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        return;
+      }
       onRefreshList();
+      if (canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        void loadDetail(targetMemoryId, false);
+        void loadHistory(targetMemoryId);
+      }
     } catch (error) {
+      if (!canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       setFormError(message);
       toast({ title: "Failed to update memory", description: message, variant: "destructive" });
     } finally {
-      setIsSaving(false);
+      if (canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        setIsSaving(false);
+      }
     }
   };
 
   const deleteMemory = async () => {
-    if (activeMemoryId === null) {
+    const targetMemoryId = activeMemoryIdRef.current;
+    if (targetMemoryId === null || targetMemoryId !== activeMemoryId) {
       return;
     }
+    const operation = beginMemoryOperation(
+      mutationGeneration.current,
+      targetMemoryId,
+    );
+    mutationGeneration.current = operation.generation;
     setIsDeleting(true);
     try {
-      const deletedMemoryId = activeMemoryId;
-      await sidecarDelete(memoryApiPath(deletedMemoryId));
+      await sidecarDelete(memoryApiPath(targetMemoryId));
+      if (!canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        return;
+      }
       toast({ title: "Memory deleted", variant: "success" });
+      if (!canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        return;
+      }
       setShowDeleteDialog(false);
-      onMemoryIdChange(null);
+      setIsDeleting(false);
+      if (!canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        return;
+      }
+      onDeleted(targetMemoryId);
+      if (!canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        return;
+      }
       activateMemory(null);
-      onDeleted(deletedMemoryId);
     } catch (error) {
+      if (!canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        return;
+      }
       toast({
         title: "Failed to delete memory",
         description: error instanceof Error ? error.message : String(error),
         variant: "destructive",
       });
     } finally {
-      setIsDeleting(false);
+      if (canApplyMemoryOperation(
+        operation,
+        mutationGeneration.current,
+        activeMemoryIdRef.current,
+        mountedRef.current,
+      )) {
+        setIsDeleting(false);
+      }
     }
   };
 
@@ -332,11 +537,24 @@ export function MemoryDetailDrawer({
                     <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-t border-memBorder-primary pt-4">
                       <div className="flex min-w-0 flex-wrap gap-2">
                         <Button type="button" variant="outline" disabled={!activeMemoryId} onClick={async () => {
-                          if (activeMemoryId) {
+                          const targetMemoryId = activeMemoryIdRef.current;
+                          if (targetMemoryId) {
                             try {
-                              await navigator.clipboard.writeText(activeMemoryId);
+                              await navigator.clipboard.writeText(targetMemoryId);
+                              if (
+                                !mountedRef.current
+                                || activeMemoryIdRef.current !== targetMemoryId
+                              ) {
+                                return;
+                              }
                               toast({ title: "Memory ID copied", variant: "success" });
                             } catch (error) {
+                              if (
+                                !mountedRef.current
+                                || activeMemoryIdRef.current !== targetMemoryId
+                              ) {
+                                return;
+                              }
                               toast({
                                 title: "Failed to copy memory ID",
                                 description: error instanceof Error ? error.message : String(error),
@@ -417,7 +635,9 @@ export function MemoryDetailDrawer({
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Keep editing</AlertDialogCancel>
-            <AlertDialogAction onClick={discardAndContinue}>Discard changes</AlertDialogAction>
+            <AlertDialogAction disabled={isBusy} onClick={discardAndContinue}>
+              Discard changes
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
