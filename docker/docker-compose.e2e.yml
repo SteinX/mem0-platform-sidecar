@@ -119,5 +119,51 @@ services:
       - -p
       - no:cacheprovider
 
+  dashboard:
+    build:
+      context: ${MEM0_E2E_DASHBOARD_CONTEXT:?set MEM0_E2E_DASHBOARD_CONTEXT}
+      dockerfile: Dockerfile.e2e
+    environment:
+      AUTH_DISABLED: "true"
+      NEXT_PUBLIC_API_URL: http://mem0:8000
+      NEXT_PUBLIC_INSTANCE_NAME: Browser Smoke
+      SIDECAR_INTERNAL_API_URL: http://mem0:8000
+      SIDECAR_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/dashboard/memories').then(r => { if (!r.ok) process.exit(1) })"
+      interval: 3s
+      timeout: 5s
+      retries: 90
+
+  browser:
+    image: flaresolverr/flaresolverr:latest
+    entrypoint: /usr/bin/chromium
+    command:
+      - --headless=new
+      - --no-sandbox
+      - --disable-dev-shm-usage
+      - --disable-gpu
+      - --remote-debugging-address=0.0.0.0
+      - --remote-debugging-port=9222
+      - --remote-allow-origins=*
+      - --user-data-dir=/tmp/browser-smoke-profile
+      - about:blank
+    depends_on:
+      dashboard:
+        condition: service_healthy
+
+  browser-smoke:
+    build:
+      context: ..
+      dockerfile: tests/e2e/browser_smoke.Dockerfile
+    environment:
+      MEM0_E2E_BROWSER_CDP: http://127.0.0.1:9222
+      MEM0_E2E_DASHBOARD_URL: http://dashboard:3000
+    network_mode: service:browser
+
 volumes:
   postgres-data:

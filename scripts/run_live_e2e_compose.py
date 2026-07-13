@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -69,6 +71,8 @@ def compose_up_command(project_name: str) -> list[str]:
         "openai-stub",
         "postgres",
         "mem0",
+        "dashboard",
+        "browser",
     ]
 
 
@@ -92,7 +96,70 @@ def compose_build_runner_command(project_name: str) -> list[str]:
         "build",
         "e2e-runner",
         "e2e-adoption-runner",
+        "browser-smoke",
     ]
+
+
+def postgres_smoke_command(project_name: str) -> list[str]:
+    return [
+        *compose_command(project_name),
+        "run",
+        "--rm",
+        "--no-deps",
+        "e2e-runner",
+        "python",
+        "/app/scripts/run_postgres_migration_smoke.py",
+        "--database-url=postgresql+psycopg://postgres:e2e-postgres@postgres/postgres",
+    ]
+
+
+def browser_smoke_command(project_name: str) -> list[str]:
+    return [
+        *compose_command(project_name),
+        "run",
+        "--rm",
+        "--no-deps",
+        "browser-smoke",
+        "node",
+        "/app/run-browser-smoke.cjs",
+    ]
+
+
+def prepare_dashboard_context(upstream_context: Path, target: Path) -> Path:
+    source = upstream_context / "server" / "dashboard"
+    if not (source / "package.json").is_file():
+        raise FileNotFoundError(f"Dashboard checkout not found at {source}")
+    shutil.copytree(
+        source,
+        target,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(
+            "node_modules",
+            ".next",
+            "tsconfig.tsbuildinfo",
+        ),
+    )
+    apply_script = (
+        ROOT
+        / "integrations"
+        / "mem0-dashboard-overlay"
+        / "scripts"
+        / "apply-dashboard-overlay"
+    )
+    subprocess.run([str(apply_script), str(target)], cwd=ROOT, check=True)
+    shutil.copy2(
+        ROOT / "tests" / "e2e" / "dashboard_client_layout.browser-smoke.tsx",
+        target / "src" / "app" / "(root)" / "clientLayout.tsx",
+    )
+    shutil.copy2(
+        ROOT
+        / "integrations"
+        / "mem0-dashboard-overlay"
+        / "docker"
+        / "Dockerfile.browser-dashboard",
+        target / "Dockerfile.e2e",
+    )
+    return target
 
 
 def compose_down_command(project_name: str) -> list[str]:
@@ -240,6 +307,9 @@ def dump_diagnostics(base_compose: list[str], *, env: dict[str, str]) -> None:
             "openai-stub",
             "e2e-runner",
             "e2e-adoption-runner",
+            "dashboard",
+            "browser",
+            "browser-smoke",
         ],
         cwd=ROOT,
         env=env,
@@ -258,8 +328,23 @@ def main() -> int:
         f"mem0-sidecar-e2e-{unique_suffix}",
     )
     timeout_seconds = int(os.environ.get("MEM0_E2E_STARTUP_TIMEOUT", "180"))
+    upstream_context = resolve_upstream_context()
+    dashboard_temp = tempfile.TemporaryDirectory(prefix="mem0-dashboard-smoke-")
+    try:
+        dashboard_context = prepare_dashboard_context(
+            upstream_context,
+            Path(dashboard_temp.name) / "dashboard",
+        )
+    except Exception:
+        dashboard_temp.cleanup()
+        raise
     compose_env = os.environ.copy()
-    compose_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(resolve_upstream_context())
+    compose_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(upstream_context)
+    compose_env["MEM0_E2E_DASHBOARD_CONTEXT"] = str(dashboard_context)
+    compose_env["MEM0_E2E_PROJECT_ID"] = project_id
+    runner_env = build_runner_env(project_id=project_id)
+    runner_env["MEM0_E2E_DASHBOARD_CONTEXT"] = str(dashboard_context)
+    runner_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(upstream_context)
     base_compose = compose_command(project_name)
 
     try:
@@ -271,19 +356,21 @@ def main() -> int:
         )
         run(
             compose_build_runner_command(project_name),
-            env=build_runner_env(project_id=project_id),
+            env=runner_env,
         )
+        run(postgres_smoke_command(project_name), env=compose_env)
         run(
             compose_run_command(project_name),
-            env=build_runner_env(project_id=project_id),
+            env=runner_env,
         )
         run(
             compose_run_command(
                 project_name,
                 service_name="e2e-adoption-runner",
             ),
-            env=build_runner_env(project_id=project_id),
+            env=runner_env,
         )
+        run(browser_smoke_command(project_name), env=compose_env)
     except Exception:
         dump_diagnostics(base_compose, env=compose_env)
         raise
@@ -297,6 +384,7 @@ def main() -> int:
             text=True,
             check=False,
         )
+        dashboard_temp.cleanup()
         if cleanup_result.returncode != 0:
             diagnostic = (
                 cleanup_result.stderr.strip()
