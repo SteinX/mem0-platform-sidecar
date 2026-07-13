@@ -20,6 +20,10 @@ CATEGORY_FIELD_EDITOR = (
     "src/app/(root)/dashboard/categories/category-field-editor.tsx"
 )
 EXPORT_PAGE = "src/app/(root)/dashboard/export/page.tsx"
+REQUESTS_PAGE = "src/app/(root)/dashboard/requests/page.tsx"
+REQUEST_TRACE_DRAWER = (
+    "src/app/(root)/dashboard/requests/request-trace-drawer.tsx"
+)
 SIDECAR_PROXY = "src/utils/sidecar-proxy.ts"
 SIDECAR_ROUTE = "src/app/api/sidecar/[...path]/route.ts"
 DEFAULT_PNPM_PACKAGE = "pnpm@10.34.2"
@@ -111,6 +115,19 @@ def memory_explorer_harness_command(
     return [
         node,
         str(overlay_root / "scripts" / "test-memory-explorer-state.cjs"),
+        str(dashboard_dir),
+    ]
+
+
+def request_trace_harness_command(
+    overlay_root: Path, dashboard_dir: Path
+) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-request-trace-state.cjs"),
         str(dashboard_dir),
     ]
 
@@ -1141,6 +1158,75 @@ def verify_proxy_contract(dashboard_dir: Path) -> str | None:
     return None
 
 
+def verify_requests_page(dashboard_dir: Path) -> str | None:
+    page_content = (dashboard_dir / REQUESTS_PAGE).read_text()
+    drawer_content = (dashboard_dir / REQUEST_TRACE_DRAWER).read_text()
+    if (
+        "sidecarQuery<SidecarTracePage>" not in page_content
+        or '"/v1/events/query"' not in page_content
+    ):
+        return "Requests page must query /v1/events/query"
+    for contract, error in (
+        ("new AbortController()", "Requests page must abort stale list requests"),
+        ("controller.abort()", "Requests page must clean up stale list requests"),
+        ("requestGeneration", "Requests page must ignore stale list responses"),
+        ("pageDataRef.current", "Requests page must preserve data while refreshing"),
+        ("ResponsiveContainer", "Requests page missing responsive timeline"),
+        ("pageData.timeline.length > 0", "Requests timeline must guard empty axes"),
+        (
+            "allowAnyMatch={false}",
+            "Requests filters must not offer unsupported Match any semantics",
+        ),
+        (
+            'operators: ["equals"]',
+            "Requests filters must expose exact matches only",
+        ),
+        (
+            'aria-label="Request timeline summary"',
+            "Requests timeline missing accessible summary",
+        ),
+        ("setTraceRequestIdInUrl(current, id)", "Requests page must deep-link the drawer"),
+        (
+            "closeTraceRequestUrl(current)",
+            "Requests page must close the drawer without clearing filters",
+        ),
+        (
+            "writeTraceControlUrl(next, query.operation, query.has_results)",
+            "Requests page must persist operation query state",
+        ),
+    ):
+        if contract not in page_content:
+            return error
+    if "window." in page_content or "document." in page_content:
+        return "Requests page must not access browser globals during render"
+
+    for contract, error in (
+        ("<Sheet", "Request drawer must use the accessible Sheet primitive"),
+        ("SheetTitle", "Request drawer missing an accessible title"),
+        ("SheetDescription", "Request drawer missing an accessible description"),
+        ("Request Payload", "Request drawer missing request payload tab"),
+        ("Retrieved Memories", "Request drawer missing retrieved memories tab"),
+        ("new AbortController()", "Request drawer must abort stale detail requests"),
+        ("activeRequestIdRef", "Request drawer must ignore stale detail responses"),
+        ("encodeURIComponent(requestId)", "Request drawer must encode event IDs"),
+        ("result_previews.slice(0, 20)", "Request drawer must cap previews at 20"),
+        (
+            "result_previews_omitted",
+            "Request drawer must expose omitted preview metadata",
+        ),
+        (
+            "result_previews_scan_truncated",
+            "Request drawer must expose scan truncation metadata",
+        ),
+        ("navigator.clipboard", "Request drawer missing Clipboard API support"),
+        ('document.execCommand("copy")', "Request drawer missing clipboard fallback"),
+        ("Raw error", "Request drawer must expose failure payloads"),
+    ):
+        if contract not in drawer_content:
+            return error
+    return None
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: verify-dashboard-overlay <dashboard-dir>", file=sys.stderr)
@@ -1168,6 +1254,7 @@ def main() -> int:
         verify_categories_page(dashboard_dir),
         verify_export_page(dashboard_dir),
         verify_proxy_contract(dashboard_dir),
+        verify_requests_page(dashboard_dir),
     )
     for error in checks:
         if error is not None:
@@ -1201,6 +1288,11 @@ def main() -> int:
         )
         subprocess.run(
             memory_explorer_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
+        subprocess.run(
+            request_trace_harness_command(overlay_root, dashboard_dir),
             cwd=dashboard_dir,
             check=True,
         )

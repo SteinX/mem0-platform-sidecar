@@ -42,12 +42,14 @@ export type ExplorerFilterFieldOption = {
   value: ExplorerField;
   label: string;
   options?: Array<{ value: string; label: string }>;
+  operators?: ExplorerOperator[];
 };
 
 type FilterBuilderProps = {
   match: ExplorerMatch;
   filters: ExplorerFilter[];
   fields: ExplorerFilterFieldOption[];
+  allowAnyMatch?: boolean;
   onApply: (match: ExplorerMatch, filters: ExplorerFilter[]) => void;
   onRemoveAll: (filters: ExplorerFilter[]) => void;
 };
@@ -63,27 +65,33 @@ export function FilterBuilder({
   match,
   filters,
   fields,
+  allowAnyMatch = true,
   onApply,
   onRemoveAll,
 }: FilterBuilderProps) {
-  const [draft, setDraft] = useState(
-    () => createFilterBuilderDraft(match, filters),
+  const [draft, setDraft] = useState(() =>
+    createFilterBuilderDraft(match, filters),
   );
   const draftMatch = draft.match;
   const draftFilters = draft.filters;
 
   function handleOpenChange(nextOpen: boolean) {
-    setDraft((current) => nextOpen
-      ? openFilterBuilderDraft(match, filters)
-      : cancelFilterBuilderDraft(current));
+    setDraft((current) =>
+      nextOpen
+        ? openFilterBuilderDraft(match, filters)
+        : cancelFilterBuilderDraft(current),
+    );
   }
 
-  function updateFilter(id: string, update: (filter: ExplorerFilter) => ExplorerFilter) {
+  function updateFilter(
+    id: string,
+    update: (filter: ExplorerFilter) => ExplorerFilter,
+  ) {
     setDraft((current) => ({
       ...current,
-      filters: current.filters.map((filter) => (
-        filter.id === id ? update(filter) : filter
-      )),
+      filters: current.filters.map((filter) =>
+        filter.id === id ? update(filter) : filter,
+      ),
     }));
   }
 
@@ -132,26 +140,37 @@ export function FilterBuilder({
           <div className="space-y-2">
             <Label htmlFor="explorer-filter-match">Match</Label>
             <Select
+              disabled={!allowAnyMatch}
               value={draftMatch}
-              onValueChange={(value) => setDraft((current) => ({
-                ...current,
-                match: value as ExplorerMatch,
-              }))}
+              onValueChange={(value) =>
+                setDraft((current) => ({
+                  ...current,
+                  match: value as ExplorerMatch,
+                }))
+              }
             >
-              <SelectTrigger id="explorer-filter-match" aria-label="Filter match mode">
+              <SelectTrigger
+                id="explorer-filter-match"
+                aria-label="Filter match mode"
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">Match all</SelectItem>
-                <SelectItem value="any">Match any</SelectItem>
+                {allowAnyMatch ? (
+                  <SelectItem value="any">Match any</SelectItem>
+                ) : null}
               </SelectContent>
             </Select>
           </div>
 
           <div className="space-y-3">
             {draftFilters.map((filter, index) => {
-              const field = fields.find((candidate) => candidate.value === filter.field);
-              const operators = filterOperatorsForField(filter.field);
+              const field = fields.find(
+                (candidate) => candidate.value === filter.field,
+              );
+              const operators =
+                field?.operators ?? filterOperatorsForField(filter.field);
               return (
                 <div
                   key={filter.id}
@@ -160,16 +179,19 @@ export function FilterBuilder({
                   className="grid gap-2 rounded-lg border p-3 sm:grid-cols-[1fr_1fr_2fr_auto]"
                 >
                   <div className="space-y-1">
-                    <Label htmlFor={`${filter.id}-field`}>Field {index + 1}</Label>
+                    <Label htmlFor={`${filter.id}-field`}>
+                      Field {index + 1}
+                    </Label>
                     <Select
                       value={filter.field}
-                      onValueChange={(value) => updateFilter(
-                        filter.id,
-                        (current) => changeExplorerFilterField(
-                          current,
-                          value as ExplorerField,
-                        ),
-                      )}
+                      onValueChange={(value) =>
+                        updateFilter(filter.id, (current) =>
+                          changeExplorerFilterField(
+                            current,
+                            value as ExplorerField,
+                          ),
+                        )
+                      }
                     >
                       <SelectTrigger
                         id={`${filter.id}-field`}
@@ -188,16 +210,19 @@ export function FilterBuilder({
                   </div>
 
                   <div className="space-y-1">
-                    <Label htmlFor={`${filter.id}-operator`}>Operator {index + 1}</Label>
+                    <Label htmlFor={`${filter.id}-operator`}>
+                      Operator {index + 1}
+                    </Label>
                     <Select
                       value={filter.operator}
-                      onValueChange={(value) => updateFilter(
-                        filter.id,
-                        (current) => changeExplorerFilterOperator(
-                          current,
-                          value as ExplorerOperator,
-                        ),
-                      )}
+                      onValueChange={(value) =>
+                        updateFilter(filter.id, (current) =>
+                          changeExplorerFilterOperator(
+                            current,
+                            value as ExplorerOperator,
+                          ),
+                        )
+                      }
                     >
                       <SelectTrigger
                         id={`${filter.id}-operator`}
@@ -255,7 +280,9 @@ export function FilterBuilder({
               >
                 Cancel
               </Button>
-              <Button type="button" onClick={applyFilters}>Apply</Button>
+              <Button type="button" onClick={applyFilters}>
+                Apply
+              </Button>
             </div>
           </div>
         </div>
@@ -268,7 +295,10 @@ function renderValueEditor(
   filter: ExplorerFilter,
   index: number,
   field: ExplorerFilterFieldOption | undefined,
-  updateFilter: (id: string, update: (filter: ExplorerFilter) => ExplorerFilter) => void,
+  updateFilter: (
+    id: string,
+    update: (filter: ExplorerFilter) => ExplorerFilter,
+  ) => void,
 ) {
   if (filter.field === "metadata") {
     const value = metadataValue(filter.value);
@@ -278,19 +308,29 @@ function renderValueEditor(
           aria-label="Metadata key"
           placeholder="Metadata key"
           value={value.key}
-          onChange={(event) => updateFilter(filter.id, (current) => ({
-            ...current,
-            value: { ...metadataValue(current.value), key: event.target.value },
-          }))}
+          onChange={(event) =>
+            updateFilter(filter.id, (current) => ({
+              ...current,
+              value: {
+                ...metadataValue(current.value),
+                key: event.target.value,
+              },
+            }))
+          }
         />
         <Input
           aria-label="Metadata value"
           placeholder="Metadata value"
           value={value.value}
-          onChange={(event) => updateFilter(filter.id, (current) => ({
-            ...current,
-            value: { ...metadataValue(current.value), value: event.target.value },
-          }))}
+          onChange={(event) =>
+            updateFilter(filter.id, (current) => ({
+              ...current,
+              value: {
+                ...metadataValue(current.value),
+                value: event.target.value,
+              },
+            }))
+          }
         />
       </div>
     );
@@ -299,7 +339,10 @@ function renderValueEditor(
   if (filter.operator === "in" && field?.options !== undefined) {
     const selected = arrayValue(filter.value);
     return (
-      <fieldset className="flex flex-wrap gap-3" aria-label={`Values for filter ${index + 1}`}>
+      <fieldset
+        className="flex flex-wrap gap-3"
+        aria-label={`Values for filter ${index + 1}`}
+      >
         <legend className="sr-only">Choose values</legend>
         {field.options.map((option) => {
           const id = `${filter.id}-${option.value}`;
@@ -308,14 +351,16 @@ function renderValueEditor(
               <Checkbox
                 id={id}
                 checked={selected.includes(option.value)}
-                onCheckedChange={(checked) => updateFilter(filter.id, (current) => ({
-                  ...current,
-                  value: toggleFilterValue(
-                    arrayValue(current.value),
-                    option.value,
-                    checked === true,
-                  ),
-                }))}
+                onCheckedChange={(checked) =>
+                  updateFilter(filter.id, (current) => ({
+                    ...current,
+                    value: toggleFilterValue(
+                      arrayValue(current.value),
+                      option.value,
+                      checked === true,
+                    ),
+                  }))
+                }
               />
               <Label htmlFor={id}>{option.label}</Label>
             </div>
@@ -331,10 +376,12 @@ function renderValueEditor(
         aria-label="Comma-separated IDs"
         placeholder="Comma-separated IDs"
         value={arrayValue(filter.value).join(", ")}
-        onChange={(event) => updateFilter(filter.id, (current) => ({
-          ...current,
-          value: parseCommaSeparatedFilterValues(event.target.value),
-        }))}
+        onChange={(event) =>
+          updateFilter(filter.id, (current) => ({
+            ...current,
+            value: parseCommaSeparatedFilterValues(event.target.value),
+          }))
+        }
       />
     );
   }
@@ -343,17 +390,23 @@ function renderValueEditor(
     return (
       <Select
         value={scalarValue(filter.value)}
-        onValueChange={(value) => updateFilter(filter.id, (current) => ({
-          ...current,
-          value,
-        }))}
+        onValueChange={(value) =>
+          updateFilter(filter.id, (current) => ({
+            ...current,
+            value,
+          }))
+        }
       >
-        <SelectTrigger aria-label={`${field.label} value for filter ${index + 1}`}>
+        <SelectTrigger
+          aria-label={`${field.label} value for filter ${index + 1}`}
+        >
           <SelectValue placeholder="Choose a value" />
         </SelectTrigger>
         <SelectContent>
           {field.options.map((option) => (
-            <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
           ))}
         </SelectContent>
       </Select>
@@ -365,17 +418,20 @@ function renderValueEditor(
       aria-label={`${field?.label ?? filter.field} value for filter ${index + 1}`}
       placeholder="Value"
       value={scalarValue(filter.value)}
-      onChange={(event) => updateFilter(filter.id, (current) => ({
-        ...current,
-        value: event.target.value,
-      }))}
+      onChange={(event) =>
+        updateFilter(filter.id, (current) => ({
+          ...current,
+          value: event.target.value,
+        }))
+      }
     />
   );
 }
 
-function metadataValue(
-  value: ExplorerFilter["value"],
-): { key: string; value: string } {
+function metadataValue(value: ExplorerFilter["value"]): {
+  key: string;
+  value: string;
+} {
   return !Array.isArray(value) && typeof value === "object"
     ? value
     : { key: "", value: "" };

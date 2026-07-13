@@ -183,6 +183,8 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/app/(root)/dashboard/memories/memories-page.tsx",
         "src/app/(root)/dashboard/memories/memory-categories.tsx",
         "src/app/(root)/dashboard/memories/memory-detail-drawer.tsx",
+        "src/app/(root)/dashboard/requests/page.tsx",
+        "src/app/(root)/dashboard/requests/request-trace-drawer.tsx",
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/config/route.ts",
         "src/app/api/sidecar/[...path]/route.ts",
@@ -193,6 +195,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/utils/category-editor-state.ts",
         "src/utils/explorer-query-state.ts",
         "src/utils/memory-explorer-state.ts",
+        "src/utils/request-trace-state.ts",
         "src/types/dashboard-explorer.ts",
         "src/types/sidecar.ts",
         "src/components/self-hosted/explorer/date-range-filter.tsx",
@@ -450,6 +453,173 @@ def test_dashboard_overlay_includes_memory_explorer_page_and_drawer_contracts():
         assert contract in drawer_content
 
     assert (OVERLAY / "scripts/test-memory-explorer-state.cjs").is_file()
+
+
+def test_dashboard_overlay_includes_request_trace_page_and_drawer_contracts():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    page_path = "src/app/(root)/dashboard/requests/page.tsx"
+    drawer_path = (
+        "src/app/(root)/dashboard/requests/request-trace-drawer.tsx"
+    )
+    state_path = "src/utils/request-trace-state.ts"
+
+    for relative in (page_path, drawer_path, state_path):
+        assert relative in manifest["files"]
+        source = OVERLAY / "overlays" / relative
+        assert source.is_file()
+        assert_dashboard_tsx_transpiles(source)
+
+    sidecar_api = (
+        OVERLAY / "overlays/src/utils/sidecar-api.ts"
+    ).read_text()
+    assert "options: Pick<RequestInit, \"signal\"> = {}" in sidecar_api
+    assert "signal: options.signal" in sidecar_api
+
+    page_content = (OVERLAY / "overlays" / page_path).read_text()
+    for contract in (
+        "Overview",
+        "ADD",
+        "SEARCH",
+        "GET ALL",
+        "Has Results",
+        "DateRangeFilter",
+        "FilterBuilder",
+        'operators: ["equals"]',
+        "allowAnyMatch={false}",
+        "ResponsiveContainer",
+        "BarChart",
+        "Bar",
+        "XAxis",
+        "Tooltip",
+        "Request timeline summary",
+        "No request activity for this range",
+        "Time",
+        "Type",
+        "Entities",
+        "Event",
+        "Latency",
+        "Status",
+        "Loading requests",
+        "No requests found",
+        "Could not load requests",
+        "Pagination",
+        "requestId",
+        "operation",
+        "hasResults",
+        "sidecarQuery<SidecarTracePage>",
+        '"/v1/events/query"',
+        "signal: controller.signal",
+        "AbortController",
+        "controller.abort()",
+        "requestGeneration",
+        "isRefreshing",
+        "setPageData(response)",
+        "page: 1",
+        "const canonicalSearch = canonicalParams.toString()",
+        "if (canonicalSearch !== search)",
+        "md:hidden",
+        "aria-disabled",
+    ):
+        assert contract in page_content
+    assert "window." not in page_content
+    assert "document." not in page_content
+    assert re.search(
+        r"pageData\.timeline\.length\s*>\s*0\s*\?\s*\(",
+        page_content,
+    )
+
+    drawer_content = (OVERLAY / "overlays" / drawer_path).read_text()
+    for contract in (
+        "SheetTitle",
+        "SheetDescription",
+        "Request Payload",
+        "Retrieved Memories",
+        "Copy ID",
+        "Copy JSON",
+        "Show more",
+        "Show less",
+        "Result count",
+        "No memories retrieved",
+        "result_previews.slice(0, 20)",
+        "result_previews_omitted",
+        "result_previews_scan_truncated",
+        "Raw error",
+        "Loading request details",
+        "Could not load request details",
+        "Retry details",
+        "AbortController",
+        "controller.abort()",
+        "activeRequestIdRef",
+        "const targetRequestId = activeRequestIdRef.current",
+        "activeRequestIdRef.current === targetRequestId",
+        "requestGeneration",
+        "encodeURIComponent",
+        "sidecarGet<SidecarTrace>",
+        "signal: controller.signal",
+        "navigator.clipboard",
+        "document.execCommand",
+        "Failed to copy",
+        "overflow-x-auto",
+        "overflow-x-hidden",
+        "sm:max-w-2xl",
+    ):
+        assert contract in drawer_content
+
+    assert (OVERLAY / "scripts/test-request-trace-state.cjs").is_file()
+
+
+def test_request_trace_state_harness_executes_applied_target(tmp_path):
+    dashboard = applied_upstream_overlay(tmp_path)
+
+    result = subprocess.run(
+        [
+            "node",
+            str(OVERLAY / "scripts/test-request-trace-state.cjs"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "request trace state harness: 4 contract groups passed" in result.stdout
+
+
+def test_dashboard_overlay_verifier_runs_request_trace_state_contracts():
+    verifier = runpy.run_path(str(VERIFY_DASHBOARD_OVERLAY))
+    dashboard = Path("/tmp/upstream-dashboard")
+
+    assert verifier["request_trace_harness_command"](
+        OVERLAY,
+        dashboard,
+    )[-2:] == [
+        str(OVERLAY / "scripts/test-request-trace-state.cjs"),
+        str(dashboard),
+    ]
+    source = VERIFY_DASHBOARD_OVERLAY.read_text()
+    assert re.search(
+        r"subprocess\.run\(\s*request_trace_harness_command\(",
+        source,
+    )
+
+
+def test_request_trace_verifier_rejects_missing_runtime_wiring(tmp_path):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/requests/page.tsx"
+    content = page.read_text()
+    assert '"/v1/events/query"' in content
+    page.write_text(content.replace(
+        '"/v1/events/query"',
+        '"/v1/events/missing"',
+        1,
+    ))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert "Requests page must query /v1/events/query" in result.stderr
 
 
 def test_dashboard_overlay_verifier_runs_memory_explorer_runtime_contracts():

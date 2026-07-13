@@ -30,8 +30,12 @@ function withParams(path: string, params: Record<string, string> = {}): string {
 export async function sidecarGet<T>(
   path: string,
   params?: Record<string, string>,
+  options: Pick<RequestInit, "signal"> = {},
 ): Promise<T> {
-  const response = await fetch(withParams(path, params), { method: "GET" });
+  const response = await fetch(withParams(path, params), {
+    method: "GET",
+    signal: options.signal,
+  });
   return parseResponse<T>(response);
 }
 
@@ -39,12 +43,17 @@ async function sidecarRequest<T>(
   method: "POST" | "PUT" | "PATCH",
   path: string,
   body: unknown,
+  options: Pick<RequestInit, "signal"> = {},
 ): Promise<T> {
-  const response = await fetch(`${SIDECAR_API_PREFIX}${normalizeSidecarPath(path)}`, {
-    method,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const response = await fetch(
+    `${SIDECAR_API_PREFIX}${normalizeSidecarPath(path)}`,
+    {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: options.signal,
+    },
+  );
   return parseResponse<T>(response);
 }
 
@@ -56,8 +65,12 @@ export async function sidecarPost<T>(path: string, body: unknown): Promise<T> {
   return sidecarRequest<T>("POST", path, body);
 }
 
-export async function sidecarQuery<T>(path: string, body: object): Promise<T> {
-  return sidecarRequest<T>("POST", path, body);
+export async function sidecarQuery<T>(
+  path: string,
+  body: object,
+  options: Pick<RequestInit, "signal"> = {},
+): Promise<T> {
+  return sidecarRequest<T>("POST", path, body, options);
 }
 
 export async function sidecarPatch<T>(path: string, body: object): Promise<T> {
@@ -65,9 +78,12 @@ export async function sidecarPatch<T>(path: string, body: object): Promise<T> {
 }
 
 export async function sidecarDelete(path: string): Promise<void> {
-  const response = await fetch(`${SIDECAR_API_PREFIX}${normalizeSidecarPath(path)}`, {
-    method: "DELETE",
-  });
+  const response = await fetch(
+    `${SIDECAR_API_PREFIX}${normalizeSidecarPath(path)}`,
+    {
+      method: "DELETE",
+    },
+  );
   if (!response.ok) {
     await parseResponse<never>(response);
   }
