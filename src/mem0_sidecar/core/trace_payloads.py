@@ -51,8 +51,6 @@ _SECRET_KEYS = frozenset(
         "codeverifier",
         "encryptionkey",
         "idtoken",
-        "githubtoken",
-        "gitlabprivatetoken",
         "oauthaccesstoken",
         "oauthtoken",
         "password",
@@ -68,7 +66,6 @@ _SECRET_KEYS = frozenset(
         "sessiontoken",
         "setcookie",
         "signingkey",
-        "slackbottoken",
         "token",
         "xapikey",
         "xauthtoken",
@@ -79,52 +76,51 @@ _NON_CREDENTIAL_KEY_TOKENS = frozenset({"favorite", "has", "is", "require", "req
 _NON_CREDENTIAL_TRAILING_TOKENS = frozenset(
     {"configured", "count", "counts", "enabled", "present", "required", "status"}
 )
-_CREDENTIAL_TOKEN_SUFFIXES = (
-    ("access", "key", "id"),
-    ("authorization", "code"),
-    ("code", "verifier"),
-    ("secret", "access", "key"),
-    ("access", "token"),
-    ("api", "key"),
-    ("api", "secret"),
-    ("api", "token"),
-    ("client", "password"),
-    ("client", "secret"),
-    ("consumer", "secret"),
-    ("private", "key"),
-    ("refresh", "token"),
-    ("secret", "key"),
-    ("set", "cookie"),
+_NON_CREDENTIAL_NORMALIZED_KEYS = frozenset(
+    {"favoritecookie", "haspassword", "issecret", "requiresauthorization"}
 )
-_CREDENTIAL_FINAL_TOKENS = frozenset(
-    {
-        "authorization",
-        "cookie",
-        "credential",
-        "credentials",
-        "passphrase",
-        "passwd",
-        "password",
-        "secret",
-    }
+_NON_CREDENTIAL_NORMALIZED_SUFFIXES = (
+    "configured",
+    "count",
+    "counts",
+    "enabled",
+    "present",
+    "required",
+    "status",
 )
-_TOKEN_CREDENTIAL_QUALIFIERS = frozenset(
-    {
-        "access",
-        "api",
-        "auth",
-        "bearer",
-        "bot",
-        "csrf",
-        "id",
-        "oauth",
-        "private",
-        "refresh",
-        "session",
-    }
-)
-_TOKEN_CREDENTIAL_PROVIDERS = frozenset(
-    {"github", "gitlab", "mem0", "openai", "slack"}
+_CREDENTIAL_NORMALIZED_SUFFIXES = (
+    "accesskeyid",
+    "accesskeyids",
+    "accesskeys",
+    "apikey",
+    "apikeys",
+    "authorization",
+    "authorizationcode",
+    "authorizationcodes",
+    "codeverifier",
+    "codeverifiers",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "encryptionkey",
+    "encryptionkeys",
+    "passphrase",
+    "passphrases",
+    "password",
+    "passwords",
+    "privatekey",
+    "privatekeys",
+    "secret",
+    "secretaccesskey",
+    "secretaccesskeys",
+    "secretkey",
+    "secretkeys",
+    "secrets",
+    "signingkey",
+    "signingkeys",
+    "token",
+    "tokens",
 )
 
 _PREVIEW_STRING_FIELDS = (
@@ -203,33 +199,21 @@ def _key_tokens(key: str) -> tuple[str, ...]:
     )
 
 
-def _tokens_end_with(tokens: tuple[str, ...], suffix: tuple[str, ...]) -> bool:
-    return len(tokens) >= len(suffix) and tokens[-len(suffix) :] == suffix
-
-
 def _is_secret_key(key: str) -> bool:
     tokens = _key_tokens(key)
     if not tokens:
         return False
-    if tokens[-1] in _NON_CREDENTIAL_TRAILING_TOKENS:
+    normalized = "".join(tokens)
+    if normalized in _NON_CREDENTIAL_NORMALIZED_KEYS:
+        return False
+    if tokens[-1] in _NON_CREDENTIAL_TRAILING_TOKENS or normalized.endswith(
+        _NON_CREDENTIAL_NORMALIZED_SUFFIXES
+    ):
         return False
     if any(token in _NON_CREDENTIAL_KEY_TOKENS for token in tokens[:-1]):
         return False
-
-    normalized = "".join(tokens)
-    if normalized in _SECRET_KEYS:
-        return True
-    if any(_tokens_end_with(tokens, suffix) for suffix in _CREDENTIAL_TOKEN_SUFFIXES):
-        return True
-    if tokens[-1] in _CREDENTIAL_FINAL_TOKENS:
-        return True
-    if tokens[-1] != "token":
-        return False
-
-    qualifiers = frozenset(tokens[:-1])
-    provider_prefix = "".join(tokens[:-1])
-    return bool(qualifiers & _TOKEN_CREDENTIAL_QUALIFIERS) or provider_prefix in (
-        _TOKEN_CREDENTIAL_PROVIDERS
+    return normalized in _SECRET_KEYS or normalized.endswith(
+        _CREDENTIAL_NORMALIZED_SUFFIXES
     )
 
 
