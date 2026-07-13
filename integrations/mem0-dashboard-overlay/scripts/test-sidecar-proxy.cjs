@@ -48,6 +48,10 @@ function traceProxyOptions(fetchUpstream, overrides = {}) {
   });
 }
 
+function jsonHeaders(extra = {}) {
+  return { "Content-Type": "application/json", ...extra };
+}
+
 async function testEventQueryForcesRuntimeScope(proxy) {
   const calls = [];
   const payload = {
@@ -66,7 +70,7 @@ async function testEventQueryForcesRuntimeScope(proxy) {
       "http://dashboard.local/api/sidecar/v1/events/query?project_id=forged-query-project&app_id=forged-query-app",
       {
         method: "POST",
-        headers: { "X-Request-ID": "event-query-123" },
+        headers: jsonHeaders({ "X-Request-ID": "event-query-123" }),
         body: JSON.stringify(payload),
       },
     ),
@@ -203,6 +207,7 @@ async function testEventRoutesFailClosedWithoutPortableRuntimeScope(proxy) {
     const response = await proxy(
       new Request("http://dashboard.local/api/sidecar/v1/events/query", {
         method: "POST",
+        headers: jsonHeaders(),
         body: "{}",
       }),
       "/v1/events/query",
@@ -228,18 +233,242 @@ async function testUnauthenticatedEventRequestsAreRejected(proxy) {
     const response = await proxy(
       new Request(`http://dashboard.local/api/sidecar${path}`, {
         method,
+        headers: body === undefined ? undefined : jsonHeaders(),
         body,
       }),
       path,
-      traceProxyOptions(async () => {
-        fetchCalled = true;
-        return Response.json({});
-      }, { validateDashboardSession: async () => false }),
+      traceProxyOptions(
+        async () => {
+          fetchCalled = true;
+          return Response.json({});
+        },
+        { validateDashboardSession: async () => false },
+      ),
     );
     assert.equal(response.status, 401, `${method} ${path}`);
     assert.deepEqual(await response.json(), { error: "Unauthorized" });
     assert.equal(fetchCalled, false, `${method} ${path}`);
   }
+}
+
+async function testUnauthenticatedAllowedRouteHidesMissingBaseUrl(proxy) {
+  let fetchCalled = false;
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/events/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }),
+    "/v1/events/query",
+    traceProxyOptions(
+      async () => {
+        fetchCalled = true;
+        return Response.json({});
+      },
+      {
+        baseUrl: null,
+        validateDashboardSession: async () => false,
+      },
+    ),
+  );
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: "Unauthorized" });
+  assert.equal(fetchCalled, false);
+}
+
+async function testUnauthenticatedRouteDoesNotInspectUnsafeProjectConfig(
+  proxy,
+) {
+  let fetchCalled = false;
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/projects/forged/categories",
+      { method: "GET" },
+    ),
+    "/v1/projects/forged/categories",
+    proxyOptions(
+      async () => {
+        fetchCalled = true;
+        return Response.json({});
+      },
+      {
+        baseUrl: null,
+        configuredProjectId: "\ud800",
+        validateDashboardSession: async () => false,
+      },
+    ),
+  );
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: "Unauthorized" });
+  assert.equal(fetchCalled, false);
+}
+
+async function testUnsupportedRouteWinsBeforeAuthAndConfiguration(proxy) {
+  let sessionValidated = false;
+  let fetchCalled = false;
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/events", {
+      method: "GET",
+    }),
+    "/v1/events",
+    traceProxyOptions(
+      async () => {
+        fetchCalled = true;
+        return Response.json({});
+      },
+      {
+        baseUrl: null,
+        validateDashboardSession: async () => {
+          sessionValidated = true;
+          return false;
+        },
+      },
+    ),
+  );
+
+  assert.equal(response.status, 403);
+  assert.deepEqual(await response.json(), {
+    error: "Sidecar route is not allowed",
+  });
+  assert.equal(sessionValidated, false);
+  assert.equal(fetchCalled, false);
+}
+
+async function testScopedJsonRoutesRequireJsonMediaType(proxy) {
+  const requests = [
+    ["POST", "/v1/events/query"],
+    ["POST", "/v1/memories/query"],
+    ["PATCH", "/v1/memories/memory-one"],
+    ["POST", "/v1/exports"],
+  ];
+  for (const [method, path] of requests) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request(`http://dashboard.local/api/sidecar${path}`, {
+        method,
+        headers: { "Content-Type": "text/plain" },
+        body: "{}",
+      }),
+      path,
+      traceProxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+
+    assert.equal(response.status, 415, `${method} ${path}`);
+    assert.deepEqual(await response.json(), {
+      error: "Content-Type must be application/json",
+    });
+    assert.equal(fetchCalled, false, `${method} ${path}`);
+  }
+}
+
+async function testEventQueryRejectsInvalidJsonAndArrayBodies(proxy) {
+  for (const body of ["{not-json", "[]"]) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request("http://dashboard.local/api/sidecar/v1/events/query", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body,
+      }),
+      "/v1/events/query",
+      traceProxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+
+    assert.equal(response.status, 400, body);
+    assert.deepEqual(await response.json(), { error: "Invalid JSON body" });
+    assert.equal(fetchCalled, false, body);
+  }
+}
+
+async function testAuthDisabledEventQueryRejectsDeclaredOversizedJson(proxy) {
+  let fetchCalled = false;
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/events/query", {
+      method: "POST",
+      headers: jsonHeaders({ "Content-Length": "65537" }),
+      body: "{}",
+    }),
+    "/v1/events/query",
+    traceProxyOptions(
+      async () => {
+        fetchCalled = true;
+        return Response.json({});
+      },
+      { validateDashboardSession: async () => true },
+    ),
+  );
+
+  assert.equal(response.status, 413);
+  assert.deepEqual(await response.json(), { error: "JSON body is too large" });
+  assert.equal(fetchCalled, false);
+}
+
+async function testAuthDisabledEventQueryRejectsStreamedOversizedJson(proxy) {
+  let fetchCalled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(40_000));
+      controller.enqueue(new Uint8Array(40_000));
+    },
+    cancel() {
+      throw new Error("hostile stream refused cancellation");
+    },
+  });
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/events/query", {
+      method: "POST",
+      headers: jsonHeaders(),
+      body,
+      duplex: "half",
+    }),
+    "/v1/events/query",
+    traceProxyOptions(
+      async () => {
+        fetchCalled = true;
+        return Response.json({});
+      },
+      { validateDashboardSession: async () => true },
+    ),
+  );
+
+  assert.equal(response.status, 413);
+  assert.deepEqual(await response.json(), { error: "JSON body is too large" });
+  assert.equal(fetchCalled, false);
+}
+
+async function testEventQueryRejectsInvalidUtf8Json(proxy) {
+  let fetchCalled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array([0xff]));
+      controller.close();
+    },
+  });
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/events/query", {
+      method: "POST",
+      headers: jsonHeaders(),
+      body,
+      duplex: "half",
+    }),
+    "/v1/events/query",
+    traceProxyOptions(async () => {
+      fetchCalled = true;
+      return Response.json({});
+    }),
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid JSON body" });
+  assert.equal(fetchCalled, false);
 }
 
 async function testMemoryQueryForcesRuntimeScopeAndPreservesQuery(proxy) {
@@ -248,9 +477,7 @@ async function testMemoryQueryForcesRuntimeScopeAndPreservesQuery(proxy) {
     project_id: "forged-body-project",
     app_id: "forged-body-app",
     match: "all",
-    filters: [
-      { field: "user_id", operator: "equals", value: "alice" },
-    ],
+    filters: [{ field: "user_id", operator: "equals", value: "alice" }],
     date_range: { from: null, to: null },
     page: 2,
     page_size: 20,
@@ -261,7 +488,7 @@ async function testMemoryQueryForcesRuntimeScopeAndPreservesQuery(proxy) {
       "http://dashboard.local/api/sidecar/v1/memories/query?project_id=forged-query-project&app_id=forged-query-app&trace=query",
       {
         method: "POST",
-        headers: { "X-Request-ID": "memory-query-123" },
+        headers: jsonHeaders({ "X-Request-ID": "memory-query-123" }),
         body: JSON.stringify(payload),
       },
     ),
@@ -274,10 +501,7 @@ async function testMemoryQueryForcesRuntimeScopeAndPreservesQuery(proxy) {
 
   assert.equal(response.status, 200);
   assert.equal(calls.length, 1);
-  assert.equal(
-    calls[0].url,
-    "http://sidecar.internal/v1/memories/query",
-  );
+  assert.equal(calls[0].url, "http://sidecar.internal/v1/memories/query");
   assert.equal(calls[0].init.method, "POST");
   assert.equal(calls[0].init.headers.get("X-Request-ID"), "memory-query-123");
   assert.deepEqual(JSON.parse(calls[0].init.body), {
@@ -298,6 +522,7 @@ async function testMemoryQueryUsesOnlyConfiguredAppScope(proxy) {
       "http://dashboard.local/api/sidecar/v1/memories/query?app_id=forged-query-app",
       {
         method: "POST",
+        headers: jsonHeaders(),
         body: JSON.stringify({ app_id: "forged-body-app", match: "all" }),
       },
     ),
@@ -326,6 +551,7 @@ async function testMemoryQueryRejectsInvalidJson(proxy) {
   const response = await proxy(
     new Request("http://dashboard.local/api/sidecar/v1/memories/query", {
       method: "POST",
+      headers: jsonHeaders(),
       body: "{not-json",
     }),
     "/v1/memories/query",
@@ -345,6 +571,7 @@ async function testMemoryQueryRejectsArrayBody(proxy) {
   const response = await proxy(
     new Request("http://dashboard.local/api/sidecar/v1/memories/query", {
       method: "POST",
+      headers: jsonHeaders(),
       body: "[]",
     }),
     "/v1/memories/query",
@@ -438,7 +665,11 @@ async function testMemoryPatchPreservesFieldsAndForcesRuntimeScope(proxy) {
   const response = await proxy(
     new Request(
       "http://dashboard.local/api/sidecar/v1/memories/memory-one?project_id=forged-query&app_id=forged-query-app",
-      { method: "PATCH", body: JSON.stringify(payload) },
+      {
+        method: "PATCH",
+        headers: jsonHeaders(),
+        body: JSON.stringify(payload),
+      },
     ),
     "/v1/memories/memory-one",
     proxyOptions(
@@ -470,6 +701,7 @@ async function testMemoryPatchRejectsArrayBody(proxy) {
   const response = await proxy(
     new Request("http://dashboard.local/api/sidecar/v1/memories/memory-one", {
       method: "PATCH",
+      headers: jsonHeaders(),
       body: "[]",
     }),
     "/v1/memories/memory-one",
@@ -489,6 +721,7 @@ async function testMemoryPatchRejectsInvalidJson(proxy) {
   const response = await proxy(
     new Request("http://dashboard.local/api/sidecar/v1/memories/memory-one", {
       method: "PATCH",
+      headers: jsonHeaders(),
       body: "{not-json",
     }),
     "/v1/memories/memory-one",
@@ -525,7 +758,9 @@ async function testMemoryDeleteForcesRuntimeScope(proxy) {
   );
 }
 
-async function testMemoryRoutesRejectTraversalDoubleEncodingAndExtraSegments(proxy) {
+async function testMemoryRoutesRejectTraversalDoubleEncodingAndExtraSegments(
+  proxy,
+) {
   const rejected = [
     ["GET", "/v1/memories/.."],
     ["GET", "/v1/memories/%2E%2E"],
@@ -578,6 +813,7 @@ async function testUnauthenticatedMemoryRequestIsRejected(proxy) {
   const response = await proxy(
     new Request("http://dashboard.local/api/sidecar/v1/memories/query", {
       method: "POST",
+      headers: jsonHeaders(),
       body: "{}",
     }),
     "/v1/memories/query",
@@ -623,6 +859,7 @@ async function testRealSidecarEncodedIdRoundTrip(proxy, baseUrl) {
       "http://dashboard.local/api/sidecar/v1/memories/query?app_id=forged&trace=forged",
       {
         method: "POST",
+        headers: jsonHeaders(),
         body: JSON.stringify({ app_id: "forged", page_size: 20 }),
       },
     ),
@@ -784,7 +1021,7 @@ async function testExportPostForcesConfiguredProjectInBodyAndQuery(proxy) {
       "http://dashboard.local/api/sidecar/v1/exports?project_id=forged-query-project&trace=export",
       {
         method: "POST",
-        headers: { "X-Request-ID": "export-create-123" },
+        headers: jsonHeaders({ "X-Request-ID": "export-create-123" }),
         body: JSON.stringify(payload),
       },
     ),
@@ -803,10 +1040,7 @@ async function testExportPostForcesConfiguredProjectInBodyAndQuery(proxy) {
   );
   assert.equal(calls[0].init.method, "POST");
   assert.equal(calls[0].init.headers.get("Content-Type"), "application/json");
-  assert.equal(
-    calls[0].init.headers.get("X-Request-ID"),
-    "export-create-123",
-  );
+  assert.equal(calls[0].init.headers.get("X-Request-ID"), "export-create-123");
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     filters: payload.filters,
     format: payload.format,
@@ -858,9 +1092,21 @@ async function main() {
     proxySidecarRequest,
   );
   await testUnauthenticatedEventRequestsAreRejected(proxySidecarRequest);
-  await testMemoryQueryForcesRuntimeScopeAndPreservesQuery(
+  await testUnauthenticatedAllowedRouteHidesMissingBaseUrl(proxySidecarRequest);
+  await testUnauthenticatedRouteDoesNotInspectUnsafeProjectConfig(
     proxySidecarRequest,
   );
+  await testUnsupportedRouteWinsBeforeAuthAndConfiguration(proxySidecarRequest);
+  await testScopedJsonRoutesRequireJsonMediaType(proxySidecarRequest);
+  await testEventQueryRejectsInvalidJsonAndArrayBodies(proxySidecarRequest);
+  await testAuthDisabledEventQueryRejectsDeclaredOversizedJson(
+    proxySidecarRequest,
+  );
+  await testAuthDisabledEventQueryRejectsStreamedOversizedJson(
+    proxySidecarRequest,
+  );
+  await testEventQueryRejectsInvalidUtf8Json(proxySidecarRequest);
+  await testMemoryQueryForcesRuntimeScopeAndPreservesQuery(proxySidecarRequest);
   await testMemoryQueryUsesOnlyConfiguredAppScope(proxySidecarRequest);
   await testMemoryQueryRejectsInvalidJson(proxySidecarRequest);
   await testMemoryQueryRejectsArrayBody(proxySidecarRequest);
@@ -880,9 +1126,7 @@ async function main() {
   );
   await testUnauthenticatedMemoryRequestIsRejected(proxySidecarRequest);
   await testUpstreamFailureDoesNotLeakInternalDetails(proxySidecarRequest);
-  await testCategoryCollectionPostForcesConfiguredProject(
-    proxySidecarRequest,
-  );
+  await testCategoryCollectionPostForcesConfiguredProject(proxySidecarRequest);
   await testPatchRewritesProjectEncodesCategoryAndForwardsBody(
     proxySidecarRequest,
   );
@@ -893,7 +1137,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 27 contracts passed");
+  console.log("sidecar proxy request harness: 35 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(

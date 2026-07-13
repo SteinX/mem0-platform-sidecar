@@ -911,11 +911,13 @@ def test_dashboard_overlay_includes_exact_request_trace_types():
         re.S,
     )
     assert trace is not None
+    compact_trace = re.sub(r"\s+", "", trace.group("body"))
     for field in (
         "id: string;",
         "correlation_id: string | null;",
         "operation: string;",
-        'display_operation: "ADD" | "SEARCH" | "GET ALL";',
+        'display_operation: | "ADD" | "SEARCH" | "GET ALL" | "UPDATE" | '
+        '"DELETE" | "OTHER";',
         'status: "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";',
         'entities: Array<{ type: "user" | "agent" | "app" | "run"; id: string }>;',
         "request: Record<string, unknown>;",
@@ -930,7 +932,7 @@ def test_dashboard_overlay_includes_exact_request_trace_types():
         "result_previews_omitted: number;",
         "result_previews_scan_truncated: boolean;",
     ):
-        assert field in trace.group("body")
+        assert re.sub(r"\s+", "", field) in compact_trace
 
     query = re.search(
         r"export type SidecarTraceQuery\s*=\s*\{(?P<body>.*?)\n\};",
@@ -940,6 +942,7 @@ def test_dashboard_overlay_includes_exact_request_trace_types():
     assert query is not None
     assert re.search(r"^\s*project_id\s*:", query.group("body"), re.M) is None
     assert re.search(r"^\s*app_id\s*:", query.group("body"), re.M) is None
+    compact_query = re.sub(r"\s+", "", query.group("body"))
     for field in (
         'operation: "ADD" | "SEARCH" | "GET_ALL" | null;',
         'statuses: Array<"PENDING" | "RUNNING" | "SUCCEEDED" | '
@@ -951,7 +954,7 @@ def test_dashboard_overlay_includes_exact_request_trace_types():
         "page: number;",
         "page_size: number;",
     ):
-        assert field in query.group("body")
+        assert re.sub(r"\s+", "", field) in compact_query
 
     for field in (
         "timestamp: string;",
@@ -982,7 +985,7 @@ def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "sidecar proxy request harness: 27 contracts passed" in result.stdout
+    assert "sidecar proxy request harness: 35 contracts passed" in result.stdout
 
 
 def test_sidecar_proxy_harness_rejects_stale_applied_target(tmp_path):

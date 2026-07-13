@@ -203,6 +203,40 @@ def test_event_to_trace_dict_uses_bounded_legacy_fallbacks(db_session) -> None:
     assert len(json.dumps(trace).encode()) <= 65_536
 
 
+@pytest.mark.parametrize(
+    ("operation", "display_operation"),
+    [
+        ("memory.add", "ADD"),
+        ("memory.search", "SEARCH"),
+        ("memory.list", "GET ALL"),
+        ("memory.update", "UPDATE"),
+        ("memory.delete", "DELETE"),
+        ("legacy.custom-operation", "OTHER"),
+    ],
+)
+def test_event_to_trace_dict_closes_display_operation_union(
+    db_session,
+    operation: str,
+    display_operation: str,
+) -> None:
+    event = Event(
+        project_id="repo-a",
+        app_id="app-a",
+        operation=operation,
+        status=EventStatus.SUCCEEDED,
+        request_json="{}",
+        response_json="{}",
+        error_json="{}",
+    )
+    db_session.add(event)
+    db_session.flush()
+
+    trace = _trace(event)
+
+    assert trace["operation"] == operation
+    assert trace["display_operation"] == display_operation
+
+
 def test_legacy_event_service_serialization_tolerates_non_object_json(
     db_session,
 ) -> None:

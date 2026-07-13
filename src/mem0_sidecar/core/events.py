@@ -15,6 +15,8 @@ DISPLAY_OPERATION = {
     "memory.add": "ADD",
     "memory.search": "SEARCH",
     "memory.list": "GET ALL",
+    "memory.update": "UPDATE",
+    "memory.delete": "DELETE",
 }
 _MAX_LEGACY_JSON_BYTES = 65_536
 _ENTITY_FIELDS = (
@@ -199,7 +201,7 @@ def event_to_trace_dict(event: Event) -> dict[str, Any]:
         "id": event.id,
         "correlation_id": correlation_id,
         "operation": operation,
-        "display_operation": DISPLAY_OPERATION.get(operation, operation),
+        "display_operation": DISPLAY_OPERATION.get(operation, "OTHER"),
         "status": _event_status(event),
         "entities": _event_entities(event, stored_request),
         "request": _public_request(stored_request),
