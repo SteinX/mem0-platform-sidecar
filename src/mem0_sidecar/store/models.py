@@ -259,9 +259,32 @@ class Event(Base):
 
 class Entity(Base):
     __tablename__ = "entities"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "app_id",
+            "entity_type",
+            "entity_id",
+            name="uq_entities_project_app_type_id",
+        ),
+        Index(
+            "ix_entities_project_app_type_updated",
+            "project_id",
+            "app_id",
+            "entity_type",
+            "updated_at",
+        ),
+        Index(
+            "ix_entities_project_app_last_seen",
+            "project_id",
+            "app_id",
+            "last_seen_at",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    app_id: Mapped[str] = mapped_column(String(256), nullable=False)
     entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(256), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(256))
