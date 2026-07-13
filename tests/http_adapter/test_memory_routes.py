@@ -1,6 +1,7 @@
 import json
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import insert, select
 from sqlalchemy.orm import Session
@@ -142,6 +143,25 @@ def _index_route_memory(
             metadata={"type": "decision"},
         )
         session.commit()
+
+
+def _track_transactions(monkeypatch) -> tuple[list[Session], list[Session]]:
+    commit_calls: list[Session] = []
+    rollback_calls: list[Session] = []
+    original_commit = Session.commit
+    original_rollback = Session.rollback
+
+    def track_commit(session: Session) -> None:
+        commit_calls.append(session)
+        original_commit(session)
+
+    def track_rollback(session: Session) -> None:
+        rollback_calls.append(session)
+        original_rollback(session)
+
+    monkeypatch.setattr(Session, "commit", track_commit)
+    monkeypatch.setattr(Session, "rollback", track_rollback)
+    return commit_calls, rollback_calls
 
 
 def test_memory_routes_round_trip_with_fake_upstream(tmp_path) -> None:
@@ -1038,14 +1058,7 @@ def test_patch_memory_commits_success(tmp_path, monkeypatch) -> None:
         mem0_client=mem0,
     )
     _index_route_memory(app, "mem-1")
-    commit_calls: list[Session] = []
-    original_commit = Session.commit
-
-    def track_commit(session: Session) -> None:
-        commit_calls.append(session)
-        original_commit(session)
-
-    monkeypatch.setattr(Session, "commit", track_commit)
+    commit_calls, rollback_calls = _track_transactions(monkeypatch)
 
     response = TestClient(app).patch(
         "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
@@ -1056,6 +1069,7 @@ def test_patch_memory_commits_success(tmp_path, monkeypatch) -> None:
     assert response.json()["memory"]["memory"] == "after"
     assert mem0.update_calls == [("mem-1", {"text": "after"})]
     assert len(commit_calls) == 1
+    assert rollback_calls == []
     with app.state.session_factory() as session:
         event = session.scalar(
             select(Event).where(
@@ -1080,14 +1094,7 @@ def test_patch_memory_rolls_back_and_maps_validation_to_422(
         mem0_client=ExplorerRouteMem0Client(),
     )
     _index_route_memory(app, "mem-1")
-    rollback_calls: list[Session] = []
-    original_rollback = Session.rollback
-
-    def track_rollback(session: Session) -> None:
-        rollback_calls.append(session)
-        original_rollback(session)
-
-    monkeypatch.setattr(Session, "rollback", track_rollback)
+    commit_calls, rollback_calls = _track_transactions(monkeypatch)
 
     response = TestClient(app).patch(
         "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
@@ -1096,7 +1103,19 @@ def test_patch_memory_rolls_back_and_maps_validation_to_422(
 
     assert response.status_code == 422
     assert "Unsupported memory update fields" in response.json()["detail"]
+    assert commit_calls == []
     assert len(rollback_calls) == 1
+    with app.state.session_factory() as session:
+        events = session.scalars(
+            select(Event).where(Event.project_id == "repo-a")
+        ).all()
+        projection = MemoryIndexRepository(session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="mem-1",
+            app_id="app-a",
+        )
+    assert events == []
+    assert projection is not None and projection.deleted_at is None
 
 
 def test_patch_memory_wrong_app_is_404_without_upstream_access(tmp_path) -> None:
@@ -1138,14 +1157,7 @@ def test_patch_memory_rolls_back_unexpected_failure(tmp_path, monkeypatch) -> No
         mem0_client=mem0,
     )
     _index_route_memory(app, "mem-1")
-    rollback_calls: list[Session] = []
-    original_rollback = Session.rollback
-
-    def track_rollback(session: Session) -> None:
-        rollback_calls.append(session)
-        original_rollback(session)
-
-    monkeypatch.setattr(Session, "rollback", track_rollback)
+    commit_calls, rollback_calls = _track_transactions(monkeypatch)
 
     response = TestClient(app, raise_server_exceptions=False).patch(
         "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
@@ -1153,7 +1165,105 @@ def test_patch_memory_rolls_back_unexpected_failure(tmp_path, monkeypatch) -> No
     )
 
     assert response.status_code == 500
+    assert len(commit_calls) == 1
     assert len(rollback_calls) == 1
+    with app.state.session_factory() as session:
+        event = session.scalar(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.update",
+                Event.status == EventStatus.FAILED,
+            )
+        )
+        projection = MemoryIndexRepository(session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="mem-1",
+            app_id="app-a",
+        )
+    assert event is not None
+    assert projection is not None and projection.deleted_at is None
+
+
+def test_patch_memory_persists_failed_event_and_stale_marker_on_upstream_404(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    mem0 = ExplorerRouteMem0Client(
+        {"mem-1": {"id": "mem-1", "memory": "before"}}
+    )
+    mem0.update_error = Mem0UpstreamError(
+        method="PUT",
+        path="/memories/mem-1",
+        status_code=404,
+        message="missing",
+    )
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+    commit_calls, rollback_calls = _track_transactions(monkeypatch)
+
+    response = TestClient(app).patch(
+        "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
+        json={"text": "after"},
+    )
+
+    assert response.status_code == 404
+    assert len(commit_calls) == 1
+    assert len(rollback_calls) == 1
+    with app.state.session_factory() as session:
+        event = session.scalar(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.update",
+                Event.status == EventStatus.FAILED,
+            )
+        )
+        stale = MemoryIndexRepository(session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="mem-1",
+            include_deleted=True,
+        )
+    assert event is not None
+    assert stale is not None and stale.deleted_at is not None
+
+
+def test_patch_memory_refresh_protocol_error_is_500_and_persists_audit(
+    tmp_path,
+) -> None:
+    mem0 = ExplorerRouteMem0Client(
+        {"mem-1": {"id": "different-id", "memory": "before"}}
+    )
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+
+    response = TestClient(app, raise_server_exceptions=False).patch(
+        "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
+        json={"text": "after"},
+    )
+
+    assert response.status_code == 500
+    with app.state.session_factory() as session:
+        event = session.scalar(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.update",
+                Event.status == EventStatus.FAILED,
+            )
+        )
+    assert event is not None
 
 
 def test_memory_history_wrong_app_is_404_without_upstream_access(tmp_path) -> None:
@@ -1197,6 +1307,57 @@ def test_memory_history_returns_scoped_results(tmp_path) -> None:
     assert response.status_code == 200
     assert response.json() == {"results": [{"event": "UPDATE"}]}
     assert mem0.history_calls == ["mem-1"]
+
+
+def test_memory_history_protocol_error_is_500(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    mem0.history_response = {"unexpected": []}
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/v1/memories/mem-1/history?project_id=repo-a&app_id=app-a"
+    )
+
+    assert response.status_code == 500
+
+
+@pytest.mark.parametrize(
+    "list_response",
+    [
+        {},
+        {"results": [], "total": "unknown"},
+        {"results": [{"memory": "missing id"}]},
+    ],
+)
+def test_reconcile_protocol_errors_are_500(
+    tmp_path,
+    list_response: dict[str, Any],
+) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    mem0.list_response = list_response
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/v1/projects/repo-a/memories/reconcile",
+        json={"project_id": "repo-a", "app_id": "app-a"},
+    )
+
+    assert response.status_code == 500
 
 
 def test_reconcile_rejects_path_project_mismatch_without_upstream_access(
