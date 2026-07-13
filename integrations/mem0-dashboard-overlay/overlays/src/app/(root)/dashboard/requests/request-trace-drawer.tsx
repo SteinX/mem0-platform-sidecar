@@ -27,11 +27,13 @@ import {
 type RequestTraceDrawerProps = {
   requestId: string | null;
   onRequestIdChange: (requestId: string | null) => void;
+  onRestoreFocus: () => void;
 };
 
 export function RequestTraceDrawer({
   requestId,
   onRequestIdChange,
+  onRestoreFocus,
 }: RequestTraceDrawerProps) {
   const [detail, setDetail] = useState<SidecarTrace | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -179,6 +181,10 @@ export function RequestTraceDrawer({
       <SheetContent
         side="right"
         className="flex w-full max-w-full flex-col gap-0 overflow-x-hidden p-0 sm:max-w-2xl"
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          onRestoreFocus();
+        }}
       >
         <SheetHeader className="border-b border-memBorder-primary px-5 py-4 pr-12 text-left">
           <div className="flex min-w-0 flex-wrap items-center gap-2">

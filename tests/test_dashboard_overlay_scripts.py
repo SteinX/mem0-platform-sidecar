@@ -522,7 +522,7 @@ def test_dashboard_overlay_includes_request_trace_page_and_drawer_contracts():
         "md:hidden",
         "aria-disabled",
         "<TraceEventButton",
-        "onOpen={() => setDrawerRequestId(row.id)}",
+        "onOpen={(opener) => openRequestTrace(row.id, opener)}",
         "event.stopPropagation()",
         "Open request ${trace.id}",
     ):
@@ -600,6 +600,46 @@ def test_request_trace_state_harness_executes_applied_target(tmp_path):
     assert "request trace state harness: 5 contract groups passed" in result.stdout
 
 
+def test_request_trace_focus_restoration_contracts():
+    page = (
+        OVERLAY
+        / "overlays/src/app/(root)/dashboard/requests/page.tsx"
+    ).read_text()
+    drawer = (
+        OVERLAY
+        / "overlays/src/app/(root)/dashboard/requests/request-trace-drawer.tsx"
+    ).read_text()
+
+    for contract in (
+        "const pageHeadingRef = useRef<HTMLHeadingElement>(null)",
+        "const requestOpenerRef = useRef<HTMLElement | null>(null)",
+        "const openerRequestIdRef = useRef<string | null>(null)",
+        "openerRequestIdRef.current !== requestId",
+        "requestOpenerRef.current = null",
+        "onOpen={(opener) => openRequestTrace(row.id, opener)}",
+        "openRequestTrace(row.id, null)",
+        "openRequestTrace(trace.id, event.currentTarget)",
+        "const opener = requestOpenerRef.current",
+        "opener?.isConnected",
+        "pageHeadingRef.current",
+        "if (!mountedRef.current)",
+        "target?.isConnected",
+        "target.focus()",
+        "ref={pageHeadingRef}",
+        "tabIndex={-1}",
+        "onRestoreFocus={restoreRequestFocus}",
+    ):
+        assert contract in page
+
+    for contract in (
+        "onRestoreFocus: () => void",
+        "onCloseAutoFocus={(event) =>",
+        "event.preventDefault();",
+        "onRestoreFocus();",
+    ):
+        assert contract in drawer
+
+
 def test_dashboard_overlay_verifier_runs_request_trace_state_contracts():
     verifier = runpy.run_path(str(VERIFY_DASHBOARD_OVERLAY))
     dashboard = Path("/tmp/upstream-dashboard")
@@ -661,6 +701,18 @@ def test_request_trace_verifier_rejects_missing_runtime_wiring(tmp_path):
             "<EntityBadges",
             "<MissingEntityBadges",
             "Request drawer must render shared entity badges",
+        ),
+        (
+            "src/app/(root)/dashboard/requests/page.tsx",
+            "onRestoreFocus={restoreRequestFocus}",
+            "onRestoreFocus={missingRestoreRequestFocus}",
+            "Requests page must pass focus restoration to the drawer",
+        ),
+        (
+            "src/app/(root)/dashboard/requests/request-trace-drawer.tsx",
+            "onCloseAutoFocus={(event) =>",
+            "onMissingCloseAutoFocus={(event) =>",
+            "Request drawer must restore focus on close",
         ),
     ],
 )

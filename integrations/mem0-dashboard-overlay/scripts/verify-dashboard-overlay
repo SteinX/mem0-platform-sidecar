@@ -1211,12 +1211,44 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
             "Requests table must expose a keyboard-accessible row action",
         ),
         (
-            "onOpen={() => setDrawerRequestId(row.id)}",
-            "Requests table row action must open the trace drawer",
+            "onOpen={(opener) => openRequestTrace(row.id, opener)}",
+            "Requests desktop action must capture its focus opener",
         ),
         (
             "event.stopPropagation()",
             "Requests table row action must safely stop row propagation",
+        ),
+        (
+            "openRequestTrace(trace.id, event.currentTarget)",
+            "Requests mobile action must capture its focus opener",
+        ),
+        (
+            "openRequestTrace(row.id, null)",
+            "Requests pointer row action must use the focus fallback",
+        ),
+        (
+            "opener?.isConnected",
+            "Requests focus restoration must reject disconnected openers",
+        ),
+        (
+            "pageHeadingRef.current",
+            "Requests focus restoration must fall back to the page heading",
+        ),
+        (
+            "if (!mountedRef.current)",
+            "Requests focus restoration must reject work after unmount",
+        ),
+        (
+            "ref={pageHeadingRef}",
+            "Requests page heading must expose a stable focus target",
+        ),
+        (
+            "tabIndex={-1}",
+            "Requests page heading must be programmatically focusable",
+        ),
+        (
+            "onRestoreFocus={restoreRequestFocus}",
+            "Requests page must pass focus restoration to the drawer",
         ),
     ):
         if contract not in page_content:
@@ -1272,6 +1304,18 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
         (
             "canApplyTraceDetailRequest(\n        copyTarget,",
             "Request drawer copy completion must reject stale generations",
+        ),
+        (
+            "onCloseAutoFocus={(event) =>",
+            "Request drawer must restore focus on close",
+        ),
+        (
+            "event.preventDefault();",
+            "Request drawer must override the missing-trigger focus default",
+        ),
+        (
+            "onRestoreFocus();",
+            "Request drawer must invoke the page focus restoration callback",
         ),
     ):
         if contract not in drawer_content:

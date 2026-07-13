@@ -107,6 +107,9 @@ export default function RequestsPage() {
   const requestGeneration = useRef(0);
   const pageDataRef = useRef<SidecarTracePage | null>(null);
   const mountedRef = useRef(true);
+  const pageHeadingRef = useRef<HTMLHeadingElement>(null);
+  const requestOpenerRef = useRef<HTMLElement | null>(null);
+  const openerRequestIdRef = useRef<string | null>(null);
 
   const requestId = normalizeRequestId(searchParams.get("requestId"));
 
@@ -114,11 +117,20 @@ export default function RequestsPage() {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      requestOpenerRef.current = null;
+      openerRequestIdRef.current = null;
       requestGeneration.current = nextTraceRequestGeneration(
         requestGeneration.current,
       );
     };
   }, []);
+
+  useEffect(() => {
+    if (requestId !== null && openerRequestIdRef.current !== requestId) {
+      requestOpenerRef.current = null;
+      openerRequestIdRef.current = null;
+    }
+  }, [requestId]);
 
   useEffect(() => {
     const currentParams = new URLSearchParams(search);
@@ -282,6 +294,28 @@ export default function RequestsPage() {
     [replaceParams, search],
   );
 
+  const openRequestTrace = useCallback(
+    (id: string, opener: HTMLElement | null) => {
+      requestOpenerRef.current = opener?.isConnected ? opener : null;
+      openerRequestIdRef.current = id;
+      setDrawerRequestId(id);
+    },
+    [setDrawerRequestId],
+  );
+
+  const restoreRequestFocus = useCallback(() => {
+    if (!mountedRef.current) {
+      return;
+    }
+    const opener = requestOpenerRef.current;
+    requestOpenerRef.current = null;
+    openerRequestIdRef.current = null;
+    const target = opener?.isConnected ? opener : pageHeadingRef.current;
+    if (target?.isConnected) {
+      target.focus();
+    }
+  }, []);
+
   const columns = useMemo<TraceColumn[]>(
     () => [
       {
@@ -317,7 +351,7 @@ export default function RequestsPage() {
         render: (_value, row) => (
           <TraceEventButton
             trace={row}
-            onOpen={() => setDrawerRequestId(row.id)}
+            onOpen={(opener) => openRequestTrace(row.id, opener)}
           />
         ),
       },
@@ -334,7 +368,7 @@ export default function RequestsPage() {
         render: (_value, row) => <StatusBadge status={row.status} />,
       },
     ],
-    [addIdentityFilter, setDrawerRequestId],
+    [addIdentityFilter, openRequestTrace],
   );
 
   const rows = pageData?.results ?? [];
@@ -347,7 +381,13 @@ export default function RequestsPage() {
     <div className="min-w-0 space-y-5">
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 space-y-1">
-          <h1 className="font-fustat text-xl font-semibold">Requests</h1>
+          <h1
+            ref={pageHeadingRef}
+            tabIndex={-1}
+            className="font-fustat text-xl font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Requests
+          </h1>
           <p className="break-words text-sm text-onSurface-default-secondary">
             Inspect scoped memory operations, latency, results, and sanitized
             payloads.
@@ -503,7 +543,7 @@ export default function RequestsPage() {
               data={rows}
               columns={columns}
               getRowKey={(row) => row.id}
-              onRowClick={(row) => setDrawerRequestId(row.id)}
+              onRowClick={(row) => openRequestTrace(row.id, null)}
             />
           </div>
           <div className="space-y-2 md:hidden">
@@ -512,7 +552,9 @@ export default function RequestsPage() {
                 key={trace.id}
                 type="button"
                 className="w-full min-w-0 space-y-3 rounded-md border border-memBorder-primary p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                onClick={() => setDrawerRequestId(trace.id)}
+                onClick={(event) =>
+                  openRequestTrace(trace.id, event.currentTarget)
+                }
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex flex-wrap items-center gap-2">
@@ -577,6 +619,7 @@ export default function RequestsPage() {
       <RequestTraceDrawer
         requestId={requestId}
         onRequestIdChange={setDrawerRequestId}
+        onRestoreFocus={restoreRequestFocus}
       />
     </div>
   );
@@ -658,7 +701,7 @@ function TraceEventButton({
   onOpen,
 }: {
   trace: SidecarTrace;
-  onOpen: () => void;
+  onOpen: (opener: HTMLButtonElement) => void;
 }) {
   const label = traceEventLabel(trace);
   return (
@@ -669,7 +712,7 @@ function TraceEventButton({
       aria-label={`Open request ${trace.id}: ${label}`}
       onClick={(event) => {
         event.stopPropagation();
-        onOpen();
+        onOpen(event.currentTarget);
       }}
     >
       {label}
