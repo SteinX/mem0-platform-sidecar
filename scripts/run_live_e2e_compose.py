@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = ROOT / "docker" / "docker-compose.e2e.yml"
@@ -71,13 +72,17 @@ def compose_up_command(project_name: str) -> list[str]:
     ]
 
 
-def compose_run_command(project_name: str) -> list[str]:
+def compose_run_command(
+    project_name: str,
+    *,
+    service_name: str = "e2e-runner",
+) -> list[str]:
     return [
         *compose_command(project_name),
         "run",
         "--rm",
         "--no-deps",
-        "e2e-runner",
+        service_name,
     ]
 
 
@@ -86,6 +91,7 @@ def compose_build_runner_command(project_name: str) -> list[str]:
         *compose_command(project_name),
         "build",
         "e2e-runner",
+        "e2e-adoption-runner",
     ]
 
 
@@ -98,6 +104,83 @@ def compose_down_command(project_name: str) -> list[str]:
         "--rmi",
         "local",
     ]
+
+
+def compose_cleanup_check_command(project_name: str) -> list[str]:
+    return [
+        *compose_command(project_name),
+        "ps",
+        "--all",
+        "--quiet",
+    ]
+
+
+def compose_cleanup_resource_commands(
+    project_name: str,
+) -> dict[str, list[str]]:
+    project_label = f"label=com.docker.compose.project={project_name}"
+    return {
+        "containers": [
+            "docker",
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            project_label,
+        ],
+        "networks": [
+            "docker",
+            "network",
+            "ls",
+            "--quiet",
+            "--filter",
+            project_label,
+        ],
+        "volumes": [
+            "docker",
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            project_label,
+        ],
+        "images": [
+            "docker",
+            "image",
+            "ls",
+            "--quiet",
+            "--filter",
+            f"reference={project_name}-*",
+        ],
+    }
+
+
+def verify_compose_cleanup(project_name: str, *, env: dict[str, str]) -> None:
+    remaining: list[str] = []
+    for resource_type, command in compose_cleanup_resource_commands(
+        project_name
+    ).items():
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            diagnostic = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(
+                "Could not verify Compose cleanup for "
+                f"{resource_type}: {diagnostic or result.returncode}"
+            )
+        if resource_ids := result.stdout.strip():
+            remaining.append(f"{resource_type}={resource_ids}")
+    if remaining:
+        raise RuntimeError(
+            "Compose cleanup completed but project resources remain: "
+            + "; ".join(remaining)
+        )
 
 
 def wait_for_mem0_ready(
@@ -156,6 +239,7 @@ def dump_diagnostics(base_compose: list[str], *, env: dict[str, str]) -> None:
             "postgres",
             "openai-stub",
             "e2e-runner",
+            "e2e-adoption-runner",
         ],
         cwd=ROOT,
         env=env,
@@ -164,10 +248,14 @@ def dump_diagnostics(base_compose: list[str], *, env: dict[str, str]) -> None:
 
 
 def main() -> int:
-    project_id = os.environ.get("MEM0_E2E_PROJECT_ID", DEFAULT_PROJECT_ID)
+    unique_suffix = f"{os.getpid()}-{uuid4().hex[:8]}"
+    project_id = os.environ.get(
+        "MEM0_E2E_PROJECT_ID",
+        f"{DEFAULT_PROJECT_ID}-{unique_suffix}",
+    )
     project_name = os.environ.get(
         "MEM0_E2E_COMPOSE_PROJECT",
-        f"mem0-sidecar-e2e-{os.getpid()}",
+        f"mem0-sidecar-e2e-{unique_suffix}",
     )
     timeout_seconds = int(os.environ.get("MEM0_E2E_STARTUP_TIMEOUT", "180"))
     compose_env = os.environ.copy()
@@ -189,16 +277,42 @@ def main() -> int:
             compose_run_command(project_name),
             env=build_runner_env(project_id=project_id),
         )
+        run(
+            compose_run_command(
+                project_name,
+                service_name="e2e-adoption-runner",
+            ),
+            env=build_runner_env(project_id=project_id),
+        )
     except Exception:
         dump_diagnostics(base_compose, env=compose_env)
         raise
     finally:
-        subprocess.run(
+        active_exception = sys.exc_info()[0] is not None
+        cleanup_result = subprocess.run(
             compose_down_command(project_name),
             cwd=ROOT,
             env=compose_env,
+            capture_output=True,
+            text=True,
             check=False,
         )
+        if cleanup_result.returncode != 0:
+            diagnostic = (
+                cleanup_result.stderr.strip()
+                or cleanup_result.stdout.strip()
+                or str(cleanup_result.returncode)
+            )
+            print(f"Compose cleanup failed: {diagnostic}", file=sys.stderr)
+            if not active_exception:
+                raise RuntimeError(f"Compose cleanup failed: {diagnostic}")
+        else:
+            try:
+                verify_compose_cleanup(project_name, env=compose_env)
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                if not active_exception:
+                    raise
 
     return 0
 

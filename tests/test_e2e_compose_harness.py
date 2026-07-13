@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+import scripts.run_live_e2e_compose as compose_runner
 from scripts.run_live_e2e_compose import (
     build_runner_env,
     compose_build_runner_command,
@@ -66,11 +69,29 @@ def test_compose_run_command_executes_pytest_inside_compose_network() -> None:
     assert "--build" not in command
 
 
-def test_compose_build_runner_command_builds_only_runner() -> None:
+def test_compose_run_command_can_select_dedicated_adoption_runner() -> None:
+    command = compose_run_command(
+        "sidecar-e2e-test",
+        service_name="e2e-adoption-runner",
+    )
+
+    assert command[-4:] == [
+        "run",
+        "--rm",
+        "--no-deps",
+        "e2e-adoption-runner",
+    ]
+
+
+def test_compose_build_runner_command_builds_both_isolated_runners() -> None:
     command = compose_build_runner_command("sidecar-e2e-test")
 
     assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
-    assert command[-2:] == ["build", "e2e-runner"]
+    assert command[-3:] == [
+        "build",
+        "e2e-runner",
+        "e2e-adoption-runner",
+    ]
 
 
 def test_compose_down_command_removes_local_test_images() -> None:
@@ -80,6 +101,73 @@ def test_compose_down_command_removes_local_test_images() -> None:
     assert command[-5:] == ["down", "-v", "--remove-orphans", "--rmi", "local"]
 
 
+def test_compose_cleanup_check_lists_remaining_project_resources() -> None:
+    command = compose_runner.compose_cleanup_check_command("sidecar-e2e-test")
+
+    assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
+    assert command[-3:] == ["ps", "--all", "--quiet"]
+
+
+def test_compose_cleanup_checks_project_containers_networks_volumes_and_images():
+    commands = compose_runner.compose_cleanup_resource_commands(
+        "sidecar-e2e-test"
+    )
+
+    assert commands == {
+        "containers": [
+            "docker",
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            "label=com.docker.compose.project=sidecar-e2e-test",
+        ],
+        "networks": [
+            "docker",
+            "network",
+            "ls",
+            "--quiet",
+            "--filter",
+            "label=com.docker.compose.project=sidecar-e2e-test",
+        ],
+        "volumes": [
+            "docker",
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            "label=com.docker.compose.project=sidecar-e2e-test",
+        ],
+        "images": [
+            "docker",
+            "image",
+            "ls",
+            "--quiet",
+            "--filter",
+            "reference=sidecar-e2e-test-*",
+        ],
+    }
+
+
+def test_verify_compose_cleanup_rejects_remaining_resources(monkeypatch) -> None:
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: compose_runner.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="container-id\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="resources remain"):
+        compose_runner.verify_compose_cleanup(
+            "sidecar-e2e-test",
+            env={},
+        )
+
+
 def test_e2e_postgres_healthcheck_waits_for_final_server() -> None:
     compose_file = ROOT / "docker" / "docker-compose.e2e.yml"
 
@@ -87,3 +175,101 @@ def test_e2e_postgres_healthcheck_waits_for_final_server() -> None:
 
     assert "cat /proc/1/comm" in content
     assert "pg_isready -q -d postgres -U postgres" in content
+
+
+def test_e2e_compose_keeps_unscoped_adoption_gate_on_dedicated_runner() -> None:
+    compose_file = ROOT / "docker" / "docker-compose.e2e.yml"
+    content = compose_file.read_text()
+    default_start = content.index("  e2e-runner:")
+    adoption_start = content.index("  e2e-adoption-runner:")
+    volumes_start = content.index("\nvolumes:")
+    default_runner = content[default_start:adoption_start]
+    adoption_runner = content[adoption_start:volumes_start]
+
+    assert "MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED" not in default_runner
+    assert 'MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED: "true"' in adoption_runner
+    assert 'MEM0_E2E_ADOPTION_ENABLED: "true"' in adoption_runner
+    assert "MEM0_E2E_PROJECT_ID:" in adoption_runner
+    assert '"not adoption_e2e"' in default_runner
+    assert '"adoption_e2e"' in adoption_runner
+    assert 'MEM0_OSS_LIST_FETCH_LIMIT: "5000"' in content
+
+
+def test_compose_main_runs_default_then_dedicated_adoption_runner(
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
+    monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
+    monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    monkeypatch.setattr(
+        compose_runner,
+        "run",
+        lambda command, *, env: commands.append(command),
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "wait_for_mem0_ready",
+        lambda *args, **kwargs: None,
+    )
+    def fake_subprocess_run(command, **kwargs):
+        commands.append(command)
+        return compose_runner.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(compose_runner.subprocess, "run", fake_subprocess_run)
+
+    assert compose_runner.main() == 0
+    run_services = [
+        command[-1]
+        for command in commands
+        if len(command) >= 4 and command[-4:-1] == ["run", "--rm", "--no-deps"]
+    ]
+    assert run_services == ["e2e-runner", "e2e-adoption-runner"]
+
+
+def test_compose_main_reports_cleanup_failure(monkeypatch) -> None:
+    monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
+    monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
+    monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    monkeypatch.setattr(compose_runner, "run", lambda command, *, env: None)
+    monkeypatch.setattr(
+        compose_runner,
+        "wait_for_mem0_ready",
+        lambda *args, **kwargs: None,
+    )
+
+    def fail_down(command, **kwargs):
+        return compose_runner.subprocess.CompletedProcess(
+            command,
+            1 if "down" in command else 0,
+            stdout="",
+            stderr="cleanup failed" if "down" in command else "",
+        )
+
+    monkeypatch.setattr(compose_runner.subprocess, "run", fail_down)
+
+    with pytest.raises(RuntimeError, match="Compose cleanup failed"):
+        compose_runner.main()
+
+
+def test_e2e_docs_cover_explorer_reconcile_and_cleanup_contracts() -> None:
+    content = (ROOT / "docs" / "e2e.md").read_text()
+
+    for contract in (
+        "add -> query -> detail -> patch -> history -> delete",
+        "entity, category, and date filters",
+        "stale_skipped",
+        "adopt_unscoped",
+        "MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED",
+        "one-project migration",
+        "shared upstream stores",
+        "unique Compose project",
+        "deadline",
+        "cleanup",
+    ):
+        assert contract in content
