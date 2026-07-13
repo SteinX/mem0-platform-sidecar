@@ -221,6 +221,26 @@ function testCredentialErrorsAreFullyRedacted(state) {
       "nonce",
     ],
     [
+      'Authorization: Digest username="Mufasa", realm="testrealm", nonce="abc"; retry',
+      "Authorization=[redacted]; retry",
+      "nonce",
+    ],
+    [
+      'Authorization: Digest username="Mufasa", realm="test,realm", nonce="a,b,c"; retry',
+      "Authorization=[redacted]; retry",
+      "a,b,c",
+    ],
+    [
+      'Proxy-Authorization: Digest username="Mufasa", realm="proxy", nonce="abc"\nretry',
+      "Proxy-Authorization=[redacted] retry",
+      "realm",
+    ],
+    [
+      'Authorization: Digest username="Mufasa", realm="testrealm", nonce="abc", retry without credentials',
+      "Authorization=[redacted], retry without credentials",
+      "nonce",
+    ],
+    [
       "Authorization: Custom account=alpha signature=omega\nnormal response text",
       "Authorization=[redacted] normal response text",
       "signature=omega",
@@ -233,6 +253,16 @@ function testCredentialErrorsAreFullyRedacted(state) {
     assert.equal(sanitized, expected);
     assert.equal(sanitized.includes(leaked), false, input);
   }
+}
+
+function testMalformedLongCredentialInputIsBounded(state) {
+  const input = `Authorization: Digest username="${"x".repeat(100_000)}`;
+  let sanitized;
+  assert.doesNotThrow(() => {
+    sanitized = state.sanitizeExplorerError(input, "fallback");
+  });
+  assert.equal(sanitized, "Authorization=[redacted]");
+  assert.ok(sanitized.length <= 240);
 }
 
 function escapeHtmlText(value) {
@@ -496,10 +526,11 @@ function main() {
   testFieldOperatorAndInEditorsResetCompatibleValues(modules.componentState);
   testRemoveAllAndEntityClickPayloads(modules.componentState);
   testCredentialErrorsAreFullyRedacted(modules.componentState);
+  testMalformedLongCredentialInputIsBounded(modules.componentState);
   testSingleEntityBadgePreservesExactAccessibleId(modules);
   testPassiveLegacyEntityBadgesStayOutOfTabOrder(modules);
   testFailedMemoryIdsRenderExactly(modules);
-  console.log("explorer components harness: 9 contracts passed");
+  console.log("explorer components harness: 10 contracts passed");
 }
 
 try {

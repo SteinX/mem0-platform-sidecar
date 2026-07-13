@@ -744,7 +744,7 @@ def test_explorer_component_harness_runs_entity_regressions(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "explorer components harness: 9 contracts passed" in result.stdout
+    assert "explorer components harness: 10 contracts passed" in result.stdout
 
 
 def test_entity_explorer_verifier_enforces_runtime_contracts(tmp_path):
