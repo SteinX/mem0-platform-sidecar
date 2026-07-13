@@ -35,6 +35,18 @@ def test_live_runner_retains_postgres_migration_and_real_browser_smokes() -> Non
     ]
 
 
+def test_browser_smoke_allows_for_first_compile_on_entity_route() -> None:
+    browser_smoke = (
+        ROOT
+        / "integrations"
+        / "mem0-dashboard-overlay"
+        / "scripts"
+        / "run-browser-smoke.cjs"
+    ).read_text()
+
+    assert 'await waitText("No entities found.", 30000);' in browser_smoke
+
+
 def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
     tmp_path,
 ) -> None:

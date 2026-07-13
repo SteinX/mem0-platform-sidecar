@@ -486,7 +486,7 @@ async function main() {
 
     await setMode("empty");
     await navigate("/dashboard/entities");
-    await waitText("No entities found.");
+    await waitText("No entities found.", 30000);
     check(true, "entity empty state rendered");
     await setMode("normal");
     await clickButton("Refresh");
