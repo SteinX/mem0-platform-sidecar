@@ -327,6 +327,64 @@ function testStrictDateRangesRejectInvalidAndReversedValues(state) {
   );
 }
 
+function testRangeOrderingUsesBackendMicrosecondPrecision(state) {
+  const range = (from, to) => state.readExplorerUrlState(
+    new URLSearchParams({ from, to }),
+  ).date_range;
+
+  assert.deepEqual(
+    range(
+      "2026-07-13T12:00:00.0009Z",
+      "2026-07-13T12:00:00.0001Z",
+    ),
+    { from: null, to: null },
+  );
+  assert.deepEqual(
+    range(
+      "2026-07-13T12:00:00.000900+02:00",
+      "2026-07-13T10:00:00.000900Z",
+    ),
+    {
+      from: "2026-07-13T12:00:00.000900+02:00",
+      to: "2026-07-13T10:00:00.000900Z",
+    },
+  );
+  assert.deepEqual(
+    range(
+      "2026-07-13T12:00:00.000900+02:00",
+      "2026-07-13T10:00:00.000100Z",
+    ),
+    { from: null, to: null },
+  );
+  assert.deepEqual(
+    range(
+      "2026-07-13T12:00:00.0000009Z",
+      "2026-07-13T12:00:00.0000001Z",
+    ),
+    {
+      from: "2026-07-13T12:00:00.0000009Z",
+      to: "2026-07-13T12:00:00.0000001Z",
+    },
+  );
+  assert.deepEqual(
+    range(
+      "2026-07-13T12:00:00.0000019Z",
+      "2026-07-13T12:00:00.0000009Z",
+    ),
+    { from: null, to: null },
+  );
+  assert.deepEqual(
+    range(
+      "0001-01-01T01:00:00.000001+01:00",
+      "0001-01-01T00:00:00.000001Z",
+    ),
+    {
+      from: "0001-01-01T01:00:00.000001+01:00",
+      to: "0001-01-01T00:00:00.000001Z",
+    },
+  );
+}
+
 function testRoundTripRetainsDrawerAndUnknownParamsWithoutChangingPath(state) {
   const url = new URL(
     "https://dashboard.test/dashboard?memoryId=mem%2F42&requestId=req-7"
@@ -380,8 +438,9 @@ function main() {
   testUtcDatePresetsUseInjectedNow(state);
   testMalformedFieldsFallBackIndependently(state);
   testStrictDateRangesRejectInvalidAndReversedValues(state);
+  testRangeOrderingUsesBackendMicrosecondPrecision(state);
   testRoundTripRetainsDrawerAndUnknownParamsWithoutChangingPath(state);
-  console.log("explorer query state harness: 8 contracts passed");
+  console.log("explorer query state harness: 9 contracts passed");
 }
 
 try {

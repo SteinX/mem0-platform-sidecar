@@ -250,7 +250,11 @@ function readPage(raw: string | null): number {
 function readDateRange(searchParams: URLSearchParams): ExplorerDateRange {
   const from = parseIsoDate(searchParams.get("from"));
   const to = parseIsoDate(searchParams.get("to"));
-  if (from !== null && to !== null && from.timestamp > to.timestamp) {
+  if (
+    from !== null
+    && to !== null
+    && from.epochMicroseconds > to.epochMicroseconds
+  ) {
     return { from: null, to: null };
   }
   return {
@@ -261,7 +265,7 @@ function readDateRange(searchParams: URLSearchParams): ExplorerDateRange {
 
 function parseIsoDate(
   raw: string | null,
-): { value: string; timestamp: number } | null {
+): { value: string; epochMicroseconds: bigint } | null {
   if (raw === null) {
     return null;
   }
@@ -293,8 +297,24 @@ function parseIsoDate(
     return null;
   }
 
-  const timestamp = Date.parse(raw);
-  return Number.isFinite(timestamp) ? { value: raw, timestamp } : null;
+  const utcCalendar = new Date(0);
+  utcCalendar.setUTCFullYear(year, month - 1, day);
+  utcCalendar.setUTCHours(hour, minute, second, 0);
+  const calendarMilliseconds = utcCalendar.getTime();
+  if (!Number.isFinite(calendarMilliseconds)) {
+    return null;
+  }
+
+  const fraction = (match[7] ?? "").slice(0, 6).padEnd(6, "0");
+  const offsetSign = BigInt(match[8] === "-" ? -1 : 1);
+  const offsetMicroseconds = offsetSign
+    * BigInt(offsetHour * 60 + offsetMinute)
+    * BigInt(60)
+    * BigInt(1_000_000);
+  const epochMicroseconds = BigInt(calendarMilliseconds) * BigInt(1_000)
+    + BigInt(fraction)
+    - offsetMicroseconds;
+  return { value: raw, epochMicroseconds };
 }
 
 function daysInMonth(year: number, month: number): number {
