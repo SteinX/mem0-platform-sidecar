@@ -11,6 +11,7 @@ from mem0_sidecar.core.explorer_filters import (
     ExplorerFilter,
     parse_explorer_query,
 )
+from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
 from mem0_sidecar.store.models import Entity, Project
@@ -43,7 +44,9 @@ class EntityQuery:
 def _normalize_entity_type(value: object) -> str:
     if type(value) is not str:
         raise ValueError("Unsupported entity type")
-    normalized = value.strip().lower()
+    if value != value.strip():
+        raise ValueError("Unsupported entity type")
+    normalized = value.lower()
     if normalized not in _ENTITY_TYPES:
         raise ValueError("Unsupported entity type")
     return normalized
@@ -53,6 +56,22 @@ def _normalize_type_filter(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return [_normalize_entity_type(item) for item in value]
     return _normalize_entity_type(value)
+
+
+def _portable_id(value: object, *, field_name: str) -> str:
+    normalized = validate_scope_id(value, field_name=field_name)
+    if normalized is None:
+        raise ValueError(f"{field_name} is required")
+    return normalized
+
+
+def _normalize_id_filter(value: object, *, field_name: str) -> object:
+    if isinstance(value, (list, tuple)):
+        return [
+            _portable_id(item, field_name=field_name)
+            for item in value
+        ]
+    return _portable_id(value, field_name=field_name)
 
 
 def parse_entity_query(payload: Mapping[str, object]) -> EntityQuery:
@@ -72,6 +91,17 @@ def parse_entity_query(payload: Mapping[str, object]) -> EntityQuery:
                 normalized_filter = dict(raw_filter)
                 normalized_filter["value"] = _normalize_type_filter(
                     raw_filter.get("value")
+                )
+                filters.append(normalized_filter)
+            elif (
+                isinstance(raw_filter, Mapping)
+                and raw_filter.get("field") in _FILTER_ENTITY_TYPES
+            ):
+                normalized_filter = dict(raw_filter)
+                field_name = raw_filter["field"]
+                normalized_filter["value"] = _normalize_id_filter(
+                    raw_filter.get("value"),
+                    field_name=field_name,
                 )
                 filters.append(normalized_filter)
             else:
@@ -168,20 +198,29 @@ def _filter_predicate(item: ExplorerFilter) -> Any:
     )
 
 
+def _safe_upstream_status_code(exc: Exception) -> int | None:
+    if type(exc) is not Mem0UpstreamError:
+        return None
+    try:
+        status_code = object.__getattribute__(exc, "status_code")
+    except BaseException:
+        return None
+    if type(status_code) is not int or not 100 <= status_code <= 599:
+        return None
+    return status_code
+
+
 def _safe_delete_error(exc: Exception) -> dict[str, Any]:
-    error_type = type(exc).__name__
     safe: dict[str, Any] = {
         "error_type": (
-            error_type[:128]
-            if type(error_type) is str
+            "Mem0UpstreamError"
+            if isinstance(exc, Mem0UpstreamError)
             else "UpstreamDeleteError"
         ),
         "message": "Upstream memory deletion failed",
     }
-    if isinstance(exc, Mem0UpstreamError):
-        status_code = exc.status_code
-        if type(status_code) is int and 100 <= status_code <= 599:
-            safe["upstream_status_code"] = status_code
+    if (status_code := _safe_upstream_status_code(exc)) is not None:
+        safe["upstream_status_code"] = status_code
     return safe
 
 
@@ -196,6 +235,8 @@ class EntityService:
         app_id: str,
         query: EntityQuery,
     ) -> dict[str, Any]:
+        project_id = _portable_id(project_id, field_name="project_id")
+        app_id = _portable_id(app_id, field_name="app_id")
         query = _validated_query(query)
         predicates: list[Any] = [
             Entity.project_id == project_id,
@@ -249,6 +290,12 @@ class EntityService:
         entity_id: str,
     ) -> dict[str, Any]:
         normalized_type = _normalize_entity_type(entity_type)
+        project_id = _portable_id(project_id, field_name="project_id")
+        app_id = _portable_id(app_id, field_name="app_id")
+        entity_id = _portable_id(
+            entity_id,
+            field_name=f"{normalized_type}_id",
+        )
         entity = EntityRepository(self.session).get_project_entity(
             project_id,
             app_id,
@@ -258,6 +305,8 @@ class EntityService:
         return _entity_payload(entity)
 
     def rebuild_entities(self, project_id: str, app_id: str) -> dict[str, int]:
+        project_id = _portable_id(project_id, field_name="project_id")
+        app_id = _portable_id(app_id, field_name="app_id")
         entities = EntityRepository(self.session).rebuild_project_entities(
             project_id,
             app_id,
@@ -272,6 +321,12 @@ class EntityService:
         entity_id: str,
     ) -> dict[str, Any]:
         normalized_type = _normalize_entity_type(entity_type)
+        project_id = _portable_id(project_id, field_name="project_id")
+        app_id = _portable_id(app_id, field_name="app_id")
+        entity_id = _portable_id(
+            entity_id,
+            field_name=f"{normalized_type}_id",
+        )
         with self.session.no_autoflush:
             project = self.session.scalar(
                 select(Project)
@@ -326,8 +381,14 @@ class EntityService:
             try:
                 await self.mem0.delete_memory(memory_id)
             except Exception as exc:
-                failed.append({"id": memory_id, "error": _safe_delete_error(exc)})
-                continue
+                if not (
+                    isinstance(exc, Mem0UpstreamError)
+                    and _safe_upstream_status_code(exc) == 404
+                ):
+                    failed.append(
+                        {"id": memory_id, "error": _safe_delete_error(exc)}
+                    )
+                    continue
             memory_repo.delete_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,
