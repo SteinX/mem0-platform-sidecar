@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Copy, RefreshCw } from "lucide-react";
 
+import { EntityBadges } from "@/components/self-hosted/explorer/entity-badges";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -137,17 +138,28 @@ export function RequestTraceDrawer({
   const hasRawError = detail !== null && Object.keys(detail.error).length > 0;
 
   const copy = useCallback(async (label: string, value: string) => {
-    const targetRequestId = activeRequestIdRef.current;
-    if (targetRequestId === null) {
+    const targetId = activeRequestIdRef.current;
+    if (targetId === null) {
       return;
     }
+    const copyTarget = {
+      generation: requestGeneration.current,
+      targetId,
+    };
+    const canApplyCopyTarget = () =>
+      canApplyTraceDetailRequest(
+        copyTarget,
+        requestGeneration.current,
+        activeRequestIdRef.current,
+        mountedRef.current,
+      );
     try {
       await copyText(value);
-      if (activeRequestIdRef.current === targetRequestId) {
+      if (canApplyCopyTarget()) {
         toast({ title: `${label} copied`, variant: "success" });
       }
     } catch (error) {
-      if (activeRequestIdRef.current === targetRequestId) {
+      if (canApplyCopyTarget()) {
         toast({
           title: `Failed to copy ${label.toLowerCase()}`,
           description: error instanceof Error ? error.message : String(error),
@@ -263,6 +275,21 @@ export function RequestTraceDrawer({
                       value={formatTimestamp(detail.completed_at)}
                     />
                   </dl>
+
+                  <section
+                    aria-labelledby="request-entities-heading"
+                    className="min-w-0 space-y-2"
+                  >
+                    <h3 id="request-entities-heading" className="font-semibold">
+                      Entities
+                    </h3>
+                    <EntityBadges
+                      userId={detailEntityId(detail, "user")}
+                      agentId={detailEntityId(detail, "agent")}
+                      appId={detailEntityId(detail, "app")}
+                      runId={detailEntityId(detail, "run")}
+                    />
+                  </section>
 
                   {displayedQuery !== null ? (
                     <section
@@ -423,6 +450,13 @@ function TraceField({ label, value }: { label: string; value: string }) {
       <dd className="break-all font-mono text-xs">{value}</dd>
     </div>
   );
+}
+
+function detailEntityId(
+  detail: SidecarTrace,
+  type: SidecarTrace["entities"][number]["type"],
+): string | null {
+  return detail.entities.find((entity) => entity.type === type)?.id ?? null;
 }
 
 function JsonSection({

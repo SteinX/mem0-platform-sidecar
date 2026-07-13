@@ -482,6 +482,9 @@ def test_dashboard_overlay_includes_request_trace_page_and_drawer_contracts():
         "SEARCH",
         "GET ALL",
         "Has Results",
+        'aria-label="Has results filter"',
+        "setRequestTraceOperation(query, operation)",
+        "toggleRequestTraceHasResults(query)",
         "DateRangeFilter",
         "FilterBuilder",
         'operators: ["equals"]',
@@ -505,7 +508,6 @@ def test_dashboard_overlay_includes_request_trace_page_and_drawer_contracts():
         "Pagination",
         "requestId",
         "operation",
-        "hasResults",
         "sidecarQuery<SidecarTracePage>",
         '"/v1/events/query"',
         "signal: controller.signal",
@@ -519,6 +521,10 @@ def test_dashboard_overlay_includes_request_trace_page_and_drawer_contracts():
         "if (canonicalSearch !== search)",
         "md:hidden",
         "aria-disabled",
+        "<TraceEventButton",
+        "onOpen={() => setDrawerRequestId(row.id)}",
+        "event.stopPropagation()",
+        "Open request ${trace.id}",
     ):
         assert contract in page_content
     assert "window." not in page_content
@@ -532,6 +538,11 @@ def test_dashboard_overlay_includes_request_trace_page_and_drawer_contracts():
     for contract in (
         "SheetTitle",
         "SheetDescription",
+        "EntityBadges",
+        'detailEntityId(detail, "user")',
+        'detailEntityId(detail, "agent")',
+        'detailEntityId(detail, "app")',
+        'detailEntityId(detail, "run")',
         "Request Payload",
         "Retrieved Memories",
         "Copy ID",
@@ -550,8 +561,10 @@ def test_dashboard_overlay_includes_request_trace_page_and_drawer_contracts():
         "AbortController",
         "controller.abort()",
         "activeRequestIdRef",
-        "const targetRequestId = activeRequestIdRef.current",
-        "activeRequestIdRef.current === targetRequestId",
+        "generation: requestGeneration.current",
+        "const targetId = activeRequestIdRef.current",
+        "targetId,",
+        "canApplyTraceDetailRequest(\n        copyTarget,",
         "requestGeneration",
         "encodeURIComponent",
         "sidecarGet<SidecarTrace>",
@@ -584,7 +597,7 @@ def test_request_trace_state_harness_executes_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "request trace state harness: 4 contract groups passed" in result.stdout
+    assert "request trace state harness: 5 contract groups passed" in result.stdout
 
 
 def test_dashboard_overlay_verifier_runs_request_trace_state_contracts():
@@ -620,6 +633,50 @@ def test_request_trace_verifier_rejects_missing_runtime_wiring(tmp_path):
 
     assert result.returncode == 1
     assert "Requests page must query /v1/events/query" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative", "before", "after", "error"),
+    [
+        (
+            "src/app/(root)/dashboard/requests/page.tsx",
+            "setRequestTraceOperation(query, operation)",
+            "setRequestTraceOperationMissing(query, operation)",
+            "Requests page must consume the independent operation reducer",
+        ),
+        (
+            "src/app/(root)/dashboard/requests/page.tsx",
+            "toggleRequestTraceHasResults(query)",
+            "toggleRequestTraceHasResultsMissing(query)",
+            "Requests page must consume the independent result reducer",
+        ),
+        (
+            "src/app/(root)/dashboard/requests/page.tsx",
+            "<TraceEventButton",
+            "<MissingTraceEventButton",
+            "Requests table must expose a keyboard-accessible row action",
+        ),
+        (
+            "src/app/(root)/dashboard/requests/request-trace-drawer.tsx",
+            "<EntityBadges",
+            "<MissingEntityBadges",
+            "Request drawer must render shared entity badges",
+        ),
+    ],
+)
+def test_request_trace_verifier_rejects_missing_review_contracts(
+    tmp_path, relative, before, after, error
+):
+    dashboard = applied_overlay(tmp_path)
+    target = dashboard / relative
+    content = target.read_text()
+    assert before in content
+    target.write_text(content.replace(before, after, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert error in result.stderr
 
 
 def test_dashboard_overlay_verifier_runs_memory_explorer_runtime_contracts():

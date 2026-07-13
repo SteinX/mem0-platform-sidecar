@@ -130,6 +130,68 @@ function urlContracts(state) {
   assert.equal(controls.get("filters"), initial.get("filters"));
 }
 
+function independentControlContracts(state) {
+  const combined = {
+    match: "all",
+    filters: [],
+    date_range: { from: null, to: null },
+    operation: "SEARCH",
+    has_results: true,
+    page: 9,
+    page_size: 20,
+  };
+
+  const addWithResults = state.setRequestTraceOperation(combined, "ADD");
+  assert.deepEqual(addWithResults, {
+    ...combined,
+    operation: "ADD",
+    page: 1,
+  });
+  assert.equal(
+    addWithResults.has_results,
+    true,
+    "operation changes must preserve the independent result filter",
+  );
+
+  const overviewWithResults = state.setRequestTraceOperation(combined, null);
+  assert.equal(overviewWithResults.operation, null);
+  assert.equal(overviewWithResults.has_results, true);
+  assert.equal(overviewWithResults.page, 1);
+
+  const searchWithoutResultFilter =
+    state.toggleRequestTraceHasResults(combined);
+  assert.equal(searchWithoutResultFilter.operation, "SEARCH");
+  assert.equal(searchWithoutResultFilter.has_results, null);
+  assert.equal(searchWithoutResultFilter.page, 1);
+
+  const searchWithResults = state.toggleRequestTraceHasResults({
+    ...combined,
+    has_results: null,
+  });
+  assert.equal(searchWithResults.operation, "SEARCH");
+  assert.equal(searchWithResults.has_results, true);
+  assert.equal(searchWithResults.page, 1);
+
+  const params = state.writeTraceControlUrl(
+    new URLSearchParams("requestId=trace-1"),
+    addWithResults.operation,
+    addWithResults.has_results,
+  );
+  assert.equal(params.get("operation"), "ADD");
+  assert.equal(params.get("hasResults"), "true");
+  assert.equal(params.get("requestId"), "trace-1");
+
+  assert.deepEqual(state.requestTraceQueryPayload(addWithResults), {
+    operation: "ADD",
+    statuses: [],
+    has_results: true,
+    date_range: combined.date_range,
+    entity_filters: {},
+    page: 1,
+    page_size: 20,
+  });
+}
+
 function generationContracts(state) {
   const listGeneration = state.nextTraceRequestGeneration(8);
   assert.equal(listGeneration, 9);
@@ -158,6 +220,16 @@ function generationContracts(state) {
     state.canApplyTraceDetailRequest(detail, 12, "event/a", false),
     false,
   );
+  assert.equal(
+    state.canApplyTraceDetailRequest(
+      { generation: 21, targetId: "same-event" },
+      23,
+      "same-event",
+      true,
+    ),
+    false,
+    "closing and reopening the same ID must reject old clipboard/detail work",
+  );
 }
 
 function pageBoundaryContracts(state) {
@@ -182,9 +254,10 @@ function main() {
   const state = loadState(dashboardDir);
   filterAndPayloadContracts(state);
   urlContracts(state);
+  independentControlContracts(state);
   generationContracts(state);
   pageBoundaryContracts(state);
-  console.log("request trace state harness: 4 contract groups passed");
+  console.log("request trace state harness: 5 contract groups passed");
 }
 
 main();
