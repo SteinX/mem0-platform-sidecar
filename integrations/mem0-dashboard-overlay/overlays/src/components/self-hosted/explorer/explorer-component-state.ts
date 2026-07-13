@@ -188,6 +188,53 @@ export function truncateIdentity(value: string): string {
   return value.length <= 18 ? value : `${value.slice(0, 9)}…${value.slice(-6)}`;
 }
 
+const MAX_EXPLORER_ERROR_INPUT_LENGTH = 4_096;
+
+function redactAuthorizationCredentials(message: string): string {
+  const assignmentPattern =
+    /\b(proxy[-_ ]?authorization|authorization)\s*[:=]\s*/gi;
+  let output = "";
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = assignmentPattern.exec(message)) !== null) {
+    output += message.slice(cursor, match.index);
+    output += `${match[1]}=[redacted]`;
+    cursor = authorizationCredentialEnd(message, assignmentPattern.lastIndex);
+    assignmentPattern.lastIndex = cursor;
+  }
+  return output + message.slice(cursor);
+}
+
+function authorizationCredentialEnd(message: string, start: number): number {
+  let quote: '"' | "'" | null = null;
+  for (let index = start; index < message.length; index += 1) {
+    const character = message[index];
+    if (quote !== null) {
+      if (character === "\\") {
+        index += 1;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === ";" || character === "\r" || character === "\n") {
+      return index;
+    } else if (
+      character === "," &&
+      !isAuthorizationParameter(message, index + 1)
+    ) {
+      return index;
+    }
+  }
+  return message.length;
+}
+
+function isAuthorizationParameter(message: string, start: number): boolean {
+  return /^\s*[A-Za-z][A-Za-z0-9_-]*\s*=/.test(message.slice(start));
+}
+
 export function sanitizeExplorerError(
   error: unknown,
   fallback: string,
@@ -204,11 +251,9 @@ export function sanitizeExplorerError(
   } else if (typeof error === "string" && error.trim() !== "") {
     message = error;
   }
-  const sanitized = message
-    .replace(
-      /\b(proxy[-_ ]?authorization|authorization)\s*[:=]\s*[^\r\n,;]+/gi,
-      "$1=[redacted]",
-    )
+  const sanitized = redactAuthorizationCredentials(
+    message.slice(0, MAX_EXPLORER_ERROR_INPUT_LENGTH),
+  )
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/https?:\/\/\S+/gi, "[redacted url]")
     .replace(
