@@ -94,10 +94,14 @@ class ExplorerMem0Client(FakeMem0Client):
 
     async def get_memory_history(self, memory_id: str) -> Any:
         self.history_calls.append(memory_id)
+        if isinstance(self.history_response, Exception):
+            raise self.history_response
         return self.history_response
 
     async def list_memories(self, params: dict[str, Any]) -> Any:
         self.list_calls.append(params)
+        if isinstance(self.list_response, Exception):
+            raise self.list_response
         return self.list_response
 
 
@@ -1283,6 +1287,25 @@ async def test_reconcile_rejects_malformed_envelope_without_stale_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_wraps_list_decode_value_error_with_cause(db_session) -> None:
+    _create_project(db_session)
+    decode_error = ValueError("list response is not JSON")
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = decode_error
+
+    with pytest.raises(MemoryUpstreamProtocolError) as exc_info:
+        await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+            project_id="repo-a",
+            app_id="app-a",
+            adopt_unscoped=False,
+            allow_adopt_unscoped=False,
+            default_project_id="repo-a",
+        )
+
+    assert exc_info.value.__cause__ is decode_error
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "envelope",
     [
@@ -1364,6 +1387,26 @@ async def test_get_memory_history_rejects_unknown_response_shape(db_session) -> 
             memory_id="mem-1",
             request_app_id="app-a",
         )
+
+
+@pytest.mark.asyncio
+async def test_get_memory_history_wraps_decode_value_error_with_cause(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-1")
+    decode_error = ValueError("history response is not JSON")
+    mem0 = ExplorerMem0Client()
+    mem0.history_response = decode_error
+
+    with pytest.raises(MemoryUpstreamProtocolError) as exc_info:
+        await MemoryService(session=db_session, mem0=mem0).get_memory_history(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+        )
+
+    assert exc_info.value.__cause__ is decode_error
 
 
 @pytest.mark.asyncio
@@ -1572,8 +1615,8 @@ async def test_query_memories_never_gets_beyond_single_bounded_candidate_buffer(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [ValueError("bad update"), TypeError("bad update")])
-async def test_update_memory_preserves_non_http_update_errors_without_stale(
+@pytest.mark.parametrize("error", [TypeError("bad update"), RuntimeError("bad update")])
+async def test_update_memory_preserves_non_value_update_errors_without_stale(
     db_session,
     error: Exception,
 ) -> None:
@@ -1603,6 +1646,97 @@ async def test_update_memory_preserves_non_http_update_errors_without_stale(
     assert projection.deleted_at is None
     event = EventRepository(db_session).list_project_events("repo-a")[-1]
     assert event.status is EventStatus.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["update", "refresh"])
+async def test_update_memory_wraps_decode_value_errors_at_call_boundaries(
+    db_session,
+    failure_stage: str,
+) -> None:
+    _create_project(db_session)
+    projection = _index_memory(db_session, "mem-1")
+    decode_error = ValueError(f"{failure_stage} response is not JSON")
+
+    class DecodeFailureClient(ExplorerMem0Client):
+        async def update_memory(
+            self,
+            memory_id: str,
+            payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            self.update_calls.append((memory_id, payload))
+            if failure_stage == "update":
+                raise decode_error
+            return {"message": "updated"}
+
+        async def get_memory(self, memory_id: str) -> Any:
+            self.get_memory_ids.append(memory_id)
+            if failure_stage == "refresh":
+                raise decode_error
+            return self.records[memory_id]
+
+    mem0 = DecodeFailureClient(
+        {"mem-1": {"id": "mem-1", "memory": "before", "metadata": {}}}
+    )
+
+    with pytest.raises(MemoryUpstreamProtocolError) as exc_info:
+        await MemoryService(session=db_session, mem0=mem0).update_memory(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+            payload={"text": "after"},
+        )
+
+    assert exc_info.value.__cause__ is decode_error
+    assert projection.deleted_at is None
+    event = EventRepository(db_session).list_project_events("repo-a")[-1]
+    assert event.status is EventStatus.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["update", "refresh"])
+async def test_update_memory_preserves_non_404_upstream_http_errors(
+    db_session,
+    failure_stage: str,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-1")
+    upstream_error = Mem0UpstreamError(
+        method="PUT" if failure_stage == "update" else "GET",
+        path="/memories/mem-1",
+        status_code=503,
+        message="unavailable",
+    )
+
+    class HttpFailureClient(ExplorerMem0Client):
+        async def update_memory(
+            self,
+            memory_id: str,
+            payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            if failure_stage == "update":
+                raise upstream_error
+            return {"message": "updated"}
+
+        async def get_memory(self, memory_id: str) -> Any:
+            if failure_stage == "refresh":
+                raise upstream_error
+            return self.records[memory_id]
+
+    with pytest.raises(Mem0UpstreamError) as exc_info:
+        await MemoryService(
+            session=db_session,
+            mem0=HttpFailureClient(
+                {"mem-1": {"id": "mem-1", "memory": "before"}}
+            ),
+        ).update_memory(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+            payload={"text": "after"},
+        )
+
+    assert exc_info.value is upstream_error
 
 
 @pytest.mark.asyncio
