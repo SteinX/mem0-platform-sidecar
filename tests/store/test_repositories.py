@@ -1971,9 +1971,7 @@ def test_event_repository_scrubs_embedded_credentials_from_every_trace_field(
     request_document = json.loads(event.request_json)
     response_document = json.loads(succeeded.response_json)
     error_document = json.loads(failed.error_json)
-    assert request_document["message"] == (
-        "Authorization: [REDACTED]; api_key=[REDACTED], keep."
-    )
+    assert request_document["message"] == "Authorization: [REDACTED]."
     assert request_document["nested"] == [
         "password=[REDACTED])",
         {"line": "x-api-key: [REDACTED]\nkeep line"},
@@ -2029,8 +2027,10 @@ def test_event_repository_scrubs_structured_and_full_authorization_values(
         "prefix\\\"secret-suffix",
         "digest-nonce",
         "digest-response",
+        "folded-secret",
         "aws-credential",
         "aws-signature",
+        "proxy-secret",
         "correlation-secret",
     )
     event = repository.create_event(
@@ -2047,12 +2047,15 @@ def test_event_repository_scrubs_structured_and_full_authorization_values(
             ),
             "escaped": 'api_key="prefix\\\"secret-suffix"; keep',
             "digest": (
-                "Authorization: Digest username=user, nonce=digest-nonce, "
-                "response=digest-response\nkeep digest tail"
+                "Authorization: Digest username=user; nonce=digest-nonce; "
+                "response=digest-response\n folded-secret\nkeep digest tail"
             ),
             "aws": (
-                "Authorization: AWS4-HMAC-SHA256 Credential=aws-credential, "
+                "Authorization: AWS4-HMAC-SHA256 Credential=aws-credential; "
                 "Signature=aws-signature\nkeep aws tail"
+            ),
+            "embedded": (
+                'prefix {"Proxy-Authorization":"Basic proxy-secret"} suffix'
             ),
         },
         correlation_id='{"api_key":"correlation-secret"}',
@@ -2099,6 +2102,8 @@ def test_event_repository_uses_shared_secret_vocabulary_for_url_components(
         "https://example.com/?access_key_id=query-secret",
         "https://example.com/#access_token=fragment-secret&token_type=Bearer",
         "https://example.com/#access_token%3Dencoded-fragment-secret",
+        "https://example.com/#access_token%253Ddouble-fragment-secret",
+        "https://example.com/?secret%255Fkey=double-query-secret",
         "https://example.com/?broken",
         "https://example.com/?value=%ZZ",
     ]
