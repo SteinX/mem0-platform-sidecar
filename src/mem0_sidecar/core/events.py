@@ -4,7 +4,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from mem0_sidecar.core.scope import validate_scope_id
-from mem0_sidecar.core.trace_payloads import bounded_trace_document
+from mem0_sidecar.core.trace_payloads import (
+    bounded_trace_document,
+    trace_result_summary,
+)
 from mem0_sidecar.store.models import Event
 from mem0_sidecar.store.repositories import EventRepository, _safe_trace_document
 
@@ -122,6 +125,20 @@ def _safe_nonnegative_int(value: object, *, fallback: int = 0) -> int:
     return fallback
 
 
+def _bounded_count_sum(left: int, right: int) -> int:
+    return min(left + right, 2**63 - 1)
+
+
+def _preview_source_count(previews: list[object]) -> int:
+    if previews and isinstance(previews[-1], dict):
+        marker = previews[-1]
+        if set(marker) == {"_trace_truncated_items"}:
+            truncated = _safe_nonnegative_int(marker["_trace_truncated_items"])
+            if truncated:
+                return _bounded_count_sum(len(previews) - 1, truncated)
+    return len(previews)
+
+
 def _safe_latency(value: object) -> float | None:
     if type(value) not in (int, float):
         return None
@@ -150,10 +167,17 @@ def event_to_trace_dict(event: Event) -> dict[str, Any]:
     stored_request = _safe_json_document(getattr(event, "request_json", "{}"))
     response = _safe_json_document(getattr(event, "response_json", "{}"))
     error = _safe_json_document(getattr(event, "error_json", "{}"))
-    previews = response.pop("result_previews", [])
-    if not isinstance(previews, list):
-        previews = []
+    raw_previews = response.pop("result_previews", [])
     omitted = _safe_nonnegative_int(response.pop("result_previews_omitted", 0))
+    if isinstance(raw_previews, list):
+        _, previews = trace_result_summary({"results": raw_previews})
+        raw_preview_count = _preview_source_count(raw_previews)
+        omitted = _bounded_count_sum(
+            omitted,
+            max(raw_preview_count - len(previews), 0),
+        )
+    else:
+        previews = []
     scan_truncated = response.pop("result_previews_scan_truncated", False) is True
     fallback_result_count = _safe_nonnegative_int(
         response.get("total"), fallback=len(previews)

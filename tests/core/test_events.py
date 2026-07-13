@@ -1,6 +1,8 @@
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from mem0_sidecar.core import events
 from mem0_sidecar.core.events import EventService
 from mem0_sidecar.store.models import Event, EventStatus
@@ -272,3 +274,51 @@ def test_event_to_trace_dict_rescrubs_legacy_string_secrets_and_internal_urls(
     assert trace["request"] == {"message": "authorization=[REDACTED]"}
     assert trace["result_count"] == 3
     assert trace["has_results"] is True
+
+
+@pytest.mark.parametrize("preview_count", [50, 75])
+def test_event_to_trace_dict_caps_and_resanitizes_legacy_result_previews(
+    db_session,
+    preview_count: int,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    legacy_previews: list[object] = ["malformed-preview"] + [
+        {
+            "id": f"mem-{index}",
+            "memory": f"memory {index}",
+            "metadata": {"private": f"secret-preview-{index}"},
+        }
+        for index in range(preview_count - 1)
+    ]
+    event = Event(
+        project_id="repo-a",
+        app_id="app-a",
+        operation="memory.search",
+        status=EventStatus.SUCCEEDED,
+        request_json="{}",
+        response_json=json.dumps(
+            {
+                "result_previews": legacy_previews,
+                "result_previews_omitted": 4,
+            }
+        ),
+        error_json="{}",
+        result_count=preview_count,
+        has_results=1,
+    )
+    db_session.add(event)
+    db_session.flush()
+
+    trace = _trace(event)
+
+    assert trace["result_previews"] == [
+        {"id": f"mem-{index}", "memory": f"memory {index}"}
+        for index in range(20)
+    ]
+    assert trace["result_previews_omitted"] == 4 + preview_count - 20
+    assert "malformed-preview" not in json.dumps(trace)
+    assert "secret-preview" not in json.dumps(trace)
