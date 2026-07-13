@@ -43,7 +43,9 @@ import {
   normalizeTracePage,
   requestTraceQueryPayload,
   resetRequestTraceQueryPage,
+  setRequestTraceOperation,
   setTraceRequestIdInUrl,
+  toggleRequestTraceHasResults,
   writeTraceControlUrl,
   type RequestTraceQueryState,
 } from "@/utils/request-trace-state";
@@ -83,13 +85,11 @@ const FILTER_FIELDS: ExplorerFilterFieldOption[] = [
 const OPERATION_CONTROLS: Array<{
   label: string;
   operation: TraceOperation;
-  hasResults: boolean | null;
 }> = [
-  { label: "Overview", operation: null, hasResults: null },
-  { label: "ADD", operation: "ADD", hasResults: null },
-  { label: "SEARCH", operation: "SEARCH", hasResults: null },
-  { label: "GET ALL", operation: "GET_ALL", hasResults: null },
-  { label: "Has Results", operation: null, hasResults: true },
+  { label: "Overview", operation: null },
+  { label: "ADD", operation: "ADD" },
+  { label: "SEARCH", operation: "SEARCH" },
+  { label: "GET ALL", operation: "GET_ALL" },
 ];
 
 export default function RequestsPage() {
@@ -259,18 +259,16 @@ export default function RequestsPage() {
     [applyCriteria, query.filters],
   );
 
-  const selectControl = useCallback(
-    (operation: TraceOperation, hasResults: boolean | null) => {
-      writeQuery(
-        resetRequestTraceQueryPage({
-          ...query,
-          operation,
-          has_results: hasResults,
-        }),
-      );
+  const selectOperation = useCallback(
+    (operation: TraceOperation) => {
+      writeQuery(setRequestTraceOperation(query, operation));
     },
     [query, writeQuery],
   );
+
+  const toggleHasResults = useCallback(() => {
+    writeQuery(toggleRequestTraceHasResults(query));
+  }, [query, writeQuery]);
 
   const setDrawerRequestId = useCallback(
     (id: string | null) => {
@@ -317,12 +315,10 @@ export default function RequestsPage() {
         label: "Event",
         width: 29,
         render: (_value, row) => (
-          <p
-            className="line-clamp-2 whitespace-normal break-words"
-            title={traceEventLabel(row)}
-          >
-            {traceEventLabel(row)}
-          </p>
+          <TraceEventButton
+            trace={row}
+            onOpen={() => setDrawerRequestId(row.id)}
+          />
         ),
       },
       {
@@ -338,7 +334,7 @@ export default function RequestsPage() {
         render: (_value, row) => <StatusBadge status={row.status} />,
       },
     ],
-    [addIdentityFilter],
+    [addIdentityFilter, setDrawerRequestId],
   );
 
   const rows = pageData?.results ?? [];
@@ -375,9 +371,7 @@ export default function RequestsPage() {
         aria-label="Request operation filters"
       >
         {OPERATION_CONTROLS.map((control) => {
-          const active =
-            query.operation === control.operation &&
-            query.has_results === control.hasResults;
+          const active = query.operation === control.operation;
           return (
             <Button
               key={control.label}
@@ -385,14 +379,27 @@ export default function RequestsPage() {
               size="sm"
               variant={active ? "default" : "outline"}
               aria-pressed={active}
-              onClick={() =>
-                selectControl(control.operation, control.hasResults)
-              }
+              onClick={() => selectOperation(control.operation)}
             >
               {control.label}
             </Button>
           );
         })}
+      </div>
+
+      <div
+        className="flex flex-wrap items-center gap-2"
+        aria-label="Has results filter"
+      >
+        <Button
+          type="button"
+          size="sm"
+          variant={query.has_results === true ? "default" : "outline"}
+          aria-pressed={query.has_results === true}
+          onClick={toggleHasResults}
+        >
+          Has Results
+        </Button>
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -643,6 +650,30 @@ function TraceEntities({
       runId={traceEntityId(trace, "run")}
       onBadgeClick={onBadgeClick}
     />
+  );
+}
+
+function TraceEventButton({
+  trace,
+  onOpen,
+}: {
+  trace: SidecarTrace;
+  onOpen: () => void;
+}) {
+  const label = traceEventLabel(trace);
+  return (
+    <button
+      type="button"
+      className="line-clamp-2 w-full rounded-sm text-left whitespace-normal break-words hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+      title={label}
+      aria-label={`Open request ${trace.id}: ${label}`}
+      onClick={(event) => {
+        event.stopPropagation();
+        onOpen();
+      }}
+    >
+      {label}
+    </button>
   );
 }
 

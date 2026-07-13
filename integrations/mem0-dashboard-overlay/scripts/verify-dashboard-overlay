@@ -1194,6 +1194,30 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
             "writeTraceControlUrl(next, query.operation, query.has_results)",
             "Requests page must persist operation query state",
         ),
+        (
+            "setRequestTraceOperation(query, operation)",
+            "Requests page must consume the independent operation reducer",
+        ),
+        (
+            "toggleRequestTraceHasResults(query)",
+            "Requests page must consume the independent result reducer",
+        ),
+        (
+            'aria-label="Has results filter"',
+            "Requests page must expose an independent result toggle",
+        ),
+        (
+            "<TraceEventButton",
+            "Requests table must expose a keyboard-accessible row action",
+        ),
+        (
+            "onOpen={() => setDrawerRequestId(row.id)}",
+            "Requests table row action must open the trace drawer",
+        ),
+        (
+            "event.stopPropagation()",
+            "Requests table row action must safely stop row propagation",
+        ),
     ):
         if contract not in page_content:
             return error
@@ -1221,6 +1245,34 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
         ("navigator.clipboard", "Request drawer missing Clipboard API support"),
         ('document.execCommand("copy")', "Request drawer missing clipboard fallback"),
         ("Raw error", "Request drawer must expose failure payloads"),
+        (
+            "<EntityBadges",
+            "Request drawer must render shared entity badges",
+        ),
+        (
+            'detailEntityId(detail, "user")',
+            "Request drawer must render the user entity",
+        ),
+        (
+            'detailEntityId(detail, "agent")',
+            "Request drawer must render the agent entity",
+        ),
+        (
+            'detailEntityId(detail, "app")',
+            "Request drawer must render the app entity",
+        ),
+        (
+            'detailEntityId(detail, "run")',
+            "Request drawer must render the run entity",
+        ),
+        (
+            "generation: requestGeneration.current",
+            "Request drawer copy target must capture the active generation",
+        ),
+        (
+            "canApplyTraceDetailRequest(\n        copyTarget,",
+            "Request drawer copy completion must reject stale generations",
+        ),
     ):
         if contract not in drawer_content:
             return error

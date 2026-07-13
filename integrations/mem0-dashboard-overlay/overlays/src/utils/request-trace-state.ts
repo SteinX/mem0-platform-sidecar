@@ -106,6 +106,22 @@ export function resetRequestTraceQueryPage(
   return { ...query, page: 1 };
 }
 
+export function setRequestTraceOperation(
+  query: RequestTraceQueryState,
+  operation: SidecarTraceQuery["operation"],
+): RequestTraceQueryState {
+  return resetRequestTraceQueryPage({ ...query, operation });
+}
+
+export function toggleRequestTraceHasResults(
+  query: RequestTraceQueryState,
+): RequestTraceQueryState {
+  return resetRequestTraceQueryPage({
+    ...query,
+    has_results: query.has_results === true ? null : true,
+  });
+}
+
 export function normalizeTracePage(
   value: unknown,
   pageSize: unknown = DEFAULT_PAGE_SIZE,
