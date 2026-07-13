@@ -418,6 +418,9 @@ class MemoryService:
         event = event_repo.create_event(
             project_id=project_id,
             app_id=scope.app_id,
+            user_id=scope.user_id,
+            agent_id=scope.agent_id,
+            run_id=scope.run_id,
             operation="memory.add",
             request=oss_payload,
             subject_type="memory",
@@ -642,6 +645,9 @@ class MemoryService:
         event = event_repo.create_event(
             project_id=project_id,
             app_id=effective_app_id,
+            user_id=memory.user_id,
+            agent_id=memory.agent_id,
+            run_id=memory.run_id,
             operation="memory.update",
             request=patch,
             subject_type="memory",
@@ -911,6 +917,9 @@ class MemoryService:
         event = event_repo.create_event(
             project_id=project_id,
             app_id=effective_app_id,
+            user_id=memory.user_id,
+            agent_id=memory.agent_id,
+            run_id=memory.run_id,
             operation="memory.delete",
             request=_memory_delete_request(
                 project_id=project_id,

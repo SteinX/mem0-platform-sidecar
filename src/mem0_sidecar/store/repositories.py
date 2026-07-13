@@ -6,15 +6,17 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.explorer_filters import ExplorerFilter, ExplorerQuery
+from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.core.trace_payloads import (
     bounded_trace_document,
+    sanitize_trace_payload,
     trace_key_is_secret,
     trace_result_summary,
 )
@@ -47,13 +49,15 @@ _URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = "),.;"
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _AUTHORIZATION_VALUE_PATTERN = re.compile(
-    r"(?i)(?P<prefix>\bauthorization\s*[:=]\s*)"
-    r"(?:(?:bearer|basic|token)\s+)?"
-    r"(?P<value>[^\s,;)\]}]+)"
+    r"(?im)(?P<prefix>\b(?P<quote>['\"]?)(?:proxy[ ._-]?)?"
+    r"authorization(?P=quote)\s*[:=]\s*)"
+    r"(?P<value>[^;\r\n]+)"
 )
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)(?P<prefix>(?P<key>[a-z][a-z0-9_.-]{0,127})\s*[:=]\s*)"
-    r"(?P<value>\[REDACTED\]|\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;)\]}]+)"
+    r"(?i)(?P<prefix>(?P<quote>['\"]?)(?P<key>[a-z][a-z0-9_. -]{0,127}?)"
+    r"(?P=quote)\s*[:=]\s*)"
+    r"(?P<value>\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|"
+    r"'(?:\\.|[^'\\])*'|[^\s,;)\]}]+)"
 )
 _STANDALONE_CREDENTIAL_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:"
@@ -142,8 +146,16 @@ def _sensitive_url(url: str, internal_hosts: frozenset[str]) -> bool:
             return True
 
     components = [parsed.query]
-    if "=" in parsed.fragment or "&" in parsed.fragment:
-        components.append(parsed.fragment)
+    try:
+        decoded_fragment = unquote(
+            parsed.fragment,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except (UnicodeError, ValueError):
+        return True
+    if "=" in decoded_fragment or "&" in decoded_fragment:
+        components.append(decoded_fragment)
     for component in components:
         if not component:
             continue
@@ -202,6 +214,16 @@ def _scrub_credential_string(value: str) -> str:
 
 
 def _scrub_trace_string(value: str, internal_hosts: frozenset[str]) -> str:
+    stripped = value.strip()
+    if stripped.startswith(("{", "[")) and stripped.endswith(("}", "]")):
+        try:
+            parsed = json.loads(stripped)
+        except (RecursionError, TypeError, UnicodeError, ValueError):
+            parsed = None
+        if type(parsed) in {dict, list}:
+            sanitized = sanitize_trace_payload(parsed)
+            scrubbed = _scrub_trace_strings(sanitized, internal_hosts)
+            return _trace_json(scrubbed)
     return _scrub_credential_string(_scrub_url_string(value, internal_hosts))
 
 
@@ -393,6 +415,9 @@ class EventPage:
 class _EventCandidate:
     event_id: str
     app_id: str | None
+    user_id: str | None
+    agent_id: str | None
+    run_id: str | None
     request_json: str
     created_at: datetime
     operation: str
@@ -546,16 +571,20 @@ def _request_app_id(request: Mapping[str, object]) -> str | None:
         if field_name not in request:
             continue
         value = request[field_name]
-        if type(value) is not str or not value or str.__len__(value) > 256:
+        try:
+            validated = validate_scope_id(value, field_name="app_id")
+        except ValueError:
             return None
-        values.append(value)
+        values.append(validated)
 
     metadata = request.get("metadata")
     if type(metadata) is dict and "_mem0_sidecar_app_id" in metadata:
         value = metadata["_mem0_sidecar_app_id"]
-        if type(value) is not str or not value or str.__len__(value) > 256:
+        try:
+            validated = validate_scope_id(value, field_name="app_id")
+        except ValueError:
             return None
-        values.append(value)
+        values.append(validated)
     if not values:
         return None
     return values[0] if all(value == values[0] for value in values) else None
@@ -579,16 +608,54 @@ def _raw_canonical_event_app_id(
 
     canonical: list[str] = []
     for value in values:
-        if (
-            type(value) is not str
-            or not value
-            or str.__len__(value) > 256
-        ):
-            raise ValueError("canonical event app scope is invalid")
-        canonical.append(value)
+        try:
+            validated = validate_scope_id(value, field_name="app_id")
+        except ValueError as exc:
+            raise ValueError("canonical event app scope is invalid") from exc
+        canonical.append(validated)
     if any(value != canonical[0] for value in canonical[1:]):
         raise ValueError("canonical event app scope markers conflict")
     return canonical[0]
+
+
+def _raw_canonical_event_entity_id(
+    request: dict[str, Any],
+    explicit_value: str | None,
+    *,
+    field_name: Literal["user_id", "agent_id", "run_id"],
+) -> str | None:
+    values: list[object] = []
+    if field_name in request:
+        values.append(request[field_name])
+    if explicit_value is not None:
+        values.append(explicit_value)
+    if not values:
+        return None
+
+    canonical: list[str] = []
+    for value in values:
+        try:
+            validated = validate_scope_id(value, field_name=field_name)
+        except ValueError as exc:
+            entity_name = field_name.removesuffix("_id")
+            raise ValueError(f"canonical event {entity_name} scope is invalid") from exc
+        canonical.append(validated)
+    if any(value != canonical[0] for value in canonical[1:]):
+        entity_name = field_name.removesuffix("_id")
+        raise ValueError(f"canonical event {entity_name} scope markers conflict")
+    return canonical[0]
+
+
+def _legacy_request_entity_id(
+    request: Mapping[str, object],
+    field_name: Literal["user_id", "agent_id", "run_id"],
+) -> str | None:
+    if field_name not in request:
+        return None
+    try:
+        return validate_scope_id(request[field_name], field_name=field_name)
+    except ValueError:
+        return None
 
 
 def _same_optional_datetime(
@@ -606,6 +673,9 @@ def _event_matches_candidate(event: object, candidate: _EventCandidate) -> bool:
     return (
         event.id == candidate.event_id
         and event.app_id == candidate.app_id
+        and event.user_id == candidate.user_id
+        and event.agent_id == candidate.agent_id
+        and event.run_id == candidate.run_id
         and event.request_json == candidate.request_json
         and _as_utc(event.created_at) == _as_utc(candidate.created_at)
         and event.operation == candidate.operation
@@ -626,6 +696,9 @@ def _matches_event_scope(
     app_id: str,
     entity_filters: Mapping[str, str],
     canonical_app_id: str | None,
+    canonical_user_id: str | None,
+    canonical_agent_id: str | None,
+    canonical_run_id: str | None,
 ) -> bool:
     effective_app_id = canonical_app_id
     request: dict[str, object] | None = None
@@ -637,18 +710,25 @@ def _matches_event_scope(
     if effective_app_id != app_id:
         return False
 
+    canonical_entities = {
+        "user_id": canonical_user_id,
+        "agent_id": canonical_agent_id,
+        "run_id": canonical_run_id,
+    }
     for field_name, expected in entity_filters.items():
         if field_name == "app_id":
             actual = effective_app_id
         elif field_name in {"user_id", "agent_id", "run_id"}:
-            if request is None:
-                request = _event_request(request_json)
-            if request is None:
-                return False
-            actual = request.get(field_name)
+            actual = canonical_entities[field_name]
+            if actual is None:
+                if request is None:
+                    request = _event_request(request_json)
+                if request is None:
+                    return False
+                actual = _legacy_request_entity_id(request, field_name)
         else:
             return False
-        if not isinstance(actual, str) or actual != expected:
+        if actual != expected:
             return False
     return True
 
@@ -822,19 +902,37 @@ class EventRepository:
         *,
         project_id: str,
         app_id: str | None = None,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
         operation: str,
         request: dict[str, Any] | None = None,
         subject_type: str | None = None,
         subject_id: str | None = None,
         correlation_id: str | None = None,
+        allow_project_scope: bool = False,
     ) -> Event:
         started_at = _utc_now()
         internal_hosts = _project_internal_hosts(self.session, project_id)
         raw_request = request or {}
         canonical_app_id = _raw_canonical_event_app_id(raw_request, app_id)
+        if canonical_app_id is None and not allow_project_scope:
+            raise ValueError("canonical event app scope is required")
+        canonical_user_id = _raw_canonical_event_entity_id(
+            raw_request, user_id, field_name="user_id"
+        )
+        canonical_agent_id = _raw_canonical_event_entity_id(
+            raw_request, agent_id, field_name="agent_id"
+        )
+        canonical_run_id = _raw_canonical_event_entity_id(
+            raw_request, run_id, field_name="run_id"
+        )
         event = Event(
             project_id=project_id,
             app_id=canonical_app_id,
+            user_id=canonical_user_id,
+            agent_id=canonical_agent_id,
+            run_id=canonical_run_id,
             operation=operation,
             status=EventStatus.PENDING,
             subject_type=subject_type,
@@ -936,10 +1034,30 @@ class EventRepository:
         app_id: str,
         query: EventQuery,
     ) -> EventPage:
+        app_id = validate_scope_id(app_id, field_name="app_id")
         conditions = [
             Event.project_id == project_id,
             or_(Event.app_id == app_id, Event.app_id.is_(None)),
         ]
+        entity_columns = {
+            "user_id": Event.user_id,
+            "agent_id": Event.agent_id,
+            "run_id": Event.run_id,
+        }
+        validated_entity_filters: dict[str, str] = {}
+        for field_name, expected in query.entity_filters.items():
+            if field_name == "app_id":
+                validated_entity_filters[field_name] = validate_scope_id(
+                    expected, field_name=field_name
+                )
+                continue
+            column = entity_columns.get(field_name)
+            if column is None:
+                validated_entity_filters[field_name] = expected
+                continue
+            validated = validate_scope_id(expected, field_name=field_name)
+            validated_entity_filters[field_name] = validated
+            conditions.append(or_(column == validated, column.is_(None)))
         if query.operation is not None:
             conditions.append(Event.operation == query.operation)
         if query.statuses:
@@ -956,6 +1074,7 @@ class EventRepository:
                 project_id=project_id,
                 app_id=app_id,
                 query=query,
+                entity_filters=validated_entity_filters,
                 conditions=conditions,
             )
             if page is not None:
@@ -968,6 +1087,7 @@ class EventRepository:
         project_id: str,
         app_id: str,
         query: EventQuery,
+        entity_filters: Mapping[str, str],
         conditions: list[object],
     ) -> EventPage | None:
         rows = list(
@@ -975,6 +1095,9 @@ class EventRepository:
                 select(
                     Event.id,
                     Event.app_id,
+                    Event.user_id,
+                    Event.agent_id,
+                    Event.run_id,
                     Event.request_json,
                     Event.created_at,
                     Event.operation,
@@ -1002,8 +1125,11 @@ class EventRepository:
             if _matches_event_scope(
                 candidate.request_json,
                 app_id,
-                query.entity_filters,
+                entity_filters,
                 candidate.app_id,
+                candidate.user_id,
+                candidate.agent_id,
+                candidate.run_id,
             )
         ]
         offset = (query.page - 1) * query.page_size

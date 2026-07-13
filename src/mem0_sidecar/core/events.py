@@ -39,6 +39,7 @@ class EventService:
             request=request,
             subject_type=subject_type,
             subject_id=subject_id,
+            allow_project_scope=True,
         )
         return self.events.mark_succeeded(event.id, response=response)
 

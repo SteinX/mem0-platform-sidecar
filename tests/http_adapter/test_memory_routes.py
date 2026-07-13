@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 import uvicorn
 from fastapi.testclient import TestClient
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.config import SidecarSettings
@@ -329,6 +329,7 @@ def test_event_routes_do_not_leak_other_project_events(tmp_path) -> None:
             request={"text": "visible"},
             subject_type="memory",
             subject_id="mem-a",
+            allow_project_scope=True,
         )
         event_repo.mark_succeeded(visible_event.id, response={"id": "mem-a"})
         hidden_event = event_repo.create_event(
@@ -337,6 +338,7 @@ def test_event_routes_do_not_leak_other_project_events(tmp_path) -> None:
             request={"text": "hidden"},
             subject_type="memory",
             subject_id="mem-b",
+            allow_project_scope=True,
         )
         event_repo.mark_succeeded(hidden_event.id, response={"id": "mem-b"})
         session.commit()
@@ -489,6 +491,93 @@ def test_route_scoped_add_preserves_query_app_id_and_bootstraps_default_app_id(
 
     assert project_a is not None
     assert project_a.default_app_id == "app-x"
+
+
+@pytest.mark.parametrize(
+    "invalid_app_id",
+    [
+        "x" * 257,
+        "\x00",
+        " ",
+        "app\n-a",
+        " app-a",
+        "app-a ",
+    ],
+)
+def test_route_scoped_add_rejects_invalid_app_before_any_mutation(
+    tmp_path,
+    invalid_app_id: str,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    with app.state.session_factory() as session:
+        ProjectRepository(session).upsert_default_project(
+            project_id="repo-a",
+            name="Repo A",
+            mem0_base_url="http://mem0.local",
+            default_app_id="app-good",
+        )
+        session.commit()
+
+    response = TestClient(app).post(
+        "/v3/memories/add/",
+        json={
+            "project_id": "repo-a",
+            "app_id": invalid_app_id,
+            "text": "must not be sent",
+            "user_id": "root",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith("app_id must be a portable")
+    assert mem0.add_payloads == []
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        event_count = session.scalar(select(func.count()).select_from(Event))
+    assert project is not None
+    assert project.default_app_id == "app-good"
+    assert event_count == 0
+
+
+def test_route_scoped_add_accepts_256_character_app_id(tmp_path) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    app_id = "x" * 256
+
+    response = TestClient(app).post(
+        "/v3/memories/add/",
+        json={
+            "project_id": "repo-a",
+            "app_id": app_id,
+            "text": "accepted",
+            "user_id": "root",
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(mem0.add_payloads) == 1
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        event = session.scalar(select(Event).where(Event.operation == "memory.add"))
+    assert project is not None
+    assert project.default_app_id == app_id
+    assert event is not None
+    assert event.app_id == app_id
 
 
 def test_route_scoped_search_preserves_explicit_app_id_without_bootstrapping_project(
