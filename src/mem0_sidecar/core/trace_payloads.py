@@ -35,11 +35,8 @@ _NON_CREDENTIAL_KEY_TOKENS = frozenset({"favorite", "has", "is", "require", "req
 _NON_CREDENTIAL_TRAILING_TOKENS = frozenset(
     {"configured", "count", "counts", "enabled", "present", "required", "status"}
 )
-_NON_CREDENTIAL_UNSEGMENTED_SUFFIXES = (
-    "favoritecookie",
-    "haspassword",
-    "issecret",
-    "requiresauthorization",
+_NON_CREDENTIAL_NORMALIZED_KEYS = frozenset(
+    {"favoritecookie", "haspassword", "issecret", "requiresauthorization"}
 )
 _NON_CREDENTIAL_NORMALIZED_SUFFIXES = (
     "configured",
@@ -172,9 +169,7 @@ def _is_secret_key(key: str) -> bool:
     if not tokens:
         return False
     normalized = "".join(tokens)
-    if len(tokens) == 1 and normalized.endswith(
-        _NON_CREDENTIAL_UNSEGMENTED_SUFFIXES
-    ):
+    if normalized in _NON_CREDENTIAL_NORMALIZED_KEYS:
         return False
     if tokens[-1] in _NON_CREDENTIAL_TRAILING_TOKENS or normalized.endswith(
         _NON_CREDENTIAL_NORMALIZED_SUFFIXES
