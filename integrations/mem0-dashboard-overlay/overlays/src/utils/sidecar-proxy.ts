@@ -37,30 +37,37 @@ function isMemoryQueryPath(method: string, path: string): boolean {
   return method === "POST" && path === "/v1/memories/query";
 }
 
-function canonicalMemoryId(encodedId: string): string | null {
+function canonicalResourceId(
+  encodedId: string,
+  reservedIds: ReadonlySet<string>,
+): string | null {
   if (!encodedId) {
     return null;
   }
 
-  let memoryId: string;
+  let resourceId: string;
   try {
-    memoryId = decodeURIComponent(encodedId);
+    resourceId = decodeURIComponent(encodedId);
   } catch {
     return null;
   }
 
-  const hasTraversalSegment = memoryId
+  const hasTraversalSegment = resourceId
     .split(/[\\/]/)
     .some((segment) => segment === "." || segment === "..");
   if (
-    memoryId === "query" ||
+    reservedIds.has(resourceId) ||
     hasTraversalSegment ||
-    /[\u0000-\u001f\u007f]/.test(memoryId) ||
-    /%[0-9a-f]{2}/i.test(memoryId)
+    /[\u0000-\u001f\u007f]/.test(resourceId) ||
+    resourceId.includes("%")
   ) {
     return null;
   }
-  return encodeURIComponent(encodeURIComponent(memoryId));
+  return encodeURIComponent(encodeURIComponent(resourceId));
+}
+
+function canonicalMemoryId(encodedId: string): string | null {
+  return canonicalResourceId(encodedId, new Set(["query"]));
 }
 
 function memoryItemId(path: string): string | null {
@@ -92,11 +99,33 @@ function isMemoryPath(method: string, path: string): boolean {
   );
 }
 
-function memoryPathFromRequestUrl(
+function isEventQueryPath(method: string, path: string): boolean {
+  return method === "POST" && path === "/v1/events/query";
+}
+
+function eventItemId(path: string): string | null {
+  const match = path.match(/^\/v1\/event\/([^/]+)$/);
+  return match
+    ? canonicalResourceId(match[1], new Set(["query"]))
+    : null;
+}
+
+function isEventItemPath(method: string, path: string): boolean {
+  return method === "GET" && eventItemId(path) !== null;
+}
+
+function isEventPath(method: string, path: string): boolean {
+  return isEventQueryPath(method, path) || isEventItemPath(method, path);
+}
+
+function sidecarPathFromRequestUrl(
   request: Request,
   normalizedPath: string,
 ): string {
-  if (!normalizedPath.startsWith("/v1/memories/")) {
+  if (
+    !normalizedPath.startsWith("/v1/memories/") &&
+    !normalizedPath.startsWith("/v1/event/")
+  ) {
     return normalizedPath;
   }
 
@@ -107,7 +136,8 @@ function memoryPathFromRequestUrl(
     return normalizedPath;
   }
   const requestPath = pathname.slice(prefixIndex + proxyPrefix.length);
-  return requestPath.startsWith("/v1/memories/")
+  return requestPath.startsWith("/v1/memories/") ||
+    requestPath.startsWith("/v1/event/")
     ? requestPath
     : normalizedPath;
 }
@@ -117,7 +147,8 @@ function isAllowedSidecarRequest(method: string, path: string): boolean {
     isProjectCategoriesPath(method, path) ||
     isProjectCategoryItemPath(method, path) ||
     isExportPath(method, path) ||
-    isMemoryPath(method, path)
+    isMemoryPath(method, path) ||
+    isEventPath(method, path)
   );
 }
 
@@ -142,6 +173,13 @@ function scopedSidecarPath(
   if (isMemoryQueryPath(method, path)) {
     return path;
   }
+  if (isEventQueryPath(method, path)) {
+    return path;
+  }
+  const eventId = eventItemId(path);
+  if (eventId !== null) {
+    return `/v1/event/${eventId}`;
+  }
   const historyId = memoryHistoryId(path);
   if (historyId !== null) {
     return `/v1/memories/${historyId}/history`;
@@ -151,6 +189,28 @@ function scopedSidecarPath(
     return `/v1/memories/${itemId}`;
   }
   return path;
+}
+
+function isPortableScopeId(value: unknown, maximum: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= maximum &&
+    value === value.trim() &&
+    value.normalize("NFC") === value &&
+    !/\s/u.test(value) &&
+    !/\p{C}/u.test(value)
+  );
+}
+
+function hasConfiguredTraceScope(
+  configuredProjectId: string,
+  configuredAppId?: string,
+): configuredAppId is string {
+  return (
+    isPortableScopeId(configuredProjectId, 128) &&
+    isPortableScopeId(configuredAppId, 256)
+  );
 }
 
 function scopedJsonBody(
@@ -198,7 +258,7 @@ export async function proxySidecarRequest(
   if (!baseUrl) {
     return jsonError("SIDECAR_INTERNAL_API_URL is not configured", 500);
   }
-  const requestPath = memoryPathFromRequestUrl(request, normalizedPath);
+  const requestPath = sidecarPathFromRequestUrl(request, normalizedPath);
   const scopedPath = scopedSidecarPath(
     request.method,
     requestPath,
@@ -211,6 +271,13 @@ export async function proxySidecarRequest(
     return jsonError("Unauthorized", 401);
   }
 
+  const isEventRequest = isEventPath(request.method, requestPath);
+  if (
+    isEventRequest &&
+    !hasConfiguredTraceScope(configuredProjectId, configuredAppId)
+  ) {
+    return jsonError("Sidecar trace scope is not configured", 500);
+  }
   const isMemoryItemRequest = isMemoryItemPath(request.method, requestPath);
   const isMemoryHistoryRequest = isMemoryHistoryPath(
     request.method,
@@ -218,7 +285,7 @@ export async function proxySidecarRequest(
   );
   const isMemoryRequest = isMemoryPath(request.method, requestPath);
   const url = new URL(`${baseUrl}${scopedPath}`);
-  if (!isMemoryRequest) {
+  if (!isMemoryRequest && !isEventRequest) {
     new URL(request.url).searchParams.forEach((value, key) => {
       if (key !== "project_id" && key !== "app_id") {
         url.searchParams.append(key, value);
@@ -236,6 +303,10 @@ export async function proxySidecarRequest(
     if (configuredAppId !== undefined) {
       url.searchParams.set("app_id", configuredAppId);
     }
+  }
+  if (isEventItemPath(request.method, requestPath)) {
+    url.searchParams.set("project_id", configuredProjectId);
+    url.searchParams.set("app_id", configuredAppId!);
   }
 
   const headers = new Headers();
@@ -260,6 +331,7 @@ export async function proxySidecarRequest(
       init.body = scopedBody;
     } else if (
       isMemoryQueryPath(request.method, scopedPath) ||
+      isEventQueryPath(request.method, scopedPath) ||
       isMemoryItemRequest
     ) {
       const scopedBody = scopedJsonBody(

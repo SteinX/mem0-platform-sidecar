@@ -40,6 +40,208 @@ function proxyOptions(fetchUpstream, overrides = {}) {
   };
 }
 
+function traceProxyOptions(fetchUpstream, overrides = {}) {
+  return proxyOptions(fetchUpstream, {
+    configuredProjectId: "runtime-project",
+    configuredAppId: "runtime-app",
+    ...overrides,
+  });
+}
+
+async function testEventQueryForcesRuntimeScope(proxy) {
+  const calls = [];
+  const payload = {
+    project_id: "forged-body-project",
+    app_id: "forged-body-app",
+    operation: "SEARCH",
+    statuses: ["SUCCEEDED"],
+    has_results: true,
+    date_range: { from: null, to: null },
+    entity_filters: { user_id: "alice" },
+    page: 2,
+    page_size: 20,
+  };
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/events/query?project_id=forged-query-project&app_id=forged-query-app",
+      {
+        method: "POST",
+        headers: { "X-Request-ID": "event-query-123" },
+        body: JSON.stringify(payload),
+      },
+    ),
+    "/v1/events/query",
+    traceProxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ results: [], total: 0 });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://sidecar.internal/v1/events/query");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers.get("X-Request-ID"), "event-query-123");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    operation: payload.operation,
+    statuses: payload.statuses,
+    has_results: payload.has_results,
+    date_range: payload.date_range,
+    entity_filters: payload.entity_filters,
+    page: payload.page,
+    page_size: payload.page_size,
+    project_id: "runtime-project",
+    app_id: "runtime-app",
+  });
+}
+
+async function testEventDetailEncodesIdAndForcesRuntimeScope(proxy) {
+  const calls = [];
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/event/event%2Fone?project_id=forged&app_id=forged-app&trace=forged",
+      { method: "GET" },
+    ),
+    "/v1/event/event/one",
+    traceProxyOptions(async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ id: "event/one" });
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/event/event%252Fone?project_id=runtime-project&app_id=runtime-app",
+  );
+  assert.equal(calls[0].init.body, undefined);
+}
+
+async function testEventRoutesRejectMutationsAndNearMatches(proxy) {
+  const rejected = [
+    ["GET", "/v1/events/query"],
+    ["PUT", "/v1/events/query"],
+    ["PATCH", "/v1/events/query"],
+    ["DELETE", "/v1/events/query"],
+    ["POST", "/v1/event/event-one"],
+    ["PUT", "/v1/event/event-one"],
+    ["PATCH", "/v1/event/event-one"],
+    ["DELETE", "/v1/event/event-one"],
+    ["GET", "/v1/events"],
+    ["GET", "/v1/events/event-one"],
+    ["GET", "/v1/event/event-one/extra"],
+  ];
+
+  for (const [method, normalizedPath] of rejected) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request(`http://dashboard.local/api/sidecar${normalizedPath}`, {
+        method,
+        body: ["POST", "PUT", "PATCH"].includes(method) ? "{}" : undefined,
+      }),
+      normalizedPath,
+      traceProxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+    assert.equal(response.status, 403, `${method} ${normalizedPath}`);
+    assert.equal(fetchCalled, false, `${method} ${normalizedPath}`);
+  }
+}
+
+async function testEventDetailRejectsUnsafeEncodedIds(proxy) {
+  const rejected = [
+    "/v1/event/..",
+    "/v1/event/%2E%2E",
+    "/v1/event/%2e%2e%2fhealth",
+    "/v1/event/safe%2f..%2fhealth",
+    "/v1/event/%2e%2e%5chealth",
+    "/v1/event/safe%5c..%5chealth",
+    "/v1/event/%71uery",
+    "/v1/event/event%252Fone",
+    "/v1/event/event%00one",
+    "/v1/event/event%1fone",
+    "/v1/event/event%7fone",
+    "/v1/event/event%",
+    "/v1/event/event%GGone",
+    "/v1/event/event%FFone",
+  ];
+
+  for (const normalizedPath of rejected) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request(`http://dashboard.local/api/sidecar${normalizedPath}`, {
+        method: "GET",
+      }),
+      normalizedPath,
+      traceProxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+    assert.equal(response.status, 403, normalizedPath);
+    assert.equal(fetchCalled, false, normalizedPath);
+  }
+}
+
+async function testEventRoutesFailClosedWithoutPortableRuntimeScope(proxy) {
+  const invalidScopes = [
+    { configuredAppId: undefined },
+    { configuredAppId: "" },
+    { configuredAppId: "two words" },
+    { configuredAppId: "\u0000app" },
+    { configuredAppId: "a".repeat(257) },
+    { configuredProjectId: "" },
+    { configuredProjectId: "two words" },
+    { configuredProjectId: "p".repeat(129) },
+  ];
+
+  for (const scope of invalidScopes) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request("http://dashboard.local/api/sidecar/v1/events/query", {
+        method: "POST",
+        body: "{}",
+      }),
+      "/v1/events/query",
+      traceProxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({ results: [] });
+      }, scope),
+    );
+    assert.equal(response.status, 500, JSON.stringify(scope));
+    assert.deepEqual(await response.json(), {
+      error: "Sidecar trace scope is not configured",
+    });
+    assert.equal(fetchCalled, false, JSON.stringify(scope));
+  }
+}
+
+async function testUnauthenticatedEventRequestsAreRejected(proxy) {
+  for (const [method, path, body] of [
+    ["POST", "/v1/events/query", "{}"],
+    ["GET", "/v1/event/event-one", undefined],
+  ]) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request(`http://dashboard.local/api/sidecar${path}`, {
+        method,
+        body,
+      }),
+      path,
+      traceProxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }, { validateDashboardSession: async () => false }),
+    );
+    assert.equal(response.status, 401, `${method} ${path}`);
+    assert.deepEqual(await response.json(), { error: "Unauthorized" });
+    assert.equal(fetchCalled, false, `${method} ${path}`);
+  }
+}
+
 async function testMemoryQueryForcesRuntimeScopeAndPreservesQuery(proxy) {
   const calls = [];
   const payload = {
@@ -648,6 +850,14 @@ async function main() {
   const dashboardDir = path.resolve(process.argv[2]);
   const { proxySidecarRequest } = await loadProxyModule(dashboardDir);
 
+  await testEventQueryForcesRuntimeScope(proxySidecarRequest);
+  await testEventDetailEncodesIdAndForcesRuntimeScope(proxySidecarRequest);
+  await testEventRoutesRejectMutationsAndNearMatches(proxySidecarRequest);
+  await testEventDetailRejectsUnsafeEncodedIds(proxySidecarRequest);
+  await testEventRoutesFailClosedWithoutPortableRuntimeScope(
+    proxySidecarRequest,
+  );
+  await testUnauthenticatedEventRequestsAreRejected(proxySidecarRequest);
   await testMemoryQueryForcesRuntimeScopeAndPreservesQuery(
     proxySidecarRequest,
   );
@@ -683,7 +893,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 21 contracts passed");
+  console.log("sidecar proxy request harness: 27 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(
