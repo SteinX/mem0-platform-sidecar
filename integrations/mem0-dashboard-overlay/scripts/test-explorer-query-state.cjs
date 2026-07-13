@@ -95,6 +95,133 @@ function testBlankRowsAreRemovedAndIdsStayStable(state) {
   assert.deepEqual(state.normalizeExplorerFilters(normalized), normalized);
 }
 
+function testFiltersMustMatchBackendContract(state) {
+  const filters = [
+    { id: " equals ", field: "category", operator: "equals", value: " work " },
+    {
+      id: "not-equals",
+      field: "memory_id",
+      operator: "not_equals",
+      value: " mem-1 ",
+    },
+    {
+      id: "in",
+      field: "user_id",
+      operator: "in",
+      value: [" alice ", "bob"],
+    },
+    {
+      id: "entity",
+      field: "entity_type",
+      operator: "equals",
+      value: " agent ",
+    },
+    {
+      id: "entity-in",
+      field: "entity_type",
+      operator: "in",
+      value: ["user", " run "],
+    },
+    {
+      id: "metadata",
+      field: "metadata",
+      operator: "contains",
+      value: { key: " source ", value: " codex " },
+    },
+    {
+      id: "metadata-string",
+      field: "metadata",
+      operator: "contains",
+      value: "source",
+    },
+    {
+      id: "metadata-extra-key",
+      field: "metadata",
+      operator: "contains",
+      value: { key: "source", value: "codex", extra: true },
+    },
+    {
+      id: "metadata-equals",
+      field: "metadata",
+      operator: "equals",
+      value: { key: "source", value: "codex" },
+    },
+    {
+      id: "scalar-contains",
+      field: "category",
+      operator: "contains",
+      value: "work",
+    },
+    {
+      id: "equals-array",
+      field: "category",
+      operator: "equals",
+      value: ["work"],
+    },
+    { id: "in-string", field: "user_id", operator: "in", value: "alice" },
+    {
+      id: "partial-in",
+      field: "user_id",
+      operator: "in",
+      value: ["alice", " "],
+    },
+    {
+      id: "non-string-in",
+      field: "run_id",
+      operator: "in",
+      value: ["run-1", 7],
+    },
+    {
+      id: "bad-entity",
+      field: "entity_type",
+      operator: "equals",
+      value: "team",
+    },
+    {
+      id: "bad-entity-in",
+      field: "entity_type",
+      operator: "in",
+      value: ["user", "team"],
+    },
+  ];
+  const original = structuredClone(filters);
+
+  assert.deepEqual(state.normalizeExplorerFilters(filters), [
+    { id: " equals ", field: "category", operator: "equals", value: "work" },
+    {
+      id: "not-equals",
+      field: "memory_id",
+      operator: "not_equals",
+      value: "mem-1",
+    },
+    {
+      id: "in",
+      field: "user_id",
+      operator: "in",
+      value: ["alice", "bob"],
+    },
+    {
+      id: "entity",
+      field: "entity_type",
+      operator: "equals",
+      value: "agent",
+    },
+    {
+      id: "entity-in",
+      field: "entity_type",
+      operator: "in",
+      value: ["user", "run"],
+    },
+    {
+      id: "metadata",
+      field: "metadata",
+      operator: "contains",
+      value: { key: "source", value: "codex" },
+    },
+  ]);
+  assert.deepEqual(filters, original, "normalization must not mutate input");
+}
+
 function testMatchModesArePreserved(state) {
   for (const match of ["all", "any"]) {
     const initial = new URLSearchParams({ match });
@@ -154,6 +281,52 @@ function testMalformedFieldsFallBackIndependently(state) {
   });
 }
 
+function testStrictDateRangesRejectInvalidAndReversedValues(state) {
+  const valid = "2026-07-13T12:34:56.789Z";
+  assert.deepEqual(
+    state.readExplorerUrlState(new URLSearchParams({
+      from: "2024-02-29T12:00:00+05:30",
+      to: "2024-02-29T07:00:00Z",
+    })).date_range,
+    {
+      from: "2024-02-29T12:00:00+05:30",
+      to: "2024-02-29T07:00:00Z",
+    },
+  );
+  const invalidValues = [
+    "2026-02-30T12:00:00Z",
+    "2026-07-13T24:00:00Z",
+    "2026-07-13T12:60:00Z",
+    "2026-07-13T12:00:60Z",
+    "2026-07-13T12:00:00+24:00",
+    "2026-07-13T12:00:00+02:60",
+    "2026-07-13T12:00:00",
+  ];
+
+  for (const from of invalidValues) {
+    assert.deepEqual(
+      state.readExplorerUrlState(new URLSearchParams({ from, to: valid }))
+        .date_range,
+      { from: null, to: valid },
+      from,
+    );
+  }
+  assert.deepEqual(
+    state.readExplorerUrlState(new URLSearchParams({
+      from: valid,
+      to: "2026-02-30T12:00:00Z",
+    })).date_range,
+    { from: valid, to: null },
+  );
+  assert.deepEqual(
+    state.readExplorerUrlState(new URLSearchParams({
+      from: "2026-07-14T01:00:00+02:00",
+      to: "2026-07-13T22:59:59Z",
+    })).date_range,
+    { from: null, to: null },
+  );
+}
+
 function testRoundTripRetainsDrawerAndUnknownParamsWithoutChangingPath(state) {
   const url = new URL(
     "https://dashboard.test/dashboard?memoryId=mem%2F42&requestId=req-7"
@@ -202,11 +375,13 @@ function main() {
   const state = loadExplorerQueryStateModule(path.resolve(process.argv[2]));
   testExactRuntimeExports(state);
   testBlankRowsAreRemovedAndIdsStayStable(state);
+  testFiltersMustMatchBackendContract(state);
   testMatchModesArePreserved(state);
   testUtcDatePresetsUseInjectedNow(state);
   testMalformedFieldsFallBackIndependently(state);
+  testStrictDateRangesRejectInvalidAndReversedValues(state);
   testRoundTripRetainsDrawerAndUnknownParamsWithoutChangingPath(state);
-  console.log("explorer query state harness: 6 contracts passed");
+  console.log("explorer query state harness: 8 contracts passed");
 }
 
 try {
