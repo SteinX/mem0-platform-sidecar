@@ -265,10 +265,10 @@ function isPortableScopeId(value: unknown, maximum: number): value is string {
 function hasConfiguredTraceScope(
   configuredProjectId: string,
   configuredAppId?: string,
-): configuredAppId is string {
+): boolean {
   return (
     isPortableScopeId(configuredProjectId, 128) &&
-    isPortableScopeId(configuredAppId, 256)
+    (configuredAppId === undefined || isPortableScopeId(configuredAppId, 256))
   );
 }
 
@@ -438,7 +438,9 @@ export async function proxySidecarRequest(
   }
   if (isEventItemPath(request.method, requestPath)) {
     url.searchParams.set("project_id", configuredProjectId);
-    url.searchParams.set("app_id", configuredAppId!);
+    if (configuredAppId !== undefined) {
+      url.searchParams.set("app_id", configuredAppId);
+    }
   }
 
   const headers = new Headers();
