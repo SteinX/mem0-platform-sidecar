@@ -159,6 +159,8 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/utils/sidecar-proxy.ts",
         "src/utils/category-schema.ts",
         "src/utils/category-editor-state.ts",
+        "src/utils/explorer-query-state.ts",
+        "src/types/dashboard-explorer.ts",
         "src/types/sidecar.ts",
         "src/app/(root)/dashboard/components/main-nav.tsx",
     ]:
@@ -220,6 +222,40 @@ def test_dashboard_overlay_includes_category_editor_state_contract():
         assert symbol in state_content
 
     harness = OVERLAY / "scripts" / "test-category-editor-state.cjs"
+    assert harness.exists()
+
+
+def test_dashboard_overlay_includes_explorer_query_state_contract():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    type_path = "src/types/dashboard-explorer.ts"
+    state_path = "src/utils/explorer-query-state.ts"
+
+    assert type_path in manifest["files"]
+    assert state_path in manifest["files"]
+
+    type_content = (OVERLAY / "overlays" / type_path).read_text()
+    for symbol in (
+        "export type ExplorerMatch",
+        "export type ExplorerField",
+        "export type ExplorerOperator",
+        "export type ExplorerFilter",
+        "export type ExplorerDateRange",
+        "export type ExplorerQueryPayload",
+    ):
+        assert symbol in type_content
+    assert "project_id" not in type_content
+
+    state_content = (OVERLAY / "overlays" / state_path).read_text()
+    for symbol in (
+        "export function createExplorerFilter",
+        "export function normalizeExplorerFilters",
+        "export function datePresetRange",
+        "export function readExplorerUrlState",
+        "export function writeExplorerUrlState",
+    ):
+        assert symbol in state_content
+
+    harness = OVERLAY / "scripts" / "test-explorer-query-state.cjs"
     assert harness.exists()
 
 

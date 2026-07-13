@@ -14,6 +14,8 @@
     "src/utils/sidecar-proxy.ts",
     "src/utils/category-schema.ts",
     "src/utils/category-editor-state.ts",
+    "src/utils/explorer-query-state.ts",
+    "src/types/dashboard-explorer.ts",
     "src/types/sidecar.ts"
   ]
 }
