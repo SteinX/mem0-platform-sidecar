@@ -1,6 +1,11 @@
 import os
+import sys
+import time
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -12,13 +17,20 @@ from mem0_sidecar.store.models import MemoryIndex
 pytestmark = pytest.mark.e2e
 
 
-def _live_settings(tmp_path) -> SidecarSettings:
+def _live_settings(
+    tmp_path,
+    *,
+    project_id: str | None = None,
+    database_name: str = "sidecar-e2e.sqlite3",
+) -> SidecarSettings:
     base_url = os.environ.get("MEM0_E2E_BASE_URL")
     if not base_url:
         pytest.skip("MEM0_E2E_BASE_URL is not set")
-    project_id = os.environ.get("MEM0_E2E_PROJECT_ID", "sidecar-e2e")
+    project_id = project_id or os.environ.get(
+        "MEM0_E2E_PROJECT_ID", "sidecar-e2e"
+    )
     return SidecarSettings(
-        database_url=f"sqlite:///{tmp_path / 'sidecar-e2e.sqlite3'}",
+        database_url=f"sqlite:///{tmp_path / database_name}",
         mem0_base_url=base_url,
         mem0_api_key=os.environ.get("MEM0_E2E_API_KEY"),
         default_project_id=project_id,
@@ -54,65 +66,550 @@ def _extract_memory_ids(payload: dict[str, object]) -> list[str]:
     return ids
 
 
-def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
-    settings = _live_settings(tmp_path)
+def _scoped_params(*, project_id: str, app_id: str) -> dict[str, str]:
+    return {"project_id": project_id, "app_id": app_id}
+
+
+def _delete_scoped_memory(
+    client: TestClient,
+    *,
+    memory_id: str,
+    project_id: str,
+    app_id: str,
+) -> str | None:
+    try:
+        response = client.delete(
+            f"/v1/memories/{memory_id}",
+            params=_scoped_params(project_id=project_id, app_id=app_id),
+        )
+    except Exception as exc:
+        return f"Scoped cleanup raised {type(exc).__name__}: {exc}"
+    if response.status_code != 200:
+        if response.status_code == 404:
+            return "Scoped cleanup returned HTTP 404 with active projection"
+        return (
+            f"Scoped cleanup returned HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+    return None
+
+
+def _add_direct_upstream_memory(
+    settings: SidecarSettings,
+    *,
+    text: str,
+    user_id: str,
+    run_id: str,
+    metadata: dict[str, object],
+) -> str:
+    response = httpx.post(
+        f"{settings.mem0_base_url.rstrip('/')}/memories",
+        json={
+            "messages": [{"role": "user", "content": text}],
+            "user_id": user_id,
+            "run_id": run_id,
+            "infer": False,
+            "metadata": metadata,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    memory_ids = _extract_memory_ids(response.json())
+    assert memory_ids, response.text
+    return memory_ids[0]
+
+
+def _delete_direct_upstream_memory(
+    settings: SidecarSettings,
+    memory_id: str,
+) -> str | None:
+    try:
+        response = httpx.delete(
+            f"{settings.mem0_base_url.rstrip('/')}/memories/{memory_id}",
+            timeout=30,
+        )
+    except Exception as exc:
+        return f"Direct upstream cleanup raised {type(exc).__name__}: {exc}"
+    if response.status_code not in {200, 404}:
+        return (
+            f"Direct upstream cleanup returned HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+    return None
+
+
+def _upstream_absence_error(
+    settings: SidecarSettings,
+    memory_id: str,
+) -> str | None:
+    try:
+        response = httpx.get(
+            f"{settings.mem0_base_url.rstrip('/')}/memories",
+            params={"top_k": 5000, "show_expired": "true"},
+            timeout=30,
+        )
+    except Exception as exc:
+        return f"Upstream cleanup verification raised {type(exc).__name__}: {exc}"
+    if response.status_code != 200:
+        return (
+            f"Upstream cleanup verification returned HTTP "
+            f"{response.status_code}: {response.text}"
+        )
+    try:
+        memory_ids = _extract_memory_ids(response.json())
+    except Exception as exc:
+        return (
+            "Upstream cleanup verification could not decode the list response: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if memory_id in memory_ids:
+        return f"Upstream cleanup verification still found {memory_id}"
+    return None
+
+
+def _projection_absence_error(
+    client: TestClient,
+    *,
+    memory_id: str,
+    project_id: str,
+    app_id: str,
+) -> str | None:
+    try:
+        session_factory = client.app.state.session_factory
+    except AttributeError:
+        return None
+
+    def active_projection() -> MemoryIndex | None:
+        with session_factory() as session:
+            return session.scalar(
+                select(MemoryIndex).where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.mem0_memory_id == memory_id,
+                    MemoryIndex.deleted_at.is_(None),
+                )
+            )
+
+    if active_projection() is None:
+        return None
+    try:
+        response = client.post(
+            "/v1/memories/query",
+            json={"project_id": project_id, "app_id": app_id},
+        )
+    except Exception as exc:
+        return f"Projection cleanup raised {type(exc).__name__}: {exc}"
+    if response.status_code != 200:
+        return (
+            f"Projection cleanup returned HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+    if active_projection() is not None:
+        return f"Projection cleanup still found active {memory_id}"
+    return None
+
+
+def _cleanup_memory_fixture(
+    client: TestClient,
+    settings: SidecarSettings,
+    *,
+    memory_id: str,
+    project_id: str,
+    app_id: str,
+) -> str | None:
+    scoped_error = _delete_scoped_memory(
+        client,
+        memory_id=memory_id,
+        project_id=project_id,
+        app_id=app_id,
+    )
+    absence_error = _upstream_absence_error(settings, memory_id)
+    if scoped_error is not None or absence_error is not None:
+        direct_error = _delete_direct_upstream_memory(settings, memory_id)
+        absence_error = _upstream_absence_error(settings, memory_id)
+        if absence_error is not None:
+            diagnostics = "; ".join(
+                error
+                for error in (scoped_error, direct_error, absence_error)
+                if error is not None
+            )
+            return diagnostics
+    return _projection_absence_error(
+        client,
+        memory_id=memory_id,
+        project_id=project_id,
+        app_id=app_id,
+    )
+
+
+def _cleanup_direct_fixture(
+    settings: SidecarSettings,
+    memory_id: str,
+) -> str | None:
+    direct_error = _delete_direct_upstream_memory(settings, memory_id)
+    absence_error = _upstream_absence_error(settings, memory_id)
+    if absence_error is None:
+        return None
+    return "; ".join(
+        error for error in (direct_error, absence_error) if error is not None
+    )
+
+
+def _report_cleanup_failure(error: str | None) -> None:
+    if error is None:
+        return
+    if sys.exc_info()[0] is None:
+        raise AssertionError(error)
+    print(error, file=sys.stderr)
+
+
+def _report_cleanup_failures(errors: list[str | None]) -> None:
+    combined = "; ".join(error for error in errors if error is not None)
+    _report_cleanup_failure(combined or None)
+
+
+def test_cleanup_failures_are_aggregated_before_reporting() -> None:
+    with pytest.raises(AssertionError) as exc_info:
+        _report_cleanup_failures(["first cleanup failed", None, "second failed"])
+
+    assert "first cleanup failed" in str(exc_info.value)
+    assert "second failed" in str(exc_info.value)
+
+
+def test_scoped_cleanup_reports_non_success_response() -> None:
+    class FailedCleanupClient:
+        def delete(self, *args, **kwargs):
+            return SimpleNamespace(status_code=500, text="cleanup failed")
+
+    error = _delete_scoped_memory(
+        FailedCleanupClient(),
+        memory_id="mem-1",
+        project_id="project-a",
+        app_id="app-a",
+    )
+
+    assert error == "Scoped cleanup returned HTTP 500: cleanup failed"
+
+
+def test_scoped_cleanup_rejects_404_with_active_projection(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'cleanup.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="project-a",
+        ),
+        mem0_client=object(),
+    )
+    with app.state.session_factory() as session:
+        session.add(
+            MemoryIndex(
+                project_id="project-a",
+                mem0_memory_id="mem-1",
+                app_id="app-a",
+            )
+        )
+        session.commit()
+
+    class MissingCleanupClient:
+        def __init__(self):
+            self.app = app
+
+        def delete(self, *args, **kwargs):
+            return SimpleNamespace(status_code=404, text="not found")
+
+    error = _delete_scoped_memory(
+        MissingCleanupClient(),
+        memory_id="mem-1",
+        project_id="project-a",
+        app_id="app-a",
+    )
+
+    assert error == "Scoped cleanup returned HTTP 404 with active projection"
+
+
+def test_direct_cleanup_reports_non_success_response(monkeypatch) -> None:
+    monkeypatch.setattr(
+        httpx,
+        "delete",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=500,
+            text="cleanup failed",
+        ),
+    )
+
+    error = _delete_direct_upstream_memory(
+        SidecarSettings(mem0_base_url="http://mem0.local"),
+        "mem-1",
+    )
+
+    assert error == "Direct upstream cleanup returned HTTP 500: cleanup failed"
+
+
+def test_fixture_cleanup_falls_back_to_upstream_and_proves_absence(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    class MissingScopedClient:
+        def delete(self, *args, **kwargs):
+            calls.append("scoped")
+            return SimpleNamespace(status_code=404, text="not found")
+
+    monkeypatch.setattr(
+        httpx,
+        "delete",
+        lambda *args, **kwargs: (
+            calls.append("direct")
+            or SimpleNamespace(status_code=200, text="deleted")
+        ),
+    )
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200,
+            text='{"results": []}',
+            json=lambda: {"results": []},
+        ),
+    )
+
+    error = _cleanup_memory_fixture(
+        MissingScopedClient(),
+        SidecarSettings(mem0_base_url="http://mem0.local"),
+        memory_id="mem-1",
+        project_id="project-a",
+        app_id="app-a",
+    )
+
+    assert error is None
+    assert calls == ["scoped", "direct"]
+
+
+def _wait_for_history_update(
+    client: TestClient,
+    *,
+    memory_id: str,
+    project_id: str,
+    app_id: str,
+    updated_text: str,
+    timeout_seconds: float = 15,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_seconds
+    last_diagnostic = "history endpoint was not called"
+    while time.monotonic() < deadline:
+        response = client.get(
+            f"/v1/memories/{memory_id}/history",
+            params=_scoped_params(project_id=project_id, app_id=app_id),
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            if _record_contains(payload.get("results", []), updated_text):
+                return payload
+            last_diagnostic = f"history had no update: {payload!r}"
+        else:
+            last_diagnostic = (
+                f"history returned HTTP {response.status_code}: {response.text}"
+            )
+        time.sleep(0.25)
+    raise AssertionError(
+        f"Timed out waiting for memory history update: {last_diagnostic}"
+    )
+
+
+def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
+    tmp_path,
+) -> None:
+    token = uuid4().hex
+    project_id = f"e2e-project-{token}"
+    app_id = f"e2e-app-{token}"
+    wrong_app_id = f"e2e-wrong-app-{token}"
+    user_id = f"e2e-user-{token}"
+    agent_id = f"e2e-agent-{token}"
+    run_id = f"e2e-run-{token}"
+    category_name = f"e2e-category-{token}"
+    settings = _live_settings(tmp_path, project_id=project_id)
     client = TestClient(create_app(settings=settings))
-    marker = f"sidecar-e2e-{uuid4()}"
-    add_body: dict[str, object] | None = None
-    memory_ids: list[str] = []
-    cleanup_memory_ids: set[str] = set()
+    marker = f"sidecar-e2e-{token}"
+    updated_text = f"Updated {marker}"
+    memory_id: str | None = None
+    category_id: str | None = None
+    created_after = datetime.now(UTC) - timedelta(minutes=1)
 
     try:
+        category_response = client.post(
+            f"/v1/projects/{project_id}/categories",
+            json={
+                "name": category_name,
+                "description": "Live memory explorer category",
+                "schema": {"type": "object"},
+                "enabled": True,
+                "strategy": "metadata",
+            },
+        )
+        assert category_response.status_code == 201, category_response.text
+        category_id = category_response.json()["id"]
+
         add_response = client.post(
             "/v3/memories/add/",
             json={
                 "text": f"Remember {marker}",
-                "user_id": "sidecar-e2e-user",
-                "app_id": settings.default_project_id,
+                "project_id": project_id,
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "app_id": app_id,
+                "run_id": run_id,
                 "infer": False,
-                "metadata": {"type": "e2e", "marker": marker},
+                "metadata": {
+                    "category": category_name,
+                    "marker": marker,
+                    "revision": "before",
+                },
             },
         )
         assert add_response.status_code == 200, add_response.text
         add_body = add_response.json()
         memory_ids = _extract_memory_ids(add_body["memory"])
-        assert memory_ids, add_body
+        assert len(memory_ids) == 1, add_body
+        memory_id = memory_ids[0]
         assert add_body["event"]["status"] == "SUCCEEDED"
-        cleanup_memory_ids = set(memory_ids)
 
-        search_response = client.post(
-            "/v3/memories/search/",
+        created_before = datetime.now(UTC) + timedelta(minutes=1)
+        query_response = client.post(
+            "/v1/memories/query",
             json={
-                "query": marker,
-                "user_id": "sidecar-e2e-user",
-                "app_id": settings.default_project_id,
+                "project_id": project_id,
+                "app_id": app_id,
+                "match": "all",
+                "filters": [
+                    {
+                        "field": "entity_type",
+                        "operator": "equals",
+                        "value": "app",
+                    },
+                    {
+                        "field": "category",
+                        "operator": "equals",
+                        "value": category_name,
+                    },
+                    {
+                        "field": "metadata",
+                        "operator": "contains",
+                        "value": {"key": "marker", "value": marker},
+                    },
+                ],
+                "date_range": {
+                    "from": created_after.isoformat(),
+                    "to": created_before.isoformat(),
+                },
             },
         )
-        assert search_response.status_code == 200, search_response.text
-        search_body = search_response.json()
-        results = search_body["results"]
-        assert any(
-            any(_record_contains(result, memory_id) for memory_id in memory_ids)
-            or _record_contains(result, marker)
-            for result in results
-        ), search_body
+        assert query_response.status_code == 200, query_response.text
+        query_body = query_response.json()
+        assert query_body["stale_skipped"] == 0
+        assert [item["id"] for item in query_body["results"]] == [memory_id]
 
-        get_response = client.get(f"/v1/memories/{memory_ids[0]}/")
-        assert get_response.status_code == 200, get_response.text
-        assert get_response.json().get("id") == memory_ids[0]
+        detail_response = client.get(
+            f"/v1/memories/{memory_id}",
+            params=_scoped_params(project_id=project_id, app_id=app_id),
+        )
+        assert detail_response.status_code == 200, detail_response.text
+        assert detail_response.json()["id"] == memory_id
 
-        for memory_id in memory_ids:
-            delete_response = client.delete(f"/v1/memories/{memory_id}/")
-            assert delete_response.status_code == 200, delete_response.text
-            assert delete_response.json()["event"]["status"] == "SUCCEEDED"
-            cleanup_memory_ids.discard(memory_id)
+        patch_response = client.patch(
+            f"/v1/memories/{memory_id}",
+            params=_scoped_params(project_id=project_id, app_id=app_id),
+            json={
+                "text": updated_text,
+                "metadata": {
+                    "category": category_name,
+                    "marker": marker,
+                    "revision": "after",
+                },
+                "expiration_date": "2099-12-31",
+            },
+        )
+        assert patch_response.status_code == 200, patch_response.text
+        patched = patch_response.json()
+        assert patched["event"]["status"] == "SUCCEEDED"
+        assert patched["memory"]["memory"] == updated_text
+        assert patched["memory"]["metadata"]["revision"] == "after"
+        assert patched["memory"]["expiration_date"] == "2099-12-31"
+
+        history = _wait_for_history_update(
+            client,
+            memory_id=memory_id,
+            project_id=project_id,
+            app_id=app_id,
+            updated_text=updated_text,
+        )
+        assert _record_contains(history["results"], updated_text)
+
+        wrong_app_query = client.post(
+            "/v1/memories/query",
+            json={"project_id": project_id, "app_id": wrong_app_id},
+        )
+        assert wrong_app_query.status_code == 200, wrong_app_query.text
+        assert wrong_app_query.json()["results"] == []
+        assert wrong_app_query.json()["total"] == 0
+
+        wrong_app_get = client.get(
+            f"/v1/memories/{memory_id}",
+            params=_scoped_params(
+                project_id=project_id,
+                app_id=wrong_app_id,
+            ),
+        )
+        assert wrong_app_get.status_code == 404, wrong_app_get.text
+
+        delete_response = client.delete(
+            f"/v1/memories/{memory_id}",
+            params=_scoped_params(project_id=project_id, app_id=app_id),
+        )
+        assert delete_response.status_code == 200, delete_response.text
+        assert delete_response.json()["event"]["status"] == "SUCCEEDED"
+
+        deleted_query = client.post(
+            "/v1/memories/query",
+            json={"project_id": project_id, "app_id": app_id},
+        )
+        assert deleted_query.status_code == 200, deleted_query.text
+        assert all(
+            item["id"] != memory_id for item in deleted_query.json()["results"]
+        )
+        with client.app.state.session_factory() as session:
+            projection = session.scalar(
+                select(MemoryIndex).where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.mem0_memory_id == memory_id,
+                )
+            )
+        assert projection is not None and projection.deleted_at is not None
     finally:
-        if add_body is not None:
-            for memory_id in cleanup_memory_ids:
-                try:
-                    client.delete(f"/v1/memories/{memory_id}/")
-                except Exception:
-                    pass
+        cleanup_errors: list[str | None] = []
+        if memory_id is not None:
+            cleanup_errors.append(
+                _cleanup_memory_fixture(
+                    client,
+                    settings,
+                    memory_id=memory_id,
+                    project_id=project_id,
+                    app_id=app_id,
+                )
+            )
+        if category_id is not None:
+            try:
+                category_cleanup = client.delete(
+                    f"/v1/projects/{project_id}/categories/{category_id}"
+                )
+                if category_cleanup.status_code != 204:
+                    cleanup_errors.append(
+                        "Category cleanup returned HTTP "
+                        f"{category_cleanup.status_code}: {category_cleanup.text}"
+                    )
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"Category cleanup raised {type(exc).__name__}: {exc}"
+                )
+        _report_cleanup_failures(cleanup_errors)
 
     events_response = client.get("/v1/events")
     assert events_response.status_code == 200, events_response.text
@@ -121,14 +618,232 @@ def test_live_sidecar_add_search_get_delete_against_mem0_oss(tmp_path) -> None:
     assert "memory.delete" in operations
 
 
-def test_live_categories_and_export_flow(tmp_path) -> None:
-    settings = _live_settings(tmp_path)
+def test_live_reconcile_imports_only_marked_scope(tmp_path) -> None:
+    token = uuid4().hex
+    project_id = f"reconcile-project-{token}"
+    app_id = f"reconcile-app-{token}"
+    other_app_id = f"reconcile-other-app-{token}"
+    user_id = f"reconcile-user-{token}"
+    run_id = f"reconcile-run-{token}"
+    marker = f"marked-reconcile-{token}"
+    creator_settings = _live_settings(
+        tmp_path,
+        project_id=project_id,
+        database_name="marked-creator.sqlite3",
+    )
+    target_settings = _live_settings(
+        tmp_path,
+        project_id=project_id,
+        database_name="marked-target.sqlite3",
+    )
+    creator = TestClient(create_app(settings=creator_settings))
+    target = TestClient(create_app(settings=target_settings))
+    memory_id: str | None = None
+    cleanup_targets: list[tuple[str, str]] = []
+
+    try:
+        add_response = creator.post(
+            "/v3/memories/add/",
+            json={
+                "project_id": project_id,
+                "app_id": app_id,
+                "user_id": user_id,
+                "run_id": run_id,
+                "text": marker,
+                "infer": False,
+                "metadata": {"marker": marker},
+            },
+        )
+        assert add_response.status_code == 200, add_response.text
+        memory_id = add_response.json()["event"]["subject_id"]
+        cleanup_targets.append((memory_id, app_id))
+
+        other_scope_response = creator.post(
+            "/v3/memories/add/",
+            json={
+                "project_id": project_id,
+                "app_id": other_app_id,
+                "user_id": f"other-{user_id}",
+                "run_id": f"other-{run_id}",
+                "text": f"other-{marker}",
+                "infer": False,
+                "metadata": {"marker": f"other-{marker}"},
+            },
+        )
+        assert other_scope_response.status_code == 200, other_scope_response.text
+        cleanup_targets.append(
+            (other_scope_response.json()["event"]["subject_id"], other_app_id)
+        )
+
+        reconcile_response = target.post(
+            f"/v1/projects/{project_id}/memories/reconcile",
+            json={
+                "project_id": project_id,
+                "app_id": app_id,
+                "adopt_unscoped": False,
+            },
+        )
+        assert reconcile_response.status_code == 200, reconcile_response.text
+        reconcile = reconcile_response.json()
+        assert set(reconcile) == {
+            "scanned",
+            "indexed",
+            "skipped_unscoped",
+            "skipped_other_scope",
+            "stale_marked",
+        }
+        assert reconcile["scanned"] >= 1
+        assert reconcile["indexed"] == 1
+        assert reconcile["skipped_unscoped"] >= 0
+        assert reconcile["skipped_other_scope"] >= 1
+        assert (
+            reconcile["indexed"]
+            + reconcile["skipped_unscoped"]
+            + reconcile["skipped_other_scope"]
+            == reconcile["scanned"]
+        )
+        assert reconcile["stale_marked"] == 0
+
+        detail_response = target.get(
+            f"/v1/memories/{memory_id}",
+            params=_scoped_params(project_id=project_id, app_id=app_id),
+        )
+        assert detail_response.status_code == 200, detail_response.text
+        assert detail_response.json()["id"] == memory_id
+    finally:
+        cleanup_errors = []
+        for cleanup_memory_id, cleanup_app_id in cleanup_targets:
+            cleanup_errors.append(
+                _cleanup_memory_fixture(
+                    creator,
+                    creator_settings,
+                    memory_id=cleanup_memory_id,
+                    project_id=project_id,
+                    app_id=cleanup_app_id,
+                )
+            )
+        if memory_id is not None:
+            cleanup_errors.append(
+                _projection_absence_error(
+                    target,
+                    memory_id=memory_id,
+                    project_id=project_id,
+                    app_id=app_id,
+                )
+            )
+        _report_cleanup_failures(cleanup_errors)
+
+
+def test_live_reconcile_refuses_unscoped_adoption_without_runtime_gate(
+    tmp_path,
+) -> None:
+    token = uuid4().hex
+    project_id = f"refuse-project-{token}"
+    app_id = f"refuse-app-{token}"
+    settings = _live_settings(tmp_path, project_id=project_id)
     client = TestClient(create_app(settings=settings))
-    project_id = "e2e-dashboard-overlay"
-    app_id = "dashboard-overlay"
-    user_id = "root"
-    marker = f"dashboard overlay export marker {uuid4()}"
-    out_of_scope_marker = f"dashboard overlay out-of-scope marker {uuid4()}"
+    memory_id = _add_direct_upstream_memory(
+        settings,
+        text=f"unscoped-refusal-{token}",
+        user_id=f"refuse-user-{token}",
+        run_id=f"refuse-run-{token}",
+        metadata={"e2e_marker": token},
+    )
+
+    try:
+        response = client.post(
+            f"/v1/projects/{project_id}/memories/reconcile",
+            json={
+                "project_id": project_id,
+                "app_id": app_id,
+                "adopt_unscoped": True,
+            },
+        )
+        assert response.status_code == 422, response.text
+        assert response.json() == {
+            "detail": "Unscoped memory adoption is disabled at runtime"
+        }
+        query_response = client.post(
+            "/v1/memories/query",
+            json={"project_id": project_id, "app_id": app_id},
+        )
+        assert query_response.status_code == 200, query_response.text
+        assert query_response.json()["results"] == []
+    finally:
+        _report_cleanup_failure(
+            _cleanup_direct_fixture(settings, memory_id)
+        )
+
+
+@pytest.mark.adoption_e2e
+def test_live_reconcile_adopts_unscoped_only_in_dedicated_runner(tmp_path) -> None:
+    if os.environ.get("MEM0_E2E_ADOPTION_ENABLED") != "true":
+        pytest.skip("dedicated unscoped-adoption runner is not enabled")
+
+    token = uuid4().hex
+    project_id = f"adopt-project-{token}"
+    app_id = f"adopt-app-{token}"
+    settings = _live_settings(tmp_path, project_id=project_id)
+    assert settings.allow_adopt_unscoped_memories is True
+    assert settings.default_project_id == project_id
+    client = TestClient(create_app(settings=settings))
+    memory_id = _add_direct_upstream_memory(
+        settings,
+        text=f"unscoped-adoption-{token}",
+        user_id=f"adopt-user-{token}",
+        run_id=f"adopt-run-{token}",
+        metadata={"e2e_marker": token},
+    )
+    adopted = False
+
+    try:
+        response = client.post(
+            f"/v1/projects/{project_id}/memories/reconcile",
+            json={
+                "project_id": project_id,
+                "app_id": app_id,
+                "adopt_unscoped": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        adopted = True
+        counters = response.json()
+        assert counters["indexed"] == 1
+        assert counters["skipped_unscoped"] == 0
+
+        detail_response = client.get(
+            f"/v1/memories/{memory_id}",
+            params=_scoped_params(project_id=project_id, app_id=app_id),
+        )
+        assert detail_response.status_code == 200, detail_response.text
+    finally:
+        if adopted:
+            cleanup_error = _cleanup_memory_fixture(
+                client,
+                settings,
+                memory_id=memory_id,
+                project_id=project_id,
+                app_id=app_id,
+            )
+        else:
+            cleanup_error = _cleanup_direct_fixture(settings, memory_id)
+        _report_cleanup_failure(cleanup_error)
+
+
+def test_live_categories_and_export_flow(tmp_path) -> None:
+    token = uuid4().hex
+    project_id = f"overlay-project-{token}"
+    app_id = f"overlay-app-{token}"
+    other_app_id = f"overlay-other-app-{token}"
+    user_id = f"overlay-user-{token}"
+    other_user_id = f"overlay-other-user-{token}"
+    run_id = f"overlay-run-{token}"
+    other_run_id = f"overlay-other-run-{token}"
+    category_name = f"preferences-{token}"
+    settings = _live_settings(tmp_path, project_id=project_id)
+    client = TestClient(create_app(settings=settings))
+    marker = f"dashboard overlay export marker {token}"
+    out_of_scope_marker = f"dashboard overlay out-of-scope marker {token}"
     cleanup_targets: list[tuple[str, str]] = []
     category_id: str | None = None
     category_schema = {
@@ -151,7 +866,7 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
         categories_response = client.post(
             f"/v1/projects/{project_id}/categories",
             json={
-                "name": "preferences",
+                "name": category_name,
                 "description": "E2E preferences category",
                 "schema": category_schema,
                 "enabled": True,
@@ -179,8 +894,9 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
                 "project_id": project_id,
                 "app_id": app_id,
                 "user_id": user_id,
+                "run_id": run_id,
                 "infer": False,
-                "metadata": {"category": "preferences"},
+                "metadata": {"category": category_name},
                 "messages": [{"role": "user", "content": marker}],
             },
         )
@@ -196,22 +912,23 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
                 )
             )
         assert indexed_memory is not None
-        assert indexed_memory.category == "preferences"
+        assert indexed_memory.category == category_name
 
         out_of_scope_response = client.post(
             "/v3/memories/add/",
             json={
                 "project_id": project_id,
-                "app_id": f"{app_id}-other",
-                "user_id": f"{user_id}-other",
+                "app_id": other_app_id,
+                "user_id": other_user_id,
+                "run_id": other_run_id,
                 "infer": False,
-                "metadata": {"category": "preferences"},
+                "metadata": {"category": category_name},
                 "messages": [{"role": "user", "content": out_of_scope_marker}],
             },
         )
         assert out_of_scope_response.status_code == 200, out_of_scope_response.text
         out_of_scope_memory_id = out_of_scope_response.json()["event"]["subject_id"]
-        cleanup_targets.append((out_of_scope_memory_id, f"{app_id}-other"))
+        cleanup_targets.append((out_of_scope_memory_id, other_app_id))
 
         export_response = client.post(
             "/v1/exports",
@@ -245,18 +962,30 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
         assert disable_response.json()["enabled"] is False
         assert disable_response.json()["version"] == 3
     finally:
-        try:
-            for cleanup_memory_id, cleanup_app_id in cleanup_targets:
-                delete_response = client.delete(
-                    f"/v1/memories/{cleanup_memory_id}",
-                    params={"project_id": project_id, "app_id": cleanup_app_id},
+        cleanup_errors = []
+        for cleanup_memory_id, cleanup_app_id in cleanup_targets:
+            cleanup_errors.append(
+                _cleanup_memory_fixture(
+                    client,
+                    settings,
+                    memory_id=cleanup_memory_id,
+                    project_id=project_id,
+                    app_id=cleanup_app_id,
                 )
-                assert delete_response.status_code == 200, delete_response.text
-        finally:
-            if category_id is not None:
+            )
+        if category_id is not None:
+            try:
                 delete_category_response = client.delete(
                     f"/v1/projects/{project_id}/categories/{category_id}"
                 )
-                assert (
-                    delete_category_response.status_code == 204
-                ), delete_category_response.text
+                if delete_category_response.status_code != 204:
+                    cleanup_errors.append(
+                        "Category cleanup returned HTTP "
+                        f"{delete_category_response.status_code}: "
+                        f"{delete_category_response.text}"
+                    )
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"Category cleanup raised {type(exc).__name__}: {exc}"
+                )
+        _report_cleanup_failures(cleanup_errors)

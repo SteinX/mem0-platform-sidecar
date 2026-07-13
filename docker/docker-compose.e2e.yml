@@ -48,6 +48,7 @@ services:
       DASHBOARD_URL: http://localhost:3000
       JWT_SECRET: e2e-jwt-secret
       MEM0_TELEMETRY: "false"
+      MEM0_OSS_LIST_FETCH_LIMIT: "5000"
       OPENAI_API_KEY: e2e-openai-key
       OPENAI_BASE_URL: http://openai-stub:8000/v1
       POSTGRES_HOST: postgres
@@ -80,6 +81,43 @@ services:
       MEM0_E2E_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
+    command:
+      - python
+      - -m
+      - pytest
+      - tests/e2e/test_live_mem0_oss.py
+      - -v
+      - -rs
+      - -m
+      - "not adoption_e2e"
+      - -p
+      - no:cacheprovider
+
+  e2e-adoption-runner:
+    build:
+      context: ..
+      dockerfile: tests/e2e/sidecar_e2e_runner.Dockerfile
+    depends_on:
+      mem0:
+        condition: service_healthy
+    environment:
+      MEM0_E2E_BASE_URL: http://mem0:8000
+      MEM0_E2E_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
+      MEM0_E2E_ADOPTION_ENABLED: "true"
+      MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    command:
+      - python
+      - -m
+      - pytest
+      - tests/e2e/test_live_mem0_oss.py
+      - -v
+      - -rs
+      - -m
+      - "adoption_e2e"
+      - -p
+      - no:cacheprovider
 
 volumes:
   postgres-data:

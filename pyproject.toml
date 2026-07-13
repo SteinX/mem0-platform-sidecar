@@ -34,6 +34,7 @@ pythonpath = ["src"]
 asyncio_mode = "auto"
 markers = [
   "e2e: tests that require a live Mem0 OSS-compatible REST service",
+  "adoption_e2e: live tests that require the isolated unscoped-adoption gate",
 ]
 
 [tool.ruff]

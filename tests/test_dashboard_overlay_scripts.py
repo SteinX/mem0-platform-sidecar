@@ -219,6 +219,32 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
     assert "src/utils/category-editor-state.ts" in manifest["files"]
 
 
+def test_dashboard_overlay_readme_documents_memory_explorer_operations():
+    content = (OVERLAY / "README.md").read_text()
+
+    for contract in (
+        "Memory Explorer",
+        "/dashboard/memories?memoryId=",
+        "SIDECAR_APP_ID",
+        "results",
+        "has_more",
+        "stale_skipped",
+        "5000",
+        "scanned",
+        "indexed",
+        "skipped_unscoped",
+        "skipped_other_scope",
+        "stale_marked",
+        "MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED",
+        "one-project migration",
+        "shared upstream store",
+        "AUTH_DISABLED",
+        "apply-dashboard-overlay",
+        "Remove the overlay",
+    ):
+        assert contract in content
+
+
 def test_dashboard_overlay_includes_category_schema_builder_contract():
     manifest = json.loads((OVERLAY / "manifest.json").read_text())
     schema_path = "src/utils/category-schema.ts"
