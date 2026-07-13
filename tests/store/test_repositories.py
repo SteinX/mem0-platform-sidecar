@@ -1227,34 +1227,92 @@ def test_event_repository_lists_and_gets_events_scoped_to_project(db_session) ->
 
     visible = event_repo.create_event(
         project_id="repo-a",
+        app_id="app-a",
         operation="memory.add",
-        request={"text": "visible"},
+        request={"app_id": "app-a", "text": "visible"},
         subject_type="memory",
         subject_id="mem-a",
-        allow_project_scope=True,
     )
     event_repo.mark_succeeded(visible.id, response={"id": "mem-a"})
 
     hidden = event_repo.create_event(
         project_id="repo-b",
+        app_id="app-a",
         operation="memory.add",
-        request={"text": "hidden"},
+        request={"app_id": "app-a", "text": "hidden"},
         subject_type="memory",
         subject_id="mem-b",
-        allow_project_scope=True,
     )
     event_repo.mark_succeeded(hidden.id, response={"id": "mem-b"})
+    wrong_app = event_repo.create_event(
+        project_id="repo-a",
+        app_id="app-b",
+        operation="memory.add",
+        request={"app_id": "app-b", "text": "wrong app"},
+        subject_type="memory",
+        subject_id="mem-c",
+    )
+    event_repo.mark_succeeded(wrong_app.id, response={"id": "mem-c"})
     db_session.commit()
 
     listed = event_repo.list_project_events("repo-a")
-    fetched = event_repo.get_project_event("repo-a", visible.id)
+    fetched = event_repo.get_project_event("repo-a", "app-a", visible.id)
 
-    assert [event.id for event in listed] == [visible.id]
+    assert [event.id for event in listed] == [visible.id, wrong_app.id]
     assert fetched.id == visible.id
     assert fetched.project_id == "repo-a"
 
     with pytest.raises(KeyError):
-        event_repo.get_project_event("repo-a", hidden.id)
+        event_repo.get_project_event("repo-a", "app-a", hidden.id)
+    with pytest.raises(KeyError):
+        event_repo.get_project_event("repo-a", "app-a", wrong_app.id)
+
+
+def test_event_repository_legacy_list_allows_5000_and_rejects_5001(
+    db_session,
+) -> None:
+    created_at = datetime(2026, 7, 13, tzinfo=UTC)
+    rows = [
+        {
+            "id": f"event-{index:04d}",
+            "project_id": "repo-a",
+            "operation": "memory.search",
+            "status": EventStatus.SUCCEEDED,
+            "request_json": "{}",
+            "response_json": "{}",
+            "error_json": "{}",
+            "result_count": 0,
+            "has_results": 0,
+            "created_at": created_at,
+        }
+        for index in range(5000)
+    ]
+    db_session.execute(insert(Event), rows)
+    repository = EventRepository(db_session)
+
+    assert len(repository.list_project_events("repo-a")) == 5000
+
+    db_session.execute(
+        insert(Event),
+        {
+            "id": "event-over-limit",
+            "project_id": "repo-a",
+            "operation": "memory.search",
+            "status": EventStatus.SUCCEEDED,
+            "request_json": "{}",
+            "response_json": "{}",
+            "error_json": "{}",
+            "result_count": 0,
+            "has_results": 0,
+            "created_at": created_at,
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="event list exceeds 5000 records; use POST /v1/events/query",
+    ):
+        repository.list_project_events("repo-a")
 
 
 def test_event_model_matches_request_trace_migration() -> None:

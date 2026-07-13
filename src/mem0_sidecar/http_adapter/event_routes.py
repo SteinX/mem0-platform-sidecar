@@ -8,12 +8,15 @@ from mem0_sidecar.core.explorer_filters import parse_explorer_query
 from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.http_adapter.dependencies import get_session
 from mem0_sidecar.http_adapter.project_scope import (
-    resolve_app_id,
     resolve_project_app_id,
     resolve_project_id,
 )
 from mem0_sidecar.store.models import EventStatus
-from mem0_sidecar.store.repositories import EventQuery, EventRepository
+from mem0_sidecar.store.repositories import (
+    EVENT_SCAN_LIMIT,
+    EventQuery,
+    EventRepository,
+)
 
 event_router = APIRouter()
 SessionDependency = Annotated[Session, Depends(get_session)]
@@ -23,9 +26,75 @@ _DISPLAY_OPERATIONS = {
     "GET_ALL": "memory.list",
 }
 _ENTITY_FILTER_FIELDS = frozenset({"user_id", "agent_id", "app_id", "run_id"})
+_QUERY_KEYS = frozenset(
+    {
+        "project_id",
+        "app_id",
+        "operation",
+        "statuses",
+        "has_results",
+        "date_range",
+        "entity_filters",
+        "page",
+        "page_size",
+    }
+)
+_DATE_RANGE_KEYS = frozenset({"from", "to"})
+
+
+def _explicit_scope_value(
+    request: Request,
+    payload: dict[str, Any] | None,
+    field_name: str,
+) -> str | None:
+    if payload is not None and field_name in payload:
+        return validate_scope_id(payload[field_name], field_name=field_name)
+    if field_name in request.query_params:
+        return validate_scope_id(
+            request.query_params.get(field_name),
+            field_name=field_name,
+        )
+    return None
+
+
+def _resolve_event_scope(
+    request: Request,
+    session: Session,
+    payload: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    explicit_project_id = _explicit_scope_value(
+        request,
+        payload,
+        "project_id",
+    )
+    project_id = explicit_project_id or validate_scope_id(
+        request.app.state.settings.default_project_id,
+        field_name="project_id",
+    )
+    requested_app_id = _explicit_scope_value(request, payload, "app_id")
+    app_id = resolve_project_app_id(
+        session,
+        project_id=project_id,
+        request_app_id=requested_app_id,
+    )
+    if app_id is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project_id, validate_scope_id(app_id, field_name="app_id")
 
 
 def _parse_event_query(payload: dict[str, Any]) -> EventQuery:
+    unknown_keys = set(payload) - _QUERY_KEYS
+    if unknown_keys:
+        names = ", ".join(sorted(str(key) for key in unknown_keys))
+        raise ValueError(f"unknown query fields: {names}")
+
+    raw_date_range = payload.get("date_range")
+    if isinstance(raw_date_range, dict):
+        unknown_date_keys = set(raw_date_range) - _DATE_RANGE_KEYS
+        if unknown_date_keys:
+            names = ", ".join(sorted(str(key) for key in unknown_date_keys))
+            raise ValueError(f"unknown date_range fields: {names}")
+
     raw_operation = payload.get("operation")
     if raw_operation is None:
         operation = None
@@ -40,13 +109,18 @@ def _parse_event_query(payload: dict[str, Any]) -> EventQuery:
     if len(raw_statuses) > len(EventStatus):
         raise ValueError(f"statuses must contain at most {len(EventStatus)} items")
     statuses: list[EventStatus] = []
+    seen_statuses: set[EventStatus] = set()
     for index, raw_status in enumerate(raw_statuses):
         if type(raw_status) is not str:
             raise ValueError(f"statuses[{index}] is invalid")
         try:
-            statuses.append(EventStatus(raw_status))
+            status = EventStatus(raw_status)
         except ValueError as exc:
             raise ValueError(f"statuses[{index}] is invalid") from exc
+        if status in seen_statuses:
+            raise ValueError(f"statuses[{index}] is duplicated")
+        seen_statuses.add(status)
+        statuses.append(status)
 
     has_results = payload.get("has_results")
     if has_results is not None and type(has_results) is not bool:
@@ -72,6 +146,8 @@ def _parse_event_query(payload: dict[str, Any]) -> EventQuery:
         },
         allowed_fields=set(),
     )
+    if (shared_query.page - 1) * shared_query.page_size >= EVENT_SCAN_LIMIT:
+        raise ValueError("page exceeds 5000-record event scan horizon")
     return EventQuery(
         operation=operation,
         statuses=tuple(statuses),
@@ -91,27 +167,8 @@ def query_events(
     session: SessionDependency,
 ) -> dict[str, Any]:
     try:
-        for field_name in ("project_id", "app_id"):
-            if field_name in payload:
-                validate_scope_id(payload[field_name], field_name=field_name)
-        project_id = validate_scope_id(
-            resolve_project_id(request, payload),
-            field_name="project_id",
-        )
-        requested_app_id = validate_scope_id(
-            resolve_app_id(request, payload),
-            field_name="app_id",
-            required=False,
-        )
-        app_id = resolve_project_app_id(
-            session,
-            project_id=project_id,
-            request_app_id=requested_app_id,
-        )
-        if app_id is None:
-            raise HTTPException(status_code=404, detail="Project not found")
-        app_id = validate_scope_id(app_id, field_name="app_id")
         query = _parse_event_query(payload)
+        project_id, app_id = _resolve_event_scope(request, session, payload)
         page = EventRepository(session).query_project_events(
             project_id,
             app_id,
@@ -140,7 +197,10 @@ def list_events(
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
     service = EventService(EventRepository(session))
-    return {"results": service.list_project_events(project_id)}
+    try:
+        return {"results": service.list_project_events(project_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @event_router.get("/v1/event/{event_id}")
@@ -150,9 +210,15 @@ def get_event(
     request: Request,
     session: SessionDependency,
 ) -> dict[str, Any]:
-    project_id = resolve_project_id(request)
     service = EventService(EventRepository(session))
     try:
-        return service.get_project_event(project_id, event_id)
+        project_id, app_id = _resolve_event_scope(request, session)
+        return service.get_project_event(project_id, app_id, event_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=404, detail="Event not found") from exc
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Event not found") from exc

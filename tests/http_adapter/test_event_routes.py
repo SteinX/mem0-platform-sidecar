@@ -207,6 +207,46 @@ def test_query_events_rejects_invalid_filters(tmp_path, field, value) -> None:
 
 
 @pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        {"totally_unknown": {"nested": [["x"] * 200]}},
+        {"date_range": {"unexpected": [["x"] * 200]}},
+        {"statuses": ["SUCCEEDED", "SUCCEEDED"]},
+        {"page": 5001, "page_size": 1},
+        {"page": 51, "page_size": 100},
+    ],
+)
+def test_query_events_rejects_unknown_bomb_duplicate_and_unreachable_page(
+    tmp_path,
+    invalid_payload,
+) -> None:
+    app = _create_test_app(tmp_path)
+
+    response = TestClient(app).post("/v1/events/query", json=invalid_payload)
+
+    assert response.status_code == 422
+
+
+def test_query_events_rejects_schema_before_resolving_unknown_project(
+    tmp_path,
+) -> None:
+    app = _create_test_app(tmp_path)
+
+    response = TestClient(app).post(
+        "/v1/events/query",
+        json={
+            "project_id": "repo-missing",
+            "totally_unknown": {"nested": [["x"] * 200]},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "unknown query fields: totally_unknown"}
+    with app.state.session_factory() as session:
+        assert session.get(Project, "repo-missing") is None
+
+
+@pytest.mark.parametrize(
     "scope_payload",
     [
         {"project_id": ""},
@@ -276,6 +316,22 @@ def test_query_events_isolates_project_and_app_scope(tmp_path) -> None:
     assert response.json()["total"] == 1
 
 
+def test_query_events_treats_app_only_scope_as_app_within_default_project(
+    tmp_path,
+) -> None:
+    app = _create_test_app(tmp_path)
+    _seed_project(app, "repo-a", app_id="repo-default-app")
+    visible_id = _seed_event(app, project_id="repo-a", app_id="app-a")
+
+    response = TestClient(app).post(
+        "/v1/events/query",
+        json={"app_id": "app-a"},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["results"]] == [visible_id]
+
+
 def test_query_events_unknown_project_does_not_bootstrap(tmp_path) -> None:
     app = _create_test_app(tmp_path)
 
@@ -303,6 +359,89 @@ def test_event_detail_returns_404_for_another_project(tmp_path) -> None:
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Event not found"}
+
+
+def test_event_detail_unknown_project_returns_generic_404_without_bootstrap(
+    tmp_path,
+) -> None:
+    app = _create_test_app(tmp_path)
+
+    response = TestClient(app).get(
+        "/v1/event/missing-event",
+        params={"project_id": "repo-missing", "app_id": "app-a"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Event not found"}
+    with app.state.session_factory() as session:
+        assert session.get(Project, "repo-missing") is None
+
+
+def test_event_detail_returns_404_for_another_app_in_the_same_project(
+    tmp_path,
+) -> None:
+    app = _create_test_app(tmp_path)
+    _seed_project(app, "repo-a", app_id="app-a")
+    event_id = _seed_event(app, project_id="repo-a", app_id="app-b")
+    client = TestClient(app)
+
+    hidden = client.get(
+        f"/v1/event/{event_id}",
+        params={"project_id": "repo-a", "app_id": "app-a"},
+    )
+    visible = client.get(
+        f"/v1/event/{event_id}",
+        params={"project_id": "repo-a", "app_id": "app-b"},
+    )
+
+    assert hidden.status_code == 404
+    assert hidden.json() == {"detail": "Event not found"}
+    assert visible.status_code == 200
+    assert visible.json()["id"] == event_id
+
+
+def test_event_detail_legacy_null_app_is_matched_safely_and_fails_closed(
+    tmp_path,
+) -> None:
+    app = _create_test_app(tmp_path)
+    _seed_project(app, "repo-a", app_id="app-a")
+    with app.state.session_factory() as session:
+        scoped = Event(
+            project_id="repo-a",
+            app_id=None,
+            operation="memory.search",
+            status=EventStatus.SUCCEEDED,
+            request_json=json.dumps({"app_id": "app-a", "query": "safe"}),
+        )
+        unscoped = Event(
+            project_id="repo-a",
+            app_id=None,
+            operation="memory.search",
+            status=EventStatus.SUCCEEDED,
+            request_json=json.dumps({"query": "ambiguous"}),
+        )
+        session.add_all([scoped, unscoped])
+        session.commit()
+        scoped_id = scoped.id
+        unscoped_id = unscoped.id
+    client = TestClient(app)
+
+    scoped_visible = client.get(
+        f"/v1/event/{scoped_id}",
+        params={"project_id": "repo-a", "app_id": "app-a"},
+    )
+    scoped_hidden = client.get(
+        f"/v1/event/{scoped_id}",
+        params={"project_id": "repo-a", "app_id": "app-b"},
+    )
+    unscoped_hidden = client.get(
+        f"/v1/event/{unscoped_id}",
+        params={"project_id": "repo-a", "app_id": "app-a"},
+    )
+
+    assert scoped_visible.status_code == 200
+    assert scoped_hidden.status_code == 404
+    assert unscoped_hidden.status_code == 404
 
 
 def test_query_events_exposes_successful_and_failed_search_traces(tmp_path) -> None:
@@ -436,3 +575,19 @@ def test_query_events_validates_entity_filters_before_repository_call(
 
     assert response.status_code == 422
     assert called is False
+
+
+def test_legacy_event_list_maps_repository_cap_to_422(tmp_path, monkeypatch) -> None:
+    app = _create_test_app(tmp_path)
+
+    def reject_unbounded_list(self, project_id):
+        raise ValueError("event list exceeds 5000 records; use POST /v1/events/query")
+
+    monkeypatch.setattr(EventRepository, "list_project_events", reject_unbounded_list)
+
+    response = TestClient(app, raise_server_exceptions=False).get("/v1/events")
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "event list exceeds 5000 records; use POST /v1/events/query"
+    }
