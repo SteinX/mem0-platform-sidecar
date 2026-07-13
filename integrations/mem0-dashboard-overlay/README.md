@@ -9,9 +9,10 @@ The self-hosted surface currently includes:
 - Export (JSON only)
 - Memory Explorer at `/dashboard/memories`
 - Request Trace Explorer at `/dashboard/requests`
+- Entity Explorer at `/dashboard/entities`
 
-Entities are not part of this overlay. Categories, Export, Memory Explorer, and
-Request Trace Explorer appear as first-class self-hosted dashboard surfaces.
+Categories, Export, Memory Explorer, Request Trace Explorer, and Entity Explorer
+appear as first-class self-hosted dashboard surfaces.
 
 ## Apply and verify
 
@@ -26,13 +27,16 @@ python integrations/mem0-dashboard-overlay/scripts/verify-dashboard-overlay \
 
 The apply script copies every path in `manifest.json` and overwrites matching
 files. Commit or otherwise back up local dashboard changes before applying it.
+Applying and verifying the files does not compile or restart the dashboard. Run
+the upstream dashboard typecheck/build, then rebuild and restart the dashboard
+deployment before sending traffic to the new overlay.
 
 Configure the dashboard runtime, not the browser build, with:
 
 ```bash
 SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
 SIDECAR_PROJECT_ID=default
-# Optional: pin Memory and Request Trace Explorers to one app in the project.
+# Optional: pin Memory, Request Trace, and Entity Explorers to one app.
 SIDECAR_APP_ID=default
 # Mirror this only when the Mem0 OSS server itself is intentionally auth-disabled.
 AUTH_DISABLED=false
@@ -42,7 +46,8 @@ AUTH_DISABLED=false
 unset, the overlay falls back to `MEM0_SIDECAR_DEFAULT_PROJECT_ID`, then
 `default`. `SIDECAR_APP_ID`, when set, is the authoritative app for Memory
 Explorer query/detail/history/mutation calls and Request Trace query/detail
-calls. When it is unset, the sidecar uses the existing project's
+calls, plus Entity Explorer query/detail/delete calls. When it is unset, the
+sidecar uses the existing project's
 `default_app_id`; read routes never create a missing project. Caller-supplied
 project/app values are removed by the same-origin proxy.
 
@@ -102,6 +107,62 @@ The drawer uses these scoped routes:
 Open a drawer directly with
 `/dashboard/memories?memoryId=<percent-encoded-memory-id>`. Closing the drawer
 removes `memoryId` while preserving the current filters and pagination.
+
+## Entity Explorer API
+
+Entity Explorer exposes the exact projection types `USER`, `RUN`, `AGENT`, and
+`APP` (serialized by the sidecar as `user`, `run`, `agent`, and `app`). Every
+entity row belongs to one exact project and app. Reusing a user, agent, or run ID
+in another app or project creates a separate projection and never broadens the
+current dashboard scope.
+
+The projection is derived only from active sidecar memory-index rows. An
+entity's `memory_count` is the number of active rows whose corresponding
+identity column exactly equals its ID; `last_seen_at` is the maximum of those
+rows' `updated_at` values. A missing identity produces no row. Successful
+memory add, update, delete, and reconciliation operations refresh the affected
+app projection.
+
+Entity queries use `POST /v1/entities/query`; the drawer uses
+`GET /v1/entities/{type}/{id}`. View Memories opens Memory Explorer with one
+exact identity filter (`user_id`, `agent_id`, `app_id`, or `run_id`), so its
+result set is equivalent to the entity's scoped projected memories.
+
+Projection rebuild is an administrative repair operation and is deliberately
+not allowed through the dashboard's same-origin proxy. Call the sidecar itself:
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/projects/default/entities/rebuild \
+  -H 'Content-Type: application/json' \
+  -d '{"project_id":"default","app_id":"default"}'
+```
+
+Rebuild deletes and recreates only that project/app projection from the active
+memory index. It removes obsolete rows, does not touch other scopes, and is
+idempotent in projected content: repeated rebuilds over an unchanged index
+produce the same types, IDs, counts, and last-seen values without accumulating
+duplicates. Treat it as an operator action; it does not scan or mutate Mem0 OSS.
+
+### Entity deletion safety
+
+The dashboard fetches fresh entity detail before confirmation and requires the
+operator to type the exact, case-sensitive entity ID. The dialog shows that
+fresh projected memory count. Confirmation calls
+`DELETE /v1/entities/{type}/{id}` in the configured project/app scope.
+
+The sidecar snapshots only the active memory IDs for that exact scope, type,
+and ID, then calls the upstream single-memory delete once per ID. It never uses
+an upstream bulk identity delete. A broad user/agent/run deletion is forbidden
+because Mem0 OSS does not carry the sidecar's project/app boundary in that
+operation; the same identity may legitimately exist in another app or project,
+and bulk deletion could destroy those foreign memories. An upstream per-ID 404
+is treated as converged deletion, not a reason to broaden the operation.
+
+The result status is `SUCCEEDED`, `PARTIAL`, or `FAILED`, with exact requested,
+deleted, and failed counts plus sanitized per-memory failures. Successful IDs
+are tombstoned locally and the projection is rebuilt; failed IDs remain active
+and visible. The dashboard refetches after success or a partial result, keeps
+partial/failed details visible, and never removes rows optimistically.
 
 ## Request Trace Explorer API
 

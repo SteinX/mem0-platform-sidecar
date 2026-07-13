@@ -617,6 +617,93 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         )
         assert _record_contains(history["results"], updated_text)
 
+        rebuild_response = client.post(
+            f"/v1/projects/{project_id}/entities/rebuild",
+            json={"project_id": project_id, "app_id": app_id},
+        )
+        assert rebuild_response.status_code == 200, rebuild_response.text
+        assert rebuild_response.json() == {
+            "entities": 4,
+            "project_id": project_id,
+            "app_id": app_id,
+        }
+
+        entity_by_type: dict[str, dict[str, object]] = {}
+        for entity_type, entity_id in (("user", user_id), ("app", app_id)):
+            entity_response = client.post(
+                "/v1/entities/query",
+                json={
+                    "project_id": project_id,
+                    "app_id": app_id,
+                    "entity_type": entity_type,
+                    "filters": [
+                        {
+                            "field": f"{entity_type}_id",
+                            "operator": "equals",
+                            "value": entity_id,
+                        }
+                    ],
+                },
+            )
+            assert entity_response.status_code == 200, entity_response.text
+            entity_payload = entity_response.json()
+            assert entity_payload["total"] == 1
+            assert len(entity_payload["results"]) == 1
+            entity = entity_payload["results"][0]
+            assert entity["type"] == entity_type
+            assert entity["entity_id"] == entity_id
+            assert entity["memory_count"] == 1
+            entity_by_type[entity_type] = entity
+
+            entity_memory_response = client.post(
+                "/v1/memories/query",
+                json={
+                    "project_id": project_id,
+                    "app_id": app_id,
+                    "match": "all",
+                    "filters": [
+                        {
+                            "field": f"{entity_type}_id",
+                            "operator": "equals",
+                            "value": entity_id,
+                        }
+                    ],
+                },
+            )
+            assert (
+                entity_memory_response.status_code == 200
+            ), entity_memory_response.text
+            entity_memories = entity_memory_response.json()
+            assert entity_memories["total"] == entity["memory_count"]
+            assert entity_memories["stale_skipped"] == 0
+            assert {item["id"] for item in entity_memories["results"]} == {
+                memory_id
+            }
+
+        assert entity_by_type["user"]["last_seen_at"] is not None
+        assert entity_by_type["app"]["last_seen_at"] is not None
+
+        foreign_entity_response = client.post(
+            "/v1/entities/query",
+            json={
+                "project_id": project_id,
+                "app_id": foreign_app_id,
+                "entity_type": "user",
+                "filters": [
+                    {
+                        "field": "user_id",
+                        "operator": "equals",
+                        "value": user_id,
+                    }
+                ],
+            },
+        )
+        assert foreign_entity_response.status_code == 200, (
+            foreign_entity_response.text
+        )
+        assert foreign_entity_response.json()["total"] == 1
+        assert foreign_entity_response.json()["results"][0]["memory_count"] == 1
+
         wrong_app_query = client.post(
             "/v1/memories/query",
             json={"project_id": project_id, "app_id": wrong_app_id},
@@ -635,11 +722,17 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         assert wrong_app_get.status_code == 404, wrong_app_get.text
 
         delete_response = client.delete(
-            f"/v1/memories/{memory_id}",
+            f"/v1/entities/user/{user_id}",
+            headers={"X-Request-ID": f"live-entity-delete-{token}"},
             params=_scoped_params(project_id=project_id, app_id=app_id),
         )
         assert delete_response.status_code == 200, delete_response.text
-        assert delete_response.json()["event"]["status"] == "SUCCEEDED"
+        delete_body = delete_response.json()
+        assert delete_body["status"] == "SUCCEEDED"
+        assert delete_body["requested_count"] == 1
+        assert delete_body["deleted_count"] == 1
+        assert delete_body["failed_count"] == 0
+        assert delete_body["failed"] == []
 
         deleted_query = client.post(
             "/v1/memories/query",
@@ -649,6 +742,56 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         assert deleted_query.status_code == 200, deleted_query.text
         assert all(
             item["id"] != memory_id for item in deleted_query.json()["results"]
+        )
+
+        deleted_entity_response = client.get(
+            f"/v1/entities/user/{user_id}",
+            params=_scoped_params(project_id=project_id, app_id=app_id),
+        )
+        assert deleted_entity_response.status_code == 404, (
+            deleted_entity_response.text
+        )
+        surviving_entity_response = client.get(
+            f"/v1/entities/user/{user_id}",
+            params=_scoped_params(
+                project_id=project_id,
+                app_id=foreign_app_id,
+            ),
+        )
+        assert surviving_entity_response.status_code == 200, (
+            surviving_entity_response.text
+        )
+        assert surviving_entity_response.json()["memory_count"] == 1
+        surviving_memory_response = client.post(
+            "/v1/memories/query",
+            json={
+                "project_id": project_id,
+                "app_id": foreign_app_id,
+                "match": "all",
+                "filters": [
+                    {
+                        "field": "user_id",
+                        "operator": "equals",
+                        "value": user_id,
+                    }
+                ],
+            },
+        )
+        assert surviving_memory_response.status_code == 200, (
+            surviving_memory_response.text
+        )
+        assert {
+            item["id"] for item in surviving_memory_response.json()["results"]
+        } == {foreign_memory_id}
+        surviving_detail_response = client.get(
+            f"/v1/memories/{foreign_memory_id}",
+            params=_scoped_params(
+                project_id=project_id,
+                app_id=foreign_app_id,
+            ),
+        )
+        assert surviving_detail_response.status_code == 200, (
+            surviving_detail_response.text
         )
         with client.app.state.session_factory() as session:
             projection = session.scalar(
@@ -701,6 +844,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
     operations = [event["operation"] for event in events_response.json()["results"]]
     assert "memory.add" in operations
     assert "memory.delete" in operations
+    assert "entity.delete" in operations
 
     trace_query = client.post(
         "/v1/events/query",
