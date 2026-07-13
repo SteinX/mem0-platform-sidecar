@@ -93,6 +93,11 @@ export type SidecarMemoryPage = {
   stale_skipped: number;
 };
 
+export type SidecarMemoryUpdateResponse = {
+  memory: SidecarMemory;
+  event: Record<string, unknown>;
+};
+
 export type SidecarMemoryHistoryEntry = {
   id?: string;
   memory_id?: string;

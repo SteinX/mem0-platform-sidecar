@@ -20,6 +20,11 @@ export type ParsedMemoryHistory = {
   }>;
 };
 
+export type MemoryOperation = {
+  generation: number;
+  targetId: string;
+};
+
 export function memoryQueryPayload(
   query: ExplorerQueryPayload,
 ): SidecarMemoryQuery {
@@ -44,6 +49,27 @@ export function memoryQueriesEqual(
 
 export function nextMemoryRequestGeneration(current: number): number {
   return current + 1;
+}
+
+export function beginMemoryOperation(
+  currentGeneration: number,
+  targetId: string,
+): MemoryOperation {
+  return {
+    generation: nextMemoryRequestGeneration(currentGeneration),
+    targetId,
+  };
+}
+
+export function canApplyMemoryOperation(
+  operation: MemoryOperation,
+  currentGeneration: number,
+  activeMemoryId: string | null,
+  mounted: boolean,
+): boolean {
+  return mounted
+    && operation.generation === currentGeneration
+    && operation.targetId === activeMemoryId;
 }
 
 export function isCurrentMemoryRequest(
@@ -185,6 +211,21 @@ export function memoryDeleteNavigation(
 
 export function memoryApiPath(memoryId: string): string {
   return `/v1/memories/${encodeURIComponent(memoryId)}`;
+}
+
+export function normalizeMemoryId(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim();
+  return normalized === "" ? null : normalized;
+}
+
+export function shouldShowMemoryPagination(
+  page: number,
+  hasMore: boolean,
+): boolean {
+  return page > 1 || hasMore;
 }
 
 export function setMemoryIdInUrl(

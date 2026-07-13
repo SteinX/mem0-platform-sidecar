@@ -180,6 +180,8 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/app/(root)/dashboard/categories/category-field-editor.tsx",
         "src/app/(root)/dashboard/categories/category-editor-drawer.tsx",
         "src/app/(root)/dashboard/memories/page.tsx",
+        "src/app/(root)/dashboard/memories/memories-page.tsx",
+        "src/app/(root)/dashboard/memories/memory-categories.tsx",
         "src/app/(root)/dashboard/memories/memory-detail-drawer.tsx",
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/config/route.ts",
@@ -319,18 +321,28 @@ def test_dashboard_overlay_includes_shared_explorer_components():
 def test_dashboard_overlay_includes_memory_explorer_page_and_drawer_contracts():
     manifest = json.loads((OVERLAY / "manifest.json").read_text())
     page_path = "src/app/(root)/dashboard/memories/page.tsx"
+    screen_path = "src/app/(root)/dashboard/memories/memories-page.tsx"
     drawer_path = (
         "src/app/(root)/dashboard/memories/memory-detail-drawer.tsx"
     )
+    categories_path = (
+        "src/app/(root)/dashboard/memories/memory-categories.tsx"
+    )
     state_path = "src/utils/memory-explorer-state.ts"
 
-    for relative in (page_path, drawer_path, state_path):
+    for relative in (
+        page_path,
+        screen_path,
+        drawer_path,
+        categories_path,
+        state_path,
+    ):
         assert relative in manifest["files"]
         source = OVERLAY / "overlays" / relative
         assert source.is_file()
         assert_dashboard_tsx_transpiles(source)
 
-    page_content = (OVERLAY / "overlays" / page_path).read_text()
+    page_content = (OVERLAY / "overlays" / screen_path).read_text()
     for contract in (
         "Time",
         "Entities",
@@ -340,7 +352,6 @@ def test_dashboard_overlay_includes_memory_explorer_page_and_drawer_contracts():
         "DateRangeFilter",
         "FilterBuilder",
         "DataTable",
-        "CategoriesDisplay",
         "stale_skipped",
         "Loading memories",
         "No memories found",
@@ -352,6 +363,9 @@ def test_dashboard_overlay_includes_memory_explorer_page_and_drawer_contracts():
         "md:hidden",
         "aria-disabled",
         "tabIndex",
+        "normalizeMemoryId",
+        "shouldShowMemoryPagination",
+        "MemoryCategories",
     ):
         assert contract in page_content
 
@@ -372,6 +386,40 @@ def test_dashboard_overlay_includes_memory_explorer_page_and_drawer_contracts():
         "sm:max-w-2xl",
         "await navigator.clipboard.writeText",
         "Failed to copy memory ID",
+        "beginMemoryOperation",
+        "canApplyMemoryOperation",
+        "mutationGeneration",
+        "mountedRef",
+        "activeMemoryIdRef",
+        "SidecarMemoryUpdateResponse",
+        "response.memory",
+    ):
+        assert contract in drawer_content
+
+    assert "CategoriesDisplay" not in page_content
+    categories_content = (OVERLAY / "overlays" / categories_path).read_text()
+    for contract in (
+        "Popover",
+        "PopoverTrigger",
+        "PopoverContent",
+        "aria-expanded",
+        "Show ${remainingCount} more categories",
+        "event.stopPropagation()",
+        "mobile",
+    ):
+        assert contract in categories_content
+
+    for contract in (
+        "return () =>",
+        "requestGeneration.current = nextMemoryRequestGeneration",
+    ):
+        assert contract in page_content
+    for contract in (
+        "if (isBusy)",
+        "onMemoryIdChange(activeMemoryId)",
+        "detailGeneration.current = nextMemoryRequestGeneration",
+        "historyGeneration.current = nextMemoryRequestGeneration",
+        "mutationGeneration.current = nextMemoryRequestGeneration",
     ):
         assert contract in drawer_content
 
@@ -396,6 +444,67 @@ def test_dashboard_overlay_verifier_runs_memory_explorer_runtime_contracts():
     )
 
 
+def test_memory_explorer_mutations_consume_target_scoped_runtime_guards():
+    verifier = runpy.run_path(str(VERIFY_DASHBOARD_OVERLAY))
+    drawer = (
+        OVERLAY
+        / "overlays/src/app/(root)/dashboard/memories/memory-detail-drawer.tsx"
+    ).read_text()
+
+    for function_name in ("saveMemory", "deleteMemory"):
+        body = verifier["extract_named_arrow_function_body"](
+            drawer,
+            function_name,
+        )
+        assert body is not None
+        assert "beginMemoryOperation(" in body
+        assert body.count("canApplyMemoryOperation(") >= 4
+        assert "activeMemoryIdRef.current" in body
+        assert "mountedRef.current" in body
+
+    save_body = verifier["extract_named_arrow_function_body"](
+        drawer,
+        "saveMemory",
+    )
+    delete_body = verifier["extract_named_arrow_function_body"](
+        drawer,
+        "deleteMemory",
+    )
+    assert save_body is not None and "response.memory" in save_body
+    assert delete_body is not None and "onDeleted(targetMemoryId)" in delete_body
+
+    component = verifier["extract_named_component_body"](
+        drawer,
+        "MemoryDetailDrawer",
+    )
+    assert component is not None
+    effects = []
+    for match in re.finditer(r"\buseEffect\s*\(", component):
+        arguments = verifier["extract_balanced"](
+            component,
+            component.find("(", match.start()),
+            "(",
+            ")",
+        )
+        assert arguments is not None
+        effects.append(arguments)
+    assert any(
+        "if (isBusy)" in effect
+        and "onMemoryIdChange(activeMemoryId)" in effect
+        for effect in effects
+    )
+    cleanup = next(
+        effect for effect in effects
+        if "mountedRef.current = false" in effect
+    )
+    for generation in (
+        "detailGeneration.current",
+        "historyGeneration.current",
+        "mutationGeneration.current",
+    ):
+        assert generation in cleanup
+
+
 def test_memory_explorer_harness_verifies_the_applied_dashboard(tmp_path):
     dashboard = applied_upstream_overlay(tmp_path)
     result = subprocess.run(
@@ -411,7 +520,7 @@ def test_memory_explorer_harness_verifies_the_applied_dashboard(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "memory explorer state harness: 8 contracts passed" in result.stdout
+    assert "memory explorer state harness: 11 contracts passed" in result.stdout
 
 
 def test_memory_explorer_harness_rejects_tampered_applied_source(tmp_path):

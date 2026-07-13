@@ -6,6 +6,8 @@
     "src/app/(root)/dashboard/categories/category-field-editor.tsx",
     "src/app/(root)/dashboard/categories/category-editor-drawer.tsx",
     "src/app/(root)/dashboard/memories/page.tsx",
+    "src/app/(root)/dashboard/memories/memories-page.tsx",
+    "src/app/(root)/dashboard/memories/memory-categories.tsx",
     "src/app/(root)/dashboard/memories/memory-detail-drawer.tsx",
     "src/app/(root)/dashboard/export/page.tsx",
     "src/app/(root)/dashboard/components/main-nav.tsx",
