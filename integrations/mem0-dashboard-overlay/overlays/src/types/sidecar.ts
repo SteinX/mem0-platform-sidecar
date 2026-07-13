@@ -1,3 +1,9 @@
+import type {
+  ExplorerDateRange,
+  ExplorerFilter,
+  ExplorerMatch,
+} from "@/types/dashboard-explorer";
+
 export type SidecarCategoryInput = {
   name: string;
   description: string;
@@ -53,4 +59,49 @@ export type SidecarExportDownload = {
   filters: Record<string, string>;
   memories: unknown[];
   skipped: { id: string; reason: string }[];
+};
+
+export type SidecarMemory = {
+  id: string;
+  memory: string | null;
+  user_id: string | null;
+  agent_id: string | null;
+  app_id: string | null;
+  run_id: string | null;
+  categories: string[];
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+  expiration_date: string | null;
+};
+
+export type SidecarMemoryQuery = {
+  match: ExplorerMatch;
+  filters: Array<Omit<ExplorerFilter, "id">>;
+  date_range: ExplorerDateRange;
+  page: number;
+  page_size: number;
+  sort: "created_at_desc" | "created_at_asc";
+};
+
+export type SidecarMemoryPage = {
+  results: SidecarMemory[];
+  page: number;
+  page_size: number;
+  total: number;
+  has_more: boolean;
+  stale_skipped: number;
+};
+
+export type SidecarMemoryHistoryEntry = {
+  id?: string;
+  memory_id?: string;
+  input?: { role: string; content: string }[];
+  old_memory?: string | null;
+  new_memory?: string | null;
+  user_id?: string;
+  categories?: string[];
+  event?: string;
+  created_at?: string;
+  updated_at?: string;
 };
