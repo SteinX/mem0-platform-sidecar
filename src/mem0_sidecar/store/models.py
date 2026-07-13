@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -176,6 +177,27 @@ class MemoryIndex(Base):
 
 class Event(Base):
     __tablename__ = "events"
+    __table_args__ = (
+        Index("ix_events_project_created", "project_id", "created_at"),
+        Index(
+            "ix_events_project_operation_created",
+            "project_id",
+            "operation",
+            "created_at",
+        ),
+        Index(
+            "ix_events_project_status_created",
+            "project_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "ix_events_project_has_results_created",
+            "project_id",
+            "has_results",
+            "created_at",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
@@ -188,6 +210,14 @@ class Event(Base):
     request_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     response_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     error_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    correlation_id: Mapped[str | None] = mapped_column(String(256))
+    latency_ms: Mapped[float | None] = mapped_column(Float)
+    result_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    has_results: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

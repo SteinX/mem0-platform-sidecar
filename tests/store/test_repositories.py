@@ -5,10 +5,11 @@ from datetime import UTC, datetime, timedelta
 from threading import Barrier
 
 import pytest
-from sqlalchemy import UniqueConstraint, create_engine, insert
+from sqlalchemy import Index, UniqueConstraint, create_engine, insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+import mem0_sidecar.store.repositories as repositories
 from mem0_sidecar.core.explorer_filters import (
     MEMORY_FILTER_FIELDS,
     parse_explorer_query,
@@ -16,6 +17,7 @@ from mem0_sidecar.core.explorer_filters import (
 from mem0_sidecar.store.models import (
     Base,
     Category,
+    Event,
     EventStatus,
     ExportStatus,
     JobStatus,
@@ -1244,3 +1246,404 @@ def test_event_repository_lists_and_gets_events_scoped_to_project(db_session) ->
 
     with pytest.raises(KeyError):
         event_repo.get_project_event("repo-a", hidden.id)
+
+
+def test_event_model_matches_request_trace_migration() -> None:
+    columns = Event.__table__.columns
+    indexes = {
+        index.name: tuple(column.name for column in index.columns)
+        for index in Event.__table__.indexes
+        if isinstance(index, Index)
+    }
+
+    assert columns["correlation_id"].nullable is True
+    assert columns["latency_ms"].nullable is True
+    assert columns["result_count"].nullable is False
+    assert columns["has_results"].nullable is False
+    assert columns["result_count"].default.arg == 0
+    assert columns["has_results"].default.arg == 0
+    assert str(columns["result_count"].server_default.arg) == "0"
+    assert str(columns["has_results"].server_default.arg) == "0"
+    assert indexes == {
+        "ix_events_project_created": ("project_id", "created_at"),
+        "ix_events_project_operation_created": (
+            "project_id",
+            "operation",
+            "created_at",
+        ),
+        "ix_events_project_status_created": (
+            "project_id",
+            "status",
+            "created_at",
+        ),
+        "ix_events_project_has_results_created": (
+            "project_id",
+            "has_results",
+            "created_at",
+        ),
+    }
+
+
+def test_event_repository_sanitizes_requests_and_success_results(
+    db_session,
+    monkeypatch,
+) -> None:
+    projects = ProjectRepository(db_session)
+    projects.upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    started_at = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    completed_at = started_at + timedelta(milliseconds=125)
+    times = iter((started_at, completed_at))
+    monkeypatch.setattr(repositories, "_utc_now", lambda: next(times))
+    repository = EventRepository(db_session)
+
+    event = repository.create_event(
+        project_id="repo-a",
+        operation="memory.search",
+        correlation_id="request-123",
+        request={
+            "app_id": "app-a",
+            "user_id": "alice",
+            "query": "Where are my notes?",
+            "api_key": "must-not-persist",
+        },
+    )
+
+    assert event.started_at == started_at
+    assert event.correlation_id == "request-123"
+    assert json.loads(event.request_json) == {
+        "api_key": "[REDACTED]",
+        "app_id": "app-a",
+        "query": "Where are my notes?",
+        "user_id": "alice",
+    }
+
+    succeeded = repository.mark_succeeded(
+        event.id,
+        response={
+            "authorization": "Bearer must-not-persist",
+            "results": [
+                {
+                    "id": "mem-1",
+                    "memory": "first",
+                    "user_id": "alice",
+                    "api_key": "preview-secret",
+                },
+                {"id": "mem-2", "memory": "second", "score": 0.75},
+            ],
+            "total": 2,
+        },
+    )
+    response = json.loads(succeeded.response_json)
+
+    assert succeeded.status is EventStatus.SUCCEEDED
+    assert succeeded.completed_at == completed_at
+    assert succeeded.latency_ms == pytest.approx(125.0)
+    assert succeeded.result_count == 2
+    assert succeeded.has_results == 1
+    assert response["authorization"] == "[REDACTED]"
+    assert response["result_previews"] == [
+        {"id": "mem-1", "memory": "first", "user_id": "alice"},
+        {"id": "mem-2", "memory": "second", "score": 0.75},
+    ]
+    assert len(succeeded.request_json.encode()) <= 65_536
+    assert len(succeeded.response_json.encode()) <= 65_536
+
+
+def test_event_repository_sanitizes_failures_and_uses_created_latency_fallback(
+    db_session,
+    monkeypatch,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 7, 13, 11, 0, tzinfo=UTC)
+    completed_at = created_at + timedelta(milliseconds=250)
+    repository = EventRepository(db_session)
+    event = repository.create_event(
+        project_id="repo-a",
+        operation="memory.search",
+        request={"app_id": "app-a"},
+    )
+    event.created_at = created_at
+    event.started_at = None
+    event.result_count = 99
+    event.has_results = 1
+    monkeypatch.setattr(repositories, "_utc_now", lambda: completed_at)
+
+    failed = repository.mark_failed(
+        event.id,
+        error={"token": "must-not-persist", "message": "x" * 80_000},
+    )
+    error = json.loads(failed.error_json)
+
+    assert failed.status is EventStatus.FAILED
+    assert failed.completed_at == completed_at
+    assert failed.latency_ms == pytest.approx(250.0)
+    assert failed.result_count == 0
+    assert failed.has_results == 0
+    assert error["token"] == "[REDACTED]"
+    assert len(failed.error_json.encode()) <= 65_536
+
+
+def _add_trace_event(
+    db_session,
+    *,
+    event_id: str,
+    project_id: str = "repo-a",
+    operation: str = "memory.search",
+    status: EventStatus = EventStatus.SUCCEEDED,
+    request: object = None,
+    created_at: datetime,
+    result_count: int = 0,
+) -> Event:
+    event = Event(
+        id=event_id,
+        project_id=project_id,
+        operation=operation,
+        status=status,
+        request_json=json.dumps(request if request is not None else {}),
+        response_json="{}",
+        error_json="{}",
+        created_at=created_at,
+        started_at=created_at,
+        completed_at=created_at,
+        result_count=result_count,
+        has_results=1 if result_count else 0,
+    )
+    db_session.add(event)
+    return event
+
+
+def test_event_query_filters_and_total_are_strictly_project_app_scoped(
+    db_session,
+) -> None:
+    projects = ProjectRepository(db_session)
+    for project_id in ("repo-a", "repo-b"):
+        projects.upsert_default_project(
+            project_id=project_id,
+            name=project_id,
+            mem0_base_url="http://mem0:8000",
+        )
+    base = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+    _add_trace_event(
+        db_session,
+        event_id="visible-primary",
+        request={
+            "app_id": "app-a",
+            "user_id": "alice",
+            "agent_id": "codex",
+            "run_id": "run-1",
+        },
+        created_at=base,
+        result_count=2,
+    )
+    _add_trace_event(
+        db_session,
+        event_id="visible-sidecar-key",
+        status=EventStatus.FAILED,
+        request={"_mem0_sidecar_app_id": "app-a", "user_id": "alice"},
+        created_at=base - timedelta(hours=1),
+    )
+    _add_trace_event(
+        db_session,
+        event_id="wrong-app",
+        request={"app_id": "app-b", "user_id": "alice"},
+        created_at=base,
+        result_count=3,
+    )
+    _add_trace_event(
+        db_session,
+        event_id="missing-app",
+        request={"user_id": "alice"},
+        created_at=base,
+    )
+    malformed = _add_trace_event(
+        db_session,
+        event_id="malformed-app",
+        request={"app_id": 123, "user_id": "alice"},
+        created_at=base,
+    )
+    malformed.request_json = "not-json"
+    _add_trace_event(
+        db_session,
+        event_id="wrong-project",
+        project_id="repo-b",
+        request={"app_id": "app-a", "user_id": "alice"},
+        created_at=base,
+    )
+    db_session.flush()
+    repository = EventRepository(db_session)
+
+    page = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(page=1, page_size=20),
+    )
+
+    assert [item.id for item in page.items] == [
+        "visible-primary",
+        "visible-sidecar-key",
+    ]
+    assert page.total == 2
+    assert sum(bucket["count"] for bucket in page.buckets) == 2
+
+    filtered = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            operation="memory.search",
+            statuses=(EventStatus.SUCCEEDED,),
+            has_results=True,
+            from_at=base - timedelta(minutes=1),
+            to_at=base,
+            entity_filters={
+                "user_id": "alice",
+                "agent_id": "codex",
+                "run_id": "run-1",
+            },
+            page=1,
+            page_size=20,
+        ),
+    )
+
+    assert [item.id for item in filtered.items] == ["visible-primary"]
+    assert filtered.total == 1
+
+
+def test_event_query_pages_newest_first_and_buckets_at_48_hour_boundary(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    first_hour = datetime(2026, 7, 1, 1, 30, tzinfo=UTC)
+    second_hour = datetime(2026, 7, 1, 2, 15, tzinfo=UTC)
+    for event_id, created_at in (
+        ("event-a", first_hour),
+        ("event-b", first_hour),
+        ("event-c", second_hour),
+    ):
+        _add_trace_event(
+            db_session,
+            event_id=event_id,
+            request={"app_id": "app-a"},
+            created_at=created_at,
+        )
+    db_session.flush()
+    repository = EventRepository(db_session)
+    from_at = datetime(2026, 7, 1, tzinfo=UTC)
+    exact_boundary = from_at + timedelta(hours=48)
+
+    first_page = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            from_at=from_at,
+            to_at=exact_boundary,
+            page=1,
+            page_size=2,
+        ),
+    )
+    second_page = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            from_at=from_at,
+            to_at=exact_boundary,
+            page=2,
+            page_size=2,
+        ),
+    )
+
+    assert [item.id for item in first_page.items] == ["event-c", "event-b"]
+    assert [item.id for item in second_page.items] == ["event-a"]
+    assert first_page.total == second_page.total == 3
+    assert first_page.buckets == [
+        {"timestamp": "2026-07-01T01:00:00Z", "count": 2},
+        {"timestamp": "2026-07-01T02:00:00Z", "count": 1},
+    ]
+
+    daily = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            from_at=from_at,
+            to_at=exact_boundary + timedelta(microseconds=1),
+            page=1,
+            page_size=20,
+        ),
+    )
+
+    assert daily.buckets == [
+        {"timestamp": "2026-07-01T00:00:00Z", "count": 3}
+    ]
+
+
+def test_event_query_applies_sql_narrowing_before_bounded_scope_scan(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 7, 13, tzinfo=UTC)
+    db_session.add_all(
+        [
+            Event(
+                id=f"list-{index:04d}",
+                project_id="repo-a",
+                operation="memory.list",
+                status=EventStatus.SUCCEEDED,
+                request_json='{"app_id":"app-a"}',
+                response_json="{}",
+                error_json="{}",
+                created_at=created_at,
+                result_count=0,
+                has_results=0,
+            )
+            for index in range(5001)
+        ]
+    )
+    _add_trace_event(
+        db_session,
+        event_id="search-only",
+        operation="memory.search",
+        request={"app_id": "app-a"},
+        created_at=created_at,
+    )
+    db_session.flush()
+    repository = EventRepository(db_session)
+
+    narrowed = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            operation="memory.search",
+            page=1,
+            page_size=20,
+        ),
+    )
+
+    assert [item.id for item in narrowed.items] == ["search-only"]
+    with pytest.raises(
+        ValueError,
+        match="^entity filter scan exceeds 5000 records$",
+    ):
+        repository.query_project_events(
+            "repo-a",
+            "app-a",
+            repositories.EventQuery(
+                operation="memory.list",
+                page=1,
+                page_size=20,
+            ),
+        )
