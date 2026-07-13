@@ -83,6 +83,7 @@ class ExplorerRouteMem0Client(FakeMem0Client):
     def __init__(self, records: dict[str, Any] | None = None) -> None:
         super().__init__()
         self.records = dict(records or {})
+        self.get_error: Exception | None = None
         self.update_calls: list[tuple[str, dict[str, Any]]] = []
         self.update_error: Exception | None = None
         self.history_calls: list[str] = []
@@ -92,6 +93,8 @@ class ExplorerRouteMem0Client(FakeMem0Client):
 
     async def get_memory(self, memory_id: str) -> Any:
         self.get_memory_ids.append(memory_id)
+        if self.get_error is not None:
+            raise self.get_error
         value = self.records[memory_id]
         if isinstance(value, Exception):
             raise value
@@ -117,10 +120,14 @@ class ExplorerRouteMem0Client(FakeMem0Client):
 
     async def get_memory_history(self, memory_id: str) -> Any:
         self.history_calls.append(memory_id)
+        if isinstance(self.history_response, Exception):
+            raise self.history_response
         return self.history_response
 
     async def list_memories(self, params: dict[str, Any]) -> Any:
         self.list_calls.append(params)
+        if isinstance(self.list_response, Exception):
+            raise self.list_response
         return self.list_response
 
 
@@ -1266,6 +1273,46 @@ def test_patch_memory_refresh_protocol_error_is_500_and_persists_audit(
     assert event is not None
 
 
+@pytest.mark.parametrize("failure_stage", ["update", "refresh"])
+def test_patch_memory_decode_value_errors_at_call_boundaries_are_500(
+    tmp_path,
+    failure_stage: str,
+) -> None:
+    decode_error = ValueError(f"{failure_stage} response is not JSON")
+    mem0 = ExplorerRouteMem0Client(
+        {"mem-1": {"id": "mem-1", "memory": "before", "metadata": {}}}
+    )
+    if failure_stage == "update":
+        mem0.update_error = decode_error
+    else:
+        mem0.get_error = decode_error
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+
+    response = TestClient(app, raise_server_exceptions=False).patch(
+        "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
+        json={"text": "after"},
+    )
+
+    assert response.status_code == 500
+    with app.state.session_factory() as session:
+        event = session.scalar(
+            select(Event).where(
+                Event.project_id == "repo-a",
+                Event.operation == "memory.update",
+                Event.status == EventStatus.FAILED,
+            )
+        )
+    assert event is not None
+
+
 def test_memory_history_wrong_app_is_404_without_upstream_access(tmp_path) -> None:
     mem0 = ExplorerRouteMem0Client()
     app = create_app(
@@ -1329,6 +1376,26 @@ def test_memory_history_protocol_error_is_500(tmp_path) -> None:
     assert response.status_code == 500
 
 
+def test_memory_history_decode_value_error_is_500(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    mem0.history_response = ValueError("history response is not JSON")
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/v1/memories/mem-1/history?project_id=repo-a&app_id=app-a"
+    )
+
+    assert response.status_code == 500
+
+
 @pytest.mark.parametrize(
     "list_response",
     [
@@ -1343,6 +1410,26 @@ def test_reconcile_protocol_errors_are_500(
 ) -> None:
     mem0 = ExplorerRouteMem0Client()
     mem0.list_response = list_response
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/v1/projects/repo-a/memories/reconcile",
+        json={"project_id": "repo-a", "app_id": "app-a"},
+    )
+
+    assert response.status_code == 500
+
+
+def test_reconcile_list_decode_value_error_is_500(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    mem0.list_response = ValueError("list response is not JSON")
     app = create_app(
         settings=SidecarSettings(
             database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",

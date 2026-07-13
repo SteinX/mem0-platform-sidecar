@@ -646,8 +646,18 @@ class MemoryService:
             subject_id=memory_id,
         )
         try:
-            update_response = await self.mem0.update_memory(memory_id, patch)
-            refresh_response = await self.mem0.get_memory(memory_id)
+            try:
+                update_response = await self.mem0.update_memory(memory_id, patch)
+            except ValueError as exc:
+                raise MemoryUpstreamProtocolError(
+                    "Upstream memory update response could not be decoded"
+                ) from exc
+            try:
+                refresh_response = await self.mem0.get_memory(memory_id)
+            except ValueError as exc:
+                raise MemoryUpstreamProtocolError(
+                    "Upstream memory refresh response could not be decoded"
+                ) from exc
             record = _memory_record_from_response(
                 refresh_response,
                 expected_id=memory_id,
@@ -697,6 +707,10 @@ class MemoryService:
             raise KeyError(memory_id)
         try:
             response = await self.mem0.get_memory_history(memory_id)
+        except ValueError as exc:
+            raise MemoryUpstreamProtocolError(
+                "Upstream memory history response could not be decoded"
+            ) from exc
         except Exception as exc:
             if _is_upstream_not_found(exc):
                 raise KeyError(memory_id) from exc
@@ -720,9 +734,14 @@ class MemoryService:
             )
 
         scan_cutoff = datetime.now(UTC)
-        response = await self.mem0.list_memories(
-            {"top_k": _RECONCILE_SCAN_LIMIT, "show_expired": True}
-        )
+        try:
+            response = await self.mem0.list_memories(
+                {"top_k": _RECONCILE_SCAN_LIMIT, "show_expired": True}
+            )
+        except ValueError as exc:
+            raise MemoryUpstreamProtocolError(
+                "Upstream memory list response could not be decoded"
+            ) from exc
         records = _list_results(response)
         response_total = response.get("total")
         if "total" in response and (
