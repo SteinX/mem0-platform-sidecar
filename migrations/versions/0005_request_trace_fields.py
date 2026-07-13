@@ -45,7 +45,7 @@ def upgrade() -> None:
         "events",
         sa.Column(
             "result_count",
-            sa.Integer(),
+            sa.BigInteger(),
             nullable=False,
             server_default=sa.text("0"),
         ),

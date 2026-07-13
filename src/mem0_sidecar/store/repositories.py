@@ -1,4 +1,6 @@
+import hashlib
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -26,6 +28,16 @@ from mem0_sidecar.store.models import (
     Project,
 )
 
+_MAX_TRACE_BYTES = 65_536
+_MAX_LEGACY_REQUEST_CHARS = 65_536
+_MAX_LEGACY_REQUEST_DEPTH = 8
+_MAX_RESPONSE_SCAN_FIELDS = 64
+_MAX_RESPONSE_ENVELOPE_FIELDS = 40
+_MAX_PREVIEW_SCAN_ITEMS = 100
+_MAX_CORRELATION_ID_CHARS = 256
+_REDACTED_URL = "[REDACTED_URL]"
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True)
@@ -39,6 +51,134 @@ def _trace_json(value: Any) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _scrub_trace_urls(value: object) -> object:
+    if type(value) is str:
+        return _URL_PATTERN.sub(_REDACTED_URL, value)
+    if type(value) is list:
+        return [_scrub_trace_urls(item) for item in value]
+    if type(value) is dict:
+        scrubbed: dict[str, object] = {}
+        for key, item in value.items():
+            scrubbed_key = _URL_PATTERN.sub(_REDACTED_URL, key)
+            if scrubbed_key in scrubbed:
+                scrubbed[scrubbed_key] = {"_trace_key_collision": 2}
+                continue
+            scrubbed[scrubbed_key] = _scrub_trace_urls(item)
+        return scrubbed
+    return value
+
+
+def _safe_trace_document(value: object) -> dict[str, Any]:
+    document = bounded_trace_document(value)
+    scrubbed = _scrub_trace_urls(document)
+    if not isinstance(scrubbed, dict):
+        return {}
+    serialized_bytes = len(_trace_json(scrubbed).encode("utf-8"))
+    if serialized_bytes <= _MAX_TRACE_BYTES:
+        return scrubbed
+    return {
+        "_trace_truncated": True,
+        "original_bytes": serialized_bytes,
+    }
+
+
+def _bounded_correlation_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise TypeError("correlation_id must be a string")
+    character_count = str.__len__(value)
+    if character_count <= _MAX_CORRELATION_ID_CHARS and "\x00" not in value:
+        return value
+
+    digest = hashlib.sha256()
+    for offset in range(0, character_count, 4096):
+        chunk = str.__getitem__(value, slice(offset, offset + 4096))
+        digest.update(str.encode(chunk, "utf-8", "replace"))
+    return f"[SHA256:{digest.hexdigest()}]"
+
+
+def _bounded_response_envelope(
+    response: Mapping[object, object],
+) -> dict[object, object]:
+    try:
+        iterator = (
+            dict.__iter__(response)
+            if isinstance(response, dict)
+            else iter(response)
+        )
+    except Exception:
+        return {"_trace_response_fields_unreadable": True}
+
+    envelope: dict[object, object] = {}
+    truncated = False
+    for slot in range(_MAX_RESPONSE_SCAN_FIELDS + 1):
+        try:
+            key = next(iterator)
+        except StopIteration:
+            break
+        except Exception:
+            envelope["_trace_response_fields_unreadable"] = True
+            break
+        if slot == _MAX_RESPONSE_SCAN_FIELDS:
+            truncated = True
+            break
+        if key == "results":
+            continue
+        if len(envelope) >= _MAX_RESPONSE_ENVELOPE_FIELDS:
+            truncated = True
+            continue
+        try:
+            item = (
+                dict.__getitem__(response, key)
+                if isinstance(response, dict)
+                else response[key]
+            )
+        except Exception:
+            item = "[UNREADABLE]"
+        envelope[key] = item
+
+    if truncated:
+        envelope["_trace_response_fields_truncated"] = True
+    return envelope
+
+
+def _response_results(response: Mapping[str, object]) -> object:
+    try:
+        if isinstance(response, dict):
+            return dict.get(response, "results")
+        return response.get("results")
+    except Exception:
+        return None
+
+
+def _preview_omission_details(
+    response: Mapping[str, object],
+    stored_previews: list[dict[str, Any]],
+) -> tuple[int, bool]:
+    results = _response_results(response)
+    if not isinstance(results, list):
+        return 0, False
+    try:
+        returned_count = list.__len__(results)
+    except Exception:
+        return 0, False
+
+    valid_preview_count = 0
+    scan_count = min(returned_count, _MAX_PREVIEW_SCAN_ITEMS)
+    for index in range(scan_count):
+        try:
+            item = list.__getitem__(results, index)
+        except Exception:
+            break
+        _count, preview = trace_result_summary({"results": [item]})
+        if preview:
+            valid_preview_count += 1
+
+    omitted = max(valid_preview_count - len(stored_previews), 0)
+    return omitted, returned_count > _MAX_PREVIEW_SCAN_ITEMS
 
 
 def _utc_now() -> datetime:
@@ -160,28 +300,85 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _event_request(event: Event) -> dict[str, object] | None:
-    try:
-        request = json.loads(event.request_json)
-    except (json.JSONDecodeError, TypeError):
+def _legacy_json_depth_is_bounded(value: str) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(str.__len__(value)):
+        character = str.__getitem__(value, index)
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_LEGACY_REQUEST_DEPTH:
+                return False
+        elif character in "]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_string
+
+
+def _event_request(request_json: object) -> dict[str, object] | None:
+    if type(request_json) is not str:
         return None
-    return request if isinstance(request, dict) else None
+    try:
+        character_count = str.__len__(request_json)
+    except Exception:
+        return None
+    if character_count > _MAX_LEGACY_REQUEST_CHARS:
+        return None
+    if not _legacy_json_depth_is_bounded(request_json):
+        return None
+    try:
+        if len(str.encode(request_json, "utf-8")) > _MAX_TRACE_BYTES:
+            return None
+    except UnicodeError:
+        return None
+    try:
+        request = json.loads(request_json)
+    except (RecursionError, TypeError, UnicodeError, ValueError):
+        return None
+    return request if type(request) is dict else None
 
 
 def _request_app_id(request: Mapping[str, object]) -> str | None:
-    if "app_id" in request:
-        app_id = request["app_id"]
-        return app_id if isinstance(app_id, str) and app_id else None
-    app_id = request.get("_mem0_sidecar_app_id")
-    return app_id if isinstance(app_id, str) and app_id else None
+    top_level_values: list[str] = []
+    for field_name in ("app_id", "_mem0_sidecar_app_id"):
+        if field_name not in request:
+            continue
+        value = request[field_name]
+        if type(value) is not str or not value:
+            return None
+        top_level_values.append(value)
+    if top_level_values:
+        return (
+            top_level_values[0]
+            if all(value == top_level_values[0] for value in top_level_values)
+            else None
+        )
+
+    metadata = request.get("metadata")
+    if type(metadata) is not dict:
+        return None
+    value = metadata.get("_mem0_sidecar_app_id")
+    return value if type(value) is str and value else None
 
 
 def _matches_event_scope(
-    event: Event,
+    request_json: object,
     app_id: str,
     entity_filters: Mapping[str, str],
 ) -> bool:
-    request = _event_request(event)
+    request = _event_request(request_json)
     if request is None or _request_app_id(request) != app_id:
         return False
 
@@ -198,13 +395,13 @@ def _matches_event_scope(
 
 
 def _event_timeline_buckets(
-    events: list[Event],
+    created_values: list[datetime],
     query: EventQuery,
 ) -> list[dict[str, object]]:
-    if not events:
+    if not created_values:
         return []
 
-    created_values = [_as_utc(event.created_at) for event in events]
+    created_values = [_as_utc(created_at) for created_at in created_values]
     range_start = _as_utc(query.from_at) if query.from_at else min(created_values)
     range_end = _as_utc(query.to_at) if query.to_at else max(created_values)
     use_days = range_end - range_start > timedelta(hours=48)
@@ -378,8 +575,8 @@ class EventRepository:
             status=EventStatus.PENDING,
             subject_type=subject_type,
             subject_id=subject_id,
-            request_json=_trace_json(bounded_trace_document(request or {})),
-            correlation_id=correlation_id,
+            request_json=_trace_json(_safe_trace_document(request or {})),
+            correlation_id=_bounded_correlation_id(correlation_id),
             started_at=started_at,
         )
         self.session.add(event)
@@ -412,11 +609,16 @@ class EventRepository:
     def mark_succeeded(self, event_id: str, *, response: dict[str, Any]) -> Event:
         event = self.get(event_id)
         result_count, previews = trace_result_summary(response)
-        response_document = bounded_trace_document(response)
+        response_document = _bounded_response_envelope(response)
         if previews:
             response_document["result_previews"] = previews
+        omitted, scan_truncated = _preview_omission_details(response, previews)
+        if omitted:
+            response_document["result_previews_omitted"] = omitted
+        if scan_truncated:
+            response_document["result_previews_scan_truncated"] = True
         event.status = EventStatus.SUCCEEDED
-        event.response_json = _trace_json(bounded_trace_document(response_document))
+        event.response_json = _trace_json(_safe_trace_document(response_document))
         event.result_count = result_count
         event.has_results = 1 if result_count else 0
         self._complete(event)
@@ -426,7 +628,7 @@ class EventRepository:
     def mark_failed(self, event_id: str, *, error: dict[str, Any]) -> Event:
         event = self.get(event_id)
         event.status = EventStatus.FAILED
-        event.error_json = _trace_json(bounded_trace_document(error))
+        event.error_json = _trace_json(_safe_trace_document(error))
         event.result_count = 0
         event.has_results = 0
         self._complete(event)
@@ -457,33 +659,57 @@ class EventRepository:
         if query.has_results is not None:
             conditions.append(Event.has_results == (1 if query.has_results else 0))
         if query.from_at is not None:
-            conditions.append(Event.created_at >= query.from_at)
+            conditions.append(Event.created_at >= _as_utc(query.from_at))
         if query.to_at is not None:
-            conditions.append(Event.created_at <= query.to_at)
-
-        scan_count = self.session.scalar(
-            select(func.count()).select_from(Event).where(*conditions)
-        ) or 0
-        if scan_count > 5000:
-            raise ValueError("entity filter scan exceeds 5000 records")
+            conditions.append(Event.created_at <= _as_utc(query.to_at))
 
         candidates = list(
-            self.session.scalars(
-                select(Event)
+            self.session.execute(
+                select(Event.id, Event.request_json, Event.created_at)
                 .where(*conditions)
                 .order_by(Event.created_at.desc(), Event.id.desc())
+                .limit(5001)
             )
         )
+        if len(candidates) > 5000:
+            raise ValueError("entity filter scan exceeds 5000 records")
+
         matches = [
-            event
-            for event in candidates
-            if _matches_event_scope(event, app_id, query.entity_filters)
+            (event_id, created_at)
+            for event_id, request_json, created_at in candidates
+            if _matches_event_scope(request_json, app_id, query.entity_filters)
         ]
         offset = (query.page - 1) * query.page_size
+        page_ids = [
+            event_id
+            for event_id, _created_at in matches[
+                offset : offset + query.page_size
+            ]
+        ]
+        loaded_events = (
+            {
+                event.id: event
+                for event in self.session.scalars(
+                    select(Event).where(
+                        Event.project_id == project_id,
+                        Event.id.in_(page_ids),
+                    )
+                )
+            }
+            if page_ids
+            else {}
+        )
         return EventPage(
-            items=matches[offset : offset + query.page_size],
+            items=[
+                loaded_events[event_id]
+                for event_id in page_ids
+                if event_id in loaded_events
+            ],
             total=len(matches),
-            buckets=_event_timeline_buckets(matches, query),
+            buckets=_event_timeline_buckets(
+                [created_at for _event_id, created_at in matches],
+                query,
+            ),
         )
 
 
