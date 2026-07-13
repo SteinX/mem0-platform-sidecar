@@ -1,8 +1,10 @@
 import json
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 from threading import Barrier
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import BigInteger, Index, UniqueConstraint, create_engine, insert
@@ -1300,7 +1302,7 @@ def test_event_repository_sanitizes_requests_and_success_results(
     projects.upsert_default_project(
         project_id="repo-a",
         name="Repo A",
-        mem0_base_url="http://mem0:8000",
+        mem0_base_url="https://memory.example.com/api",
     )
     started_at = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
     completed_at = started_at + timedelta(milliseconds=125)
@@ -1318,6 +1320,8 @@ def test_event_repository_sanitizes_requests_and_success_results(
             "query": "Where are my notes?",
             "api_key": "must-not-persist",
             "internal_url": "http://mem0-internal:8000/v1",
+            "configured_url": "https://memory.example.com/v1",
+            "public_url": "https://example.com/docs?topic=memory",
         },
     )
 
@@ -1326,7 +1330,9 @@ def test_event_repository_sanitizes_requests_and_success_results(
     assert json.loads(event.request_json) == {
         "api_key": "[REDACTED]",
         "app_id": "app-a",
+        "configured_url": "[REDACTED_URL]",
         "internal_url": "[REDACTED_URL]",
+        "public_url": "https://example.com/docs?topic=memory",
         "query": "Where are my notes?",
         "user_id": "alice",
     }
@@ -1345,7 +1351,10 @@ def test_event_repository_sanitizes_requests_and_success_results(
                 {"id": "mem-2", "memory": "second", "score": 0.75},
             ],
             "total": 2,
-            "upstream_url": "https://mem0-internal:8443/v1/search?token=secret",
+            "message": (
+                "See https://example.com/docs; upstream https://memory.example.com/v1."
+            ),
+            "upstream_url": "https://mem0-internal:8443/v1/search",
         },
     )
     response = json.loads(succeeded.response_json)
@@ -1355,9 +1364,12 @@ def test_event_repository_sanitizes_requests_and_success_results(
     assert succeeded.latency_ms == pytest.approx(125.0)
     assert succeeded.result_count == 2
     assert succeeded.has_results == 1
-    assert response["authorization"] == "[REDACTED]"
+    assert "authorization" not in response
     assert json.loads(succeeded.request_json)["internal_url"] == "[REDACTED_URL]"
-    assert response["upstream_url"] == "[REDACTED_URL]"
+    assert response["message"] == (
+        "See https://example.com/docs; upstream [REDACTED_URL]."
+    )
+    assert "upstream_url" not in response
     assert "results" not in response
     assert response["result_previews"] == [
         {"id": "mem-1", "memory": "first", "user_id": "alice"},
@@ -1366,7 +1378,8 @@ def test_event_repository_sanitizes_requests_and_success_results(
     assert len(succeeded.request_json.encode()) <= 65_536
     assert len(succeeded.response_json.encode()) <= 65_536
     assert "mem0-internal" not in succeeded.request_json
-    assert "mem0-internal" not in succeeded.response_json
+    assert "memory.example.com" not in succeeded.request_json
+    assert "memory.example.com" not in succeeded.response_json
 
 
 def test_event_repository_persists_only_strict_bounded_result_previews(
@@ -1401,7 +1414,12 @@ def test_event_repository_persists_only_strict_bounded_result_previews(
         response={
             "results": raw_results,
             "total": 100,
-            "safe_summary": "ok",
+            "message": "ok",
+            "safe_summary": "must-not-persist",
+            "Results": [{"metadata": "case-variant-leak"}],
+            "memories": [{"metadata": "memories-leak"}],
+            "data": {"results": [{"metadata": "nested-results-leak"}]},
+            "status": {"nested": "structured-status-leak"},
         },
     )
     stored = json.loads(succeeded.response_json)
@@ -1409,16 +1427,24 @@ def test_event_repository_persists_only_strict_bounded_result_previews(
     assert succeeded.result_count == 100
     assert succeeded.has_results == 1
     assert "results" not in stored
-    assert stored["safe_summary"] == "ok"
+    assert stored["message"] == "ok"
+    assert "safe_summary" not in stored
+    assert "Results" not in stored
+    assert "memories" not in stored
+    assert "data" not in stored
+    assert "status" not in stored
     assert stored["result_previews"] == [
-        {"id": f"mem-{index}", "memory": f"memory-{index}"}
-        for index in range(20)
+        {"id": f"mem-{index}", "memory": f"memory-{index}"} for index in range(20)
     ]
     assert stored["result_previews_omitted"] == 80
     assert '"results"' not in succeeded.response_json
     assert "private-payload" not in succeeded.response_json
     assert "nested-leak" not in succeeded.response_json
     assert "must_not_persist" not in succeeded.response_json
+    assert "case-variant-leak" not in succeeded.response_json
+    assert "memories-leak" not in succeeded.response_json
+    assert "nested-results-leak" not in succeeded.response_json
+    assert "structured-status-leak" not in succeeded.response_json
 
 
 def test_event_repository_preserves_trusted_signed_64_bit_result_count(
@@ -1468,8 +1494,7 @@ def test_event_preview_omission_uses_returned_items_not_trusted_total(
         event.id,
         response={
             "results": [
-                {"id": f"mem-{index}", "memory": "visible"}
-                for index in range(10)
+                {"id": f"mem-{index}", "memory": "visible"} for index in range(10)
             ],
             "total": 1000,
         },
@@ -1481,7 +1506,7 @@ def test_event_preview_omission_uses_returned_items_not_trusted_total(
     assert "result_previews_omitted" not in stored
 
 
-def test_event_preview_omission_does_not_count_invalid_preview_items(
+def test_event_preview_omission_counts_all_unrepresented_returned_items(
     db_session,
 ) -> None:
     ProjectRepository(db_session).upsert_default_project(
@@ -1496,13 +1521,8 @@ def test_event_preview_omission_does_not_count_invalid_preview_items(
         request={"app_id": "app-a"},
     )
     response = {
-        "results": [
-            {"metadata": {"not": "previewable"}} for _index in range(50)
-        ]
-        + [
-            {"id": f"mem-{index}", "memory": "visible"}
-            for index in range(20)
-        ]
+        "results": [{"metadata": {"not": "previewable"}} for _index in range(50)]
+        + [{"id": f"mem-{index}", "memory": "visible"} for index in range(20)]
     }
 
     succeeded = repository.mark_succeeded(event.id, response=response)
@@ -1510,15 +1530,59 @@ def test_event_preview_omission_does_not_count_invalid_preview_items(
 
     assert succeeded.result_count == 70
     assert len(stored["result_previews"]) == 20
-    assert "result_previews_omitted" not in stored
+    assert stored["result_previews_omitted"] == 50
+
+
+@pytest.mark.parametrize("returned_count", [101, 150])
+def test_event_preview_metadata_uses_actual_large_result_list_length(
+    db_session,
+    returned_count,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+    event = repository.create_event(
+        project_id="repo-a",
+        operation="memory.search",
+        request={"app_id": "app-a"},
+    )
+
+    succeeded = repository.mark_succeeded(
+        event.id,
+        response={
+            "results": [
+                {"id": f"mem-{index}", "memory": "visible"}
+                for index in range(returned_count)
+            ]
+        },
+    )
+    stored = json.loads(succeeded.response_json)
+
+    assert len(stored["result_previews"]) == 20
+    assert stored["result_previews_omitted"] == returned_count - 20
+    assert stored["result_previews_scan_truncated"] is True
 
 
 def test_event_response_envelope_extraction_has_bounded_mapping_work(
     db_session,
 ) -> None:
-    class ItemsMustNotBeCalled(dict):
-        def items(self):
-            raise AssertionError("unbounded response.items() traversal")
+    class CountingMapping(Mapping[str, object]):
+        def __init__(self, values: dict[str, object]) -> None:
+            self.values = values
+            self.value_reads = 0
+
+        def __getitem__(self, key: str) -> object:
+            self.value_reads += 1
+            return self.values[key]
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self.values)
+
+        def __len__(self) -> int:
+            return len(self.values)
 
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",
@@ -1531,22 +1595,64 @@ def test_event_response_envelope_extraction_has_bounded_mapping_work(
         operation="memory.search",
         request={"app_id": "app-a"},
     )
-    response = ItemsMustNotBeCalled(
+    response = CountingMapping(
         {
             "results": [{"id": "mem-1", "memory": "one"}],
             "total": 1,
-            "safe_summary": "ok",
+            "message": "ok",
             **{f"field_{index:05d}": index for index in range(10_000)},
         }
     )
 
-    succeeded = repository.mark_succeeded(event.id, response=response)
+    succeeded = repository.mark_succeeded(
+        event.id,
+        response=response,  # type: ignore[arg-type]
+    )
     stored = json.loads(succeeded.response_json)
 
     assert succeeded.result_count == 1
     assert stored["result_previews"] == [{"id": "mem-1", "memory": "one"}]
+    assert stored["_trace_response_envelope_truncated"] is True
+    assert "message" not in stored
     assert '"results"' not in succeeded.response_json
     assert len(succeeded.response_json.encode()) <= 65_536
+    assert response.value_reads <= 2
+
+
+def test_event_response_envelope_is_deterministic_when_key_scan_is_incomplete(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+    events = [
+        repository.create_event(
+            project_id="repo-a",
+            operation="memory.search",
+            request={"app_id": "app-a"},
+        )
+        for _index in range(2)
+    ]
+    entries = [
+        ("results", [{"id": "mem-1", "memory": "one"}]),
+        ("message", "allowed-but-envelope-is-incomplete"),
+        *((f"field_{index:03d}", f"value-{index}") for index in range(80)),
+    ]
+
+    forward = repository.mark_succeeded(events[0].id, response=dict(entries))
+    reverse = repository.mark_succeeded(
+        events[1].id,
+        response=dict(reversed(entries)),
+    )
+
+    assert forward.response_json == reverse.response_json
+    assert json.loads(forward.response_json) == {
+        "_trace_response_envelope_truncated": True,
+        "result_previews": [{"id": "mem-1", "memory": "one"}],
+    }
 
 
 def test_event_repository_sanitizes_failures_and_uses_created_latency_fallback(
@@ -1577,12 +1683,12 @@ def test_event_repository_sanitizes_failures_and_uses_created_latency_fallback(
         error={
             "token": "must-not-persist",
             "message": (
-                "upstream https://user:pass@mem0-internal:8443/v1/search"
-                "?token=secret failed"
+                "failed at https://user:pass@example.com/v1/search?token=secret), retry"
             ),
             "nested": [
-                {"url": "http://mem0-internal:8000/v1"},
-                "retry https://mem0-internal:8443/path?q=secret",
+                {"url": "http://10.0.0.1/v1;"},
+                "configured http://mem0:8000/path?q=safe.",
+                "public https://example.com/help?topic=memory.",
             ],
             "padding": "x" * 80_000,
         },
@@ -1596,9 +1702,12 @@ def test_event_repository_sanitizes_failures_and_uses_created_latency_fallback(
     assert failed.has_results == 0
     assert error["token"] == "[REDACTED]"
     assert "[REDACTED_URL]" in failed.error_json
-    assert "http://" not in failed.error_json
-    assert "https://" not in failed.error_json
-    assert "mem0-internal" not in failed.error_json
+    assert "[REDACTED_URL]), retry" in error["message"]
+    assert "user:pass" not in failed.error_json
+    assert "token=secret" not in failed.error_json
+    assert "10.0.0.1" not in failed.error_json
+    assert "mem0:8000" not in failed.error_json
+    assert "https://example.com/help?topic=memory." in failed.error_json
     assert len(failed.error_json.encode()) <= 65_536
 
 
@@ -1632,6 +1741,29 @@ def test_event_repository_bounds_or_rejects_hostile_correlation_ids(
     assert first.correlation_id.endswith("]")
     assert len(first.correlation_id) <= 256
     assert first.correlation_id != long_id
+    for sensitive_id in (
+        "https://user:pass@example.com/request",
+        "https://example.com/request?token=secret",
+        "http://mem0:8000/v1/request",
+    ):
+        sensitive = repository.create_event(
+            project_id="repo-a",
+            operation="memory.search",
+            request={"app_id": "app-a"},
+            correlation_id=sensitive_id,
+        )
+        assert sensitive.correlation_id is not None
+        assert sensitive.correlation_id.startswith("[SHA256:")
+        assert sensitive.correlation_id != sensitive_id
+        assert len(sensitive.correlation_id) <= 256
+    public_id = "https://example.com/request?attempt=1"
+    public = repository.create_event(
+        project_id="repo-a",
+        operation="memory.search",
+        request={"app_id": "app-a"},
+        correlation_id=public_id,
+    )
+    assert public.correlation_id == public_id
     with pytest.raises(TypeError, match="correlation_id must be a string"):
         repository.create_event(
             project_id="repo-a",
@@ -1711,6 +1843,17 @@ def test_event_query_filters_and_total_are_strictly_project_app_scoped(
     )
     _add_trace_event(
         db_session,
+        event_id="visible-identical-markers",
+        request={
+            "app_id": "app-a",
+            "_mem0_sidecar_app_id": "app-a",
+            "metadata": {"_mem0_sidecar_app_id": "app-a"},
+            "user_id": "alice",
+        },
+        created_at=base - timedelta(hours=3),
+    )
+    _add_trace_event(
+        db_session,
         event_id="conflicting-top-level",
         request={
             "app_id": "app-b",
@@ -1759,9 +1902,18 @@ def test_event_query_filters_and_total_are_strictly_project_app_scoped(
         "visible-primary",
         "visible-sidecar-key",
         "visible-legacy-metadata",
+        "visible-identical-markers",
     ]
-    assert page.total == 3
-    assert sum(bucket["count"] for bucket in page.buckets) == 3
+    assert page.total == 4
+    assert sum(bucket["count"] for bucket in page.buckets) == 4
+
+    app_b = repository.query_project_events(
+        "repo-a",
+        "app-b",
+        repositories.EventQuery(page=1, page_size=20),
+    )
+    assert "wrong-app" in [item.id for item in app_b.items]
+    assert "conflicting-top-level" not in [item.id for item in app_b.items]
 
     filtered = repository.query_project_events(
         "repo-a",
@@ -1814,9 +1966,7 @@ def test_event_query_omits_each_hostile_legacy_request_without_crashing(
         request={"app_id": "app-a"},
         created_at=created_at,
     )
-    huge_integer.request_json = (
-        '{"app_id":"app-a","value":' + "9" * 5000 + "}"
-    )
+    huge_integer.request_json = '{"app_id":"app-a","value":' + "9" * 5000 + "}"
     deeply_nested = _add_trace_event(
         db_session,
         event_id="deeply-nested",
@@ -1824,11 +1974,7 @@ def test_event_query_omits_each_hostile_legacy_request_without_crashing(
         created_at=created_at,
     )
     deeply_nested.request_json = (
-        '{"app_id":"app-a","value":'
-        + "[" * 2000
-        + "0"
-        + "]" * 2000
-        + "}"
+        '{"app_id":"app-a","value":' + "[" * 2000 + "0" + "]" * 2000 + "}"
     )
     oversized = _add_trace_event(
         db_session,
@@ -1836,9 +1982,7 @@ def test_event_query_omits_each_hostile_legacy_request_without_crashing(
         request={"app_id": "app-a"},
         created_at=created_at,
     )
-    oversized.request_json = (
-        '{"app_id":"app-a","padding":"' + "x" * 70_000 + '"}'
-    )
+    oversized.request_json = '{"app_id":"app-a","padding":"' + "x" * 70_000 + '"}'
     db_session.flush()
 
     page = EventRepository(db_session).query_project_events(
@@ -1849,6 +1993,44 @@ def test_event_query_omits_each_hostile_legacy_request_without_crashing(
 
     assert [item.id for item in page.items] == ["visible"]
     assert page.total == 1
+
+
+def test_event_query_accepts_every_request_depth_written_by_create_event(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    nested: object = "leaf"
+    for _index in range(8):
+        nested = {"next": nested}
+    repository = EventRepository(db_session)
+    roundtrip = repository.create_event(
+        project_id="repo-a",
+        operation="memory.search",
+        request={"app_id": "app-a", "nested": nested},
+    )
+    too_deep_nested: object = "leaf"
+    for _index in range(9):
+        too_deep_nested = {"next": too_deep_nested}
+    too_deep = _add_trace_event(
+        db_session,
+        event_id="legacy-too-deep",
+        request={"app_id": "app-a", "nested": too_deep_nested},
+        created_at=datetime(2026, 7, 13, tzinfo=UTC),
+    )
+    db_session.flush()
+
+    page = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(page=1, page_size=20),
+    )
+
+    assert roundtrip.id in [item.id for item in page.items]
+    assert too_deep.id not in [item.id for item in page.items]
 
 
 def test_event_query_normalizes_offset_date_bounds_to_utc(db_session) -> None:
@@ -1954,9 +2136,7 @@ def test_event_query_pages_newest_first_and_buckets_at_48_hour_boundary(
         ),
     )
 
-    assert daily.buckets == [
-        {"timestamp": "2026-07-01T00:00:00Z", "count": 3}
-    ]
+    assert daily.buckets == [{"timestamp": "2026-07-01T00:00:00Z", "count": 3}]
 
 
 def test_event_query_applies_sql_narrowing_before_bounded_scope_scan(
@@ -2021,3 +2201,117 @@ def test_event_query_applies_sql_narrowing_before_bounded_scope_scan(
                 page_size=20,
             ),
         )
+
+
+def _add_snapshot_retry_events(db_session) -> list[str]:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    base = datetime(2026, 7, 13, tzinfo=UTC)
+    for event_id, created_at in (
+        ("snapshot-old", base),
+        ("snapshot-new", base + timedelta(seconds=1)),
+    ):
+        _add_trace_event(
+            db_session,
+            event_id=event_id,
+            request={"app_id": "app-a"},
+            created_at=created_at,
+        )
+    db_session.flush()
+    return ["snapshot-new", "snapshot-old"]
+
+
+def test_event_query_retries_the_whole_snapshot_once_when_page_fetch_changes(
+    db_session,
+    monkeypatch,
+) -> None:
+    expected_ids = _add_snapshot_retry_events(db_session)
+    original_scalars = db_session.scalars
+    fetch_count = 0
+
+    def one_shot_missing(statement, *args, **kwargs):
+        nonlocal fetch_count
+        fetch_count += 1
+        values = list(original_scalars(statement, *args, **kwargs))
+        return iter(values[1:] if fetch_count == 1 else values)
+
+    monkeypatch.setattr(db_session, "scalars", one_shot_missing)
+
+    page = EventRepository(db_session).query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(page=1, page_size=20),
+    )
+
+    assert [item.id for item in page.items] == expected_ids
+    assert page.total == 2
+    assert sum(bucket["count"] for bucket in page.buckets) == 2
+    assert fetch_count == 2
+
+
+def test_event_query_fails_closed_when_page_snapshot_never_stabilizes(
+    db_session,
+    monkeypatch,
+) -> None:
+    _add_snapshot_retry_events(db_session)
+    original_scalars = db_session.scalars
+    fetch_count = 0
+
+    def always_missing(statement, *args, **kwargs):
+        nonlocal fetch_count
+        fetch_count += 1
+        values = list(original_scalars(statement, *args, **kwargs))
+        return iter(values[1:])
+
+    monkeypatch.setattr(db_session, "scalars", always_missing)
+
+    with pytest.raises(
+        ValueError,
+        match=("^event query snapshot changed; retry with narrower filters$"),
+    ):
+        EventRepository(db_session).query_project_events(
+            "repo-a",
+            "app-a",
+            repositories.EventQuery(page=1, page_size=20),
+        )
+
+    assert fetch_count == 2
+
+
+def test_event_query_retries_when_loaded_page_fields_mutate(
+    db_session,
+    monkeypatch,
+) -> None:
+    expected_ids = _add_snapshot_retry_events(db_session)
+    original_scalars = db_session.scalars
+    fetch_count = 0
+
+    def one_shot_mutation(statement, *args, **kwargs):
+        nonlocal fetch_count
+        fetch_count += 1
+        values = list(original_scalars(statement, *args, **kwargs))
+        if fetch_count != 1:
+            return iter(values)
+        changed = SimpleNamespace(
+            **{
+                column.name: getattr(values[0], column.name)
+                for column in Event.__table__.columns
+            }
+        )
+        changed.request_json = '{"app_id":"app-b"}'
+        return iter([changed, *values[1:]])
+
+    monkeypatch.setattr(db_session, "scalars", one_shot_mutation)
+
+    page = EventRepository(db_session).query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(page=1, page_size=20),
+    )
+
+    assert [item.id for item in page.items] == expected_ids
+    assert all(isinstance(item, Event) for item in page.items)
+    assert fetch_count == 2

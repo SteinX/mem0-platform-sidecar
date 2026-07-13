@@ -1,10 +1,12 @@
 import hashlib
+import ipaddress
 import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlsplit
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -30,13 +32,36 @@ from mem0_sidecar.store.models import (
 
 _MAX_TRACE_BYTES = 65_536
 _MAX_LEGACY_REQUEST_CHARS = 65_536
-_MAX_LEGACY_REQUEST_DEPTH = 8
+_MAX_LEGACY_REQUEST_DEPTH = 9
 _MAX_RESPONSE_SCAN_FIELDS = 64
 _MAX_RESPONSE_ENVELOPE_FIELDS = 40
 _MAX_PREVIEW_SCAN_ITEMS = 100
 _MAX_CORRELATION_ID_CHARS = 256
+_EVENT_QUERY_MAX_ATTEMPTS = 2
+_EVENT_QUERY_UNSTABLE_ERROR = (
+    "event query snapshot changed; retry with narrower filters"
+)
 _REDACTED_URL = "[REDACTED_URL]"
-_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+_URL_TRAILING_PUNCTUATION = "),.;"
+_RESPONSE_STRING_FIELDS = frozenset({"id", "memory", "memory_id", "message", "status"})
+_RESPONSE_INTEGER_FIELDS = frozenset({"count", "total"})
+_RESPONSE_BOOLEAN_FIELDS = frozenset({"created", "deleted", "ok", "success", "updated"})
+_CREDENTIAL_QUERY_SUFFIXES = (
+    "accesskey",
+    "accesstoken",
+    "apikey",
+    "authorization",
+    "clientsecret",
+    "cookie",
+    "credential",
+    "credentials",
+    "password",
+    "refreshtoken",
+    "secret",
+    "sessionid",
+    "token",
+)
 
 
 def _json(value: Any) -> str:
@@ -53,26 +78,122 @@ def _trace_json(value: Any) -> str:
     )
 
 
-def _scrub_trace_urls(value: object) -> object:
+def _normalized_url_host(value: str) -> str | None:
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        _port = parsed.port
+    except (TypeError, UnicodeError, ValueError):
+        return None
+    if not host:
+        return None
+    return host.lower().rstrip(".")
+
+
+def _credential_query_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return normalized.endswith(_CREDENTIAL_QUERY_SUFFIXES)
+
+
+def _valid_public_domain(host: str) -> bool:
+    labels = host.split(".")
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        try:
+            ascii_label = label.encode("idna").decode("ascii")
+        except UnicodeError:
+            return False
+        if (
+            not ascii_label
+            or len(ascii_label) > 63
+            or ascii_label.startswith("-")
+            or ascii_label.endswith("-")
+            or re.fullmatch(r"[a-zA-Z0-9-]+", ascii_label) is None
+        ):
+            return False
+    return not labels[-1].isdigit()
+
+
+def _sensitive_url(url: str, internal_hosts: frozenset[str]) -> bool:
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        _port = parsed.port
+    except (TypeError, UnicodeError, ValueError):
+        return True
+    if parsed.scheme.lower() not in {"http", "https"} or not host:
+        return True
+    if parsed.username is not None or parsed.password is not None:
+        return True
+
+    normalized_host = host.lower().rstrip(".")
+    if normalized_host in internal_hosts:
+        return True
+    try:
+        address = ipaddress.ip_address(normalized_host)
+    except ValueError:
+        if normalized_host.endswith(
+            (".internal", ".local", ".localhost")
+        ) or not _valid_public_domain(normalized_host):
+            return True
+    else:
+        if not address.is_global:
+            return True
+
+    try:
+        query_items = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=False,
+        )
+    except (UnicodeError, ValueError):
+        return True
+    return any(_credential_query_key(key) for key, _value in query_items)
+
+
+def _scrub_url_string(value: str, internal_hosts: frozenset[str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        matched = match.group(0)
+        core = matched
+        suffix = ""
+        while core and core[-1] in _URL_TRAILING_PUNCTUATION:
+            suffix = core[-1] + suffix
+            core = core[:-1]
+        if not core or _sensitive_url(core, internal_hosts):
+            return _REDACTED_URL + suffix
+        return core + suffix
+
+    return _URL_PATTERN.sub(replace, value)
+
+
+def _scrub_trace_urls(
+    value: object,
+    internal_hosts: frozenset[str],
+) -> object:
     if type(value) is str:
-        return _URL_PATTERN.sub(_REDACTED_URL, value)
+        return _scrub_url_string(value, internal_hosts)
     if type(value) is list:
-        return [_scrub_trace_urls(item) for item in value]
+        return [_scrub_trace_urls(item, internal_hosts) for item in value]
     if type(value) is dict:
         scrubbed: dict[str, object] = {}
         for key, item in value.items():
-            scrubbed_key = _URL_PATTERN.sub(_REDACTED_URL, key)
+            scrubbed_key = _scrub_url_string(key, internal_hosts)
             if scrubbed_key in scrubbed:
                 scrubbed[scrubbed_key] = {"_trace_key_collision": 2}
                 continue
-            scrubbed[scrubbed_key] = _scrub_trace_urls(item)
+            scrubbed[scrubbed_key] = _scrub_trace_urls(item, internal_hosts)
         return scrubbed
     return value
 
 
-def _safe_trace_document(value: object) -> dict[str, Any]:
+def _safe_trace_document(
+    value: object,
+    *,
+    internal_hosts: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     document = bounded_trace_document(value)
-    scrubbed = _scrub_trace_urls(document)
+    scrubbed = _scrub_trace_urls(document, internal_hosts)
     if not isinstance(scrubbed, dict):
         return {}
     serialized_bytes = len(_trace_json(scrubbed).encode("utf-8"))
@@ -84,13 +205,22 @@ def _safe_trace_document(value: object) -> dict[str, Any]:
     }
 
 
-def _bounded_correlation_id(value: str | None) -> str | None:
+def _bounded_correlation_id(
+    value: str | None,
+    *,
+    internal_hosts: frozenset[str],
+) -> str | None:
     if value is None:
         return None
     if type(value) is not str:
         raise TypeError("correlation_id must be a string")
     character_count = str.__len__(value)
-    if character_count <= _MAX_CORRELATION_ID_CHARS and "\x00" not in value:
+    contains_sensitive_url = _scrub_url_string(value, internal_hosts) != value
+    if (
+        character_count <= _MAX_CORRELATION_ID_CHARS
+        and "\x00" not in value
+        and not contains_sensitive_url
+    ):
         return value
 
     digest = hashlib.sha256()
@@ -105,31 +235,36 @@ def _bounded_response_envelope(
 ) -> dict[object, object]:
     try:
         iterator = (
-            dict.__iter__(response)
-            if isinstance(response, dict)
-            else iter(response)
+            dict.__iter__(response) if isinstance(response, dict) else iter(response)
         )
     except Exception:
         return {"_trace_response_fields_unreadable": True}
 
-    envelope: dict[object, object] = {}
-    truncated = False
+    observed_keys: list[object] = []
     for slot in range(_MAX_RESPONSE_SCAN_FIELDS + 1):
         try:
             key = next(iterator)
         except StopIteration:
             break
         except Exception:
-            envelope["_trace_response_fields_unreadable"] = True
-            break
+            return {"_trace_response_fields_unreadable": True}
         if slot == _MAX_RESPONSE_SCAN_FIELDS:
-            truncated = True
-            break
-        if key == "results":
-            continue
-        if len(envelope) >= _MAX_RESPONSE_ENVELOPE_FIELDS:
-            truncated = True
-            continue
+            return {"_trace_response_envelope_truncated": True}
+        observed_keys.append(key)
+
+    allowed_keys = sorted(
+        key
+        for key in observed_keys
+        if type(key) is str
+        and key
+        in (
+            _RESPONSE_STRING_FIELDS
+            | _RESPONSE_INTEGER_FIELDS
+            | _RESPONSE_BOOLEAN_FIELDS
+        )
+    )[:_MAX_RESPONSE_ENVELOPE_FIELDS]
+    envelope: dict[object, object] = {}
+    for key in allowed_keys:
         try:
             item = (
                 dict.__getitem__(response, key)
@@ -137,19 +272,21 @@ def _bounded_response_envelope(
                 else response[key]
             )
         except Exception:
-            item = "[UNREADABLE]"
-        envelope[key] = item
-
-    if truncated:
-        envelope["_trace_response_fields_truncated"] = True
+            continue
+        if key in _RESPONSE_STRING_FIELDS and type(item) is str:
+            envelope[key] = item
+        elif key in _RESPONSE_INTEGER_FIELDS and type(item) is int:
+            envelope[key] = item
+        elif key in _RESPONSE_BOOLEAN_FIELDS and type(item) is bool:
+            envelope[key] = item
     return envelope
 
 
-def _response_results(response: Mapping[str, object]) -> object:
+def _response_value(response: Mapping[str, object], key: str) -> object:
     try:
         if isinstance(response, dict):
-            return dict.get(response, "results")
-        return response.get("results")
+            return dict.get(response, key)
+        return response.get(key)
     except Exception:
         return None
 
@@ -158,7 +295,7 @@ def _preview_omission_details(
     response: Mapping[str, object],
     stored_previews: list[dict[str, Any]],
 ) -> tuple[int, bool]:
-    results = _response_results(response)
+    results = _response_value(response, "results")
     if not isinstance(results, list):
         return 0, False
     try:
@@ -166,23 +303,20 @@ def _preview_omission_details(
     except Exception:
         return 0, False
 
-    valid_preview_count = 0
-    scan_count = min(returned_count, _MAX_PREVIEW_SCAN_ITEMS)
-    for index in range(scan_count):
-        try:
-            item = list.__getitem__(results, index)
-        except Exception:
-            break
-        _count, preview = trace_result_summary({"results": [item]})
-        if preview:
-            valid_preview_count += 1
-
-    omitted = max(valid_preview_count - len(stored_previews), 0)
+    omitted = max(returned_count - len(stored_previews), 0)
     return omitted, returned_count > _MAX_PREVIEW_SCAN_ITEMS
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _project_internal_hosts(session: Session, project_id: str) -> frozenset[str]:
+    project = session.get(Project, project_id)
+    if project is None:
+        return frozenset()
+    host = _normalized_url_host(project.mem0_base_url)
+    return frozenset({host}) if host is not None else frozenset()
 
 
 @dataclass(frozen=True)
@@ -215,6 +349,23 @@ class EventPage:
     items: list[Event]
     total: int
     buckets: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class _EventCandidate:
+    event_id: str
+    request_json: str
+    created_at: datetime
+    operation: str
+    status: EventStatus
+    has_results: int
+    result_count: int
+    correlation_id: str | None
+    latency_ms: float | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    subject_type: str | None
+    subject_id: str | None
 
 
 _MEMORY_FILTER_COLUMNS = {
@@ -351,26 +502,53 @@ def _event_request(request_json: object) -> dict[str, object] | None:
 
 
 def _request_app_id(request: Mapping[str, object]) -> str | None:
-    top_level_values: list[str] = []
+    values: list[str] = []
     for field_name in ("app_id", "_mem0_sidecar_app_id"):
         if field_name not in request:
             continue
         value = request[field_name]
         if type(value) is not str or not value:
             return None
-        top_level_values.append(value)
-    if top_level_values:
-        return (
-            top_level_values[0]
-            if all(value == top_level_values[0] for value in top_level_values)
-            else None
-        )
+        values.append(value)
 
     metadata = request.get("metadata")
-    if type(metadata) is not dict:
+    if type(metadata) is dict and "_mem0_sidecar_app_id" in metadata:
+        value = metadata["_mem0_sidecar_app_id"]
+        if type(value) is not str or not value:
+            return None
+        values.append(value)
+    if not values:
         return None
-    value = metadata.get("_mem0_sidecar_app_id")
-    return value if type(value) is str and value else None
+    return values[0] if all(value == values[0] for value in values) else None
+
+
+def _same_optional_datetime(
+    left: datetime | None,
+    right: datetime | None,
+) -> bool:
+    if left is None or right is None:
+        return left is right
+    return _as_utc(left) == _as_utc(right)
+
+
+def _event_matches_candidate(event: object, candidate: _EventCandidate) -> bool:
+    if not isinstance(event, Event):
+        return False
+    return (
+        event.id == candidate.event_id
+        and event.request_json == candidate.request_json
+        and _as_utc(event.created_at) == _as_utc(candidate.created_at)
+        and event.operation == candidate.operation
+        and event.status == candidate.status
+        and event.has_results == candidate.has_results
+        and event.result_count == candidate.result_count
+        and event.correlation_id == candidate.correlation_id
+        and event.latency_ms == candidate.latency_ms
+        and _same_optional_datetime(event.started_at, candidate.started_at)
+        and _same_optional_datetime(event.completed_at, candidate.completed_at)
+        and event.subject_type == candidate.subject_type
+        and event.subject_id == candidate.subject_id
+    )
 
 
 def _matches_event_scope(
@@ -569,14 +747,20 @@ class EventRepository:
         correlation_id: str | None = None,
     ) -> Event:
         started_at = _utc_now()
+        internal_hosts = _project_internal_hosts(self.session, project_id)
         event = Event(
             project_id=project_id,
             operation=operation,
             status=EventStatus.PENDING,
             subject_type=subject_type,
             subject_id=subject_id,
-            request_json=_trace_json(_safe_trace_document(request or {})),
-            correlation_id=_bounded_correlation_id(correlation_id),
+            request_json=_trace_json(
+                _safe_trace_document(request or {}, internal_hosts=internal_hosts)
+            ),
+            correlation_id=_bounded_correlation_id(
+                correlation_id,
+                internal_hosts=internal_hosts,
+            ),
             started_at=started_at,
         )
         self.session.add(event)
@@ -608,17 +792,30 @@ class EventRepository:
 
     def mark_succeeded(self, event_id: str, *, response: dict[str, Any]) -> Event:
         event = self.get(event_id)
-        result_count, previews = trace_result_summary(response)
+        internal_hosts = _project_internal_hosts(self.session, event.project_id)
+        summary_response = {
+            "results": _response_value(response, "results"),
+            "total": _response_value(response, "total"),
+        }
+        result_count, previews = trace_result_summary(summary_response)
         response_document = _bounded_response_envelope(response)
         if previews:
             response_document["result_previews"] = previews
-        omitted, scan_truncated = _preview_omission_details(response, previews)
+        omitted, scan_truncated = _preview_omission_details(
+            summary_response,
+            previews,
+        )
         if omitted:
             response_document["result_previews_omitted"] = omitted
         if scan_truncated:
             response_document["result_previews_scan_truncated"] = True
         event.status = EventStatus.SUCCEEDED
-        event.response_json = _trace_json(_safe_trace_document(response_document))
+        event.response_json = _trace_json(
+            _safe_trace_document(
+                response_document,
+                internal_hosts=internal_hosts,
+            )
+        )
         event.result_count = result_count
         event.has_results = 1 if result_count else 0
         self._complete(event)
@@ -627,8 +824,11 @@ class EventRepository:
 
     def mark_failed(self, event_id: str, *, error: dict[str, Any]) -> Event:
         event = self.get(event_id)
+        internal_hosts = _project_internal_hosts(self.session, event.project_id)
         event.status = EventStatus.FAILED
-        event.error_json = _trace_json(_safe_trace_document(error))
+        event.error_json = _trace_json(
+            _safe_trace_document(error, internal_hosts=internal_hosts)
+        )
         event.result_count = 0
         event.has_results = 0
         self._complete(event)
@@ -663,51 +863,95 @@ class EventRepository:
         if query.to_at is not None:
             conditions.append(Event.created_at <= _as_utc(query.to_at))
 
-        candidates = list(
+        for _attempt in range(_EVENT_QUERY_MAX_ATTEMPTS):
+            page = self._query_project_events_snapshot(
+                project_id=project_id,
+                app_id=app_id,
+                query=query,
+                conditions=conditions,
+            )
+            if page is not None:
+                return page
+        raise ValueError(_EVENT_QUERY_UNSTABLE_ERROR)
+
+    def _query_project_events_snapshot(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        query: EventQuery,
+        conditions: list[object],
+    ) -> EventPage | None:
+        rows = list(
             self.session.execute(
-                select(Event.id, Event.request_json, Event.created_at)
+                select(
+                    Event.id,
+                    Event.request_json,
+                    Event.created_at,
+                    Event.operation,
+                    Event.status,
+                    Event.has_results,
+                    Event.result_count,
+                    Event.correlation_id,
+                    Event.latency_ms,
+                    Event.started_at,
+                    Event.completed_at,
+                    Event.subject_type,
+                    Event.subject_id,
+                )
                 .where(*conditions)
                 .order_by(Event.created_at.desc(), Event.id.desc())
                 .limit(5001)
             )
         )
-        if len(candidates) > 5000:
+        if len(rows) > 5000:
             raise ValueError("entity filter scan exceeds 5000 records")
-
+        candidates = [_EventCandidate(*row) for row in rows]
         matches = [
-            (event_id, created_at)
-            for event_id, request_json, created_at in candidates
-            if _matches_event_scope(request_json, app_id, query.entity_filters)
+            candidate
+            for candidate in candidates
+            if _matches_event_scope(
+                candidate.request_json,
+                app_id,
+                query.entity_filters,
+            )
         ]
         offset = (query.page - 1) * query.page_size
-        page_ids = [
-            event_id
-            for event_id, _created_at in matches[
-                offset : offset + query.page_size
-            ]
-        ]
-        loaded_events = (
-            {
-                event.id: event
-                for event in self.session.scalars(
+        page_candidates = matches[offset : offset + query.page_size]
+        if page_candidates:
+            loaded_values = list(
+                self.session.scalars(
                     select(Event).where(
                         Event.project_id == project_id,
-                        Event.id.in_(page_ids),
+                        Event.id.in_(
+                            [candidate.event_id for candidate in page_candidates]
+                        ),
                     )
                 )
+            )
+            loaded_events = {
+                event.id: event for event in loaded_values if isinstance(event, Event)
             }
-            if page_ids
-            else {}
-        )
+            if len(loaded_values) != len(page_candidates) or len(loaded_events) != len(
+                page_candidates
+            ):
+                return None
+            if any(
+                not _event_matches_candidate(
+                    loaded_events.get(candidate.event_id),
+                    candidate,
+                )
+                for candidate in page_candidates
+            ):
+                return None
+            items = [loaded_events[candidate.event_id] for candidate in page_candidates]
+        else:
+            items = []
         return EventPage(
-            items=[
-                loaded_events[event_id]
-                for event_id in page_ids
-                if event_id in loaded_events
-            ],
+            items=items,
             total=len(matches),
             buckets=_event_timeline_buckets(
-                [created_at for _event_id, created_at in matches],
+                [candidate.created_at for candidate in matches],
                 query,
             ),
         )
