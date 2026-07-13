@@ -417,6 +417,7 @@ class MemoryService:
         event_repo = EventRepository(self.session)
         event = event_repo.create_event(
             project_id=project_id,
+            app_id=scope.app_id,
             operation="memory.add",
             request=oss_payload,
             subject_type="memory",
@@ -640,6 +641,7 @@ class MemoryService:
         event_repo = EventRepository(self.session)
         event = event_repo.create_event(
             project_id=project_id,
+            app_id=effective_app_id,
             operation="memory.update",
             request=patch,
             subject_type="memory",
@@ -883,6 +885,7 @@ class MemoryService:
             event_repo = EventRepository(self.session)
             event = event_repo.create_event(
                 project_id=project_id,
+                app_id=effective_app_id,
                 operation="memory.delete",
                 request=_memory_delete_request(
                     project_id=project_id,
@@ -907,6 +910,7 @@ class MemoryService:
         event_repo = EventRepository(self.session)
         event = event_repo.create_event(
             project_id=project_id,
+            app_id=effective_app_id,
             operation="memory.delete",
             request=_memory_delete_request(
                 project_id=project_id,

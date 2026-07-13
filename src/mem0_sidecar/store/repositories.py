@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from mem0_sidecar.core.explorer_filters import ExplorerFilter, ExplorerQuery
 from mem0_sidecar.core.trace_payloads import (
     bounded_trace_document,
+    trace_key_is_secret,
     trace_result_summary,
 )
 from mem0_sidecar.store.models import (
@@ -44,26 +45,28 @@ _EVENT_QUERY_UNSTABLE_ERROR = (
 _REDACTED_URL = "[REDACTED_URL]"
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = "),.;"
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_AUTHORIZATION_VALUE_PATTERN = re.compile(
+    r"(?i)(?P<prefix>\bauthorization\s*[:=]\s*)"
+    r"(?:(?:bearer|basic|token)\s+)?"
+    r"(?P<value>[^\s,;)\]}]+)"
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?P<prefix>(?P<key>[a-z][a-z0-9_.-]{0,127})\s*[:=]\s*)"
+    r"(?P<value>\[REDACTED\]|\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;)\]}]+)"
+)
+_STANDALONE_CREDENTIAL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"sk[-_][A-Za-z0-9_-]{6,}|"
+    r"gh[pousr]_[A-Za-z0-9_-]{8,}|"
+    r"github_pat_[A-Za-z0-9_-]{6,}|"
+    r"xox[baprs]-[A-Za-z0-9_-]{6,}|"
+    r"(?:AKIA|ASIA)[A-Z0-9]{16}"
+    r")(?![A-Za-z0-9])"
+)
 _RESPONSE_STRING_FIELDS = frozenset({"id", "memory", "memory_id", "message", "status"})
 _RESPONSE_INTEGER_FIELDS = frozenset({"count", "total"})
 _RESPONSE_BOOLEAN_FIELDS = frozenset({"created", "deleted", "ok", "success", "updated"})
-_CREDENTIAL_QUERY_SUFFIXES = (
-    "accesskey",
-    "accesstoken",
-    "apikey",
-    "authorization",
-    "clientsecret",
-    "cookie",
-    "credential",
-    "credentials",
-    "password",
-    "refreshtoken",
-    "secret",
-    "sessionid",
-    "token",
-)
-
-
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True)
 
@@ -88,11 +91,6 @@ def _normalized_url_host(value: str) -> str | None:
     if not host:
         return None
     return host.lower().rstrip(".")
-
-
-def _credential_query_key(key: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
-    return normalized.endswith(_CREDENTIAL_QUERY_SUFFIXES)
 
 
 def _valid_public_domain(host: str) -> bool:
@@ -126,6 +124,8 @@ def _sensitive_url(url: str, internal_hosts: frozenset[str]) -> bool:
         return True
     if parsed.username is not None or parsed.password is not None:
         return True
+    if _INVALID_PERCENT_ESCAPE.search(url) is not None:
+        return True
 
     normalized_host = host.lower().rstrip(".")
     if normalized_host in internal_hosts:
@@ -141,15 +141,24 @@ def _sensitive_url(url: str, internal_hosts: frozenset[str]) -> bool:
         if not address.is_global:
             return True
 
-    try:
-        query_items = parse_qsl(
-            parsed.query,
-            keep_blank_values=True,
-            strict_parsing=False,
-        )
-    except (UnicodeError, ValueError):
-        return True
-    return any(_credential_query_key(key) for key, _value in query_items)
+    components = [parsed.query]
+    if "=" in parsed.fragment or "&" in parsed.fragment:
+        components.append(parsed.fragment)
+    for component in components:
+        if not component:
+            continue
+        try:
+            items = parse_qsl(
+                component,
+                keep_blank_values=True,
+                strict_parsing=True,
+                max_num_fields=64,
+            )
+        except (UnicodeError, ValueError):
+            return True
+        if any(trace_key_is_secret(key) for key, _value in items):
+            return True
+    return False
 
 
 def _scrub_url_string(value: str, internal_hosts: frozenset[str]) -> str:
@@ -167,22 +176,51 @@ def _scrub_url_string(value: str, internal_hosts: frozenset[str]) -> str:
     return _URL_PATTERN.sub(replace, value)
 
 
-def _scrub_trace_urls(
+def _redacted_assignment_value(value: str) -> str:
+    if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0]:
+        return f"{value[0]}[REDACTED]{value[-1]}"
+    suffix = "." if value.endswith(".") else ""
+    return "[REDACTED]" + suffix
+
+
+def _scrub_credential_string(value: str) -> str:
+    scrubbed = _AUTHORIZATION_VALUE_PATTERN.sub(
+        lambda match: match.group("prefix")
+        + _redacted_assignment_value(match.group("value")),
+        value,
+    )
+
+    def replace_assignment(match: re.Match[str]) -> str:
+        if not trace_key_is_secret(match.group("key")):
+            return match.group(0)
+        return match.group("prefix") + _redacted_assignment_value(
+            match.group("value")
+        )
+
+    scrubbed = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(replace_assignment, scrubbed)
+    return _STANDALONE_CREDENTIAL_PATTERN.sub("[REDACTED]", scrubbed)
+
+
+def _scrub_trace_string(value: str, internal_hosts: frozenset[str]) -> str:
+    return _scrub_credential_string(_scrub_url_string(value, internal_hosts))
+
+
+def _scrub_trace_strings(
     value: object,
     internal_hosts: frozenset[str],
 ) -> object:
     if type(value) is str:
-        return _scrub_url_string(value, internal_hosts)
+        return _scrub_trace_string(value, internal_hosts)
     if type(value) is list:
-        return [_scrub_trace_urls(item, internal_hosts) for item in value]
+        return [_scrub_trace_strings(item, internal_hosts) for item in value]
     if type(value) is dict:
         scrubbed: dict[str, object] = {}
         for key, item in value.items():
-            scrubbed_key = _scrub_url_string(key, internal_hosts)
+            scrubbed_key = _scrub_trace_string(key, internal_hosts)
             if scrubbed_key in scrubbed:
                 scrubbed[scrubbed_key] = {"_trace_key_collision": 2}
                 continue
-            scrubbed[scrubbed_key] = _scrub_trace_urls(item, internal_hosts)
+            scrubbed[scrubbed_key] = _scrub_trace_strings(item, internal_hosts)
         return scrubbed
     return value
 
@@ -193,7 +231,7 @@ def _safe_trace_document(
     internal_hosts: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     document = bounded_trace_document(value)
-    scrubbed = _scrub_trace_urls(document, internal_hosts)
+    scrubbed = _scrub_trace_strings(document, internal_hosts)
     if not isinstance(scrubbed, dict):
         return {}
     serialized_bytes = len(_trace_json(scrubbed).encode("utf-8"))
@@ -215,11 +253,11 @@ def _bounded_correlation_id(
     if type(value) is not str:
         raise TypeError("correlation_id must be a string")
     character_count = str.__len__(value)
-    contains_sensitive_url = _scrub_url_string(value, internal_hosts) != value
+    contains_sensitive_value = _scrub_trace_string(value, internal_hosts) != value
     if (
         character_count <= _MAX_CORRELATION_ID_CHARS
         and "\x00" not in value
-        and not contains_sensitive_url
+        and not contains_sensitive_value
     ):
         return value
 
@@ -354,6 +392,7 @@ class EventPage:
 @dataclass(frozen=True)
 class _EventCandidate:
     event_id: str
+    app_id: str | None
     request_json: str
     created_at: datetime
     operation: str
@@ -507,19 +546,49 @@ def _request_app_id(request: Mapping[str, object]) -> str | None:
         if field_name not in request:
             continue
         value = request[field_name]
-        if type(value) is not str or not value:
+        if type(value) is not str or not value or str.__len__(value) > 256:
             return None
         values.append(value)
 
     metadata = request.get("metadata")
     if type(metadata) is dict and "_mem0_sidecar_app_id" in metadata:
         value = metadata["_mem0_sidecar_app_id"]
-        if type(value) is not str or not value:
+        if type(value) is not str or not value or str.__len__(value) > 256:
             return None
         values.append(value)
     if not values:
         return None
     return values[0] if all(value == values[0] for value in values) else None
+
+
+def _raw_canonical_event_app_id(
+    request: dict[str, Any],
+    explicit_app_id: str | None,
+) -> str | None:
+    values: list[object] = []
+    for field_name in ("app_id", "_mem0_sidecar_app_id"):
+        if field_name in request:
+            values.append(request[field_name])
+    metadata = request.get("metadata")
+    if type(metadata) is dict and "_mem0_sidecar_app_id" in metadata:
+        values.append(metadata["_mem0_sidecar_app_id"])
+    if explicit_app_id is not None:
+        values.append(explicit_app_id)
+    if not values:
+        return None
+
+    canonical: list[str] = []
+    for value in values:
+        if (
+            type(value) is not str
+            or not value
+            or str.__len__(value) > 256
+        ):
+            raise ValueError("canonical event app scope is invalid")
+        canonical.append(value)
+    if any(value != canonical[0] for value in canonical[1:]):
+        raise ValueError("canonical event app scope markers conflict")
+    return canonical[0]
 
 
 def _same_optional_datetime(
@@ -536,6 +605,7 @@ def _event_matches_candidate(event: object, candidate: _EventCandidate) -> bool:
         return False
     return (
         event.id == candidate.event_id
+        and event.app_id == candidate.app_id
         and event.request_json == candidate.request_json
         and _as_utc(event.created_at) == _as_utc(candidate.created_at)
         and event.operation == candidate.operation
@@ -555,15 +625,26 @@ def _matches_event_scope(
     request_json: object,
     app_id: str,
     entity_filters: Mapping[str, str],
+    canonical_app_id: str | None,
 ) -> bool:
-    request = _event_request(request_json)
-    if request is None or _request_app_id(request) != app_id:
+    effective_app_id = canonical_app_id
+    request: dict[str, object] | None = None
+    if effective_app_id is None:
+        request = _event_request(request_json)
+        if request is None:
+            return False
+        effective_app_id = _request_app_id(request)
+    if effective_app_id != app_id:
         return False
 
     for field_name, expected in entity_filters.items():
         if field_name == "app_id":
-            actual = _request_app_id(request)
+            actual = effective_app_id
         elif field_name in {"user_id", "agent_id", "run_id"}:
+            if request is None:
+                request = _event_request(request_json)
+            if request is None:
+                return False
             actual = request.get(field_name)
         else:
             return False
@@ -740,6 +821,7 @@ class EventRepository:
         self,
         *,
         project_id: str,
+        app_id: str | None = None,
         operation: str,
         request: dict[str, Any] | None = None,
         subject_type: str | None = None,
@@ -748,14 +830,17 @@ class EventRepository:
     ) -> Event:
         started_at = _utc_now()
         internal_hosts = _project_internal_hosts(self.session, project_id)
+        raw_request = request or {}
+        canonical_app_id = _raw_canonical_event_app_id(raw_request, app_id)
         event = Event(
             project_id=project_id,
+            app_id=canonical_app_id,
             operation=operation,
             status=EventStatus.PENDING,
             subject_type=subject_type,
             subject_id=subject_id,
             request_json=_trace_json(
-                _safe_trace_document(request or {}, internal_hosts=internal_hosts)
+                _safe_trace_document(raw_request, internal_hosts=internal_hosts)
             ),
             correlation_id=_bounded_correlation_id(
                 correlation_id,
@@ -851,7 +936,10 @@ class EventRepository:
         app_id: str,
         query: EventQuery,
     ) -> EventPage:
-        conditions = [Event.project_id == project_id]
+        conditions = [
+            Event.project_id == project_id,
+            or_(Event.app_id == app_id, Event.app_id.is_(None)),
+        ]
         if query.operation is not None:
             conditions.append(Event.operation == query.operation)
         if query.statuses:
@@ -886,6 +974,7 @@ class EventRepository:
             self.session.execute(
                 select(
                     Event.id,
+                    Event.app_id,
                     Event.request_json,
                     Event.created_at,
                     Event.operation,
@@ -914,6 +1003,7 @@ class EventRepository:
                 candidate.request_json,
                 app_id,
                 query.entity_filters,
+                candidate.app_id,
             )
         ]
         offset = (query.page - 1) * query.page_size

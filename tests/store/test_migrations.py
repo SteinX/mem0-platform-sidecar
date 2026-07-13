@@ -21,9 +21,13 @@ MEMORY_EXPLORER_INDEXES = {
 
 REQUEST_TRACE_INDEXES = {
     "ix_events_project_created",
+    "ix_events_project_app_created",
     "ix_events_project_operation_created",
     "ix_events_project_status_created",
     "ix_events_project_has_results_created",
+}
+REQUEST_TRACE_INDEX_COLUMNS = {
+    "ix_events_project_app_created": ("project_id", "app_id", "created_at"),
 }
 
 
@@ -388,28 +392,39 @@ def test_request_trace_migration_upgrades_legacy_rows_and_downgrades(
 
     inspector = sa.inspect(engine)
     columns = {column["name"]: column for column in inspector.get_columns("events")}
-    assert {"correlation_id", "latency_ms", "result_count", "has_results"} <= set(
-        columns
-    )
+    assert {
+        "app_id",
+        "correlation_id",
+        "latency_ms",
+        "result_count",
+        "has_results",
+    } <= set(columns)
+    assert columns["app_id"]["nullable"] is True
     assert columns["result_count"]["nullable"] is False
     assert columns["has_results"]["nullable"] is False
     assert str(columns["result_count"]["default"]).strip("'()") == "0"
     assert str(columns["has_results"]["default"]).strip("'()") == "0"
-    assert REQUEST_TRACE_INDEXES <= {
-        index["name"] for index in inspector.get_indexes("events")
+    upgraded_indexes = {
+        index["name"]: tuple(index["column_names"])
+        for index in inspector.get_indexes("events")
     }
+    assert REQUEST_TRACE_INDEXES <= set(upgraded_indexes)
+    assert {
+        name: upgraded_indexes[name] for name in REQUEST_TRACE_INDEX_COLUMNS
+    } == REQUEST_TRACE_INDEX_COLUMNS
 
     with engine.connect() as connection:
         legacy = connection.execute(
             sa.text(
                 """
-                SELECT correlation_id, latency_ms, result_count, has_results
+                SELECT app_id, correlation_id, latency_ms, result_count, has_results
                 FROM events
                 WHERE id = 'event-legacy'
                 """
             )
         ).mappings().one()
     assert legacy == {
+        "app_id": None,
         "correlation_id": None,
         "latency_ms": None,
         "result_count": 0,
@@ -419,9 +434,13 @@ def test_request_trace_migration_upgrades_legacy_rows_and_downgrades(
     command.downgrade(config, "0004_memory_explorer_indexes")
 
     downgraded = sa.inspect(engine)
-    assert {"correlation_id", "latency_ms", "result_count", "has_results"}.isdisjoint(
-        column["name"] for column in downgraded.get_columns("events")
-    )
+    assert {
+        "app_id",
+        "correlation_id",
+        "latency_ms",
+        "result_count",
+        "has_results",
+    }.isdisjoint(column["name"] for column in downgraded.get_columns("events"))
     assert REQUEST_TRACE_INDEXES.isdisjoint(
         index["name"] for index in downgraded.get_indexes("events")
     )
@@ -458,5 +477,31 @@ def test_request_trace_migration_uses_postgres_bigint_for_result_count(
     result_count = next(
         column for column in added_columns if column.name == "result_count"
     )
+    app_id = next(column for column in added_columns if column.name == "app_id")
     assert isinstance(result_count.type, sa.BigInteger)
     assert result_count.type.compile(dialect=postgresql.dialect()) == "BIGINT"
+    assert app_id.nullable is True
+    assert app_id.type.compile(dialect=postgresql.dialect()) == "VARCHAR(256)"
+
+
+def test_request_trace_migration_drops_app_index_before_app_column(
+    monkeypatch,
+) -> None:
+    migration = importlib.import_module(
+        "migrations.versions.0005_request_trace_fields"
+    )
+    operations: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        migration,
+        "op",
+        SimpleNamespace(
+            drop_index=lambda name, table_name: operations.append(("index", name)),
+            drop_column=lambda table_name, name: operations.append(("column", name)),
+        ),
+    )
+
+    migration.downgrade()
+
+    assert operations.index(("index", "ix_events_project_app_created")) < (
+        operations.index(("column", "app_id"))
+    )

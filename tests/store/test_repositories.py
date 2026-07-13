@@ -1260,6 +1260,7 @@ def test_event_model_matches_request_trace_migration() -> None:
     }
 
     assert columns["correlation_id"].nullable is True
+    assert columns["app_id"].nullable is True
     assert columns["latency_ms"].nullable is True
     assert columns["result_count"].nullable is False
     assert columns["has_results"].nullable is False
@@ -1274,8 +1275,16 @@ def test_event_model_matches_request_trace_migration() -> None:
     assert columns["correlation_id"].type.compile(
         dialect=postgresql.dialect()
     ) == "VARCHAR(256)"
+    assert columns["app_id"].type.compile(
+        dialect=postgresql.dialect()
+    ) == "VARCHAR(256)"
     assert indexes == {
         "ix_events_project_created": ("project_id", "created_at"),
+        "ix_events_project_app_created": (
+            "project_id",
+            "app_id",
+            "created_at",
+        ),
         "ix_events_project_operation_created": (
             "project_id",
             "operation",
@@ -1773,11 +1782,268 @@ def test_event_repository_bounds_or_rejects_hostile_correlation_ids(
         )
 
 
+def test_event_repository_persists_raw_canonical_app_scope_before_sanitizing(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+    max_length_app_id = "m" * 256
+    cases = {
+        "private-url": (
+            "http://private.local/app",
+            {"app_id": "http://private.local/app"},
+        ),
+        "wide-request": (
+            "wide-scope",
+            {
+                **{f"field_{index:03d}": index for index in range(70)},
+                "app_id": "wide-scope",
+            },
+        ),
+        "sorted-out-request": (
+            "sorted-out-scope",
+            {
+                **{f"00_field_{index:03d}": index for index in range(50)},
+                "app_id": "sorted-out-scope",
+            },
+        ),
+        "max-length": (max_length_app_id, {"app_id": max_length_app_id}),
+    }
+
+    events = {
+        name: repository.create_event(
+            project_id="repo-a",
+            operation="memory.search",
+            request=request,
+        )
+        for name, (_app_id, request) in cases.items()
+    }
+    db_session.flush()
+
+    for name, (app_id, _request) in cases.items():
+        event = events[name]
+        assert event.app_id == app_id
+        page = repository.query_project_events(
+            "repo-a",
+            app_id,
+            repositories.EventQuery(
+                entity_filters={"app_id": app_id},
+                page=1,
+                page_size=20,
+            ),
+        )
+        assert [item.id for item in page.items] == [event.id]
+
+    assert "private.local" not in events["private-url"].request_json
+    assert "wide-scope" not in events["wide-request"].request_json
+    assert "sorted-out-scope" not in events["sorted-out-request"].request_json
+    assert repository.query_project_events(
+        "repo-a",
+        "[REDACTED_URL]",
+        repositories.EventQuery(page=1, page_size=20),
+    ).items == []
+    assert repository.query_project_events(
+        "repo-a",
+        "wrong-app",
+        repositories.EventQuery(page=1, page_size=20),
+    ).items == []
+
+
+def test_event_repository_validates_explicit_and_raw_canonical_app_scope(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+
+    explicit = repository.create_event(
+        project_id="repo-a",
+        app_id="app-a",
+        operation="memory.update",
+        request={"message": "no raw scope marker"},
+    )
+    assert explicit.app_id == "app-a"
+
+    invalid_cases = [
+        ({"app_id": "app-b"}, "app-a"),
+        (
+            {
+                "app_id": "app-a",
+                "metadata": {"_mem0_sidecar_app_id": "app-b"},
+            },
+            None,
+        ),
+        ({"app_id": ""}, None),
+        ({"app_id": "x" * 257}, None),
+        ({"app_id": 123}, "app-a"),
+    ]
+    for request, explicit_app_id in invalid_cases:
+        with pytest.raises(ValueError, match="canonical event app scope"):
+            repository.create_event(
+                project_id="repo-a",
+                app_id=explicit_app_id,
+                operation="memory.search",
+                request=request,
+            )
+
+
+def test_event_repository_scrubs_embedded_credentials_from_every_trace_field(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+    event = repository.create_event(
+        project_id="repo-a",
+        operation="memory.search",
+        request={
+            "app_id": "app-a",
+            "message": (
+                "Authorization: Bearer req-bearer; api_key=req-api, keep."
+            ),
+            "nested": [
+                "password=nested-pass)",
+                {"line": "x-api-key: line-secret\nkeep line"},
+            ],
+            "standalone": (
+                "sk-request-secret ghp_abcdefghijklmnopqrstuvwxyz123456 "
+                "xoxb-1234567890-secret AKIAABCDEFGHIJKLMNOP"
+            ),
+        },
+        correlation_id="request sk-correlation-secret",
+    )
+    succeeded = repository.mark_succeeded(
+        event.id,
+        response={
+            "message": "client_secret=resp-secret; public response.",
+            "status": "token=status-secret, ok",
+            "id": "sk-response-secret",
+        },
+    )
+    failed = repository.create_event(
+        project_id="repo-a",
+        operation="memory.search",
+        request={"app_id": "app-a"},
+    )
+    repository.mark_failed(
+        failed.id,
+        error={
+            "message": "passphrase: error-pass. keep.",
+            "nested": ["github_pat_error-secret", "xoxp-error-secret"],
+        },
+    )
+
+    request_document = json.loads(event.request_json)
+    response_document = json.loads(succeeded.response_json)
+    error_document = json.loads(failed.error_json)
+    assert request_document["message"] == (
+        "Authorization: [REDACTED]; api_key=[REDACTED], keep."
+    )
+    assert request_document["nested"] == [
+        "password=[REDACTED])",
+        {"line": "x-api-key: [REDACTED]\nkeep line"},
+    ]
+    assert request_document["standalone"] == (
+        "[REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+    )
+    assert response_document == {
+        "id": "[REDACTED]",
+        "message": "client_secret=[REDACTED]; public response.",
+        "status": "token=[REDACTED], ok",
+    }
+    assert error_document == {
+        "message": "passphrase: [REDACTED]. keep.",
+        "nested": ["[REDACTED]", "[REDACTED]"],
+    }
+    assert event.correlation_id is not None
+    assert event.correlation_id.startswith("[SHA256:")
+    persisted = event.request_json + succeeded.response_json + failed.error_json
+    for secret in (
+        "req-bearer",
+        "req-api",
+        "nested-pass",
+        "line-secret",
+        "sk-request-secret",
+        "ghp_abcdefghijklmnopqrstuvwxyz123456",
+        "xoxb-1234567890-secret",
+        "AKIAABCDEFGHIJKLMNOP",
+        "resp-secret",
+        "status-secret",
+        "sk-response-secret",
+        "error-pass",
+        "github_pat_error-secret",
+        "xoxp-error-secret",
+    ):
+        assert secret not in persisted
+
+
+def test_event_repository_uses_shared_secret_vocabulary_for_url_components(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+    event = repository.create_event(
+        project_id="repo-a",
+        operation="memory.search",
+        request={"app_id": "app-a"},
+    )
+    urls = [
+        "https://example.com/?secret%5Fkey=query-secret",
+        "https://example.com/?private_key=query-secret",
+        "https://example.com/?code_verifier=query-secret",
+        "https://example.com/?access_key_id=query-secret",
+        "https://example.com/#access_token=fragment-secret&token_type=Bearer",
+        "https://example.com/?broken",
+        "https://example.com/?value=%ZZ",
+    ]
+    succeeded = repository.mark_succeeded(
+        event.id,
+        response={
+            "message": " ".join(
+                [
+                    *urls,
+                    "https://example.com/?topic=memory#overview",
+                ]
+            )
+        },
+    )
+    stored_message = json.loads(succeeded.response_json)["message"]
+
+    assert stored_message.count("[REDACTED_URL]") == len(urls)
+    assert "query-secret" not in stored_message
+    assert "fragment-secret" not in stored_message
+    assert "https://example.com/?topic=memory#overview" in stored_message
+    for url in urls[:5]:
+        correlated = repository.create_event(
+            project_id="repo-a",
+            operation="memory.search",
+            request={"app_id": "app-a"},
+            correlation_id=url,
+        )
+        assert correlated.correlation_id is not None
+        assert correlated.correlation_id.startswith("[SHA256:")
+
+
 def _add_trace_event(
     db_session,
     *,
     event_id: str,
     project_id: str = "repo-a",
+    app_id: str | None = None,
     operation: str = "memory.search",
     status: EventStatus = EventStatus.SUCCEEDED,
     request: object = None,
@@ -1787,6 +2053,7 @@ def _add_trace_event(
     event = Event(
         id=event_id,
         project_id=project_id,
+        app_id=app_id,
         operation=operation,
         status=status,
         request_json=json.dumps(request if request is not None else {}),
@@ -2201,6 +2468,49 @@ def test_event_query_applies_sql_narrowing_before_bounded_scope_scan(
                 page_size=20,
             ),
         )
+
+
+def test_event_query_sql_narrows_canonical_app_before_scope_scan(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 7, 13, tzinfo=UTC)
+    db_session.add_all(
+        [
+            Event(
+                id=f"other-app-{index:04d}",
+                project_id="repo-a",
+                app_id="app-b",
+                operation="memory.search",
+                status=EventStatus.SUCCEEDED,
+                request_json='{"app_id":"app-b"}',
+                response_json="{}",
+                error_json="{}",
+                created_at=created_at,
+                result_count=0,
+                has_results=0,
+            )
+            for index in range(5001)
+        ]
+    )
+    target = _add_trace_event(
+        db_session,
+        event_id="canonical-target",
+        app_id="app-a",
+        request={"app_id": "[REDACTED_URL]"},
+        created_at=created_at,
+    )
+    db_session.flush()
+
+    page = EventRepository(db_session).query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(page=1, page_size=20),
+    )
+
+    assert [item.id for item in page.items] == [target.id]
 
 
 def _add_snapshot_retry_events(db_session) -> list[str]:

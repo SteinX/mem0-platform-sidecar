@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import pytest
 
+from mem0_sidecar.core import trace_payloads
 from mem0_sidecar.core.trace_payloads import (
     bounded_trace_document,
     sanitize_trace_payload,
@@ -62,6 +63,34 @@ def test_sanitize_trace_payload_normalizes_only_secret_key_names() -> None:
         "token_count": 12,
         "x-api-key": "[REDACTED]",
     }
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "Authorization",
+        "secret_key",
+        "private-key",
+        "passphrase",
+        "code_verifier",
+        "access_key_id",
+        "refresh_token",
+        "session-token",
+        "Set-Cookie",
+        "x-api-key",
+        "client_secret",
+    ],
+)
+def test_trace_key_is_secret_exports_the_sanitizer_vocabulary(key: str) -> None:
+    assert trace_payloads.trace_key_is_secret(key) is True
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["action", "token_count", "secretary", "favorite_cookie", "status"],
+)
+def test_trace_key_is_secret_preserves_known_non_credentials(key: str) -> None:
+    assert trace_payloads.trace_key_is_secret(key) is False
 
 
 def test_sanitize_trace_payload_redacts_compound_secret_keys_without_visiting_values(
