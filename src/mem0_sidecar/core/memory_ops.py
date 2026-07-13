@@ -11,7 +11,7 @@ from mem0_sidecar.core.explorer_filters import (
     ExplorerFilter,
     ExplorerQuery,
 )
-from mem0_sidecar.core.scope import Scope, normalize_scope
+from mem0_sidecar.core.scope import Scope, normalize_scope, validate_scope_id
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
 from mem0_sidecar.store.models import MemoryIndex, Project
@@ -28,10 +28,18 @@ _MEMORY_PATCH_FIELDS = frozenset({"text", "metadata", "expiration_date"})
 _RECONCILE_SCAN_LIMIT = 5000
 _HYDRATION_BUFFER = 20
 _HYDRATION_CONCURRENCY = 8
+_DIRTY_TRACE_SESSION_ERROR = (
+    "traced memory operation requires a clean session write-set"
+)
 
 
 class MemoryUpstreamProtocolError(RuntimeError):
     """The upstream response does not satisfy the memory service contract."""
+
+
+def _require_clean_trace_session(session: Session) -> None:
+    if session.new or session.dirty or session.deleted:
+        raise RuntimeError(_DIRTY_TRACE_SESSION_ERROR)
 
 
 def _append_memory_id(memory_ids: list[str], candidate: Any) -> None:
@@ -366,12 +374,50 @@ def _query_trace_entities(query: ExplorerQuery) -> dict[str, str]:
 
 
 def _hydrated_record_matches_projection(
-    record: dict[str, Any],
+    raw_record: dict[str, Any],
+    normalized_record: dict[str, Any],
     projection: MemoryIndex,
 ) -> bool:
-    return all(
-        record.get(field_name) == getattr(projection, field_name)
+    if not all(
+        normalized_record.get(field_name) == getattr(projection, field_name)
         for field_name in ("user_id", "agent_id", "app_id", "run_id")
+    ):
+        return False
+
+    raw_project_id = raw_record.get("project_id")
+    if raw_project_id is not None:
+        try:
+            normalized_project_id = validate_scope_id(
+                raw_project_id, field_name="project_id"
+            )
+        except ValueError:
+            return False
+        if normalized_project_id != projection.project_id:
+            return False
+
+    metadata = normalized_record.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    has_project_marker = SIDECAR_PROJECT_ID_METADATA_KEY in metadata
+    has_app_marker = SIDECAR_APP_ID_METADATA_KEY in metadata
+    if not has_project_marker and not has_app_marker:
+        return True
+    if not has_project_marker or not has_app_marker:
+        return False
+    try:
+        marker_project_id = validate_scope_id(
+            metadata[SIDECAR_PROJECT_ID_METADATA_KEY],
+            field_name="project_id",
+        )
+        marker_app_id = validate_scope_id(
+            metadata[SIDECAR_APP_ID_METADATA_KEY],
+            field_name="app_id",
+        )
+    except ValueError:
+        return False
+    return (
+        marker_project_id == projection.project_id
+        and marker_app_id == projection.app_id
     )
 
 
@@ -478,6 +524,7 @@ class MemoryService:
         project_id: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        _require_clean_trace_session(self.session)
         scope = normalize_scope(
             project_id=project_id,
             user_id=payload.get("user_id"),
@@ -563,6 +610,7 @@ class MemoryService:
         project_id: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        _require_clean_trace_session(self.session)
         scope = normalize_scope(
             project_id=project_id,
             user_id=payload.get("user_id"),
@@ -620,6 +668,7 @@ class MemoryService:
         app_id: str,
         query: ExplorerQuery,
     ) -> dict[str, Any]:
+        _require_clean_trace_session(self.session)
         trace_entities = _query_trace_entities(query)
         event_repo = EventRepository(self.session)
         event = event_repo.create_event(
@@ -661,7 +710,11 @@ class MemoryService:
                     expected_id=memory.mem0_memory_id,
                 )
                 normalized = _normalize_memory_record(record, projection=memory)
-                if not _hydrated_record_matches_projection(normalized, memory):
+                if not _hydrated_record_matches_projection(
+                    record,
+                    normalized,
+                    memory,
+                ):
                     return memory.mem0_memory_id, None
                 return memory.mem0_memory_id, normalized
             except Exception as exc:

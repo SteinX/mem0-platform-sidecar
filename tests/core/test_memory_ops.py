@@ -15,7 +15,7 @@ from mem0_sidecar.core.memory_ops import (
     extract_memory_ids,
 )
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
-from mem0_sidecar.store.models import EventStatus, MemoryIndex, Project
+from mem0_sidecar.store.models import Category, EventStatus, MemoryIndex, Project
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EventRepository,
@@ -536,6 +536,82 @@ async def test_add_memory_trace_uses_request_correlation_and_creates_one_event(
     assert len(stored) == 1
     assert stored[0].operation == "memory.add"
     assert stored[0].correlation_id == "request-add"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["add", "search", "list"])
+@pytest.mark.parametrize("write_state", ["new", "dirty", "deleted"])
+async def test_traced_memory_operations_reject_unrelated_session_writes_without_commit(
+    db_session,
+    operation: str,
+    write_state: str,
+) -> None:
+    _create_project(db_session)
+    baseline_category = CategoryRepository(db_session).replace_project_categories(
+        project_id="repo-a",
+        categories=[{"name": "baseline", "description": "keep"}],
+    )[0]
+    db_session.commit()
+    project = db_session.get(Project, "repo-a")
+    assert project is not None
+
+    pending_category: Category | None = None
+    if write_state == "new":
+        pending_category = Category(
+            project_id="repo-a",
+            name="must-not-commit",
+            description="pending",
+            schema_json="{}",
+        )
+        db_session.add(pending_category)
+    elif write_state == "dirty":
+        project.name = "must-not-commit"
+    else:
+        db_session.delete(baseline_category)
+
+    mem0 = ExplorerMem0Client()
+    service = MemoryService(session=db_session, mem0=mem0)
+    with pytest.raises(
+        RuntimeError,
+        match="traced memory operation requires a clean session write-set",
+    ):
+        if operation == "add":
+            await service.add_memory(
+                project_id="repo-a",
+                payload={"text": "hello", "app_id": "app-a"},
+            )
+        elif operation == "search":
+            await service.search_memories(
+                project_id="repo-a",
+                payload={"query": "hello", "app_id": "app-a"},
+            )
+        else:
+            await service.query_memories(
+                project_id="repo-a",
+                app_id="app-a",
+                query=_explorer_query(),
+            )
+
+    assert mem0.add_payloads == []
+    assert mem0.search_payloads == []
+    assert mem0.get_memory_ids == []
+    if write_state == "new":
+        assert pending_category is not None
+        assert pending_category in db_session.new
+    elif write_state == "dirty":
+        assert project in db_session.dirty
+    else:
+        assert baseline_category in db_session.deleted
+
+    db_session.rollback()
+    with Session(db_session.get_bind()) as verification_session:
+        persisted_project = verification_session.get(Project, "repo-a")
+        persisted_categories = CategoryRepository(
+            verification_session
+        ).list_project_categories("repo-a")
+    assert persisted_project is not None
+    assert persisted_project.name == "repo-a"
+    assert [category.name for category in persisted_categories] == ["baseline"]
 
 
 @pytest.mark.asyncio
@@ -1110,6 +1186,62 @@ async def test_query_memory_trace_uses_exact_entities_and_excludes_cross_app_pre
     }
     assert "must not leak" not in event.response_json
     assert "app-b" not in event.response_json
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+            SIDECAR_APP_ID_METADATA_KEY: "app-b",
+        },
+        {
+            SIDECAR_PROJECT_ID_METADATA_KEY: "repo-b",
+            SIDECAR_APP_ID_METADATA_KEY: "app-a",
+        },
+        {SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a"},
+        {SIDECAR_APP_ID_METADATA_KEY: "app-a"},
+        {
+            SIDECAR_PROJECT_ID_METADATA_KEY: 123,
+            SIDECAR_APP_ID_METADATA_KEY: "app-a",
+        },
+    ],
+)
+async def test_query_memory_rejects_partial_invalid_or_cross_scope_metadata_markers(
+    db_session,
+    metadata: dict[str, Any],
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-secret", app_id="app-a")
+    db_session.commit()
+    mem0 = ExplorerMem0Client(
+        {
+            "mem-secret": {
+                "id": "mem-secret",
+                "memory": "cross-app-secret-must-not-leak",
+                "metadata": metadata,
+            }
+        }
+    )
+
+    result = await MemoryService(session=db_session, mem0=mem0).query_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        query=_explorer_query(),
+    )
+
+    assert result["results"] == []
+    assert result["total"] == 0
+    assert result["stale_skipped"] == 1
+    stored = EventRepository(db_session).list_project_events("repo-a")
+    assert len(stored) == 1
+    event = stored[0]
+    assert event.status is EventStatus.SUCCEEDED
+    assert event.result_count == 0
+    assert "cross-app-secret-must-not-leak" not in event.response_json
+    assert "app-b" not in event.response_json
+    assert "repo-b" not in event.response_json
 
 
 @pytest.mark.asyncio
