@@ -6,6 +6,11 @@ from typing import Literal
 ExplorerMatch = Literal["all", "any"]
 ExplorerSort = Literal["created_at_desc", "created_at_asc"]
 
+EXPLORER_RECORD_HORIZON = 5000
+MAX_EXPLORER_FILTERS = 64
+MAX_EXPLORER_IN_VALUES = 100
+MAX_EXPLORER_VALUE_CHARS = 256
+
 MEMORY_FILTER_FIELDS = {
     "entity_type",
     "user_id",
@@ -54,7 +59,12 @@ class ExplorerQuery:
 def _non_empty_string(value: object, *, path: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{path} must be a non-empty string")
-    return value.strip()
+    normalized = value.strip()
+    if len(normalized) > MAX_EXPLORER_VALUE_CHARS:
+        raise ValueError(
+            f"{path} must contain at most {MAX_EXPLORER_VALUE_CHARS} characters"
+        )
+    return normalized
 
 
 def _normalize_scalar_value(field: str, value: object, *, path: str) -> str:
@@ -71,6 +81,10 @@ def _normalize_in_value(field: str, value: object, *, path: str) -> tuple[str, .
         or not value
     ):
         raise ValueError(f"{path} must be a non-empty list")
+    if len(value) > MAX_EXPLORER_IN_VALUES:
+        raise ValueError(
+            f"{path} must contain at most {MAX_EXPLORER_IN_VALUES} items"
+        )
     return tuple(
         _normalize_scalar_value(field, item, path=f"{path}[{index}]")
         for index, item in enumerate(value)
@@ -183,6 +197,10 @@ def parse_explorer_query(
     raw_filters = payload.get("filters", [])
     if not isinstance(raw_filters, list):
         raise ValueError("filters must be a list")
+    if len(raw_filters) > MAX_EXPLORER_FILTERS:
+        raise ValueError(
+            f"filters must contain at most {MAX_EXPLORER_FILTERS} items"
+        )
     filters = tuple(
         _parse_filter(value, index=index, allowed_fields=allowed_fields)
         for index, value in enumerate(raw_filters)
@@ -196,6 +214,10 @@ def parse_explorer_query(
         minimum=1,
         maximum=100,
     )
+    if page * page_size > EXPLORER_RECORD_HORIZON:
+        raise ValueError(
+            f"page window must not exceed {EXPLORER_RECORD_HORIZON} records"
+        )
 
     sort = payload.get("sort", "created_at_desc")
     if not isinstance(sort, str) or sort not in _SORTS:

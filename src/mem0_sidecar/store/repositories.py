@@ -811,6 +811,19 @@ class ProjectRepository:
         self.session.flush()
         return project
 
+    def lock_for_mutation(self, project_id: str) -> Project:
+        """Serialize projection mutations in Project -> MemoryIndex -> Entity order."""
+
+        with self.session.no_autoflush:
+            project = self.session.scalar(
+                select(Project)
+                .where(Project.id == project_id)
+                .with_for_update()
+            )
+        if project is None:
+            raise KeyError(project_id)
+        return project
+
 
 class CategoryRepository:
     def __init__(self, session: Session) -> None:
@@ -1287,7 +1300,18 @@ class MemoryIndexRepository:
         project_id: str,
         app_id: str,
         query: ExplorerQuery,
+        *,
+        window_offset: int | None = None,
+        window_limit: int | None = None,
     ) -> MemoryIndexPage:
+        offset = (
+            (query.page - 1) * query.page_size
+            if window_offset is None
+            else window_offset
+        )
+        limit = query.page_size if window_limit is None else window_limit
+        if offset < 0 or limit < 1:
+            raise ValueError("memory query window is invalid")
         scope_conditions = [
             MemoryIndex.project_id == project_id,
             MemoryIndex.app_id == app_id,
@@ -1313,13 +1337,12 @@ class MemoryIndexRepository:
             total = self.session.scalar(
                 select(func.count()).select_from(MemoryIndex).where(*conditions)
             )
-            offset = (query.page - 1) * query.page_size
             statement = (
                 select(MemoryIndex)
                 .where(*conditions)
                 .order_by(*_memory_order_by(query))
                 .offset(offset)
-                .limit(query.page_size)
+                .limit(limit)
             )
             return MemoryIndexPage(
                 items=list(self.session.scalars(statement)),
@@ -1351,9 +1374,8 @@ class MemoryIndexRepository:
             for memory in candidates
             if _matches_query_filters(memory, query)
         ]
-        offset = (query.page - 1) * query.page_size
         return MemoryIndexPage(
-            items=matches[offset : offset + query.page_size],
+            items=matches[offset : offset + limit],
             total=len(matches),
             scan_count=scan_count,
         )
@@ -1599,14 +1621,8 @@ class EntityRepository:
         project_id: str,
         app_id: str,
     ) -> list[Entity]:
+        ProjectRepository(self.session).lock_for_mutation(project_id)
         with self.session.no_autoflush:
-            project = self.session.scalar(
-                select(Project)
-                .where(Project.id == project_id)
-                .with_for_update()
-            )
-            if project is None:
-                raise KeyError(project_id)
             memories = list(
                 self.session.scalars(
                     select(MemoryIndex).where(

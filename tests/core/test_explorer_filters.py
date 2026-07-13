@@ -215,3 +215,86 @@ def test_parse_explorer_query_rejects_invalid_ranges_and_paging(
 ) -> None:
     with pytest.raises(ValueError, match=re.escape(message)):
         parse_explorer_query(payload, allowed_fields=MEMORY_FILTER_FIELDS)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {
+                "filters": [
+                    {"field": "user_id", "operator": "equals", "value": "a"}
+                    for _index in range(65)
+                ]
+            },
+            "filters must contain at most 64 items",
+        ),
+        (
+            {
+                "filters": [
+                    {
+                        "field": "user_id",
+                        "operator": "in",
+                        "value": [f"user-{index}" for index in range(101)],
+                    }
+                ]
+            },
+            "filters[0].value must contain at most 100 items",
+        ),
+        (
+            {
+                "filters": [
+                    {
+                        "field": "user_id",
+                        "operator": "equals",
+                        "value": "x" * 257,
+                    }
+                ]
+            },
+            "filters[0].value must contain at most 256 characters",
+        ),
+        (
+            {
+                "filters": [
+                    {
+                        "field": "metadata",
+                        "operator": "contains",
+                        "value": {"key": "k" * 257, "value": "v"},
+                    }
+                ]
+            },
+            "filters[0].value.key must contain at most 256 characters",
+        ),
+        (
+            {"page": 51, "page_size": 100},
+            "page window must not exceed 5000 records",
+        ),
+    ],
+)
+def test_parse_explorer_query_rejects_hostile_bounded_work(
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        parse_explorer_query(payload, allowed_fields=MEMORY_FILTER_FIELDS)
+
+
+def test_parse_explorer_query_accepts_exact_work_bounds() -> None:
+    query = parse_explorer_query(
+        {
+            "filters": [
+                {
+                    "field": "user_id",
+                    "operator": "in",
+                    "value": [f"user-{index}" for index in range(100)],
+                }
+                for _index in range(64)
+            ],
+            "page": 50,
+            "page_size": 100,
+        },
+        allowed_fields=MEMORY_FILTER_FIELDS,
+    )
+
+    assert len(query.filters) == 64
+    assert query.page * query.page_size == 5000
