@@ -177,6 +177,24 @@ def test_entity_detail_decodes_one_exact_url_segment(tmp_path) -> None:
     assert response.json()["entity_id"] == entity_id
 
 
+def test_entity_detail_preserves_literal_percent_encoded_octet(tmp_path) -> None:
+    app = _create_test_app(tmp_path)
+    entity_id = "alice%2Farchive"
+    _seed_memory(app, "literal", user_id=entity_id)
+    _seed_memory(app, "slash", user_id="alice/archive")
+    encoded_entity_id = quote(entity_id, safe="")
+
+    response = TestClient(app).get(
+        f"/v1/entities/user/{encoded_entity_id}",
+        params={"project_id": "repo-a", "app_id": "app-a"},
+    )
+
+    assert encoded_entity_id == "alice%252Farchive"
+    assert response.status_code == 200
+    assert response.json()["entity_id"] == entity_id
+    assert response.json()["memory_count"] == 1
+
+
 def test_query_entities_filters_by_exact_scope_and_body_wins_over_query_scope(
     tmp_path,
 ) -> None:
@@ -464,7 +482,7 @@ def test_entity_detail_unknown_project_and_missing_entity_are_generic_404(
         assert session.get(Project, "repo-missing") is None
 
 
-def test_entity_router_rejects_invalid_ambiguous_and_traversal_raw_paths(
+def test_entity_router_rejects_malformed_and_traversal_raw_paths(
     tmp_path,
 ) -> None:
     mem0 = EntityRouteMem0Client()
@@ -501,7 +519,6 @@ def test_entity_router_rejects_invalid_ambiguous_and_traversal_raw_paths(
                 "%FF",
                 "%C0%AF",
                 "%GG",
-                "%252F",
                 "%2E%2E",
                 "safe%2F..%2Fescape",
             )
@@ -514,13 +531,39 @@ def test_entity_router_rejects_invalid_ambiguous_and_traversal_raw_paths(
     assert statuses["%FF"] == 400
     assert statuses["%C0%AF"] == 400
     assert statuses["%GG"] == 404
-    assert statuses["%252F"] == 400
     assert statuses["%2E%2E"] == 400
     assert statuses["safe%2F..%2Fescape"] == 400
     assert mem0.deleted_ids == []
     with app.state.session_factory() as session:
         assert list(session.scalars(select(Entity.id))) == entity_ids_before
         assert list(session.scalars(select(Event.id))) == event_ids_before
+
+
+def test_delete_entity_preserves_literal_percent_encoded_octet(tmp_path) -> None:
+    mem0 = EntityRouteMem0Client()
+    app = _create_test_app(tmp_path, mem0_client=mem0)
+    entity_id = "alice%2Farchive"
+    _seed_memory(app, "literal", user_id=entity_id)
+    _seed_memory(app, "slash", user_id="alice/archive")
+    encoded_entity_id = quote(entity_id, safe="")
+
+    response = TestClient(app).delete(
+        f"/v1/entities/user/{encoded_entity_id}",
+        params={"project_id": "repo-a", "app_id": "app-a"},
+    )
+
+    assert encoded_entity_id == "alice%252Farchive"
+    assert response.status_code == 200
+    assert response.json()["status"] == "SUCCEEDED"
+    assert mem0.deleted_ids == ["literal"]
+    with app.state.session_factory() as session:
+        repository = EntityRepository(session)
+        assert repository.list_entity_memory_ids(
+            "repo-a", "app-a", "user", entity_id
+        ) == []
+        assert repository.list_entity_memory_ids(
+            "repo-a", "app-a", "user", "alice/archive"
+        ) == ["slash"]
 
 
 @pytest.mark.parametrize(
