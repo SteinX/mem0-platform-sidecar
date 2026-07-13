@@ -586,11 +586,9 @@ class MemoryService:
                     category=category,
                     metadata=metadata,
                 )
-            EntityRepository(self.session).upsert_entity(
-                project_id=project_id,
-                entity_type="app",
-                entity_id=scope.app_id,
-                display_name=scope.app_id,
+            EntityRepository(self.session).rebuild_project_entities(
+                project_id,
+                scope.app_id,
             )
             event.subject_id = memory_ids[0]
             event_repo.mark_succeeded(event.id, response=memory_response)
@@ -884,6 +882,10 @@ class MemoryService:
                 category=categories[0] if categories else None,
                 metadata=metadata,
             )
+            EntityRepository(self.session).rebuild_project_entities(
+                project_id,
+                effective_app_id,
+            )
             event_repo.mark_succeeded(event.id, response=update_response)
             return {"memory": normalized, "event": _event_payload(event)}
         except Exception as exc:
@@ -1062,6 +1064,11 @@ class MemoryService:
                 updated_at_lte=scan_cutoff,
             )
 
+        EntityRepository(self.session).rebuild_project_entities(
+            project_id,
+            app_id,
+        )
+
         return {
             "scanned": len(records),
             "indexed": indexed,
@@ -1135,6 +1142,10 @@ class MemoryService:
             memory_repo.delete_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,
+            )
+            EntityRepository(self.session).rebuild_project_entities(
+                project_id,
+                effective_app_id,
             )
             event_repo.mark_succeeded(event.id, response=response)
             return {"memory": response, "event": _event_payload(event)}

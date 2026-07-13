@@ -16,9 +16,16 @@ from mem0_sidecar.core.memory_ops import (
     extract_memory_ids,
 )
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
-from mem0_sidecar.store.models import Category, EventStatus, MemoryIndex, Project
+from mem0_sidecar.store.models import (
+    Category,
+    Entity,
+    EventStatus,
+    MemoryIndex,
+    Project,
+)
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
+    EntityRepository,
     EventRepository,
     MemoryIndexRepository,
     ProjectRepository,
@@ -2217,3 +2224,254 @@ async def test_update_memory_maps_only_upstream_404_to_stale_not_found(
     assert projection.deleted_at is not None
     event = EventRepository(db_session).list_project_events("repo-a")[-1]
     assert event.status is EventStatus.FAILED
+
+
+def _entity_ids(db_session, *, app_id: str = "app-a") -> set[tuple[str, str, int]]:
+    return {
+        (entity.entity_type, entity.entity_id, entity.memory_count)
+        for entity in db_session.query(Entity).filter_by(
+            project_id="repo-a",
+            app_id=app_id,
+        )
+    }
+
+
+@pytest.mark.asyncio
+async def test_successful_add_refreshes_all_entity_projections_before_return(
+    db_session,
+) -> None:
+    _create_project(db_session, default_app_id="app-a")
+    db_session.commit()
+
+    await MemoryService(session=db_session, mem0=FakeMem0Client()).add_memory(
+        project_id="repo-a",
+        payload={
+            "text": "hello",
+            "app_id": "app-a",
+            "user_id": "alice",
+            "agent_id": "agent-1",
+            "run_id": "run-1",
+        },
+    )
+
+    assert _entity_ids(db_session) == {
+        ("app", "app-a", 1),
+        ("user", "alice", 1),
+        ("agent", "agent-1", 1),
+        ("run", "run-1", 1),
+    }
+
+
+@pytest.mark.asyncio
+async def test_successful_update_refreshes_changed_entity_projections_before_commit(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-1")
+    EntityRepository(db_session).rebuild_project_entities("repo-a", "app-a")
+    db_session.commit()
+    mem0 = ExplorerMem0Client(
+        {
+            "mem-1": {
+                "id": "mem-1",
+                "memory": "before",
+                "user_id": "bob",
+                "agent_id": "agent-2",
+                "run_id": "run-2",
+                "metadata": {},
+            }
+        }
+    )
+
+    await MemoryService(session=db_session, mem0=mem0).update_memory(
+        project_id="repo-a",
+        memory_id="mem-1",
+        request_app_id="app-a",
+        payload={"text": "after"},
+    )
+
+    assert _entity_ids(db_session) == {
+        ("app", "app-a", 1),
+        ("user", "bob", 1),
+        ("agent", "agent-2", 1),
+        ("run", "run-2", 1),
+    }
+
+
+@pytest.mark.asyncio
+async def test_successful_delete_refreshes_entity_projections_before_commit(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-1")
+    EntityRepository(db_session).rebuild_project_entities("repo-a", "app-a")
+    db_session.commit()
+
+    await MemoryService(session=db_session, mem0=FakeMem0Client()).delete_memory(
+        project_id="repo-a",
+        memory_id="mem-1",
+        request_app_id="app-a",
+    )
+
+    assert _entity_ids(db_session) == set()
+
+
+@pytest.mark.asyncio
+async def test_successful_reconcile_refreshes_only_affected_entity_scope(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "old")
+    EntityRepository(db_session).rebuild_project_entities("repo-a", "app-a")
+    db_session.commit()
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [
+            {
+                "id": "new",
+                "user_id": "bob",
+                "agent_id": "agent-2",
+                "run_id": "run-2",
+                "metadata": {
+                    SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+                    SIDECAR_APP_ID_METADATA_KEY: "app-a",
+                },
+            }
+        ]
+    }
+
+    await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        adopt_unscoped=False,
+        allow_adopt_unscoped=False,
+        default_project_id="repo-a",
+    )
+
+    assert _entity_ids(db_session) == {
+        ("app", "app-a", 1),
+        ("user", "bob", 1),
+        ("agent", "agent-2", 1),
+        ("run", "run-2", 1),
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_memory_mutations_do_not_refresh_prior_entity_projection(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    projection = _index_memory(db_session, "mem-1")
+    EntityRepository(db_session).rebuild_project_entities("repo-a", "app-a")
+    db_session.commit()
+    expected = _entity_ids(db_session)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await MemoryService(
+            session=db_session,
+            mem0=FailingDeleteMem0Client(),
+        ).delete_memory(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+        )
+
+    assert projection.deleted_at is None
+    assert _entity_ids(db_session) == expected
+
+
+@pytest.mark.asyncio
+async def test_add_update_delete_and_reconcile_failures_never_run_entity_rebuild(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-1")
+    EntityRepository(db_session).rebuild_project_entities("repo-a", "app-a")
+    db_session.commit()
+    rebuild_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        EntityRepository,
+        "rebuild_project_entities",
+        lambda self, project_id, app_id: rebuild_calls.append((project_id, app_id)),
+    )
+
+    class FailedMutations(ExplorerMem0Client):
+        async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("add failed")
+
+        async def update_memory(
+            self,
+            memory_id: str,
+            payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            raise RuntimeError("update failed")
+
+        async def delete_memory(self, memory_id: str) -> dict[str, Any]:
+            raise RuntimeError("delete failed")
+
+    mem0 = FailedMutations()
+    mem0.list_response = RuntimeError("list failed")
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    with pytest.raises(RuntimeError, match="add failed"):
+        await service.add_memory(
+            project_id="repo-a",
+            payload={"text": "new", "app_id": "app-a"},
+        )
+    with pytest.raises(RuntimeError, match="update failed"):
+        await service.update_memory(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+            payload={"text": "after"},
+        )
+    with pytest.raises(RuntimeError, match="delete failed"):
+        await service.delete_memory(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+        )
+    with pytest.raises(RuntimeError, match="list failed"):
+        await service.reconcile_memories(
+            project_id="repo-a",
+            app_id="app-a",
+            adopt_unscoped=False,
+            allow_adopt_unscoped=False,
+            default_project_id="repo-a",
+        )
+
+    assert rebuild_calls == []
+    assert _entity_ids(db_session) == {
+        ("app", "app-a", 1),
+        ("user", "root", 1),
+        ("agent", "codex", 1),
+        ("run", "run-1", 1),
+    }
+
+
+@pytest.mark.asyncio
+async def test_repeated_add_of_same_memory_keeps_projection_counts_idempotent(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    db_session.commit()
+    service = MemoryService(session=db_session, mem0=FakeMem0Client())
+    payload = {
+        "text": "same",
+        "app_id": "app-a",
+        "user_id": "alice",
+        "agent_id": "agent-1",
+        "run_id": "run-1",
+    }
+
+    await service.add_memory(project_id="repo-a", payload=payload)
+    db_session.commit()
+    await service.add_memory(project_id="repo-a", payload=payload)
+
+    assert _entity_ids(db_session) == {
+        ("app", "app-a", 1),
+        ("user", "alice", 1),
+        ("agent", "agent-1", 1),
+        ("run", "run-1", 1),
+    }
