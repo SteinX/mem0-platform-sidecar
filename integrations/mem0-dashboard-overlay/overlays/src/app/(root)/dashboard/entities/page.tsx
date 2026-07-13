@@ -115,6 +115,10 @@ const MEMORY_QUERY: ExplorerQueryPayload = {
   sort: "created_at_desc",
 };
 
+function entityActivityTimestamp(entity: SidecarEntity): string | null {
+  return entity.last_seen_at ?? entity.updated_at;
+}
+
 export default function EntitiesPage() {
   const pathname = usePathname();
   const router = useRouter();
@@ -482,7 +486,7 @@ export default function EntitiesPage() {
         label: "Updated On",
         width: 22,
         render: (_value, entity) => (
-          <EntityTime value={entity.updated_at ?? entity.last_seen_at} />
+          <EntityTime value={entityActivityTimestamp(entity)} />
         ),
       },
       {
@@ -663,7 +667,7 @@ export default function EntitiesPage() {
                     </dt>
                     <dd>
                       <EntityTime
-                        value={entity.updated_at ?? entity.last_seen_at}
+                        value={entityActivityTimestamp(entity)}
                       />
                     </dd>
                   </div>

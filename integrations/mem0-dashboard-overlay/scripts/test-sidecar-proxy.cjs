@@ -368,7 +368,6 @@ async function testEventDetailRejectsUnsafeEncodedIds(proxy) {
 
 async function testEventRoutesFailClosedWithoutPortableRuntimeScope(proxy) {
   const invalidScopes = [
-    { configuredAppId: undefined },
     { configuredAppId: "" },
     { configuredAppId: "two words" },
     { configuredAppId: "\u0000app" },
@@ -398,6 +397,43 @@ async function testEventRoutesFailClosedWithoutPortableRuntimeScope(proxy) {
     });
     assert.equal(fetchCalled, false, JSON.stringify(scope));
   }
+}
+
+async function testEventRoutesAllowServerDefaultAppResolution(proxy) {
+  const calls = [];
+  const options = proxyOptions(async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    return Response.json({ results: [] });
+  }, { configuredProjectId: "runtime-project", configuredAppId: undefined });
+
+  const queryResponse = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/events/query", {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ app_id: "forged-app", page: 1 }),
+    }),
+    "/v1/events/query",
+    options,
+  );
+  const detailResponse = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/event/event%2Fone?app_id=forged-app",
+      { method: "GET" },
+    ),
+    "/v1/event/event/one",
+    options,
+  );
+
+  assert.equal(queryResponse.status, 200);
+  assert.equal(detailResponse.status, 200);
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    page: 1,
+    project_id: "runtime-project",
+  });
+  assert.equal(
+    calls[1].url,
+    "http://sidecar.internal/v1/event/event%252Fone?project_id=runtime-project",
+  );
 }
 
 async function testUnauthenticatedEventRequestsAreRejected(proxy) {
@@ -1275,6 +1311,7 @@ async function main() {
   await testEventRoutesFailClosedWithoutPortableRuntimeScope(
     proxySidecarRequest,
   );
+  await testEventRoutesAllowServerDefaultAppResolution(proxySidecarRequest);
   await testUnauthenticatedEventRequestsAreRejected(proxySidecarRequest);
   await testUnauthenticatedAllowedRouteHidesMissingBaseUrl(proxySidecarRequest);
   await testUnauthenticatedRouteDoesNotInspectUnsafeProjectConfig(
@@ -1321,7 +1358,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 40 contracts passed");
+  console.log("sidecar proxy request harness: 41 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(

@@ -604,6 +604,7 @@ def test_dashboard_overlay_includes_entity_explorer_contracts():
         "Refresh",
         "Entities",
         "Updated On",
+        "entityActivityTimestamp(entity)",
         "Memories",
         "Action",
         "Loading entities",
@@ -744,7 +745,7 @@ def test_explorer_component_harness_runs_entity_regressions(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "explorer components harness: 10 contracts passed" in result.stdout
+    assert "explorer components harness: 11 contracts passed" in result.stdout
 
 
 def test_entity_explorer_verifier_enforces_runtime_contracts(tmp_path):
@@ -1569,7 +1570,7 @@ def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "sidecar proxy request harness: 40 contracts passed" in result.stdout
+    assert "sidecar proxy request harness: 41 contracts passed" in result.stdout
 
 
 def test_sidecar_proxy_harness_rejects_stale_applied_target(tmp_path):

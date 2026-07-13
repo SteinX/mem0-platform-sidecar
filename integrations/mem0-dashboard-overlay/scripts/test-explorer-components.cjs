@@ -137,10 +137,16 @@ function loadModules(dashboardDir) {
     true,
     (source) => {
       assert.ok(source.includes("function DeleteFailureList"));
-      return source.replace(
-        "function DeleteFailureList",
-        "export function DeleteFailureList",
-      );
+      assert.ok(source.includes("function entityActivityTimestamp"));
+      return source
+        .replace(
+          "function DeleteFailureList",
+          "export function DeleteFailureList",
+        )
+        .replace(
+          "function entityActivityTimestamp",
+          "export function entityActivityTimestamp",
+        );
     },
   );
   return {
@@ -148,6 +154,7 @@ function loadModules(dashboardDir) {
     DateRangeFilter: dateRangeFilter.DateRangeFilter,
     EntityBadges: entityBadges.EntityBadges,
     DeleteFailureList: entityPage.DeleteFailureList,
+    entityActivityTimestamp: entityPage.entityActivityTimestamp,
     React,
     ReactDOMServer: dashboardRequire("react-dom/server"),
   };
@@ -301,6 +308,23 @@ function testFailedMemoryIdsRenderExactly(modules) {
   );
   assert.ok(html.includes("Authorization=[redacted]"), html);
   assert.equal(html.includes("page-secret"), false, html);
+}
+
+function testEntityActivityPrefersLastSeenOverAdministrativeUpdate(modules) {
+  assert.equal(
+    modules.entityActivityTimestamp({
+      last_seen_at: "2026-07-01T00:00:00Z",
+      updated_at: "2026-07-14T00:00:00Z",
+    }),
+    "2026-07-01T00:00:00Z",
+  );
+  assert.equal(
+    modules.entityActivityTimestamp({
+      last_seen_at: null,
+      updated_at: "2026-07-14T00:00:00Z",
+    }),
+    "2026-07-14T00:00:00Z",
+  );
 }
 
 function createUiStubs(React) {
@@ -530,7 +554,8 @@ function main() {
   testSingleEntityBadgePreservesExactAccessibleId(modules);
   testPassiveLegacyEntityBadgesStayOutOfTabOrder(modules);
   testFailedMemoryIdsRenderExactly(modules);
-  console.log("explorer components harness: 10 contracts passed");
+  testEntityActivityPrefersLastSeenOverAdministrativeUpdate(modules);
+  console.log("explorer components harness: 11 contracts passed");
 }
 
 try {
