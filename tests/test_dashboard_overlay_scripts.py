@@ -162,6 +162,9 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/utils/explorer-query-state.ts",
         "src/types/dashboard-explorer.ts",
         "src/types/sidecar.ts",
+        "src/components/self-hosted/explorer/date-range-filter.tsx",
+        "src/components/self-hosted/explorer/filter-builder.tsx",
+        "src/components/self-hosted/explorer/entity-badges.tsx",
         "src/app/(root)/dashboard/components/main-nav.tsx",
     ]:
         target = dashboard / relative
@@ -257,6 +260,129 @@ def test_dashboard_overlay_includes_explorer_query_state_contract():
 
     harness = OVERLAY / "scripts" / "test-explorer-query-state.cjs"
     assert harness.exists()
+
+
+def test_dashboard_overlay_includes_shared_explorer_components():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    component_paths = [
+        "src/components/self-hosted/explorer/date-range-filter.tsx",
+        "src/components/self-hosted/explorer/filter-builder.tsx",
+        "src/components/self-hosted/explorer/entity-badges.tsx",
+    ]
+
+    for relative in component_paths:
+        assert relative in manifest["files"]
+        component = OVERLAY / "overlays" / relative
+        assert component.is_file()
+        assert_dashboard_tsx_transpiles(component)
+
+
+def test_date_range_filter_has_draft_utc_and_responsive_contracts():
+    component = (
+        OVERLAY
+        / "overlays/src/components/self-hosted/explorer/date-range-filter.tsx"
+    ).read_text()
+
+    for import_path in (
+        "@/components/ui/button",
+        "@/components/ui/calendar",
+        "@/components/ui/popover",
+        "@/utils/explorer-query-state",
+    ):
+        assert f'from "{import_path}"' in component
+    for label in ("All time", "Last 24 hours", "Last 7 days", "Last 30 days"):
+        assert label in component
+    assert re.search(r"datePresetRange\(preset\)", component)
+    assert re.search(r'mode\s*=\s*"range"', component)
+    assert re.search(
+        r"numberOfMonths\s*=\s*\{\s*isDesktop\s*\?\s*2\s*:\s*1\s*\}",
+        component,
+    )
+    assert 'window.matchMedia("(min-width: 768px)")' in component
+    assert re.search(r"addEventListener\(\s*\"change\"", component)
+    assert re.search(r"removeEventListener\(\s*\"change\"", component)
+    assert re.search(r"setDraftRange\(isoRangeToCalendarRange\(value\)\)", component)
+    assert re.search(r"onChange\(calendarRangeToUtcRange\(draftRange\)\)", component)
+    assert re.search(r"setOpen\(false\)", component)
+    assert 'aria-label="Choose date range"' in component
+    cancel_button = (
+        '<Button type="button" variant="ghost" onClick={() => setOpen(false)}>'
+    )
+    assert cancel_button in component
+    assert re.search(r">\s*Cancel\s*</Button>", component)
+    assert re.search(
+        r'<Button[^>]*type="button"[^>]*>\s*Apply\s*</Button>',
+        component,
+        re.S,
+    )
+
+
+def test_filter_builder_uses_isolated_normalized_drafts_and_accessible_editors():
+    component = (
+        OVERLAY / "overlays/src/components/self-hosted/explorer/filter-builder.tsx"
+    ).read_text()
+
+    for import_path in (
+        "@/components/ui/button",
+        "@/components/ui/checkbox",
+        "@/components/ui/input",
+        "@/components/ui/popover",
+        "@/components/ui/select",
+        "@/utils/explorer-query-state",
+    ):
+        assert f'from "{import_path}"' in component
+    assert re.search(r"setDraftFilters\(cloneFilters\(filters\)\)", component)
+    assert re.search(r"setDraftMatch\(match\)", component)
+    assert re.search(
+        r"onApply\(draftMatch,\s*normalizeExplorerFilters\(draftFilters\)\)",
+        component,
+    )
+    assert re.search(r"onRemoveAll\(\[\]\)", component)
+    assert re.search(
+        r"nextFilterForField\(current,\s*value as ExplorerField\)",
+        component,
+    )
+    assert re.search(r"aria-label=\{`Remove filter \$\{index \+ 1\}`\}", component)
+    for label in (
+        "Match all",
+        "Match any",
+        "Add filter",
+        "Remove filters",
+        "Metadata key",
+        "Metadata value",
+        "Comma-separated IDs",
+        "Cancel",
+        "Apply",
+    ):
+        assert label in component
+    assert re.search(r"<Checkbox\b", component)
+    assert re.search(r"<Input[^>]+aria-label=\"Metadata key\"", component, re.S)
+    assert re.search(r"<Input[^>]+aria-label=\"Metadata value\"", component, re.S)
+
+
+def test_entity_badges_render_only_present_accessible_identities():
+    component = (
+        OVERLAY / "overlays/src/components/self-hosted/explorer/entity-badges.tsx"
+    ).read_text()
+
+    for field, label in (
+        ("user_id", "User"),
+        ("agent_id", "Agent"),
+        ("app_id", "App"),
+        ("run_id", "Run"),
+    ):
+        assert f'field: "{field}"' in component
+        assert f'label: "{label}"' in component
+    assert re.search(
+        r"\.filter\(\(identity\):\s*identity is Identity\s*"
+        r"=>\s*Boolean\(identity\.value\)\)",
+        component,
+    )
+    assert re.search(r"title=\{identity\.value\}", component)
+    assert re.search(r"truncateIdentity\(identity\.value\)", component)
+    assert re.search(r"onBadgeClick\s*\?\s*\(", component)
+    assert re.search(r"<Button\b", component)
+    assert re.search(r"<span\b", component)
 
 
 def test_apply_dashboard_overlay_copies_files(tmp_path):

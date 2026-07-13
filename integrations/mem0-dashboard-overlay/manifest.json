@@ -16,6 +16,9 @@
     "src/utils/category-editor-state.ts",
     "src/utils/explorer-query-state.ts",
     "src/types/dashboard-explorer.ts",
+    "src/components/self-hosted/explorer/date-range-filter.tsx",
+    "src/components/self-hosted/explorer/filter-builder.tsx",
+    "src/components/self-hosted/explorer/entity-badges.tsx",
     "src/types/sidecar.ts"
   ]
 }
