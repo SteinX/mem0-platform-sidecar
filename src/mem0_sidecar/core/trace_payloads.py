@@ -180,6 +180,12 @@ def _is_secret_key(key: str) -> bool:
     return normalized.endswith(_CREDENTIAL_NORMALIZED_SUFFIXES)
 
 
+def trace_key_is_secret(key: str) -> bool:
+    """Return whether a bounded trace key belongs to the secret vocabulary."""
+
+    return _is_secret_key(key)
+
+
 def _type_namespace(value: object) -> str:
     value_type = type(value)
     try:

@@ -18,6 +18,10 @@ depends_on: str | Sequence[str] | None = None
 REQUEST_TRACE_INDEXES = (
     ("ix_events_project_created", ["project_id", "created_at"]),
     (
+        "ix_events_project_app_created",
+        ["project_id", "app_id", "created_at"],
+    ),
+    (
         "ix_events_project_operation_created",
         ["project_id", "operation", "created_at"],
     ),
@@ -33,6 +37,10 @@ REQUEST_TRACE_INDEXES = (
 
 
 def upgrade() -> None:
+    op.add_column(
+        "events",
+        sa.Column("app_id", sa.String(length=256), nullable=True),
+    )
     op.add_column(
         "events",
         sa.Column("correlation_id", sa.String(length=256), nullable=True),
@@ -70,3 +78,4 @@ def downgrade() -> None:
     op.drop_column("events", "result_count")
     op.drop_column("events", "latency_ms")
     op.drop_column("events", "correlation_id")
+    op.drop_column("events", "app_id")

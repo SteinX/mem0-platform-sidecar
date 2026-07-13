@@ -181,6 +181,12 @@ class Event(Base):
     __table_args__ = (
         Index("ix_events_project_created", "project_id", "created_at"),
         Index(
+            "ix_events_project_app_created",
+            "project_id",
+            "app_id",
+            "created_at",
+        ),
+        Index(
             "ix_events_project_operation_created",
             "project_id",
             "operation",
@@ -202,6 +208,7 @@ class Event(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    app_id: Mapped[str | None] = mapped_column(String(256))
     operation: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[EventStatus] = mapped_column(
         SAEnum(EventStatus), default=EventStatus.PENDING, nullable=False
