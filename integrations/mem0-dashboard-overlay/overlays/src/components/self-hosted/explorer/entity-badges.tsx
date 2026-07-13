@@ -2,6 +2,12 @@
 
 import { Button } from "@/components/ui/button";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   createEntityBadgeItems,
   entityBadgeClickPayload,
   truncateIdentity,
@@ -19,10 +25,6 @@ type EntityBadgesProps = {
     displayName?: string | null;
   };
   onBadgeClick?: (identity: Pick<EntityBadgeItem, "field" | "value">) => void;
-};
-
-type RenderedEntityBadge = EntityBadgeItem & {
-  displayValue?: string;
 };
 
 const SINGLE_ENTITY_FIELDS: Record<
@@ -43,30 +45,48 @@ export function EntityBadges({
   entity,
   onBadgeClick,
 }: EntityBadgesProps) {
-  const identities: RenderedEntityBadge[] =
-    entity === undefined
-      ? createEntityBadgeItems({ userId, agentId, appId, runId })
-      : entity.id.trim() === ""
-        ? []
-        : [
-            {
-              ...SINGLE_ENTITY_FIELDS[entity.type],
-              value: entity.id,
-              displayValue: entity.displayName?.trim() || undefined,
-            },
-          ];
+  if (entity !== undefined) {
+    if (entity.id.trim() === "") {
+      return null;
+    }
+    const identity = SINGLE_ENTITY_FIELDS[entity.type];
+    const displayValue =
+      entity.displayName?.trim() || truncateIdentity(entity.id);
+
+    return (
+      <div className="flex flex-wrap gap-1.5" aria-label="Entity identity">
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                className="inline-flex max-w-48 items-center gap-1 rounded-md border px-2 py-1 font-mono text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                title={entity.id}
+                aria-label={`${identity.label} entity ${entity.id}`}
+                tabIndex={0}
+              >
+                <span className="font-sans font-semibold">
+                  {identity.label}
+                </span>
+                <span className="truncate">{displayValue}</span>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-[min(32rem,calc(100vw-2rem))]">
+              <p className="break-all">{entity.id}</p>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      </div>
+    );
+  }
+
+  const identities = createEntityBadgeItems({ userId, agentId, appId, runId });
 
   if (identities.length === 0) {
     return null;
   }
 
   return (
-    <div
-      className="flex flex-wrap gap-1.5"
-      aria-label={
-        entity === undefined ? "Memory identities" : "Entity identity"
-      }
-    >
+    <div className="flex flex-wrap gap-1.5" aria-label="Memory identities">
       {identities.map((identity) =>
         onBadgeClick ? (
           <Button
@@ -80,9 +100,7 @@ export function EntityBadges({
             onClick={() => onBadgeClick(entityBadgeClickPayload(identity))}
           >
             <span className="font-sans font-semibold">{identity.label}</span>
-            <span className="truncate">
-              {identity.displayValue ?? truncateIdentity(identity.value)}
-            </span>
+            <span className="truncate">{truncateIdentity(identity.value)}</span>
           </Button>
         ) : (
           <span
@@ -90,12 +108,9 @@ export function EntityBadges({
             className="inline-flex max-w-48 items-center gap-1 rounded-md border px-2 py-1 font-mono text-xs"
             title={identity.value}
             aria-label={`${identity.label} entity ${identity.value}`}
-            tabIndex={0}
           >
             <span className="font-sans font-semibold">{identity.label}</span>
-            <span className="truncate">
-              {identity.displayValue ?? truncateIdentity(identity.value)}
-            </span>
+            <span className="truncate">{truncateIdentity(identity.value)}</span>
           </span>
         ),
       )}
