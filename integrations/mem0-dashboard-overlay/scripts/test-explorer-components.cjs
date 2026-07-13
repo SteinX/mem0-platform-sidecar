@@ -8,6 +8,9 @@ const { webcrypto } = require("node:crypto");
 const { createRequire } = require("node:module");
 
 function transpileModule(typescript, sourcePath, dependencies, jsx = false) {
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`missing applied dashboard source: ${sourcePath}`);
+  }
   const source = fs.readFileSync(sourcePath, "utf8");
   const compilerOptions = {
     esModuleInterop: true,
@@ -47,30 +50,28 @@ function loadModules(dashboardDir) {
   }
   const dashboardRequire = createRequire(path.join(dashboardDir, "package.json"));
   const typescript = dashboardRequire("typescript");
-  const overlay = path.join(__dirname, "../overlays/src");
+  const sourceRoot = path.join(dashboardDir, "src");
   const common = { require: dashboardRequire };
   const queryState = transpileModule(
     typescript,
-    path.join(overlay, "utils/explorer-query-state.ts"),
+    path.join(sourceRoot, "utils/explorer-query-state.ts"),
     common,
   );
   const componentStatePath = path.join(
-    overlay,
+    sourceRoot,
     "components/self-hosted/explorer/explorer-component-state.ts",
   );
-  const componentState = fs.existsSync(componentStatePath)
-    ? transpileModule(typescript, componentStatePath, {
-      ...common,
-      "@/utils/explorer-query-state": queryState,
-    })
-    : {};
+  const componentState = transpileModule(typescript, componentStatePath, {
+    ...common,
+    "@/utils/explorer-query-state": queryState,
+  });
 
   const React = dashboardRequire("react");
   const ui = createUiStubs(React);
   const dateRangeFilter = transpileModule(
     typescript,
     path.join(
-      overlay,
+      sourceRoot,
       "components/self-hosted/explorer/date-range-filter.tsx",
     ),
     {
@@ -290,6 +291,6 @@ function main() {
 try {
   main();
 } catch (error) {
-  console.error(error);
+  console.error("explorer components harness failed:", error);
   process.exitCode = 1;
 }
