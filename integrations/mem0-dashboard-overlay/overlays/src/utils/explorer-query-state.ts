@@ -39,6 +39,10 @@ const EXPLORER_ENTITY_TYPES = new Set<ExplorerEntityType>([
   "run",
 ]);
 const DAY_IN_MILLISECONDS = 24 * 60 * 60 * 1000;
+const ISO_DATE_TIME_PATTERN = new RegExp(
+  "^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})"
+    + "(?:\\.(\\d+))?(?:Z|([+-])(\\d{2}):(\\d{2}))$",
+);
 
 export function createExplorerFilter(
   overrides: Partial<ExplorerFilter> = {},
@@ -87,10 +91,7 @@ export function readExplorerUrlState(
   return {
     match: readMatch(searchParams.get("match")),
     filters: readFilters(searchParams.get("filters")),
-    date_range: {
-      from: readIsoDate(searchParams.get("from")),
-      to: readIsoDate(searchParams.get("to")),
-    },
+    date_range: readDateRange(searchParams),
     page: readPage(searchParams.get("page")),
     page_size: 20,
     sort: "created_at_desc",
@@ -120,7 +121,9 @@ function normalizeExplorerFilter(candidate: unknown): ExplorerFilter | null {
   }
 
   const value = candidate as Record<string, unknown>;
-  const id = readNonEmpty(value.id);
+  const id = typeof value.id === "string" && value.id.trim() !== ""
+    ? value.id
+    : null;
   const field = value.field;
   const operator = value.operator;
   if (
@@ -133,7 +136,11 @@ function normalizeExplorerFilter(candidate: unknown): ExplorerFilter | null {
     return null;
   }
 
-  const normalizedValue = normalizeFilterValue(value.value);
+  const normalizedValue = normalizeFilterValue(
+    field as ExplorerField,
+    operator as ExplorerOperator,
+    value.value,
+  );
   if (normalizedValue === null) {
     return null;
   }
@@ -146,26 +153,75 @@ function normalizeExplorerFilter(candidate: unknown): ExplorerFilter | null {
 }
 
 function normalizeFilterValue(
+  field: ExplorerField,
+  operator: ExplorerOperator,
   value: unknown,
 ): ExplorerFilter["value"] | null {
-  if (typeof value === "string") {
-    return readNonEmpty(value);
+  if (field === "metadata") {
+    return operator === "contains" ? normalizeMetadataValue(value) : null;
   }
-  if (Array.isArray(value)) {
-    const items = value
-      .map(readNonEmpty)
-      .filter((item): item is string => item !== null);
-    return items.length === 0 ? null : items;
+  if (operator === "equals" || operator === "not_equals") {
+    return normalizeScalarValue(field, value);
   }
-  if (value !== null && typeof value === "object") {
-    const metadata = value as Record<string, unknown>;
-    const key = readNonEmpty(metadata.key);
-    const metadataValue = readNonEmpty(metadata.value);
-    return key === null || metadataValue === null
-      ? null
-      : { key, value: metadataValue };
+  if (operator === "in") {
+    return normalizeInValue(field, value);
   }
   return null;
+}
+
+function normalizeMetadataValue(
+  value: unknown,
+): { key: string; value: string } | null {
+  if (
+    value === null
+    || Array.isArray(value)
+    || typeof value !== "object"
+  ) {
+    return null;
+  }
+  const metadata = value as Record<string, unknown>;
+  const keys = Object.keys(metadata);
+  if (keys.length !== 2 || !keys.includes("key") || !keys.includes("value")) {
+    return null;
+  }
+  const key = readNonEmpty(metadata.key);
+  const metadataValue = readNonEmpty(metadata.value);
+  return key === null || metadataValue === null
+    ? null
+    : { key, value: metadataValue };
+}
+
+function normalizeScalarValue(
+  field: ExplorerField,
+  value: unknown,
+): string | null {
+  const normalized = readNonEmpty(value);
+  if (
+    normalized === null
+    || (field === "entity_type"
+      && !EXPLORER_ENTITY_TYPES.has(normalized as ExplorerEntityType))
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function normalizeInValue(
+  field: ExplorerField,
+  value: unknown,
+): string[] | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const normalized: string[] = [];
+  for (const item of value) {
+    const scalar = normalizeScalarValue(field, item);
+    if (scalar === null) {
+      return null;
+    }
+    normalized.push(scalar);
+  }
+  return normalized;
 }
 
 function readFilters(raw: string | null): ExplorerFilter[] {
@@ -191,15 +247,62 @@ function readPage(raw: string | null): number {
   return Number.isSafeInteger(page) && page >= 1 ? page : 1;
 }
 
-function readIsoDate(raw: string | null): string | null {
+function readDateRange(searchParams: URLSearchParams): ExplorerDateRange {
+  const from = parseIsoDate(searchParams.get("from"));
+  const to = parseIsoDate(searchParams.get("to"));
+  if (from !== null && to !== null && from.timestamp > to.timestamp) {
+    return { from: null, to: null };
+  }
+  return {
+    from: from?.value ?? null,
+    to: to?.value ?? null,
+  };
+}
+
+function parseIsoDate(
+  raw: string | null,
+): { value: string; timestamp: number } | null {
+  if (raw === null) {
+    return null;
+  }
+  const match = ISO_DATE_TIME_PATTERN.exec(raw);
+  if (match === null) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[9] === undefined ? 0 : Number(match[9]);
+  const offsetMinute = match[10] === undefined ? 0 : Number(match[10]);
   if (
-    raw === null
-    || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(raw)
-    || !Number.isFinite(Date.parse(raw))
+    year < 1
+    || month < 1
+    || month > 12
+    || day < 1
+    || day > daysInMonth(year, month)
+    || hour > 23
+    || minute > 59
+    || second > 59
+    || offsetHour > 23
+    || offsetMinute > 59
   ) {
     return null;
   }
-  return raw;
+
+  const timestamp = Date.parse(raw);
+  return Number.isFinite(timestamp) ? { value: raw, timestamp } : null;
+}
+
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    return leapYear ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 
 function readEntityType(raw: string | null): ExplorerEntityType | null {
