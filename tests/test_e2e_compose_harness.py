@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,51 @@ def test_browser_smoke_allows_for_first_compile_on_entity_route() -> None:
     ).read_text()
 
     assert 'await waitText("No entities found.", 30000);' in browser_smoke
+
+
+def test_browser_smoke_mock_uses_singular_encoded_detail_contract() -> None:
+    harness = (
+        ROOT
+        / "integrations"
+        / "mem0-dashboard-overlay"
+        / "scripts"
+        / "test-browser-smoke-contract.cjs"
+    )
+
+    result = subprocess.run(
+        ["node", str(harness)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "singular encoded detail route passed" in result.stdout
+
+
+def test_browser_smoke_requires_response_detail_and_zero_browser_errors() -> None:
+    browser_smoke = (
+        ROOT
+        / "integrations"
+        / "mem0-dashboard-overlay"
+        / "scripts"
+        / "run-browser-smoke.cjs"
+    ).read_text()
+
+    assert (
+        'await waitText("browser-smoke-detail-query-from-response");'
+        in browser_smoke
+    )
+    assert "request drawer loaded response-derived detail content" in browser_smoke
+    for zero_error_gate in (
+        "browserDiagnostics.unhandledRoutes.length === 0",
+        "browserDiagnostics.windowErrors.length === 0",
+        "pageErrors.length === 0",
+        "consoleErrors.length === 0",
+        "browserDiagnostics.unhandledRejections.length === 0",
+    ):
+        assert zero_error_gate in browser_smoke
 
 
 def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
