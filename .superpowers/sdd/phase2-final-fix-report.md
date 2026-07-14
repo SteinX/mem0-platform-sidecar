@@ -283,4 +283,133 @@ scope; fresh current application and verification passed.
 - `e9a60c8` `test: retain postgres and browser explorer smokes`
 - `e7c5aca` `test: tolerate cold entity route compile`
 
+## Follow-up: request-detail browser smoke contract
+
+Baseline reviewed: `fe77a0c`
+
+The retained Chromium smoke mocked plural `/v1/events/{id}` while the
+production request drawer calls singular `/v1/event/{id}`. Its drawer check
+waited only for static description copy, so the mock's unhandled 500 could not
+fail the smoke.
+
+### RED evidence
+
+A new Node runtime contract executes the actual `installBrowserMocks` router
+from `run-browser-smoke.cjs`. Against the baseline it failed on the production
+singular route:
+
+```text
+AssertionError [ERR_ASSERTION]: singular encoded request-detail route must be handled
+
+500 !== 200
+```
+
+The paired pytest retention check also failed because the smoke did not wait
+for response-derived content:
+
+```text
+assert 'await waitText("browser-smoke-detail-query-from-response");' in browser_smoke
+2 failed, 23 deselected
+```
+
+Self-review then found that in-page issue arrays reset on navigation. A second
+RED assertion reinstalled the browser mocks and proved the loss:
+
+```text
+AssertionError [ERR_ASSERTION]: mock-route failures must survive navigation-time mock reinstallation
++ actual - expected
++ []
+- ['GET:/api/sidecar/v1/events/trace-add%2Fdetail']
+```
+
+### Fix and focused GREEN evidence
+
+The mock now preserves the real plural query contract at `/v1/events/query`
+and handles only the exact singular detail path
+`/api/sidecar/v1/event/trace-add%2Fdetail`. The list result uses
+`trace-add/detail` so the runtime contract proves percent encoding. The detail
+response contains response-only correlation, query, and preview sentinels; the
+real drawer waits for `browser-smoke-detail-query-from-response` before it can
+pass.
+
+The smoke now records unhandled mock routes, window errors, and unhandled
+promise rejections in `sessionStorage` across navigation. CDP event listeners
+retain `Runtime.exceptionThrown` page errors and error-level
+`Runtime.consoleAPICalled` messages across pages. All five collections are
+asserted empty before the target closes.
+
+```text
+node integrations/mem0-dashboard-overlay/scripts/test-browser-smoke-contract.cjs
+browser smoke mock contract: singular encoded detail route passed
+
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
+  tests/test_e2e_compose_harness.py \
+  -k 'browser_smoke_mock_uses_singular_encoded_detail_contract or browser_smoke_requires_response_detail_and_zero_browser_errors'
+2 passed, 23 deselected in 0.22s
+```
+
+### Final verification
+
+Fresh applied-overlay verification used a disposable dashboard copy with the
+current overlay and the upstream `node_modules` linked:
+
+```text
+python integrations/mem0-dashboard-overlay/scripts/apply-dashboard-overlay \
+  /tmp/phase2-browser-fix-overlay.<suffix>/dashboard
+python integrations/mem0-dashboard-overlay/scripts/verify-dashboard-overlay \
+  /tmp/phase2-browser-fix-overlay.<suffix>/dashboard
+
+> tsc --noEmit
+sidecar proxy request harness: 41 contracts passed
+category schema harness: 12 contracts passed
+category editor state harness: 9 contracts passed
+explorer query state harness: 11 contracts passed
+explorer components harness: 11 contracts passed
+memory explorer state harness: 11 contracts passed
+request trace state harness: 5 contract groups passed
+```
+
+Focused overlay/Compose harness tests, lint, formatting, syntax, and diff
+checks passed on the final tree:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
+  tests/test_dashboard_overlay_scripts.py tests/test_e2e_compose_harness.py
+154 passed in 36.01s
+
+python -m ruff check .
+All checks passed!
+
+node --check integrations/mem0-dashboard-overlay/scripts/run-browser-smoke.cjs
+node --check integrations/mem0-dashboard-overlay/scripts/test-browser-smoke-contract.cjs
+/workspace/data/mem0/upstream/server/dashboard/node_modules/.bin/prettier --check \
+  integrations/mem0-dashboard-overlay/scripts/run-browser-smoke.cjs \
+  integrations/mem0-dashboard-overlay/scripts/test-browser-smoke-contract.cjs
+All matched files use Prettier code style!
+
+git diff --check
+<no output>
+```
+
+The final canonical isolated Compose run applied the overlay to a fresh
+dashboard context and exercised raw CDP at desktop and narrow viewports:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python scripts/run_live_e2e_compose.py
+
+PostgreSQL smoke passed: 0004->0005->0006, downgrade/re-upgrade, ORM/data checks, update/delete and reconcile/delete serialization
+11 passed, 1 deselected, 1 warning in 6.70s
+1 passed, 11 deselected, 1 warning in 0.49s
+Browser smoke passed: 40 behavior assertions across desktop and narrow viewports
+exit code 0
+```
+
+Successful project: `mem0-sidecar-e2e-115048-c1ab40a1`.
+
+The runner executed `down -v --remove-orphans --rmi local`. Independent
+post-run container, network, volume, image, and Compose-list probes returned
+no project resources. The process probe matched only its own `ps`/`rg`
+commands. Residue: 0 containers, 0 networks, 0 volumes, 0 project images, 0
+browser-smoke processes.
+
 This report is committed separately as the final audit artifact.
