@@ -92,6 +92,7 @@ def test_project_mutation_lock_is_postgresql_row_lock(db_session, monkeypatch) -
         return original_scalar(statement, *args, **kwargs)
 
     monkeypatch.setattr(db_session, "scalar", capture)
+    monkeypatch.setattr(db_session.get_bind().dialect, "name", "postgresql")
 
     project = ProjectRepository(db_session).lock_for_mutation("alpha")
 
@@ -527,6 +528,21 @@ def test_entity_detail_and_memory_ids_reject_string_subclass(db_session) -> None
         )
 
 
+def test_entity_memory_ids_reject_unbounded_mutation_targets(
+    db_session,
+    monkeypatch,
+) -> None:
+    repository = EntityRepository(db_session)
+    memory_ids = [f"memory-{index}" for index in range(5001)]
+    monkeypatch.setattr(db_session, "scalars", lambda statement: iter(memory_ids))
+
+    with pytest.raises(
+        ValueError,
+        match="mutation intent exceeds 5000 memory targets",
+    ):
+        repository.list_entity_memory_ids("alpha", "app-a", "user", "alice")
+
+
 def test_entity_rebuild_locks_project_before_snapshot_and_delete(
     db_session,
     monkeypatch,
@@ -545,17 +561,15 @@ def test_entity_rebuild_locks_project_before_snapshot_and_delete(
         )
     )
     db_session.flush()
-    original_scalar = db_session.scalar
+    project = db_session.get(Project, "alpha")
+    assert project is not None
     original_scalars = db_session.scalars
     original_execute = db_session.execute
     operations: list[str] = []
 
-    def record_project_lock(statement, *args, **kwargs):
-        sql = str(statement.compile(dialect=postgresql.dialect())).upper()
-        assert "FROM PROJECTS" in sql
-        assert "FOR UPDATE" in sql
+    def record_project_lock(repository, project_id):
         operations.append("project_lock")
-        return original_scalar(statement, *args, **kwargs)
+        return project
 
     def record_memory_snapshot(statement, *args, **kwargs):
         operations.append("memory_snapshot")
@@ -565,7 +579,7 @@ def test_entity_rebuild_locks_project_before_snapshot_and_delete(
         operations.append("scope_delete")
         return original_execute(statement, *args, **kwargs)
 
-    monkeypatch.setattr(db_session, "scalar", record_project_lock)
+    monkeypatch.setattr(ProjectRepository, "lock_for_mutation", record_project_lock)
     monkeypatch.setattr(db_session, "scalars", record_memory_snapshot)
     monkeypatch.setattr(db_session, "execute", record_scope_delete)
 
@@ -578,14 +592,13 @@ def test_entity_rebuild_rejects_unknown_project_before_snapshot_or_delete(
     db_session,
     monkeypatch,
 ) -> None:
-    original_scalar = db_session.scalar
     operations: list[str] = []
 
-    def record_project_lock(statement, *args, **kwargs):
+    def record_project_lock(repository, project_id):
         operations.append("project_lock")
-        return original_scalar(statement, *args, **kwargs)
+        raise KeyError(project_id)
 
-    monkeypatch.setattr(db_session, "scalar", record_project_lock)
+    monkeypatch.setattr(ProjectRepository, "lock_for_mutation", record_project_lock)
     monkeypatch.setattr(
         db_session,
         "scalars",
@@ -623,6 +636,8 @@ def test_entity_rebuild_uses_one_select_one_delete_and_one_flush(
         )
     )
     db_session.flush()
+    project = db_session.get(Project, "alpha")
+    assert project is not None
     original_scalars = db_session.scalars
     original_execute = db_session.execute
     original_flush = db_session.flush
@@ -643,6 +658,11 @@ def test_entity_rebuild_uses_one_select_one_delete_and_one_flush(
     monkeypatch.setattr(db_session, "scalars", counted_scalars)
     monkeypatch.setattr(db_session, "execute", counted_execute)
     monkeypatch.setattr(db_session, "flush", counted_flush)
+    monkeypatch.setattr(
+        ProjectRepository,
+        "lock_for_mutation",
+        lambda repository, project_id: project,
+    )
 
     EntityRepository(db_session).rebuild_project_entities("alpha", "app-a")
 

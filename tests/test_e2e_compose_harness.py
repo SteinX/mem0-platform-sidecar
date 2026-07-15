@@ -36,6 +36,19 @@ def test_live_runner_retains_postgres_migration_and_real_browser_smokes() -> Non
     ]
 
 
+def test_postgres_smoke_retains_phase2_exact_roundtrip_and_head_parity() -> None:
+    source = (ROOT / "scripts" / "run_postgres_migration_smoke.py").read_text()
+
+    assert "MutationIntent" in source
+    assert "MutationIntentTarget" in source
+    assert "_seed_head_roundtrip(engine)" in source
+    assert "_verify_head_roundtrip(engine)" in source
+    assert source.count('_migrate(config, "head")') == 2
+    assert source.index("session.query(MutationIntent)") < source.index(
+        "session.query(Event)"
+    )
+
+
 def test_browser_smoke_allows_for_first_compile_on_entity_route() -> None:
     browser_smoke = (
         ROOT
@@ -91,6 +104,19 @@ def test_browser_smoke_requires_response_detail_and_zero_browser_errors() -> Non
         "browserDiagnostics.unhandledRejections.length === 0",
     ):
         assert zero_error_gate in browser_smoke
+
+
+def test_browser_smoke_retains_opaque_memory_id_action_matrix() -> None:
+    browser_smoke = (
+        ROOT
+        / "integrations"
+        / "mem0-dashboard-overlay"
+        / "scripts"
+        / "run-browser-smoke.cjs"
+    ).read_text()
+
+    assert 'const opaqueMemoryIds = ["a/b", "a%b", "a%2Fb"]' in browser_smoke
+    assert "opaque memory IDs stayed distinct across all item actions" in browser_smoke
 
 
 def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
@@ -293,6 +319,7 @@ def test_e2e_postgres_healthcheck_waits_for_final_server() -> None:
 
     assert "cat /proc/1/comm" in content
     assert "pg_isready -q -d postgres -U postgres" in content
+    assert "start_period: 60s" in content
 
 
 def test_e2e_compose_keeps_unscoped_adoption_gate_on_dedicated_runner() -> None:

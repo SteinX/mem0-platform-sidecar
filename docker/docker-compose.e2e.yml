@@ -32,6 +32,7 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+      start_period: 60s
 
   mem0:
     build:

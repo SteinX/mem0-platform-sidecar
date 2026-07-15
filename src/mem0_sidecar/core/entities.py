@@ -19,6 +19,7 @@ from mem0_sidecar.store.repositories import (
     EntityRepository,
     EventRepository,
     MemoryIndexRepository,
+    MutationIntentRepository,
     ProjectRepository,
 )
 
@@ -337,6 +338,13 @@ class EntityService:
         )
         project_id = _portable_id(project_id, field_name="project_id")
         app_id = _portable_id(app_id, field_name="app_id")
+        from mem0_sidecar.core.memory_ops import MemoryService
+
+        recovery_service = MemoryService(session=self.session, mem0=self.mem0)
+        await recovery_service.recover_pending_mutations(
+            project_id=project_id,
+            app_id=app_id,
+        )
         ProjectRepository(self.session).lock_for_mutation(project_id)
 
         entity_repo = EntityRepository(self.session)
@@ -376,58 +384,88 @@ class EntityService:
             subject_id=entity_id,
             correlation_id=get_request_id(),
         )
+        intent = MutationIntentRepository(self.session).create(
+            project_id=project_id,
+            app_id=app_id,
+            event_id=event.id,
+            operation="entity.delete",
+            payload={
+                "entity_type": normalized_type,
+                "entity_id": entity_id,
+            },
+            memory_ids=memory_ids,
+        )
+        self.session.commit()
 
-        memory_repo = MemoryIndexRepository(self.session)
-        failed: list[dict[str, Any]] = []
-        deleted_count = 0
-        for memory_id in memory_ids:
-            try:
-                await self.mem0.delete_memory(memory_id)
-            except Exception as exc:
-                if not (
-                    isinstance(exc, Mem0UpstreamError)
-                    and _safe_upstream_status_code(exc) == 404
-                ):
-                    failed.append(
-                        {"id": memory_id, "error": _safe_delete_error(exc)}
-                    )
-                    continue
-            memory_repo.delete_memory(
-                project_id=project_id,
-                mem0_memory_id=memory_id,
-            )
-            deleted_count += 1
+        try:
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            intent_repo = MutationIntentRepository(self.session)
+            targets = {
+                target.memory_id: target for target in intent_repo.targets(intent.id)
+            }
+            memory_repo = MemoryIndexRepository(self.session)
+            failed: list[dict[str, Any]] = []
+            deleted_count = 0
+            for memory_id in memory_ids:
+                target = targets[memory_id]
+                try:
+                    await self.mem0.delete_memory(memory_id)
+                except Exception as exc:
+                    if not (
+                        isinstance(exc, Mem0UpstreamError)
+                        and _safe_upstream_status_code(exc) == 404
+                    ):
+                        safe_error = _safe_delete_error(exc)
+                        failed.append({"id": memory_id, "error": safe_error})
+                        intent_repo.mark_target_failed(target, safe_error)
+                        continue
+                memory_repo.delete_memory(
+                    project_id=project_id,
+                    mem0_memory_id=memory_id,
+                )
+                intent_repo.mark_target_succeeded(target)
+                deleted_count += 1
 
-        entity_repo.rebuild_project_entities(project_id, app_id)
-        failed_count = len(failed)
-        if failed_count == 0:
-            status = "SUCCEEDED"
-            event_repo.mark_succeeded(
-                event.id,
-                response={
-                    "status": status,
-                    "total": requested_count,
-                    "count": deleted_count,
-                    "success": True,
-                },
+            entity_repo.rebuild_project_entities(project_id, app_id)
+            failed_count = len(failed)
+            if failed_count == 0:
+                status = "SUCCEEDED"
+                event_repo.mark_succeeded(
+                    event.id,
+                    response={
+                        "status": status,
+                        "total": requested_count,
+                        "count": deleted_count,
+                        "success": True,
+                    },
+                )
+            else:
+                status = "PARTIAL" if deleted_count else "FAILED"
+                event_repo.mark_failed(
+                    event.id,
+                    error={
+                        "status": status,
+                        "requested_count": requested_count,
+                        "deleted_count": deleted_count,
+                        "failed_count": failed_count,
+                        "failed": failed,
+                    },
+                )
+            result = {
+                "status": status,
+                "requested_count": requested_count,
+                "deleted_count": deleted_count,
+                "failed_count": failed_count,
+                "failed": failed,
+                "event_id": event.id,
+            }
+            intent_repo.complete(intent.id, result=result)
+            self.session.commit()
+            return result
+        except BaseException as exc:
+            recovery_service._release_intent_after_failure(
+                intent.id,
+                exc,
+                mark_event_failed=isinstance(exc, Exception),
             )
-        else:
-            status = "PARTIAL" if deleted_count else "FAILED"
-            event_repo.mark_failed(
-                event.id,
-                error={
-                    "status": status,
-                    "requested_count": requested_count,
-                    "deleted_count": deleted_count,
-                    "failed_count": failed_count,
-                    "failed": failed,
-                },
-            )
-        return {
-            "status": status,
-            "requested_count": requested_count,
-            "deleted_count": deleted_count,
-            "failed_count": failed_count,
-            "failed": failed,
-            "event_id": event.id,
-        }
+            raise

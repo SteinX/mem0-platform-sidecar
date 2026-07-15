@@ -30,6 +30,8 @@ from mem0_sidecar.store.models import (
     Job,
     JobStatus,
     MemoryIndex,
+    MutationIntent,
+    MutationIntentTarget,
     Project,
 )
 
@@ -814,6 +816,20 @@ class ProjectRepository:
     def lock_for_mutation(self, project_id: str) -> Project:
         """Serialize projection mutations in Project -> MemoryIndex -> Entity order."""
 
+        if self.session.get_bind().dialect.name == "sqlite":
+            result = self.session.execute(
+                update(Project)
+                .where(Project.id == project_id)
+                .values(updated_at=Project.updated_at)
+                .execution_options(synchronize_session=False)
+            )
+            if not result.rowcount:
+                raise KeyError(project_id)
+            project = self.session.get(Project, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            return project
+
         with self.session.no_autoflush:
             project = self.session.scalar(
                 select(Project)
@@ -1075,6 +1091,7 @@ class EventRepository:
         latency = (_as_utc(completed_at) - _as_utc(origin)).total_seconds() * 1000
         event.latency_ms = max(latency, 0.0)
 
+
     def query_project_events(
         self,
         project_id: str,
@@ -1218,6 +1235,209 @@ class EventRepository:
                 query,
             ),
         )
+
+
+class MutationIntentRepository:
+    """Persist bounded repair state before an upstream mutation can begin."""
+
+    MAX_TARGETS = 5000
+    RECOVERY_LIMIT = 100
+    LEASE_SECONDS = 300
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def sanitize_payload(
+        self,
+        project_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _safe_trace_document(
+            payload,
+            internal_hosts=_project_internal_hosts(self.session, project_id),
+        )
+
+    def create(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        event_id: str,
+        operation: str,
+        payload: dict[str, Any],
+        memory_ids: Iterable[str] = (),
+    ) -> MutationIntent:
+        target_ids = list(dict.fromkeys(memory_ids))
+        if len(target_ids) > self.MAX_TARGETS:
+            raise ValueError("mutation intent exceeds 5000 memory targets")
+        now = _utc_now()
+        intent = MutationIntent(
+            project_id=project_id,
+            app_id=app_id,
+            event_id=event_id,
+            operation=operation,
+            status="PENDING",
+            payload_json=_trace_json(self.sanitize_payload(project_id, payload)),
+            attempt_count=1,
+            lease_expires_at=now + timedelta(seconds=self.LEASE_SECONDS),
+            created_at=now,
+            updated_at=now,
+        )
+        self.session.add(intent)
+        self.session.flush()
+        self.add_targets(intent.id, target_ids)
+        return intent
+
+    def add_targets(
+        self,
+        intent_id: str,
+        memory_ids: Iterable[str],
+    ) -> list[MutationIntentTarget]:
+        current = self.targets(intent_id)
+        existing = {target.memory_id for target in current}
+        new_ids = [item for item in dict.fromkeys(memory_ids) if item not in existing]
+        if len(current) + len(new_ids) > self.MAX_TARGETS:
+            raise ValueError("mutation intent exceeds 5000 memory targets")
+        targets = [
+            MutationIntentTarget(
+                intent_id=intent_id,
+                memory_id=memory_id,
+                ordinal=len(current) + ordinal,
+            )
+            for ordinal, memory_id in enumerate(new_ids)
+        ]
+        self.session.add_all(targets)
+        self.session.flush()
+        return targets
+
+    def get(self, intent_id: str) -> MutationIntent:
+        intent = self.session.get(MutationIntent, intent_id)
+        if intent is None:
+            raise KeyError(intent_id)
+        return intent
+
+    def payload(self, intent: MutationIntent) -> dict[str, Any]:
+        try:
+            payload = json.loads(intent.payload_json)
+        except (TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def list_recoverable(self, project_id: str, app_id: str) -> list[MutationIntent]:
+        now = _utc_now()
+        return list(
+            self.session.scalars(
+                select(MutationIntent)
+                .where(
+                    MutationIntent.project_id == project_id,
+                    MutationIntent.app_id == app_id,
+                    MutationIntent.status == "PENDING",
+                    or_(
+                        MutationIntent.lease_expires_at.is_(None),
+                        MutationIntent.lease_expires_at <= now,
+                    ),
+                )
+                .order_by(MutationIntent.created_at, MutationIntent.id)
+                .limit(self.RECOVERY_LIMIT)
+            )
+        )
+
+    def targets(
+        self,
+        intent_id: str,
+        *,
+        pending_only: bool = False,
+    ) -> list[MutationIntentTarget]:
+        statement = select(MutationIntentTarget).where(
+            MutationIntentTarget.intent_id == intent_id
+        )
+        if pending_only:
+            statement = statement.where(MutationIntentTarget.status == "PENDING")
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    MutationIntentTarget.ordinal,
+                    MutationIntentTarget.memory_id,
+                )
+            )
+        )
+
+    def claim_recovery(self, intent: MutationIntent) -> None:
+        now = _utc_now()
+        intent.attempt_count += 1
+        intent.lease_expires_at = now + timedelta(seconds=self.LEASE_SECONDS)
+        intent.updated_at = now
+        self.session.flush()
+
+    def mark_target_succeeded(self, target: MutationIntentTarget) -> None:
+        target.status = "COMPLETED"
+        target.error_json = "{}"
+        target.updated_at = _utc_now()
+        self.session.flush()
+
+    def mark_target_failed(
+        self,
+        target: MutationIntentTarget,
+        error: dict[str, Any],
+    ) -> None:
+        intent = self.get(target.intent_id)
+        target.status = "PENDING"
+        target.error_json = _trace_json(
+            _safe_trace_document(
+                error,
+                internal_hosts=_project_internal_hosts(
+                    self.session, intent.project_id
+                ),
+            )
+        )
+        target.updated_at = _utc_now()
+        self.session.flush()
+
+    def release_for_recovery(
+        self,
+        intent_id: str,
+        *,
+        error: dict[str, Any] | None = None,
+    ) -> MutationIntent:
+        intent = self.get(intent_id)
+        intent.status = "PENDING"
+        intent.lease_expires_at = None
+        intent.updated_at = _utc_now()
+        if error is not None:
+            intent.error_json = _trace_json(
+                _safe_trace_document(
+                    error,
+                    internal_hosts=_project_internal_hosts(
+                        self.session, intent.project_id
+                    ),
+                )
+            )
+        self.session.flush()
+        return intent
+
+    def complete(
+        self,
+        intent_id: str,
+        *,
+        result: dict[str, Any],
+    ) -> MutationIntent:
+        intent = self.get(intent_id)
+        now = _utc_now()
+        intent.status = "COMPLETED"
+        intent.result_json = _trace_json(
+            _safe_trace_document(
+                result,
+                internal_hosts=_project_internal_hosts(
+                    self.session, intent.project_id
+                ),
+            )
+        )
+        intent.error_json = "{}"
+        intent.lease_expires_at = None
+        intent.completed_at = now
+        intent.updated_at = now
+        self.session.flush()
+        return intent
 
 
 class MemoryIndexRepository:
@@ -1721,8 +1941,12 @@ class EntityRepository:
                 MemoryIndex.updated_at.desc(),
                 MemoryIndex.mem0_memory_id.asc(),
             )
+            .limit(MutationIntentRepository.MAX_TARGETS + 1)
         )
-        return list(self.session.scalars(statement))
+        memory_ids = list(self.session.scalars(statement))
+        if len(memory_ids) > MutationIntentRepository.MAX_TARGETS:
+            raise ValueError("mutation intent exceeds 5000 memory targets")
+        return memory_ids
 
 
 class ExportJobRepository:

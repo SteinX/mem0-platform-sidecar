@@ -401,10 +401,13 @@ async function testEventRoutesFailClosedWithoutPortableRuntimeScope(proxy) {
 
 async function testEventRoutesAllowServerDefaultAppResolution(proxy) {
   const calls = [];
-  const options = proxyOptions(async (url, init) => {
-    calls.push({ url: url.toString(), init });
-    return Response.json({ results: [] });
-  }, { configuredProjectId: "runtime-project", configuredAppId: undefined });
+  const options = proxyOptions(
+    async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ results: [] });
+    },
+    { configuredProjectId: "runtime-project", configuredAppId: undefined },
+  );
 
   const queryResponse = await proxy(
     new Request("http://dashboard.local/api/sidecar/v1/events/query", {
@@ -971,6 +974,72 @@ async function testMemoryDeleteForcesRuntimeScope(proxy) {
   );
 }
 
+async function testOpaqueMemoryIdsStayDistinctAcrossEveryItemAction(proxy) {
+  const cases = [
+    { id: "a/b", browser: "a%2Fb", sidecar: "a%252Fb" },
+    { id: "a%b", browser: "a%25b", sidecar: "a%2525b" },
+    { id: "a%2Fb", browser: "a%252Fb", sidecar: "a%25252Fb" },
+  ];
+  const observed = [];
+
+  for (const item of cases) {
+    for (const action of ["detail", "history", "update", "delete"]) {
+      const method =
+        action === "update" ? "PATCH" : action === "delete" ? "DELETE" : "GET";
+      const suffix = action === "history" ? "/history" : "";
+      const response = await proxy(
+        new Request(
+          `http://dashboard.local/api/sidecar/v1/memories/${item.browser}${suffix}`,
+          {
+            method,
+            headers: method === "PATCH" ? jsonHeaders() : undefined,
+            body:
+              method === "PATCH"
+                ? JSON.stringify({ text: `updated ${item.id}` })
+                : undefined,
+          },
+        ),
+        `/v1/memories/${item.id}${suffix}`,
+        proxyOptions(async (url, init) => {
+          observed.push({
+            id: item.id,
+            action,
+            url: url.toString(),
+            method: init.method,
+          });
+          return Response.json(
+            action === "history" ? { results: [] } : { id: item.id },
+          );
+        }),
+      );
+      assert.equal(response.status, 200, `${action} ${item.id}`);
+    }
+  }
+
+  assert.deepEqual(
+    observed.map(({ id, action, url, method }) => ({
+      id,
+      action,
+      url,
+      method,
+    })),
+    cases.flatMap((item) =>
+      [
+        ["detail", "GET", ""],
+        ["history", "GET", "/history"],
+        ["update", "PATCH", ""],
+        ["delete", "DELETE", ""],
+      ].map(([action, method, suffix]) => ({
+        id: item.id,
+        action,
+        method,
+        url: `http://sidecar.internal/v1/memories/${item.sidecar}${suffix}?project_id=runtime+project`,
+      })),
+    ),
+  );
+  assert.equal(new Set(observed.map((item) => item.url.split("?")[0])).size, 6);
+}
+
 async function testMemoryRoutesRejectTraversalDoubleEncodingAndExtraSegments(
   proxy,
 ) {
@@ -986,8 +1055,6 @@ async function testMemoryRoutesRejectTraversalDoubleEncodingAndExtraSegments(
     ["GET", "/v1/memories/safe%00name"],
     ["GET", "/v1/memories/safe%1fname"],
     ["GET", "/v1/memories/safe%7fname"],
-    ["GET", "/v1/memories/memory%252Fone"],
-    ["GET", "/v1/memories/%2571uery"],
     ["GET", "/v1/memories/memory-one/history/extra"],
     ["GET", "/v1/memories/memory-one/extra"],
     ["GET", "/v1/memories/query"],
@@ -1342,6 +1409,9 @@ async function main() {
   await testMemoryPatchRejectsArrayBody(proxySidecarRequest);
   await testMemoryPatchRejectsInvalidJson(proxySidecarRequest);
   await testMemoryDeleteForcesRuntimeScope(proxySidecarRequest);
+  await testOpaqueMemoryIdsStayDistinctAcrossEveryItemAction(
+    proxySidecarRequest,
+  );
   await testMemoryRoutesRejectTraversalDoubleEncodingAndExtraSegments(
     proxySidecarRequest,
   );
@@ -1358,7 +1428,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 41 contracts passed");
+  console.log("sidecar proxy request harness: 42 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(

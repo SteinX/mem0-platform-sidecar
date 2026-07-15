@@ -41,6 +41,7 @@ function isMemoryQueryPath(method: string, path: string): boolean {
 function canonicalResourceId(
   encodedId: string,
   reservedIds: ReadonlySet<string>,
+  allowLiteralPercent = false,
 ): string | null {
   if (!encodedId) {
     return null;
@@ -60,7 +61,7 @@ function canonicalResourceId(
     reservedIds.has(resourceId) ||
     hasTraversalSegment ||
     /[\u0000-\u001f\u007f]/.test(resourceId) ||
-    resourceId.includes("%")
+    (!allowLiteralPercent && resourceId.includes("%"))
   ) {
     return null;
   }
@@ -68,7 +69,7 @@ function canonicalResourceId(
 }
 
 function canonicalMemoryId(encodedId: string): string | null {
-  return canonicalResourceId(encodedId, new Set(["query"]));
+  return canonicalResourceId(encodedId, new Set(["query"]), true);
 }
 
 function memoryItemId(path: string): string | null {

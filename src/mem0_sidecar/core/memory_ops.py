@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,17 +16,19 @@ from mem0_sidecar.core.explorer_filters import (
 from mem0_sidecar.core.scope import Scope, normalize_scope, validate_scope_id
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
-from mem0_sidecar.store.models import MemoryIndex, Project
+from mem0_sidecar.store.models import MemoryIndex, MutationIntent, Project
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EntityRepository,
     EventRepository,
     MemoryIndexRepository,
+    MutationIntentRepository,
     ProjectRepository,
 )
 
 SIDECAR_PROJECT_ID_METADATA_KEY = "_mem0_sidecar_project_id"
 SIDECAR_APP_ID_METADATA_KEY = "_mem0_sidecar_app_id"
+SIDECAR_MUTATION_ID_METADATA_KEY = "_mem0_sidecar_mutation_id"
 _MEMORY_PATCH_FIELDS = frozenset({"text", "metadata", "expiration_date"})
 _RECONCILE_SCAN_LIMIT = 5000
 _HYDRATION_BUFFER = 20
@@ -107,6 +111,17 @@ def _oss_add_payload(payload: dict[str, Any], *, scope: Scope) -> dict[str, Any]
         scope=scope,
     )
     return oss_payload
+
+
+def _mutation_marker(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _oss_search_payload(payload: dict[str, Any], *, scope: Scope) -> dict[str, Any]:
@@ -519,6 +534,265 @@ class MemoryService:
         self.session = session
         self.mem0 = mem0
 
+    def _release_intent_after_failure(
+        self,
+        intent_id: str,
+        exc: BaseException,
+        *,
+        mark_event_failed: bool,
+    ) -> None:
+        self.session.rollback()
+        try:
+            intent_repo = MutationIntentRepository(self.session)
+            intent = intent_repo.get(intent_id)
+            error = (
+                _error_payload(exc)
+                if isinstance(exc, Exception)
+                else {"message": "Mutation interrupted; recovery required"}
+            )
+            intent_repo.release_for_recovery(intent_id, error=error)
+            if mark_event_failed:
+                EventRepository(self.session).mark_failed(
+                    intent.event_id,
+                    error=error,
+                )
+            self.session.commit()
+        except BaseException:
+            self.session.rollback()
+
+    async def recover_pending_mutations(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+    ) -> dict[str, int]:
+        """Converge bounded incomplete intents before the next scoped mutation."""
+
+        intent_ids = [
+            intent.id
+            for intent in MutationIntentRepository(self.session).list_recoverable(
+                project_id,
+                app_id,
+            )
+        ]
+        if not intent_ids:
+            return {"recovered": 0, "failed": 0}
+        self.session.rollback()
+        recovered = 0
+        failed = 0
+        for intent_id in intent_ids:
+            try:
+                ProjectRepository(self.session).lock_for_mutation(project_id)
+                intent_repo = MutationIntentRepository(self.session)
+                intent = intent_repo.get(intent_id)
+                if intent.status != "PENDING":
+                    self.session.rollback()
+                    continue
+                intent_repo.claim_recovery(intent)
+                if intent.operation == "memory.add":
+                    await self._recover_add_intent(intent)
+                elif intent.operation == "memory.update":
+                    await self._recover_update_intent(intent)
+                elif intent.operation in {"memory.delete", "entity.delete"}:
+                    await self._recover_delete_intent(intent)
+                else:
+                    raise RuntimeError("Unsupported durable mutation intent")
+                self.session.commit()
+                if intent.status == "COMPLETED":
+                    recovered += 1
+            except BaseException as exc:
+                self._release_intent_after_failure(
+                    intent_id,
+                    exc,
+                    mark_event_failed=isinstance(exc, Exception),
+                )
+                if not isinstance(exc, Exception):
+                    raise
+                failed += 1
+        return {"recovered": recovered, "failed": failed}
+
+    async def _recover_add_intent(self, intent: MutationIntent) -> None:
+        intent_repo = MutationIntentRepository(self.session)
+        payload = intent_repo.payload(intent)
+        upstream_payload = payload.get("upstream_payload")
+        if not isinstance(upstream_payload, dict):
+            raise RuntimeError("Add recovery payload is unavailable")
+        marker = payload.get("mutation_id")
+        if not isinstance(marker, str) or not marker:
+            raise RuntimeError("Add recovery marker is unavailable")
+
+        async def marked_records() -> list[dict[str, Any]]:
+            response = await self.mem0.list_memories(
+                {"top_k": _RECONCILE_SCAN_LIMIT, "show_expired": True}
+            )
+            records: list[dict[str, Any]] = []
+            for item in _list_results(response):
+                if not isinstance(item, dict):
+                    continue
+                metadata = item.get("metadata")
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get(SIDECAR_MUTATION_ID_METADATA_KEY) == marker
+                    and metadata.get(SIDECAR_PROJECT_ID_METADATA_KEY)
+                    == intent.project_id
+                    and metadata.get(SIDECAR_APP_ID_METADATA_KEY) == intent.app_id
+                ):
+                    records.append(item)
+            return records
+
+        records = await marked_records()
+        if not records:
+            if payload.get("replay_safe") is not True:
+                result = {
+                    "recovered": False,
+                    "retry_required": True,
+                    "reason": "sanitized_add_payload_is_lossy",
+                }
+                EventRepository(self.session).mark_failed(
+                    intent.event_id,
+                    error=result,
+                )
+                intent_repo.complete(intent.id, result=result)
+                return
+            await self.mem0.add_memory(upstream_payload)
+            records = await marked_records()
+        if not records:
+            raise RuntimeError("Marked add result is not yet visible upstream")
+
+        normalized = sorted(
+            (_normalize_memory_record(record) for record in records),
+            key=lambda item: item["id"],
+        )
+        canonical = normalized[0]
+        duplicates = normalized[1:]
+        memory_repo = MemoryIndexRepository(self.session)
+        for duplicate in duplicates:
+            try:
+                await self.mem0.delete_memory(duplicate["id"])
+            except Exception as exc:
+                if not _is_upstream_not_found(exc):
+                    raise
+            memory_repo.delete_memory(
+                project_id=intent.project_id,
+                mem0_memory_id=duplicate["id"],
+            )
+
+        metadata = dict(canonical["metadata"])
+        metadata.pop(SIDECAR_PROJECT_ID_METADATA_KEY, None)
+        metadata.pop(SIDECAR_APP_ID_METADATA_KEY, None)
+        metadata.pop(SIDECAR_MUTATION_ID_METADATA_KEY, None)
+        category = payload.get("category")
+        memory_repo.upsert_memory(
+            project_id=intent.project_id,
+            mem0_memory_id=canonical["id"],
+            user_id=canonical["user_id"],
+            agent_id=canonical["agent_id"],
+            app_id=intent.app_id,
+            run_id=canonical["run_id"],
+            category=category if isinstance(category, str) else None,
+            metadata=metadata,
+        )
+        intent_repo.add_targets(
+            intent.id,
+            [item["id"] for item in normalized],
+        )
+        for target in intent_repo.targets(intent.id):
+            intent_repo.mark_target_succeeded(target)
+        EntityRepository(self.session).rebuild_project_entities(
+            intent.project_id,
+            intent.app_id,
+        )
+        event = EventRepository(self.session).get(intent.event_id)
+        event.subject_id = canonical["id"]
+        result = {
+            "id": canonical["id"],
+            "recovered": True,
+            "duplicates_removed": len(duplicates),
+        }
+        EventRepository(self.session).mark_succeeded(event.id, response=result)
+        intent_repo.complete(intent.id, result=result)
+
+    async def _recover_update_intent(self, intent: MutationIntent) -> None:
+        intent_repo = MutationIntentRepository(self.session)
+        targets = intent_repo.targets(intent.id)
+        if len(targets) != 1:
+            raise RuntimeError("Update recovery target is invalid")
+        target = targets[0]
+        memory_repo = MemoryIndexRepository(self.session)
+        try:
+            response = await self.mem0.get_memory(target.memory_id)
+            projection = memory_repo.get_memory(
+                project_id=intent.project_id,
+                mem0_memory_id=target.memory_id,
+                app_id=intent.app_id,
+            )
+            record = _memory_record_from_response(
+                response,
+                expected_id=target.memory_id,
+            )
+            normalized = _normalize_memory_record(record, projection=projection)
+            categories = normalized["categories"]
+            memory_repo.upsert_memory(
+                project_id=intent.project_id,
+                mem0_memory_id=target.memory_id,
+                user_id=normalized["user_id"],
+                agent_id=normalized["agent_id"],
+                app_id=intent.app_id,
+                run_id=normalized["run_id"],
+                category=categories[0] if categories else None,
+                metadata=normalized["metadata"],
+            )
+        except Exception as exc:
+            if not _is_upstream_not_found(exc):
+                raise
+            memory_repo.delete_memory(
+                project_id=intent.project_id,
+                mem0_memory_id=target.memory_id,
+            )
+        intent_repo.mark_target_succeeded(target)
+        EntityRepository(self.session).rebuild_project_entities(
+            intent.project_id,
+            intent.app_id,
+        )
+        result = {"id": target.memory_id, "recovered": True}
+        EventRepository(self.session).mark_succeeded(intent.event_id, response=result)
+        intent_repo.complete(intent.id, result=result)
+
+    async def _recover_delete_intent(self, intent: MutationIntent) -> None:
+        intent_repo = MutationIntentRepository(self.session)
+        memory_repo = MemoryIndexRepository(self.session)
+        failed = 0
+        for target in intent_repo.targets(intent.id, pending_only=True):
+            try:
+                await self.mem0.delete_memory(target.memory_id)
+            except Exception as exc:
+                if not _is_upstream_not_found(exc):
+                    intent_repo.mark_target_failed(target, _error_payload(exc))
+                    failed += 1
+                    continue
+            memory_repo.delete_memory(
+                project_id=intent.project_id,
+                mem0_memory_id=target.memory_id,
+            )
+            intent_repo.mark_target_succeeded(target)
+        EntityRepository(self.session).rebuild_project_entities(
+            intent.project_id,
+            intent.app_id,
+        )
+        if failed:
+            intent_repo.release_for_recovery(
+                intent.id,
+                error={"message": "Upstream deletion recovery remains incomplete"},
+            )
+            return
+        result = {
+            "recovered": True,
+            "count": len(intent_repo.targets(intent.id)),
+            "success": True,
+        }
+        EventRepository(self.session).mark_succeeded(intent.event_id, response=result)
+        intent_repo.complete(intent.id, result=result)
+
     async def add_memory(
         self,
         *,
@@ -542,6 +816,10 @@ class MemoryService:
             if category.enabled
         }
         category = extract_category(metadata, category_names)
+        await self.recover_pending_mutations(
+            project_id=project_id,
+            app_id=scope.app_id,
+        )
         oss_payload = _oss_add_payload(payload, scope=scope)
         oss_payload.update(
             {
@@ -554,6 +832,18 @@ class MemoryService:
                 if value
             }
         )
+        event_request = {
+            **oss_payload,
+            "metadata": dict(oss_payload["metadata"]),
+        }
+        mutation_id = _mutation_marker(
+            {
+                "project_id": project_id,
+                "app_id": scope.app_id,
+                "upstream_payload": oss_payload,
+            }
+        )
+        oss_payload["metadata"][SIDECAR_MUTATION_ID_METADATA_KEY] = mutation_id
 
         event_repo = EventRepository(self.session)
         event = event_repo.create_event(
@@ -563,9 +853,30 @@ class MemoryService:
             agent_id=scope.agent_id,
             run_id=scope.run_id,
             operation="memory.add",
-            request=oss_payload,
+            request=event_request,
             subject_type="memory",
             correlation_id=get_request_id(),
+        )
+        intent_repo = MutationIntentRepository(self.session)
+        intent_payload = {
+            "mutation_id": mutation_id,
+            "upstream_payload": oss_payload,
+            "category": category,
+        }
+        sanitized_payload = intent_repo.sanitize_payload(
+            project_id,
+            intent_payload,
+        )
+        intent_payload["replay_safe"] = (
+            sanitized_payload.get("upstream_payload") == oss_payload
+            and sanitized_payload.get("category") == category
+        )
+        intent = intent_repo.create(
+            project_id=project_id,
+            app_id=scope.app_id,
+            event_id=event.id,
+            operation="memory.add",
+            payload=intent_payload,
         )
         self.session.commit()
         try:
@@ -588,19 +899,23 @@ class MemoryService:
                     category=category,
                     metadata=metadata,
                 )
+            intent_repo = MutationIntentRepository(self.session)
+            for target in intent_repo.add_targets(intent.id, memory_ids):
+                intent_repo.mark_target_succeeded(target)
             EntityRepository(self.session).rebuild_project_entities(
                 project_id,
                 scope.app_id,
             )
             event.subject_id = memory_ids[0]
             event_repo.mark_succeeded(event.id, response=memory_response)
+            intent_repo.complete(intent.id, result=memory_response)
             self.session.commit()
             return {"memory": memory_response, "event": _event_payload(event)}
-        except Exception as exc:
-            _persist_failed_trace(
-                self.session,
-                event_id=event.id,
-                error=_error_payload(exc),
+        except BaseException as exc:
+            self._release_intent_after_failure(
+                intent.id,
+                exc,
+                mark_event_failed=isinstance(exc, Exception),
             )
             raise
 
@@ -832,7 +1147,10 @@ class MemoryService:
             project_id=project_id,
             request_app_id=request_app_id,
         )
-        ProjectRepository(self.session).lock_for_mutation(project_id)
+        await self.recover_pending_mutations(
+            project_id=project_id,
+            app_id=effective_app_id,
+        )
         memory_repo = MemoryIndexRepository(self.session)
         memory = memory_repo.get_memory(
             project_id=project_id,
@@ -867,7 +1185,24 @@ class MemoryService:
             subject_type="memory",
             subject_id=memory_id,
         )
+        intent = MutationIntentRepository(self.session).create(
+            project_id=project_id,
+            app_id=effective_app_id,
+            event_id=event.id,
+            operation="memory.update",
+            payload={"memory_id": memory_id},
+            memory_ids=[memory_id],
+        )
+        self.session.commit()
         try:
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            memory = memory_repo.get_memory(
+                project_id=project_id,
+                mem0_memory_id=memory_id,
+                app_id=effective_app_id,
+            )
+            if memory is None:
+                raise KeyError(memory_id)
             try:
                 update_response = await self.mem0.update_memory(memory_id, patch)
             except ValueError as exc:
@@ -902,18 +1237,33 @@ class MemoryService:
                 effective_app_id,
             )
             event_repo.mark_succeeded(event.id, response=update_response)
-            return {"memory": normalized, "event": _event_payload(event)}
-        except Exception as exc:
+            intent_repo = MutationIntentRepository(self.session)
+            intent_repo.mark_target_succeeded(intent_repo.targets(intent.id)[0])
+            result = {"memory": normalized, "event": _event_payload(event)}
+            intent_repo.complete(intent.id, result=result)
+            self.session.commit()
+            return result
+        except BaseException as exc:
             if _is_upstream_not_found(exc):
+                self.session.rollback()
+                ProjectRepository(self.session).lock_for_mutation(project_id)
                 memory_repo.mark_stale(project_id, [memory_id])
                 EntityRepository(self.session).rebuild_project_entities(
                     project_id,
                     effective_app_id,
                 )
-            event_repo.mark_failed(event.id, error=_error_payload(exc))
-            self.session.commit()
-            if _is_upstream_not_found(exc):
+                event_repo = EventRepository(self.session)
+                event_repo.mark_failed(event.id, error=_error_payload(exc))
+                intent_repo = MutationIntentRepository(self.session)
+                intent_repo.mark_target_succeeded(intent_repo.targets(intent.id)[0])
+                intent_repo.complete(intent.id, result={"missing": True})
+                self.session.commit()
                 raise KeyError(memory_id) from exc
+            self._release_intent_after_failure(
+                intent.id,
+                exc,
+                mark_event_failed=isinstance(exc, Exception),
+            )
             raise
 
     async def get_memory_history(
@@ -1109,7 +1459,10 @@ class MemoryService:
             project_id=project_id,
             request_app_id=request_app_id,
         )
-        ProjectRepository(self.session).lock_for_mutation(project_id)
+        await self.recover_pending_mutations(
+            project_id=project_id,
+            app_id=effective_app_id,
+        )
         memory_repo = MemoryIndexRepository(self.session)
         memory = memory_repo.get_memory(
             project_id=project_id,
@@ -1158,7 +1511,24 @@ class MemoryService:
             subject_type="memory",
             subject_id=memory_id,
         )
+        intent = MutationIntentRepository(self.session).create(
+            project_id=project_id,
+            app_id=effective_app_id,
+            event_id=event.id,
+            operation="memory.delete",
+            payload={"memory_id": memory_id},
+            memory_ids=[memory_id],
+        )
+        self.session.commit()
         try:
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            memory = memory_repo.get_memory(
+                project_id=project_id,
+                mem0_memory_id=memory_id,
+                app_id=effective_app_id,
+            )
+            if memory is None:
+                raise KeyError(memory_id)
             response = await self.mem0.delete_memory(memory_id)
             memory_repo.delete_memory(
                 project_id=project_id,
@@ -1169,10 +1539,34 @@ class MemoryService:
                 effective_app_id,
             )
             event_repo.mark_succeeded(event.id, response=response)
-            return {"memory": response, "event": _event_payload(event)}
-        except Exception as exc:
-            event_repo.mark_failed(event.id, error=_error_payload(exc))
+            intent_repo = MutationIntentRepository(self.session)
+            intent_repo.mark_target_succeeded(intent_repo.targets(intent.id)[0])
+            result = {"memory": response, "event": _event_payload(event)}
+            intent_repo.complete(intent.id, result=result)
             self.session.commit()
+            return result
+        except BaseException as exc:
             if _is_upstream_not_found(exc):
+                self.session.rollback()
+                ProjectRepository(self.session).lock_for_mutation(project_id)
+                memory_repo.delete_memory(
+                    project_id=project_id,
+                    mem0_memory_id=memory_id,
+                )
+                EntityRepository(self.session).rebuild_project_entities(
+                    project_id,
+                    effective_app_id,
+                )
+                event_repo = EventRepository(self.session)
+                event_repo.mark_failed(event.id, error=_error_payload(exc))
+                intent_repo = MutationIntentRepository(self.session)
+                intent_repo.mark_target_succeeded(intent_repo.targets(intent.id)[0])
+                intent_repo.complete(intent.id, result={"missing": True})
+                self.session.commit()
                 raise KeyError(memory_id) from exc
+            self._release_intent_after_failure(
+                intent.id,
+                exc,
+                mark_event_failed=isinstance(exc, Exception),
+            )
             raise

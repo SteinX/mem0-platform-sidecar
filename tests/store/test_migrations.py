@@ -739,3 +739,165 @@ def test_entity_projection_migration_has_exact_revision_chain() -> None:
 
     assert migration.revision == "0006_entity_projection_scope"
     assert migration.down_revision == "0005_request_trace_fields"
+
+
+def test_phase2_head_rows_survive_0004_downgrade_and_reupgrade_exactly(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'phase2-lossless-roundtrip.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "head")
+    engine = sa.create_engine(database_url, future=True)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, default_app_id, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'app-a', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO events (
+                    id, project_id, app_id, user_id, agent_id, run_id,
+                    operation, status, request_json, response_json, error_json,
+                    correlation_id, latency_ms, result_count, has_results,
+                    created_at
+                ) VALUES (
+                    'head-event', 'repo-a', 'app-b', 'alice', 'agent-b', 'run-b',
+                    'memory.list', 'SUCCEEDED', '{}', '{}', '{}',
+                    'correlation-b', 12.5, 7, 1, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        for row_id, app_id, display_name, memory_count in (
+            ("head-entity-a", "app-a", "Alice A", 2),
+            ("head-entity-b", "app-b", "Alice B", 3),
+        ):
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO entities (
+                        id, project_id, app_id, entity_type, entity_id,
+                        display_name, metadata_json, memory_count,
+                        created_at, updated_at
+                    ) VALUES (
+                        :id, 'repo-a', :app_id, 'user', 'alice',
+                        :display_name, '{}', :memory_count,
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
+                    """
+                ),
+                {
+                    "id": row_id,
+                    "app_id": app_id,
+                    "display_name": display_name,
+                    "memory_count": memory_count,
+                },
+            )
+
+    command.downgrade(config, "0004_memory_explorer_indexes")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO events (
+                    id, project_id, operation, status, request_json,
+                    response_json, error_json, created_at
+                ) VALUES (
+                    'legacy-event-after-downgrade', 'repo-a', 'memory.search',
+                    'SUCCEEDED', '{}', '{}', '{}', CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO entities (
+                    id, project_id, entity_type, entity_id, metadata_json,
+                    memory_count, created_at, updated_at
+                ) VALUES (
+                    'legacy-entity-after-downgrade', 'repo-a', 'run', 'run-legacy',
+                    '{}', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        event = connection.execute(
+            sa.text(
+                """
+                SELECT app_id, user_id, agent_id, run_id, correlation_id,
+                       latency_ms, result_count, has_results
+                FROM events WHERE id = 'head-event'
+                """
+            )
+        ).mappings().one()
+        legacy_event = connection.execute(
+            sa.text(
+                """
+                SELECT app_id, correlation_id, latency_ms, result_count, has_results
+                FROM events WHERE id = 'legacy-event-after-downgrade'
+                """
+            )
+        ).mappings().one()
+        entities = connection.execute(
+            sa.text(
+                """
+                SELECT id, app_id, display_name, memory_count
+                FROM entities ORDER BY id
+                """
+            )
+        ).mappings().all()
+        tables = set(sa.inspect(connection).get_table_names())
+
+    assert event == {
+        "app_id": "app-b",
+        "user_id": "alice",
+        "agent_id": "agent-b",
+        "run_id": "run-b",
+        "correlation_id": "correlation-b",
+        "latency_ms": 12.5,
+        "result_count": 7,
+        "has_results": 1,
+    }
+    assert legacy_event == {
+        "app_id": None,
+        "correlation_id": None,
+        "latency_ms": None,
+        "result_count": 0,
+        "has_results": 0,
+    }
+    assert entities == [
+        {
+            "id": "head-entity-a",
+            "app_id": "app-a",
+            "display_name": "Alice A",
+            "memory_count": 2,
+        },
+        {
+            "id": "head-entity-b",
+            "app_id": "app-b",
+            "display_name": "Alice B",
+            "memory_count": 3,
+        },
+        {
+            "id": "legacy-entity-after-downgrade",
+            "app_id": "app-a",
+            "display_name": None,
+            "memory_count": 1,
+        },
+    ]
+    assert "_compat_0005_request_trace_fields" not in tables
+    assert "_compat_0006_entity_projection_scope" not in tables

@@ -53,7 +53,6 @@ class _SingleDecodeMemoryRoute(APIRoute):
 memory_router = APIRouter(route_class=_SingleDecodeMemoryRoute)
 SessionDependency = Annotated[Session, Depends(get_session)]
 Mem0Dependency = Annotated[Any, Depends(get_mem0_client)]
-_ENCODED_OCTET = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE)
 
 
 def _decode_memory_id(memory_id: str) -> str:
@@ -69,7 +68,6 @@ def _decode_memory_id(memory_id: str) -> str:
         decoded == "query"
         or has_traversal_segment
         or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
-        or _ENCODED_OCTET.search(decoded)
     ):
         raise HTTPException(status_code=400, detail="Invalid memory ID")
     return decoded
@@ -111,7 +109,6 @@ async def add_memory(
             project_id=project_id,
             payload=normalized_payload_for_project(request, payload),
         )
-        session.commit()
         return result
     except ValueError as exc:
         session.rollback()
@@ -239,7 +236,6 @@ async def update_memory(
             request_app_id=request_app_id,
             payload=patch,
         )
-        session.commit()
         return result
     except KeyError as exc:
         session.rollback()
@@ -348,7 +344,6 @@ async def delete_memory(
             memory_id=memory_id,
             request_app_id=request_app_id,
         )
-        session.commit()
         return result
     except KeyError as exc:
         session.rollback()

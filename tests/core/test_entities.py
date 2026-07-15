@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy.dialects import postgresql
 
 from mem0_sidecar.core.entities import EntityService, parse_entity_query
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
@@ -570,7 +569,7 @@ async def test_delete_entity_partial_failure_keeps_failed_projection_and_safe_ev
 
 
 @pytest.mark.asyncio
-async def test_delete_entity_retry_after_local_rollback_converges_on_upstream_404(
+async def test_delete_entity_owns_durable_projection_commit(
     db_session,
 ) -> None:
     _create_project(db_session, "repo-a")
@@ -583,18 +582,11 @@ async def test_delete_entity_retry_after_local_rollback_converges_on_upstream_40
     first = await service.delete_entity("repo-a", "app-a", "user", "alice")
     assert first["status"] == "SUCCEEDED"
     db_session.rollback()
-    assert EntityRepository(db_session).get_project_entity(
-        "repo-a", "app-a", "user", "alice"
-    ).memory_count == 1
-
-    retry = await service.delete_entity("repo-a", "app-a", "user", "alice")
-
-    assert retry["status"] == "SUCCEEDED"
-    assert retry["requested_count"] == 1
-    assert retry["deleted_count"] == 1
-    assert retry["failed_count"] == 0
-    assert retry["failed"] == []
-    assert mem0.deleted_ids == ["one", "one"]
+    with pytest.raises(KeyError):
+        EntityRepository(db_session).get_project_entity(
+            "repo-a", "app-a", "user", "alice"
+        )
+    assert mem0.deleted_ids == ["one"]
     assert EntityRepository(db_session).list_entity_memory_ids(
         "repo-a", "app-a", "user", "alice"
     ) == []
@@ -654,7 +646,7 @@ async def test_delete_entity_total_failure_and_missing_are_non_destructive(
 
 
 @pytest.mark.asyncio
-async def test_delete_entity_does_not_commit_caller_transaction(
+async def test_delete_entity_commits_intent_before_side_effect_and_projection_after(
     db_session,
     monkeypatch,
 ) -> None:
@@ -676,8 +668,8 @@ async def test_delete_entity_does_not_commit_caller_transaction(
         "repo-a", "app-a", "user", "alice"
     )
 
-    assert commits == 0
-    assert db_session.in_transaction()
+    assert commits == 2
+    assert not db_session.in_transaction()
 
 
 @pytest.mark.asyncio
@@ -690,26 +682,28 @@ async def test_delete_entity_locks_project_before_upstream_calls(
     _rebuild(db_session)
     db_session.commit()
     operations: list[str] = []
-    original_scalar = db_session.scalar
+    original_lock = ProjectRepository.lock_for_mutation
 
-    def record_scalar(statement, *args, **kwargs):
-        sql = str(statement.compile(dialect=postgresql.dialect())).upper()
-        if "FROM PROJECTS" in sql and "FOR UPDATE" in sql:
-            operations.append("project_lock")
-        return original_scalar(statement, *args, **kwargs)
+    def record_lock(repository, project_id):
+        operations.append("project_lock")
+        return original_lock(repository, project_id)
 
     class OrderedDeleteMem0(DeleteMem0):
         async def delete_memory(self, memory_id: str) -> dict[str, Any]:
             operations.append("upstream_delete")
             return await super().delete_memory(memory_id)
 
-    monkeypatch.setattr(db_session, "scalar", record_scalar)
+    monkeypatch.setattr(ProjectRepository, "lock_for_mutation", record_lock)
 
     await EntityService(session=db_session, mem0=OrderedDeleteMem0()).delete_entity(
         "repo-a", "app-a", "user", "alice"
     )
 
-    assert operations[0:2] == ["project_lock", "upstream_delete"]
+    upstream_index = operations.index("upstream_delete")
+    assert operations[upstream_index - 1 : upstream_index + 1] == [
+        "project_lock",
+        "upstream_delete",
+    ]
     assert operations[-1] == "project_lock"
 
 
