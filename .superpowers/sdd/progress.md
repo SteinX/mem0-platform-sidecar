@@ -145,3 +145,10 @@ Continuous review 1 re-review 3 fix wave: complete at c7e4c39 (2 P2 fixed; 2 P3 
 - Acceptance: focused 251 passed; full 993 passed/5 skipped/1 known warning; Ruff/diff/secret scan clean; retained PostgreSQL migration/guard/serialization smoke passed.
 - Aggregate Compose/browser was not rerun because this wave has no frontend diff, as required by the brief. The prior browser concern remains recorded and was not weakened.
 - Report: `.superpowers/sdd/continuous-review-1-rereview-3-fix-report.md`.
+
+Continuous review 1 re-review 4 fix wave: complete at 04bf9e4 (1 P2 fixed; 2 P3 intentionally unchanged)
+- P2 decode secrecy: the success-decode handler now leaves the active `except` context before raising its safe `Mem0UpstreamError`; invalid JSON and deep valid JSON wrappers have no cause/context links, and a bounded exception-attribute/traceback-locals traversal cannot recover either synthetic response-body secret.
+- Preserved: only ordinary `Exception` is caught; status, `outcome_unknown=True`, `response_text=None`, body-free public message/logging, all four mutation UNKNOWN states, read-only convergence, unchanged write counts, explicit terminal upstream rejection, and pre-attempt lock behavior remain green.
+- Acceptance: client 25 passed; four-operation outcome/terminal matrix 22 passed; full 993 passed/5 skipped/1 known warning; Ruff/diff/secret scan clean.
+- PostgreSQL, overlay, and Compose were not rerun because this client-only wave does not affect them, as required by the brief. Both retained P3s remain unchanged.
+- Report: `.superpowers/sdd/continuous-review-1-rereview-4-fix-report.md`.
