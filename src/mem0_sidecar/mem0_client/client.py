@@ -19,12 +19,16 @@ class Mem0UpstreamError(RuntimeError):
         message: str,
         status_code: int | None = None,
         response_text: str | None = None,
+        outcome_unknown: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.method = method
         self.path = path
         self.status_code = status_code
         self.response_text = response_text
+        self.outcome_unknown = (
+            status_code is None if outcome_unknown is None else outcome_unknown
+        )
 
 
 class Mem0RestClient:
@@ -124,6 +128,7 @@ class Mem0RestClient:
                     path=path,
                     status_code=exc.response.status_code,
                     response_text=response_text,
+                    outcome_unknown=False,
                     message=(
                         f"Mem0 upstream {method} {path} failed with "
                         f"HTTP {exc.response.status_code}: {response_text}"
@@ -144,10 +149,35 @@ class Mem0RestClient:
                 raise Mem0UpstreamError(
                     method=method,
                     path=path,
+                    outcome_unknown=True,
                     message=f"Mem0 upstream {method} {path} request failed: {exc}",
                 ) from exc
 
             duration_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            try:
+                data = response.json()
+            except (UnicodeError, ValueError) as exc:
+                LOGGER.warning(
+                    "mem0_upstream_response_decode_failed",
+                    extra=self._log_extra(
+                        method=method,
+                        path=path,
+                        status_code=response.status_code,
+                        duration_ms=duration_ms,
+                        error_type=type(exc).__name__,
+                    ),
+                )
+                raise Mem0UpstreamError(
+                    method=method,
+                    path=path,
+                    status_code=response.status_code,
+                    response_text=None,
+                    outcome_unknown=True,
+                    message=(
+                        f"Mem0 upstream {method} {path} returned an "
+                        "undecodable success response"
+                    ),
+                ) from exc
             LOGGER.info(
                 "mem0_upstream_request_completed",
                 extra=self._log_extra(
@@ -157,7 +187,6 @@ class Mem0RestClient:
                     duration_ms=duration_ms,
                 ),
             )
-            data = response.json()
             if isinstance(data, dict):
                 return data
             return {"results": data}

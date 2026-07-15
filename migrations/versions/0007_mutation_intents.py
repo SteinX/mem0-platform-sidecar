@@ -100,6 +100,25 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
+    if bind.dialect.name == "sqlite":
+        bind.execute(
+            sa.text(
+                """
+                UPDATE mutation_intents
+                SET updated_at = updated_at
+                WHERE 0 = 1
+                """
+            )
+        )
+    elif bind.dialect.name == "postgresql":
+        bind.execute(
+            sa.text(
+                """
+                LOCK TABLE mutation_intents, mutation_intent_targets
+                IN ACCESS EXCLUSIVE MODE
+                """
+            )
+        )
     unresolved_count = int(
         bind.scalar(
             sa.text(

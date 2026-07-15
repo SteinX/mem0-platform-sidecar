@@ -769,6 +769,78 @@ def _seed_interrupted_compatibility_artifacts(engine) -> None:
         )
 
 
+def _convert_ready_artifacts_to_exact_b502a26_legacy(engine) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                ALTER TABLE _compat_0005_request_trace_fields
+                RENAME TO _ready_0005_request_trace_fields
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE _compat_0005_request_trace_fields (
+                    event_id VARCHAR(36) PRIMARY KEY,
+                    app_id VARCHAR(256), user_id VARCHAR(256),
+                    agent_id VARCHAR(256), run_id VARCHAR(256),
+                    correlation_id VARCHAR(256), latency_ms DOUBLE PRECISION,
+                    result_count BIGINT NOT NULL, has_results INTEGER NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO _compat_0005_request_trace_fields (
+                    event_id, app_id, user_id, agent_id, run_id,
+                    correlation_id, latency_ms, result_count, has_results
+                )
+                SELECT
+                    event_id, app_id, user_id, agent_id, run_id,
+                    correlation_id, latency_ms, result_count, has_results
+                FROM _ready_0005_request_trace_fields
+                WHERE snapshot_kind = 'DATA'
+                """
+            )
+        )
+        connection.execute(text("DROP TABLE _ready_0005_request_trace_fields"))
+        connection.execute(
+            text(
+                """
+                ALTER TABLE _compat_0006_entity_projection_scope
+                RENAME TO _ready_0006_entity_projection_scope
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE _compat_0006_entity_projection_scope (
+                    entity_id VARCHAR(36) PRIMARY KEY,
+                    app_id VARCHAR(256) NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO _compat_0006_entity_projection_scope (
+                    entity_id, app_id
+                )
+                SELECT entity_id, app_id
+                FROM _ready_0006_entity_projection_scope
+                WHERE snapshot_kind = 'DATA'
+                """
+            )
+        )
+        connection.execute(text("DROP TABLE _ready_0006_entity_projection_scope"))
+
+
 def _run(database_url: str) -> None:
     config = _alembic_config(database_url)
     engine = create_engine(database_url, pool_pre_ping=True)
@@ -781,6 +853,7 @@ def _run(database_url: str) -> None:
         _verify_intent_downgrade_guard(engine, config)
         _seed_interrupted_compatibility_artifacts(engine)
         _downgrade(config, "0004_memory_explorer_indexes")
+        _convert_ready_artifacts_to_exact_b502a26_legacy(engine)
         _verify_downgraded_0004(engine)
         _migrate(config, "head")
         _verify_head(engine)
@@ -811,9 +884,10 @@ def main() -> int:
             connection.execute(text(f"CREATE DATABASE {quoted_database}"))
         _run(_database_url(maintenance_url, database_name))
         print(
-            "PostgreSQL smoke passed: 0004->head, interruption-safe exact "
-            "downgrade/re-upgrade, 0007 unresolved-intent refusal, ORM/data "
-            "checks, update/delete and reconcile/delete serialization"
+            "PostgreSQL smoke passed: 0004->head, interruption-safe and "
+            "b502a26-legacy exact downgrade/re-upgrade, 0007 locked "
+            "unresolved-intent refusal, ORM/data checks, update/delete and "
+            "reconcile/delete serialization"
         )
     finally:
         with maintenance_engine.connect() as connection:

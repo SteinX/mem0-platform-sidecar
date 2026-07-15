@@ -2,12 +2,13 @@ import asyncio
 import json
 from typing import Any
 
+import httpx
 import pytest
 from sqlalchemy import select, text
 
 from mem0_sidecar.core.entities import EntityService
 from mem0_sidecar.core.memory_ops import MemoryService, MutationConflictError
-from mem0_sidecar.mem0_client.client import Mem0UpstreamError
+from mem0_sidecar.mem0_client.client import Mem0RestClient, Mem0UpstreamError
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base, Entity, Event, MemoryIndex, MutationIntent
 from mem0_sidecar.store.repositories import (
@@ -94,6 +95,103 @@ class _StatefulRecoveryClient:
     async def list_memories(self, params: dict[str, Any]) -> dict[str, Any]:
         self.list_calls += 1
         return {"results": list(self.records.values()), "total": len(self.records)}
+
+
+class _RealHttpOutcomeClient:
+    """Stateful upstream exercised through the production REST client."""
+
+    def __init__(self, *, operation: str, failure_kind: str) -> None:
+        self.operation = operation
+        self.failure_kind = failure_kind
+        self.failure_injected = False
+        self.records: dict[str, dict[str, Any]] = {}
+        self.write_calls: list[tuple[str, str]] = []
+        self.read_calls: list[tuple[str, str]] = []
+        self.client = Mem0RestClient(
+            base_url="http://mem0.local",
+            transport=httpx.MockTransport(self._handler),
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.client, name)
+
+    def _lost_response(self, request: httpx.Request) -> httpx.Response:
+        self.failure_injected = True
+        if self.failure_kind == "read-timeout":
+            raise httpx.ReadTimeout("response timed out", request=request)
+        if self.failure_kind == "disconnect":
+            raise httpx.RemoteProtocolError(
+                "peer disconnected before response",
+                request=request,
+            )
+        assert self.failure_kind == "invalid-json"
+        return httpx.Response(
+            200,
+            content=b"not-json sk-response-body-secret",
+            headers={"content-type": "application/json"},
+        )
+
+    def _should_lose_response(self, operation: str) -> bool:
+        if operation != self.operation or self.failure_injected:
+            return False
+        if operation == "entity":
+            return len(self.write_calls) == 2
+        return True
+
+    async def _handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/memories":
+            payload = json.loads(request.content)
+            memory_id = "added-http"
+            self.records[memory_id] = {
+                "id": memory_id,
+                "memory": payload["text"],
+                "user_id": payload.get("user_id"),
+                "app_id": payload.get("app_id"),
+                "metadata": dict(payload.get("metadata") or {}),
+            }
+            self.write_calls.append(("POST", path))
+            if self._should_lose_response("add"):
+                return self._lost_response(request)
+            return httpx.Response(200, json=dict(self.records[memory_id]))
+
+        if request.method == "GET" and path == "/memories":
+            self.read_calls.append(("GET", path))
+            return httpx.Response(
+                200,
+                json={
+                    "results": list(self.records.values()),
+                    "total": len(self.records),
+                },
+            )
+
+        assert path.startswith("/memories/")
+        memory_id = path.removeprefix("/memories/")
+        if request.method == "GET":
+            self.read_calls.append(("GET", path))
+            record = self.records.get(memory_id)
+            if record is None:
+                return httpx.Response(404, json={"detail": "not found"})
+            return httpx.Response(200, json=dict(record))
+
+        if request.method == "PUT":
+            payload = json.loads(request.content)
+            record = self.records[memory_id]
+            if "text" in payload:
+                record["memory"] = payload["text"]
+            if "metadata" in payload:
+                record["metadata"] = dict(payload["metadata"] or {})
+            self.write_calls.append(("PUT", path))
+            if self._should_lose_response("update"):
+                return self._lost_response(request)
+            return httpx.Response(200, json={"id": memory_id, "updated": True})
+
+        assert request.method == "DELETE"
+        self.records.pop(memory_id, None)
+        self.write_calls.append(("DELETE", path))
+        if self._should_lose_response(self.operation):
+            return self._lost_response(request)
+        return httpx.Response(200, json={"id": memory_id, "deleted": True})
 
 
 def _session_factory(tmp_path):
@@ -287,6 +385,64 @@ async def test_known_upstream_500_is_terminal_and_never_replayed(
         )
     assert delete_attempts == 1
     assert "memory-one" in client.records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["read-timeout", "disconnect", "invalid-json"],
+)
+@pytest.mark.parametrize("operation", ["add", "update", "delete", "entity"])
+async def test_real_http_lost_response_is_unknown_then_converges_by_reads_only(
+    tmp_path,
+    operation: str,
+    failure_kind: str,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _RealHttpOutcomeClient(
+        operation=operation,
+        failure_kind=failure_kind,
+    )
+    if operation in {"update", "delete"}:
+        _seed_memory(factory, client, "memory-one")
+    elif operation == "entity":
+        _seed_memory(factory, client, "entity-one")
+        _seed_memory(factory, client, "entity-two")
+
+    with pytest.raises(Mem0UpstreamError) as exc_info:
+        await _invoke_mutation(factory, client, operation)
+
+    assert exc_info.value.outcome_unknown is True
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    writes_after_lost_response = list(client.write_calls)
+    if operation == "entity":
+        with factory() as session:
+            local_deleted_at = list(
+                session.scalars(
+                    select(MemoryIndex.deleted_at).order_by(
+                        MemoryIndex.mem0_memory_id
+                    )
+                )
+            )
+        assert local_deleted_at == [None, None]
+
+    result = await _recover(factory, client)
+
+    assert result == {"recovered": 1, "failed": 0}
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.write_calls == writes_after_lost_response
+    assert len(client.write_calls) == (2 if operation == "entity" else 1)
+    assert client.read_calls
+    with factory() as session:
+        active = list(
+            session.scalars(
+                select(MemoryIndex).where(MemoryIndex.deleted_at.is_(None))
+            )
+        )
+    if operation in {"delete", "entity"}:
+        assert active == []
+    else:
+        assert len(active) == 1
 
 
 @pytest.mark.asyncio

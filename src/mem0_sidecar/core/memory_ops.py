@@ -559,6 +559,14 @@ def _is_upstream_not_found(exc: Exception) -> bool:
     return isinstance(exc, Mem0UpstreamError) and exc.status_code == 404
 
 
+def _is_ambiguous_upstream_failure(exc: Exception) -> bool:
+    if isinstance(exc, MemoryUpstreamProtocolError):
+        return True
+    if not isinstance(exc, Mem0UpstreamError):
+        return False
+    return bool(getattr(exc, "outcome_unknown", exc.status_code is None))
+
+
 def _effective_request_app_id(
     session: Session,
     *,
@@ -784,17 +792,19 @@ class MemoryService:
                 failed += 1
 
         self.session.rollback()
+        ProjectRepository(self.session).lock_for_mutation(project_id)
         blockers = MutationIntentRepository(self.session).list_blocking(
             project_id,
             app_id,
         )
-        self.session.rollback()
+        blocking_statuses = {intent.status for intent in blockers}
         if blockers:
-            if any(intent.status == "EXHAUSTED" for intent in blockers):
+            self.session.rollback()
+            if "EXHAUSTED" in blocking_statuses:
                 raise MutationConflictError(
                     "Scoped mutation recovery is exhausted and remains unresolved"
                 )
-            if any(intent.status == "ACTIVE" for intent in blockers):
+            if "ACTIVE" in blocking_statuses:
                 raise MutationConflictError(
                     "Scoped mutation recovery is already in progress"
                 )
@@ -1149,9 +1159,11 @@ class MemoryService:
                 request_fingerprint=request_fingerprint,
             )
         self.session.commit()
+        upstream_attempted = False
         upstream_completed = False
         try:
             ProjectRepository(self.session).lock_for_mutation(project_id)
+            upstream_attempted = True
             memory_response = await self.mem0.add_memory(oss_payload)
             upstream_completed = True
             memory_ids = extract_memory_ids(memory_response)
@@ -1192,7 +1204,12 @@ class MemoryService:
                 intent.id,
                 exc,
                 outcome_unknown=(
-                    not isinstance(exc, Exception) or upstream_completed
+                    not isinstance(exc, Exception)
+                    or upstream_completed
+                    or (
+                        upstream_attempted
+                        and _is_ambiguous_upstream_failure(exc)
+                    )
                 ),
                 mark_event_failed=isinstance(exc, Exception),
             )
@@ -1476,6 +1493,7 @@ class MemoryService:
             memory_ids=[memory_id],
         )
         self.session.commit()
+        upstream_attempted = False
         upstream_completed = False
         try:
             ProjectRepository(self.session).lock_for_mutation(project_id)
@@ -1487,6 +1505,7 @@ class MemoryService:
             if memory is None:
                 raise KeyError(memory_id)
             try:
+                upstream_attempted = True
                 update_response = await self.mem0.update_memory(memory_id, patch)
                 upstream_completed = True
             except ValueError as exc:
@@ -1550,7 +1569,12 @@ class MemoryService:
                 intent.id,
                 exc,
                 outcome_unknown=(
-                    not isinstance(exc, Exception) or upstream_completed
+                    not isinstance(exc, Exception)
+                    or upstream_completed
+                    or (
+                        upstream_attempted
+                        and _is_ambiguous_upstream_failure(exc)
+                    )
                 ),
                 mark_event_failed=isinstance(exc, Exception),
             )
@@ -1810,6 +1834,7 @@ class MemoryService:
             memory_ids=[memory_id],
         )
         self.session.commit()
+        upstream_attempted = False
         upstream_completed = False
         try:
             ProjectRepository(self.session).lock_for_mutation(project_id)
@@ -1820,6 +1845,7 @@ class MemoryService:
             )
             if memory is None:
                 raise KeyError(memory_id)
+            upstream_attempted = True
             response = await self.mem0.delete_memory(memory_id)
             upstream_completed = True
             memory_repo.delete_memory(
@@ -1860,7 +1886,12 @@ class MemoryService:
                 intent.id,
                 exc,
                 outcome_unknown=(
-                    not isinstance(exc, Exception) or upstream_completed
+                    not isinstance(exc, Exception)
+                    or upstream_completed
+                    or (
+                        upstream_attempted
+                        and _is_ambiguous_upstream_failure(exc)
+                    )
                 ),
                 mark_event_failed=isinstance(exc, Exception),
             )

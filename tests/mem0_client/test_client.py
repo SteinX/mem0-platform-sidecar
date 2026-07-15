@@ -334,6 +334,7 @@ async def test_mem0_client_logs_and_raises_upstream_error(caplog) -> None:
     assert error.path == "/search"
     assert error.status_code == 503
     assert error.response_text == "backend warming up"
+    assert error.outcome_unknown is False
     assert any(
         record.message == "mem0_upstream_request_failed"
         and record.method == "POST"
@@ -342,3 +343,58 @@ async def test_mem0_client_logs_and_raises_upstream_error(caplog) -> None:
         and record.error_type == "HTTPStatusError"
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        httpx.ReadTimeout("response timed out"),
+        httpx.RemoteProtocolError("peer disconnected before response"),
+    ],
+)
+async def test_mem0_client_classifies_statusless_response_loss_as_ambiguous(
+    transport_error: httpx.RequestError,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        transport_error.request = request
+        raise transport_error
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(client_module.Mem0UpstreamError) as exc_info:
+        await client.delete_memory("mem-1")
+
+    error = exc_info.value
+    assert error.status_code is None
+    assert error.outcome_unknown is True
+
+
+@pytest.mark.asyncio
+async def test_mem0_client_wraps_2xx_invalid_json_as_ambiguous_without_body_leak(
+) -> None:
+    secret_body = "not-json sk-response-body-secret"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=secret_body,
+            headers={"content-type": "application/json"},
+        )
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(client_module.Mem0UpstreamError) as exc_info:
+        await client.update_memory("mem-1", {"text": "updated"})
+
+    error = exc_info.value
+    assert error.status_code == 200
+    assert error.outcome_unknown is True
+    assert error.response_text is None
+    assert secret_body not in str(error)
