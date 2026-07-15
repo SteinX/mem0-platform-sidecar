@@ -129,3 +129,12 @@ Continuous review 1 re-review fix wave: complete at a58e6aa (2 P1 and 2 P2 fixed
 - Acceptance: full 943 passed/5 skipped/1 known warning; focused recovery/route/repository/migration/opaque-ID/serialization gates; Ruff/diff/secret scan clean; fresh applied overlay typecheck plus proxy 42/category 12/editor 9/query 11/components 11/memory 11/trace 5; retained PostgreSQL migration/guard/serialization smoke passed.
 - Aggregate Compose: one bounded run stopped before service startup on Docker Buildx `panic: send on closed channel`; exact project cleanup independently proved zero containers/networks/volumes/images/processes, so no retry per brief.
 - Report: `.superpowers/sdd/continuous-review-1-rereview-fix-report.md`.
+
+Continuous review 1 re-review 2 fix wave: complete at 6c4dfac (1 P1 and 3 P2 fixed; 2 P3 intentionally unchanged)
+- P1: explicit upstream outcome classification makes status-less read/transport loss and undecodable 2xx responses UNKNOWN for add/update/delete/entity delete; stateful real-HTTP tests prove GET-only convergence, local rollback, no body leak, and no write replay.
+- P2 recovery: after recovery, the service reacquires and retains the Project lock through the caller's Event/intent/target commit; a real two-session SQLite gap test prevents a competing ACTIVE intent from being stranded.
+- P2 legacy upgrades: 0005/0006 accept only exact READY or exact b502a26 legacy schemas, restore safe non-empty snapshots, allow new source rows to receive normal defaults, and reject ambiguous empty/orphan/partial/superset/constraint-lookalike artifacts before destructive work.
+- P2 downgrade atomicity: SQLite obtains a RESERVED write lock before the unresolved count, and PostgreSQL locks parent/target tables ACCESS EXCLUSIVE before the count and drops; both real SQLite orderings and retained PostgreSQL smoke passed.
+- Acceptance: focused 575 passed; full 971 passed/5 skipped/1 known warning; Ruff/diff/secret scan clean; final PostgreSQL smoke passed; fresh applied overlay typecheck plus proxy 42/category 12/editor 9/query 11/components 11/memory 11/trace 5 passed.
+- Aggregate Compose: PostgreSQL smoke, live OSS 11, and adoption 1 passed; browser smoke timed out waiting for Memory details while the July/August date popover remained open and no detail fetch fired. No retry or frontend change per brief. Exact project cleanup proved zero containers/networks/volumes/images/processes/temp directories.
+- Report: `.superpowers/sdd/continuous-review-1-rereview-2-fix-report.md`.
