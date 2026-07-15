@@ -138,3 +138,10 @@ Continuous review 1 re-review 2 fix wave: complete at 6c4dfac (1 P1 and 3 P2 fix
 - Acceptance: focused 575 passed; full 971 passed/5 skipped/1 known warning; Ruff/diff/secret scan clean; final PostgreSQL smoke passed; fresh applied overlay typecheck plus proxy 42/category 12/editor 9/query 11/components 11/memory 11/trace 5 passed.
 - Aggregate Compose: PostgreSQL smoke, live OSS 11, and adoption 1 passed; browser smoke timed out waiting for Memory details while the July/August date popover remained open and no detail fetch fired. No retry or frontend change per brief. Exact project cleanup proved zero containers/networks/volumes/images/processes/temp directories.
 - Report: `.superpowers/sdd/continuous-review-1-rereview-2-fix-report.md`.
+
+Continuous review 1 re-review 3 fix wave: complete at c7e4c39 (2 P2 fixed; 2 P3 intentionally unchanged)
+- P2 outcome ambiguity: every ordinary `response.json()` exception, including deeply nested valid JSON `RecursionError`, is wrapped body-free as UNKNOWN; after an upstream await begins, only exact explicit `Mem0UpstreamError(outcome_unknown=False)` remains terminal. Add/update/delete/entity delete converge through reads only with unchanged write counts; pre-attempt lock failures remain terminal.
+- P2 legacy exactness: 0005/0006 require ordered dialect-specific reflected names, exact types/lengths, nullability/defaults, PK order, and no unexpected indexes/unique/FK/check objects. SQLite PRAGMA inspection closes the inline-UNIQUE blind spot; retained PostgreSQL exact legacy downgrade/re-upgrade passes.
+- Acceptance: focused 251 passed; full 993 passed/5 skipped/1 known warning; Ruff/diff/secret scan clean; retained PostgreSQL migration/guard/serialization smoke passed.
+- Aggregate Compose/browser was not rerun because this wave has no frontend diff, as required by the brief. The prior browser concern remains recorded and was not weakened.
+- Report: `.superpowers/sdd/continuous-review-1-rereview-3-fix-report.md`.
