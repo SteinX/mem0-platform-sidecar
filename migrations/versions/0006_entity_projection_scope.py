@@ -32,6 +32,7 @@ COMPATIBILITY_COLUMNS = {
     "snapshot_kind",
     "snapshot_row_count",
 }
+LEGACY_COMPATIBILITY_COLUMNS = {"entity_id", "app_id"}
 
 
 def _compatibility_table_exists() -> bool | None:
@@ -49,7 +50,7 @@ def _validate_compatibility_snapshot(
         column["name"]
         for column in sa.inspect(bind).get_columns(COMPATIBILITY_TABLE)
     }
-    if not COMPATIBILITY_COLUMNS.issubset(columns):
+    if columns != COMPATIBILITY_COLUMNS:
         raise RuntimeError("invalid 0006 compatibility snapshot structure")
     counts = bind.execute(
         sa.text(
@@ -84,6 +85,85 @@ def _validate_compatibility_snapshot(
     if not require_ready and ready_rows:
         raise RuntimeError("invalid 0006 compatibility snapshot staging state")
     return data_rows
+
+
+def _validate_legacy_compatibility_snapshot() -> int:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    column_rows = inspector.get_columns(COMPATIBILITY_TABLE)
+    columns = {column["name"]: column for column in column_rows}
+    exact_structure = (
+        set(columns) == LEGACY_COMPATIBILITY_COLUMNS
+        and inspector.get_pk_constraint(COMPATIBILITY_TABLE).get(
+            "constrained_columns"
+        )
+        == ["entity_id"]
+        and isinstance(columns["entity_id"]["type"], sa.String)
+        and columns["entity_id"]["type"].length == 36
+        and isinstance(columns["app_id"]["type"], sa.String)
+        and columns["app_id"]["type"].length == 256
+        and columns["app_id"]["nullable"] is False
+        and all(column.get("default") is None for column in column_rows)
+    )
+    if not exact_structure:
+        raise RuntimeError("invalid 0006 compatibility snapshot structure")
+    counts = bind.execute(
+        sa.text(
+            f"""
+            SELECT
+                COUNT(*) AS snapshot_rows,
+                COUNT(entity_id) AS nonnull_ids,
+                COUNT(DISTINCT entity_id) AS distinct_ids,
+                COUNT(app_id) AS nonnull_app_ids
+            FROM {COMPATIBILITY_TABLE}
+            """
+        )
+    ).mappings().one()
+    snapshot_rows = int(counts["snapshot_rows"] or 0)
+    if (
+        int(counts["nonnull_ids"] or 0) != snapshot_rows
+        or int(counts["distinct_ids"] or 0) != snapshot_rows
+        or int(counts["nonnull_app_ids"] or 0) != snapshot_rows
+    ):
+        raise RuntimeError("invalid 0006 legacy compatibility snapshot content")
+    source_rows = int(bind.scalar(sa.text("SELECT COUNT(*) FROM entities")) or 0)
+    if snapshot_rows == 0:
+        if source_rows:
+            raise RuntimeError(
+                "ambiguous empty 0006 legacy compatibility snapshot"
+            )
+        return 0
+    matched_rows = int(
+        bind.scalar(
+            sa.text(
+                f"""
+                SELECT COUNT(*)
+                FROM {COMPATIBILITY_TABLE} AS compat
+                JOIN entities ON entities.id = compat.entity_id
+                """
+            )
+        )
+        or 0
+    )
+    if matched_rows != snapshot_rows:
+        raise RuntimeError("invalid 0006 legacy compatibility snapshot content")
+    return snapshot_rows
+
+
+def _compatibility_snapshot_format() -> str | None:
+    if _compatibility_table_exists() is not True:
+        return None
+    columns = {
+        column["name"]
+        for column in sa.inspect(op.get_bind()).get_columns(COMPATIBILITY_TABLE)
+    }
+    if columns == COMPATIBILITY_COLUMNS:
+        _validate_compatibility_snapshot()
+        return "ready"
+    if columns == LEGACY_COMPATIBILITY_COLUMNS:
+        _validate_legacy_compatibility_snapshot()
+        return "legacy"
+    raise RuntimeError("invalid 0006 compatibility snapshot structure")
 
 
 def _rebuild_compatibility_snapshot() -> None:
@@ -128,8 +208,7 @@ def _rebuild_compatibility_snapshot() -> None:
 
 
 def upgrade() -> None:
-    if _compatibility_table_exists() is True:
-        _validate_compatibility_snapshot()
+    snapshot_format = _compatibility_snapshot_format()
     op.add_column(
         "entities",
         sa.Column("app_id", sa.String(length=256), nullable=True),
@@ -149,7 +228,12 @@ def upgrade() -> None:
             """
         )
     )
-    if _compatibility_table_exists():
+    if snapshot_format is not None:
+        data_predicate = (
+            "AND compat.snapshot_kind = 'DATA'"
+            if snapshot_format == "ready"
+            else ""
+        )
         op.execute(
             sa.text(
                 f"""
@@ -158,15 +242,15 @@ def upgrade() -> None:
                     SELECT compat.app_id
                     FROM {COMPATIBILITY_TABLE} AS compat
                 WHERE compat.entity_id = entities.id
-                  AND compat.snapshot_kind = 'DATA'
+                  {data_predicate}
                 )
                 WHERE EXISTS (
                     SELECT 1
                     FROM {COMPATIBILITY_TABLE} AS compat
                     WHERE compat.entity_id = entities.id
-                      AND compat.snapshot_kind = 'DATA'
+                      {data_predicate}
                 )
-                """
+                """.format(data_predicate=data_predicate)
             )
         )
     op.execute(

@@ -223,6 +223,16 @@ def _safe_upstream_status_code(exc: Exception) -> int | None:
     return status_code
 
 
+def _safe_outcome_unknown(exc: Exception) -> bool:
+    if type(exc) is not Mem0UpstreamError:
+        return False
+    try:
+        outcome_unknown = object.__getattribute__(exc, "outcome_unknown")
+    except BaseException:
+        return _safe_upstream_status_code(exc) is None
+    return outcome_unknown is True
+
+
 def _safe_delete_error(exc: Exception) -> dict[str, Any]:
     safe: dict[str, Any] = {
         "error_type": (
@@ -414,6 +424,8 @@ class EntityService:
                     await self.mem0.delete_memory(memory_id)
                     upstream_effect_observed = True
                 except Exception as exc:
+                    if _safe_outcome_unknown(exc):
+                        raise
                     if not (
                         isinstance(exc, Mem0UpstreamError)
                         and _safe_upstream_status_code(exc) == 404
@@ -483,6 +495,7 @@ class EntityService:
                     not isinstance(exc, Exception)
                     or upstream_completed
                     or upstream_effect_observed
+                    or _safe_outcome_unknown(exc)
                 ),
                 mark_event_failed=isinstance(exc, Exception),
             )

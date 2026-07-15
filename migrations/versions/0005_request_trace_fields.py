@@ -60,6 +60,10 @@ COMPATIBILITY_COLUMNS = {
     "snapshot_kind",
     "snapshot_row_count",
 }
+LEGACY_COMPATIBILITY_COLUMNS = COMPATIBILITY_COLUMNS - {
+    "snapshot_kind",
+    "snapshot_row_count",
+}
 SOURCE_COLUMNS = COMPATIBILITY_COLUMNS - {
     "event_id",
     "snapshot_kind",
@@ -82,7 +86,7 @@ def _validate_compatibility_snapshot(
         column["name"]
         for column in sa.inspect(bind).get_columns(COMPATIBILITY_TABLE)
     }
-    if not COMPATIBILITY_COLUMNS.issubset(columns):
+    if columns != COMPATIBILITY_COLUMNS:
         raise RuntimeError("invalid 0005 compatibility snapshot structure")
     counts = bind.execute(
         sa.text(
@@ -117,6 +121,96 @@ def _validate_compatibility_snapshot(
     if not require_ready and ready_rows:
         raise RuntimeError("invalid 0005 compatibility snapshot staging state")
     return data_rows
+
+
+def _validate_legacy_compatibility_snapshot() -> int:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    column_rows = inspector.get_columns(COMPATIBILITY_TABLE)
+    columns = {column["name"]: column for column in column_rows}
+    string_lengths = {
+        "event_id": 36,
+        "app_id": 256,
+        "user_id": 256,
+        "agent_id": 256,
+        "run_id": 256,
+        "correlation_id": 256,
+    }
+    exact_structure = (
+        set(columns) == LEGACY_COMPATIBILITY_COLUMNS
+        and inspector.get_pk_constraint(COMPATIBILITY_TABLE).get(
+            "constrained_columns"
+        )
+        == ["event_id"]
+        and all(
+            isinstance(columns[name]["type"], sa.String)
+            and columns[name]["type"].length == length
+            for name, length in string_lengths.items()
+        )
+        and isinstance(columns["latency_ms"]["type"], sa.Float)
+        and isinstance(columns["result_count"]["type"], sa.BigInteger)
+        and isinstance(columns["has_results"]["type"], sa.Integer)
+        and columns["result_count"]["nullable"] is False
+        and columns["has_results"]["nullable"] is False
+        and all(column.get("default") is None for column in column_rows)
+    )
+    if not exact_structure:
+        raise RuntimeError("invalid 0005 compatibility snapshot structure")
+    counts = bind.execute(
+        sa.text(
+            f"""
+            SELECT
+                COUNT(*) AS snapshot_rows,
+                COUNT(event_id) AS nonnull_ids,
+                COUNT(DISTINCT event_id) AS distinct_ids
+            FROM {COMPATIBILITY_TABLE}
+            """
+        )
+    ).mappings().one()
+    snapshot_rows = int(counts["snapshot_rows"] or 0)
+    if (
+        int(counts["nonnull_ids"] or 0) != snapshot_rows
+        or int(counts["distinct_ids"] or 0) != snapshot_rows
+    ):
+        raise RuntimeError("invalid 0005 legacy compatibility snapshot content")
+    source_rows = int(bind.scalar(sa.text("SELECT COUNT(*) FROM events")) or 0)
+    if snapshot_rows == 0:
+        if source_rows:
+            raise RuntimeError(
+                "ambiguous empty 0005 legacy compatibility snapshot"
+            )
+        return 0
+    matched_rows = int(
+        bind.scalar(
+            sa.text(
+                f"""
+                SELECT COUNT(*)
+                FROM {COMPATIBILITY_TABLE} AS compat
+                JOIN events ON events.id = compat.event_id
+                """
+            )
+        )
+        or 0
+    )
+    if matched_rows != snapshot_rows:
+        raise RuntimeError("invalid 0005 legacy compatibility snapshot content")
+    return snapshot_rows
+
+
+def _compatibility_snapshot_format() -> str | None:
+    if _compatibility_table_exists() is not True:
+        return None
+    columns = {
+        column["name"]
+        for column in sa.inspect(op.get_bind()).get_columns(COMPATIBILITY_TABLE)
+    }
+    if columns == COMPATIBILITY_COLUMNS:
+        _validate_compatibility_snapshot()
+        return "ready"
+    if columns == LEGACY_COMPATIBILITY_COLUMNS:
+        _validate_legacy_compatibility_snapshot()
+        return "legacy"
+    raise RuntimeError("invalid 0005 compatibility snapshot structure")
 
 
 def _rebuild_compatibility_snapshot() -> None:
@@ -173,15 +267,20 @@ def _rebuild_compatibility_snapshot() -> None:
     _validate_compatibility_snapshot(expected_source_rows=source_rows)
 
 
-def _restore_downgraded_trace_fields() -> None:
-    if _compatibility_table_exists() is not True:
+def _restore_downgraded_trace_fields(snapshot_format: str | None) -> None:
+    if snapshot_format is None:
         return
+    data_predicate = (
+        "AND compat.snapshot_kind = 'DATA'"
+        if snapshot_format == "ready"
+        else ""
+    )
     assignments = ",\n".join(
         f"""{field_name} = (
                 SELECT compat.{field_name}
                 FROM {COMPATIBILITY_TABLE} AS compat
                 WHERE compat.event_id = events.id
-                  AND compat.snapshot_kind = 'DATA'
+                  {data_predicate}
             )"""
         for field_name in (
             "app_id",
@@ -203,7 +302,7 @@ def _restore_downgraded_trace_fields() -> None:
                 SELECT 1
                 FROM {COMPATIBILITY_TABLE} AS compat
                 WHERE compat.event_id = events.id
-                  AND compat.snapshot_kind = 'DATA'
+                  {data_predicate}
             )
             """
         )
@@ -211,8 +310,7 @@ def _restore_downgraded_trace_fields() -> None:
 
 
 def upgrade() -> None:
-    if _compatibility_table_exists() is True:
-        _validate_compatibility_snapshot()
+    snapshot_format = _compatibility_snapshot_format()
     op.add_column(
         "events",
         sa.Column("app_id", sa.String(length=256), nullable=True),
@@ -248,7 +346,7 @@ def upgrade() -> None:
             server_default=sa.text("0"),
         ),
     )
-    _restore_downgraded_trace_fields()
+    _restore_downgraded_trace_fields(snapshot_format)
     for name, columns in REQUEST_TRACE_INDEXES:
         op.create_index(name, "events", columns, unique=False)
     if _compatibility_table_exists():
