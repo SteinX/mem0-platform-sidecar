@@ -28,6 +28,7 @@ from mem0_sidecar.store.models import Event, EventStatus, MemoryIndex, Project
 from mem0_sidecar.store.repositories import (
     EventRepository,
     MemoryIndexRepository,
+    MutationIntentRepository,
     ProjectRepository,
 )
 
@@ -551,6 +552,68 @@ def test_route_scoped_add_rejects_invalid_app_before_any_mutation(
     assert project is not None
     assert project.default_app_id == "app-good"
     assert event_count == 0
+
+
+@pytest.mark.parametrize("invalid_key", ["", "contains space", "x" * 129])
+def test_route_scoped_add_rejects_invalid_idempotency_key_before_bootstrap(
+    tmp_path,
+    invalid_key: str,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+
+    response = TestClient(app).post(
+        "/v3/memories/add/",
+        headers={"Idempotency-Key": invalid_key},
+        json={
+            "project_id": "repo-new",
+            "app_id": "app-new",
+            "text": "must not be sent",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith(
+        "Idempotency-Key must be a visible ASCII value"
+    )
+    assert mem0.add_payloads == []
+    with app.state.session_factory() as session:
+        assert session.get(Project, "repo-new") is None
+        assert session.scalar(select(func.count()).select_from(Event)) == 0
+
+
+def test_route_scoped_add_reuses_completed_result_for_same_idempotency_key(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+    request = {
+        "headers": {"Idempotency-Key": "logical-add-one"},
+        "json": {"text": "hello", "app_id": "app-a"},
+    }
+
+    first = client.post("/v3/memories/add/", **request)
+    second = client.post("/v3/memories/add/", **request)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert len(mem0.add_payloads) == 1
 
 
 def test_route_scoped_add_accepts_256_character_app_id(tmp_path) -> None:
@@ -1191,6 +1254,81 @@ def test_query_memories_unknown_project_without_app_is_404_and_not_bootstrapped(
     assert response.status_code == 404
     with app.state.session_factory() as session:
         assert session.get(Project, "repo-z") is None
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        (
+            "POST",
+            "/v3/memories/add?project_id=repo-a&app_id=app-a",
+            {"text": "blocked"},
+        ),
+        (
+            "PATCH",
+            "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
+            {"text": "after"},
+        ),
+        (
+            "DELETE",
+            "/v1/memories/mem-1?project_id=repo-a&app_id=app-a",
+            None,
+        ),
+        (
+            "DELETE",
+            "/v1/entities/user/alice?project_id=repo-a&app_id=app-a",
+            None,
+        ),
+    ],
+)
+def test_unresolved_mutation_scope_maps_to_conflict_without_upstream_write(
+    tmp_path,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+) -> None:
+    mem0 = ExplorerRouteMem0Client(
+        {"mem-1": {"id": "mem-1", "memory": "before", "metadata": {}}}
+    )
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-1")
+    with app.state.session_factory() as session:
+        event = EventRepository(session).create_event(
+            project_id="repo-a",
+            app_id="app-a",
+            operation="memory.add",
+            request={},
+            subject_type="memory",
+        )
+        intent = MutationIntentRepository(session).create(
+            project_id="repo-a",
+            app_id="app-a",
+            event_id=event.id,
+            operation="memory.add",
+            payload={},
+        )
+        intent.status = "UNKNOWN"
+        intent.lease_expires_at = None
+        session.commit()
+
+    response = TestClient(app, raise_server_exceptions=False).request(
+        method,
+        path,
+        json=body,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"].endswith("remains unresolved")
+    assert mem0.add_payloads == []
+    assert mem0.update_calls == []
+    assert mem0.deleted_ids == []
 
 
 @pytest.mark.parametrize("method", ["get", "patch", "history", "delete"])

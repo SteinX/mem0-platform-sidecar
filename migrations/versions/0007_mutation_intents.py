@@ -14,6 +14,7 @@ revision: str = "0007_mutation_intents"
 down_revision: str | None = "0006_entity_projection_scope"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+TERMINAL_INTENT_STATUSES = ("COMPLETED", "FAILED", "PARTIAL")
 
 
 def upgrade() -> None:
@@ -34,11 +35,12 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("operation", sa.String(length=128), nullable=False),
+        sa.Column("operation_key", sa.String(length=64), nullable=False),
         sa.Column(
             "status",
             sa.String(length=32),
             nullable=False,
-            server_default="PENDING",
+            server_default="ACTIVE",
         ),
         sa.Column("payload_json", sa.Text(), nullable=False, server_default="{}"),
         sa.Column("result_json", sa.Text(), nullable=False, server_default="{}"),
@@ -48,6 +50,13 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.UniqueConstraint(
+            "project_id",
+            "app_id",
+            "operation",
+            "operation_key",
+            name="uq_mutation_intents_scope_operation_key",
+        ),
     )
     op.create_index(
         "ix_mutation_intents_scope_status_created",
@@ -90,6 +99,24 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    unresolved_count = int(
+        bind.scalar(
+            sa.text(
+                """
+                SELECT COUNT(*)
+                FROM mutation_intents
+                WHERE status NOT IN ('COMPLETED', 'FAILED', 'PARTIAL')
+                """
+            )
+        )
+        or 0
+    )
+    if unresolved_count:
+        raise RuntimeError(
+            "cannot downgrade 0007 while nonterminal mutation intents remain; "
+            "recover or explicitly terminalize them first"
+        )
     op.drop_index(
         "ix_mutation_intent_targets_intent_status_ordinal",
         table_name="mutation_intent_targets",

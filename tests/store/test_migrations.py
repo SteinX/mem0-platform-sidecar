@@ -901,3 +901,355 @@ def test_phase2_head_rows_survive_0004_downgrade_and_reupgrade_exactly(
     ]
     assert "_compat_0005_request_trace_fields" not in tables
     assert "_compat_0006_entity_projection_scope" not in tables
+
+
+def test_request_trace_downgrade_rebuilds_interrupted_empty_snapshot(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'trace-interruption.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0005_request_trace_fields")
+    engine = sa.create_engine(database_url, future=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, default_app_id, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'app-a', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO events (
+                    id, project_id, app_id, user_id, agent_id, run_id,
+                    operation, status, request_json, response_json, error_json,
+                    correlation_id, latency_ms, result_count, has_results, created_at
+                ) VALUES (
+                    'trace-event', 'repo-a', 'app-b', 'alice', 'agent-b', 'run-b',
+                    'memory.list', 'SUCCEEDED', '{}', '{}', '{}',
+                    'correlation-b', 9.5, 4, 1, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                CREATE TABLE _compat_0005_request_trace_fields (
+                    event_id VARCHAR(36) PRIMARY KEY,
+                    app_id VARCHAR(256), user_id VARCHAR(256),
+                    agent_id VARCHAR(256), run_id VARCHAR(256),
+                    correlation_id VARCHAR(256), latency_ms FLOAT,
+                    result_count BIGINT NOT NULL, has_results INTEGER NOT NULL
+                )
+                """
+            )
+        )
+
+    command.downgrade(config, "0004_memory_explorer_indexes")
+    command.upgrade(config, "0005_request_trace_fields")
+    with engine.connect() as connection:
+        restored = connection.execute(
+            sa.text(
+                """
+                SELECT app_id, user_id, agent_id, run_id, correlation_id,
+                       latency_ms, result_count, has_results
+                FROM events WHERE id = 'trace-event'
+                """
+            )
+        ).mappings().one()
+
+    assert restored == {
+        "app_id": "app-b",
+        "user_id": "alice",
+        "agent_id": "agent-b",
+        "run_id": "run-b",
+        "correlation_id": "correlation-b",
+        "latency_ms": 9.5,
+        "result_count": 4,
+        "has_results": 1,
+    }
+
+
+def test_entity_projection_downgrade_rebuilds_interrupted_empty_snapshot(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'entity-interruption.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0006_entity_projection_scope")
+    engine = sa.create_engine(database_url, future=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, default_app_id, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'app-a', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO entities (
+                    id, project_id, app_id, entity_type, entity_id,
+                    metadata_json, memory_count, created_at, updated_at
+                ) VALUES (
+                    'entity-b', 'repo-a', 'app-b', 'user', 'alice',
+                    '{}', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                CREATE TABLE _compat_0006_entity_projection_scope (
+                    entity_id VARCHAR(36) PRIMARY KEY,
+                    app_id VARCHAR(256) NOT NULL
+                )
+                """
+            )
+        )
+
+    command.downgrade(config, "0005_request_trace_fields")
+    command.upgrade(config, "0006_entity_projection_scope")
+    with engine.connect() as connection:
+        restored_app_id = connection.scalar(
+            sa.text("SELECT app_id FROM entities WHERE id = 'entity-b'")
+        )
+
+    assert restored_app_id == "app-b"
+
+
+@pytest.mark.parametrize(
+    "blocking_status",
+    ["ACTIVE", "UNKNOWN", "PENDING", "EXHAUSTED"],
+)
+def test_mutation_intent_downgrade_refuses_unresolved_rows_before_drop(
+    tmp_path,
+    blocking_status: str,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'intent-downgrade.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "head")
+    engine = sa.create_engine(database_url, future=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, default_app_id, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'app-a', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO events (
+                    id, project_id, app_id, operation, status,
+                    request_json, response_json, error_json, created_at
+                ) VALUES (
+                    'intent-event', 'repo-a', 'app-a', 'memory.delete', 'FAILED',
+                    '{}', '{}', '{}', CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO mutation_intents (
+                    id, project_id, app_id, event_id, operation, operation_key,
+                    status, payload_json, result_json, error_json, attempt_count,
+                    created_at, updated_at
+                ) VALUES (
+                    'intent-one', 'repo-a', 'app-a', 'intent-event',
+                    'memory.delete', 'operation-key', :status, '{}', '{}', '{}', 2,
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            ),
+            {"status": blocking_status},
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO mutation_intent_targets (
+                    id, intent_id, memory_id, ordinal, status, error_json,
+                    created_at, updated_at
+                ) VALUES (
+                    'target-one', 'intent-one', 'memory-one', 0, 'PENDING', '{}',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="nonterminal mutation intents"):
+        command.downgrade(config, "0006_entity_projection_scope")
+
+    with engine.connect() as connection:
+        tables = set(sa.inspect(connection).get_table_names())
+        intent_count = connection.scalar(
+            sa.text("SELECT COUNT(*) FROM mutation_intents")
+        )
+        target_count = connection.scalar(
+            sa.text("SELECT COUNT(*) FROM mutation_intent_targets")
+        )
+        persisted_status = connection.scalar(
+            sa.text("SELECT status FROM mutation_intents WHERE id = 'intent-one'")
+        )
+        revision = connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+    assert {"mutation_intents", "mutation_intent_targets"}.issubset(tables)
+    assert intent_count == 1
+    assert target_count == 1
+    assert persisted_status == blocking_status
+    assert revision == "0007_mutation_intents"
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                UPDATE mutation_intents
+                SET status = 'FAILED', completed_at = CURRENT_TIMESTAMP
+                WHERE id = 'intent-one'
+                """
+            )
+        )
+    command.downgrade(config, "0006_entity_projection_scope")
+    command.upgrade(config, "head")
+
+
+def test_terminal_mutation_intent_history_allows_downgrade(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'terminal-intents.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "head")
+    engine = sa.create_engine(database_url, future=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, default_app_id, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'app-a', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        for ordinal, status in enumerate(("COMPLETED", "FAILED", "PARTIAL")):
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO events (
+                        id, project_id, app_id, operation, status,
+                        request_json, response_json, error_json, created_at
+                    ) VALUES (
+                        :event_id, 'repo-a', 'app-a', 'memory.delete', 'FAILED',
+                        '{}', '{}', '{}', CURRENT_TIMESTAMP
+                    )
+                    """
+                ),
+                {"event_id": f"terminal-event-{ordinal}"},
+            )
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO mutation_intents (
+                        id, project_id, app_id, event_id, operation, operation_key,
+                        status, payload_json, result_json, error_json, attempt_count,
+                        created_at, updated_at, completed_at
+                    ) VALUES (
+                        :intent_id, 'repo-a', 'app-a', :event_id,
+                        'memory.delete', :operation_key, :status, '{}', '{}', '{}', 1,
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
+                    """
+                ),
+                {
+                    "intent_id": f"terminal-intent-{ordinal}",
+                    "event_id": f"terminal-event-{ordinal}",
+                    "operation_key": f"terminal-key-{ordinal}",
+                    "status": status,
+                },
+            )
+
+    command.downgrade(config, "0006_entity_projection_scope")
+    assert "mutation_intents" not in sa.inspect(engine).get_table_names()
+
+
+def test_request_trace_upgrade_rejects_snapshot_without_ready_marker(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'trace-invalid-snapshot.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0005_request_trace_fields")
+    engine = sa.create_engine(database_url, future=True)
+    command.downgrade(config, "0004_memory_explorer_indexes")
+    with engine.begin() as connection:
+        connection.execute(sa.text("DROP TABLE _compat_0005_request_trace_fields"))
+        connection.execute(
+            sa.text(
+                """
+                CREATE TABLE _compat_0005_request_trace_fields (
+                    event_id VARCHAR(36), app_id VARCHAR(256),
+                    snapshot_kind VARCHAR(16), snapshot_row_count BIGINT
+                )
+                """
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="invalid 0005 compatibility snapshot"):
+        command.upgrade(config, "0005_request_trace_fields")
+
+    inspector = sa.inspect(engine)
+    assert "_compat_0005_request_trace_fields" in inspector.get_table_names()
+    assert "app_id" not in {
+        column["name"] for column in inspector.get_columns("events")
+    }
+
+
+def test_entity_projection_upgrade_rejects_snapshot_without_ready_marker(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'entity-invalid-snapshot.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0006_entity_projection_scope")
+    engine = sa.create_engine(database_url, future=True)
+    command.downgrade(config, "0005_request_trace_fields")
+    with engine.begin() as connection:
+        connection.execute(sa.text("DROP TABLE _compat_0006_entity_projection_scope"))
+        connection.execute(
+            sa.text(
+                """
+                CREATE TABLE _compat_0006_entity_projection_scope (
+                    entity_id VARCHAR(36), app_id VARCHAR(256),
+                    snapshot_kind VARCHAR(16), snapshot_row_count BIGINT
+                )
+                """
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="invalid 0006 compatibility snapshot"):
+        command.upgrade(config, "0006_entity_projection_scope")
+
+    inspector = sa.inspect(engine)
+    assert "_compat_0006_entity_projection_scope" in inspector.get_table_names()
+    assert "app_id" not in {
+        column["name"] for column in inspector.get_columns("entities")
+    }

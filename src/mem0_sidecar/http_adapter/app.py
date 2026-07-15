@@ -1,7 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from mem0_sidecar.config import SidecarSettings, load_settings
+from mem0_sidecar.core.memory_ops import MutationConflictError
 from mem0_sidecar.http_adapter.category_routes import category_router
 from mem0_sidecar.http_adapter.entity_routes import entity_router
 from mem0_sidecar.http_adapter.event_routes import event_router
@@ -64,6 +66,13 @@ def create_app(
     app.include_router(entity_router)
     app.include_router(category_router)
     app.include_router(export_router)
+
+    @app.exception_handler(MutationConflictError)
+    async def mutation_conflict_handler(
+        _request: Request,
+        exc: MutationConflictError,
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

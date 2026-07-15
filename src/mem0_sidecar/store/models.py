@@ -302,6 +302,13 @@ class Entity(Base):
 class MutationIntent(Base):
     __tablename__ = "mutation_intents"
     __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "app_id",
+            "operation",
+            "operation_key",
+            name="uq_mutation_intents_scope_operation_key",
+        ),
         Index(
             "ix_mutation_intents_scope_status_created",
             "project_id",
@@ -316,8 +323,9 @@ class MutationIntent(Base):
     app_id: Mapped[str] = mapped_column(String(256), nullable=False)
     event_id: Mapped[str] = mapped_column(ForeignKey("events.id"), nullable=False)
     operation: Mapped[str] = mapped_column(String(128), nullable=False)
+    operation_key: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(
-        String(32), default="PENDING", server_default="PENDING", nullable=False
+        String(32), default="ACTIVE", server_default="ACTIVE", nullable=False
     )
     payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     result_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)

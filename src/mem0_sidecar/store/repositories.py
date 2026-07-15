@@ -2,6 +2,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import secrets
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -1243,6 +1244,10 @@ class MutationIntentRepository:
     MAX_TARGETS = 5000
     RECOVERY_LIMIT = 100
     LEASE_SECONDS = 300
+    MAX_ATTEMPTS = 3
+    RECOVERABLE_STATUSES = ("ACTIVE", "UNKNOWN", "PENDING")
+    BLOCKING_STATUSES = ("ACTIVE", "UNKNOWN", "PENDING", "EXHAUSTED")
+    TERMINAL_STATUSES = ("COMPLETED", "FAILED", "PARTIAL")
 
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -1266,6 +1271,7 @@ class MutationIntentRepository:
         operation: str,
         payload: dict[str, Any],
         memory_ids: Iterable[str] = (),
+        operation_key: str | None = None,
     ) -> MutationIntent:
         target_ids = list(dict.fromkeys(memory_ids))
         if len(target_ids) > self.MAX_TARGETS:
@@ -1276,7 +1282,8 @@ class MutationIntentRepository:
             app_id=app_id,
             event_id=event_id,
             operation=operation,
-            status="PENDING",
+            operation_key=operation_key or secrets.token_hex(32),
+            status="ACTIVE",
             payload_json=_trace_json(self.sanitize_payload(project_id, payload)),
             attempt_count=1,
             lease_expires_at=now + timedelta(seconds=self.LEASE_SECONDS),
@@ -1287,6 +1294,30 @@ class MutationIntentRepository:
         self.session.flush()
         self.add_targets(intent.id, target_ids)
         return intent
+
+    def find_by_operation_key(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        operation: str,
+        operation_key: str,
+    ) -> MutationIntent | None:
+        return self.session.scalar(
+            select(MutationIntent).where(
+                MutationIntent.project_id == project_id,
+                MutationIntent.app_id == app_id,
+                MutationIntent.operation == operation,
+                MutationIntent.operation_key == operation_key,
+            )
+        )
+
+    def result(self, intent: MutationIntent) -> dict[str, Any]:
+        try:
+            result = json.loads(intent.result_json)
+        except (TypeError, ValueError):
+            return {}
+        return result if isinstance(result, dict) else {}
 
     def add_targets(
         self,
@@ -1331,11 +1362,30 @@ class MutationIntentRepository:
                 .where(
                     MutationIntent.project_id == project_id,
                     MutationIntent.app_id == app_id,
-                    MutationIntent.status == "PENDING",
                     or_(
-                        MutationIntent.lease_expires_at.is_(None),
-                        MutationIntent.lease_expires_at <= now,
+                        MutationIntent.status.in_(("UNKNOWN", "PENDING")),
+                        and_(
+                            MutationIntent.status == "ACTIVE",
+                            or_(
+                                MutationIntent.lease_expires_at.is_(None),
+                                MutationIntent.lease_expires_at <= now,
+                            ),
+                        ),
                     ),
+                )
+                .order_by(MutationIntent.created_at, MutationIntent.id)
+                .limit(self.RECOVERY_LIMIT)
+            )
+        )
+
+    def list_blocking(self, project_id: str, app_id: str) -> list[MutationIntent]:
+        return list(
+            self.session.scalars(
+                select(MutationIntent)
+                .where(
+                    MutationIntent.project_id == project_id,
+                    MutationIntent.app_id == app_id,
+                    MutationIntent.status.in_(self.BLOCKING_STATUSES),
                 )
                 .order_by(MutationIntent.created_at, MutationIntent.id)
                 .limit(self.RECOVERY_LIMIT)
@@ -1362,12 +1412,20 @@ class MutationIntentRepository:
             )
         )
 
-    def claim_recovery(self, intent: MutationIntent) -> None:
+    def claim_recovery(self, intent: MutationIntent) -> bool:
         now = _utc_now()
+        if intent.attempt_count >= self.MAX_ATTEMPTS:
+            self.mark_unresolved(
+                intent.id,
+                error={"message": "Mutation recovery attempts exhausted"},
+            )
+            return False
         intent.attempt_count += 1
+        intent.status = "ACTIVE"
         intent.lease_expires_at = now + timedelta(seconds=self.LEASE_SECONDS)
         intent.updated_at = now
         self.session.flush()
+        return True
 
     def mark_target_succeeded(self, target: MutationIntentTarget) -> None:
         target.status = "COMPLETED"
@@ -1381,7 +1439,7 @@ class MutationIntentRepository:
         error: dict[str, Any],
     ) -> None:
         intent = self.get(target.intent_id)
-        target.status = "PENDING"
+        target.status = "FAILED"
         target.error_json = _trace_json(
             _safe_trace_document(
                 error,
@@ -1393,14 +1451,18 @@ class MutationIntentRepository:
         target.updated_at = _utc_now()
         self.session.flush()
 
-    def release_for_recovery(
+    def mark_unresolved(
         self,
         intent_id: str,
         *,
         error: dict[str, Any] | None = None,
     ) -> MutationIntent:
         intent = self.get(intent_id)
-        intent.status = "PENDING"
+        intent.status = (
+            "EXHAUSTED"
+            if intent.attempt_count >= self.MAX_ATTEMPTS
+            else "UNKNOWN"
+        )
         intent.lease_expires_at = None
         intent.updated_at = _utc_now()
         if error is not None:
@@ -1414,6 +1476,52 @@ class MutationIntentRepository:
             )
         self.session.flush()
         return intent
+
+    def fail(
+        self,
+        intent_id: str,
+        *,
+        error: dict[str, Any],
+        status: str = "FAILED",
+        result: dict[str, Any] | None = None,
+    ) -> MutationIntent:
+        if status not in {"FAILED", "PARTIAL"}:
+            raise ValueError("terminal mutation failure status is invalid")
+        intent = self.get(intent_id)
+        now = _utc_now()
+        intent.status = status
+        intent.error_json = _trace_json(
+            _safe_trace_document(
+                error,
+                internal_hosts=_project_internal_hosts(
+                    self.session, intent.project_id
+                ),
+            )
+        )
+        if result is not None:
+            intent.result_json = _trace_json(
+                _safe_trace_document(
+                    result,
+                    internal_hosts=_project_internal_hosts(
+                        self.session, intent.project_id
+                    ),
+                )
+            )
+        intent.lease_expires_at = None
+        intent.completed_at = now
+        intent.updated_at = now
+        self.session.flush()
+        return intent
+
+    def release_for_recovery(
+        self,
+        intent_id: str,
+        *,
+        error: dict[str, Any] | None = None,
+    ) -> MutationIntent:
+        """Normalize legacy callers into the explicit ambiguous state."""
+
+        return self.mark_unresolved(intent_id, error=error)
 
     def complete(
         self,
