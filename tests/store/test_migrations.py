@@ -1084,19 +1084,42 @@ def _replace_0005_snapshot_with_exact_b502a26_schema(
     row: dict[str, object] | None,
 ) -> None:
     connection.execute(sa.text("DROP TABLE _compat_0005_request_trace_fields"))
-    connection.execute(
-        sa.text(
-            """
-            CREATE TABLE _compat_0005_request_trace_fields (
-                event_id VARCHAR(36) PRIMARY KEY,
-                app_id VARCHAR(256), user_id VARCHAR(256),
-                agent_id VARCHAR(256), run_id VARCHAR(256),
-                correlation_id VARCHAR(256), latency_ms FLOAT,
-                result_count BIGINT NOT NULL, has_results INTEGER NOT NULL
-            )
-            """
+    sa.Table(
+        "_compat_0005_request_trace_fields",
+        sa.MetaData(),
+        sa.Column("event_id", sa.String(length=36), primary_key=True),
+        sa.Column("app_id", sa.String(length=256), nullable=True),
+        sa.Column("user_id", sa.String(length=256), nullable=True),
+        sa.Column("agent_id", sa.String(length=256), nullable=True),
+        sa.Column("run_id", sa.String(length=256), nullable=True),
+        sa.Column("correlation_id", sa.String(length=256), nullable=True),
+        sa.Column("latency_ms", sa.Float(), nullable=True),
+        sa.Column("result_count", sa.BigInteger(), nullable=False),
+        sa.Column("has_results", sa.Integer(), nullable=False),
+    ).create(connection)
+    inspector = sa.inspect(connection)
+    assert [
+        (
+            column["name"],
+            type(column["type"]).__name__,
+            getattr(column["type"], "length", None),
+            column["nullable"],
+            column.get("default"),
         )
-    )
+        for column in inspector.get_columns(
+            "_compat_0005_request_trace_fields"
+        )
+    ] == [
+        ("event_id", "VARCHAR", 36, False, None),
+        ("app_id", "VARCHAR", 256, True, None),
+        ("user_id", "VARCHAR", 256, True, None),
+        ("agent_id", "VARCHAR", 256, True, None),
+        ("run_id", "VARCHAR", 256, True, None),
+        ("correlation_id", "VARCHAR", 256, True, None),
+        ("latency_ms", "FLOAT", None, True, None),
+        ("result_count", "BIGINT", None, False, None),
+        ("has_results", "INTEGER", None, False, None),
+    ]
     if row is not None:
         connection.execute(
             sa.text(
@@ -1112,22 +1135,17 @@ def _replace_0005_snapshot_with_exact_b502a26_schema(
             ),
             row,
         )
-    assert [
-        column["name"]
-        for column in sa.inspect(connection).get_columns(
-            "_compat_0005_request_trace_fields"
-        )
-    ] == [
-        "event_id",
-        "app_id",
-        "user_id",
-        "agent_id",
-        "run_id",
-        "correlation_id",
-        "latency_ms",
-        "result_count",
-        "has_results",
-    ]
+    assert inspector.get_pk_constraint(
+        "_compat_0005_request_trace_fields"
+    )["constrained_columns"] == ["event_id"]
+    assert inspector.get_indexes("_compat_0005_request_trace_fields") == []
+    assert inspector.get_unique_constraints(
+        "_compat_0005_request_trace_fields"
+    ) == []
+    assert inspector.get_foreign_keys("_compat_0005_request_trace_fields") == []
+    assert inspector.get_check_constraints(
+        "_compat_0005_request_trace_fields"
+    ) == []
 
 
 def _replace_0006_snapshot_with_exact_b502a26_schema(
@@ -1136,16 +1154,28 @@ def _replace_0006_snapshot_with_exact_b502a26_schema(
     row: dict[str, object] | None,
 ) -> None:
     connection.execute(sa.text("DROP TABLE _compat_0006_entity_projection_scope"))
-    connection.execute(
-        sa.text(
-            """
-            CREATE TABLE _compat_0006_entity_projection_scope (
-                entity_id VARCHAR(36) PRIMARY KEY,
-                app_id VARCHAR(256) NOT NULL
-            )
-            """
+    sa.Table(
+        "_compat_0006_entity_projection_scope",
+        sa.MetaData(),
+        sa.Column("entity_id", sa.String(length=36), primary_key=True),
+        sa.Column("app_id", sa.String(length=256), nullable=False),
+    ).create(connection)
+    inspector = sa.inspect(connection)
+    assert [
+        (
+            column["name"],
+            type(column["type"]).__name__,
+            getattr(column["type"], "length", None),
+            column["nullable"],
+            column.get("default"),
         )
-    )
+        for column in inspector.get_columns(
+            "_compat_0006_entity_projection_scope"
+        )
+    ] == [
+        ("entity_id", "VARCHAR", 36, False, None),
+        ("app_id", "VARCHAR", 256, False, None),
+    ]
     if row is not None:
         connection.execute(
             sa.text(
@@ -1157,12 +1187,17 @@ def _replace_0006_snapshot_with_exact_b502a26_schema(
             ),
             row,
         )
-    assert [
-        column["name"]
-        for column in sa.inspect(connection).get_columns(
-            "_compat_0006_entity_projection_scope"
-        )
-    ] == ["entity_id", "app_id"]
+    assert inspector.get_pk_constraint(
+        "_compat_0006_entity_projection_scope"
+    )["constrained_columns"] == ["entity_id"]
+    assert inspector.get_indexes("_compat_0006_entity_projection_scope") == []
+    assert inspector.get_unique_constraints(
+        "_compat_0006_entity_projection_scope"
+    ) == []
+    assert inspector.get_foreign_keys("_compat_0006_entity_projection_scope") == []
+    assert inspector.get_check_constraints(
+        "_compat_0006_entity_projection_scope"
+    ) == []
 
 
 def test_request_trace_upgrade_restores_exact_b502a26_legacy_snapshot(
@@ -1593,6 +1628,262 @@ def test_exact_legacy_validator_rejects_constraint_lookalike(
                     INSERT INTO _compat_0006_entity_projection_scope
                     VALUES ('entity-one', 'app-a')
                     """
+                )
+            )
+        monkeypatch.setattr(
+            migration,
+            "op",
+            SimpleNamespace(get_bind=lambda: connection),
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=rf"invalid {revision} compatibility snapshot structure",
+        ):
+            migration._validate_legacy_compatibility_snapshot()
+
+
+@pytest.mark.parametrize("revision", ["0005", "0006"])
+def test_exact_legacy_validator_rejects_dialect_type_and_nullability_lookalike(
+    tmp_path,
+    monkeypatch,
+    revision: str,
+) -> None:
+    engine = sa.create_engine(
+        f"sqlite:///{tmp_path / f'legacy-type-lookalike-{revision}.sqlite3'}",
+        future=True,
+    )
+    migration = importlib.import_module(
+        f"migrations.versions.{revision}_"
+        + (
+            "request_trace_fields"
+            if revision == "0005"
+            else "entity_projection_scope"
+        )
+    )
+    with engine.begin() as connection:
+        if revision == "0005":
+            connection.execute(sa.text("CREATE TABLE events (id VARCHAR(36))"))
+            connection.execute(sa.text("INSERT INTO events VALUES ('event-one')"))
+            connection.execute(
+                sa.text(
+                    """
+                    CREATE TABLE _compat_0005_request_trace_fields (
+                        event_id VARCHAR(36) PRIMARY KEY,
+                        app_id VARCHAR(256) NOT NULL, user_id VARCHAR(256),
+                        agent_id VARCHAR(256), run_id VARCHAR(256),
+                        correlation_id VARCHAR(256), latency_ms REAL,
+                        result_count BIGINT NOT NULL,
+                        has_results SMALLINT NOT NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO _compat_0005_request_trace_fields
+                    VALUES ('event-one', 'app-a', NULL, NULL, NULL, NULL, 1.0, 0, 0)
+                    """
+                )
+            )
+        else:
+            connection.execute(sa.text("CREATE TABLE entities (id VARCHAR(36))"))
+            connection.execute(sa.text("INSERT INTO entities VALUES ('entity-one')"))
+            connection.execute(
+                sa.text(
+                    """
+                    CREATE TABLE _compat_0006_entity_projection_scope (
+                        entity_id CHAR(36) PRIMARY KEY,
+                        app_id NVARCHAR(256) NOT NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO _compat_0006_entity_projection_scope
+                    VALUES ('entity-one', 'app-a')
+                    """
+                )
+            )
+        monkeypatch.setattr(
+            migration,
+            "op",
+            SimpleNamespace(get_bind=lambda: connection),
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=rf"invalid {revision} compatibility snapshot structure",
+        ):
+            migration._validate_legacy_compatibility_snapshot()
+
+
+@pytest.mark.parametrize("revision", ["0005", "0006"])
+def test_exact_legacy_validator_rejects_reordered_columns(
+    tmp_path,
+    monkeypatch,
+    revision: str,
+) -> None:
+    engine = sa.create_engine(
+        f"sqlite:///{tmp_path / f'legacy-reordered-{revision}.sqlite3'}",
+        future=True,
+    )
+    migration = importlib.import_module(
+        f"migrations.versions.{revision}_"
+        + (
+            "request_trace_fields"
+            if revision == "0005"
+            else "entity_projection_scope"
+        )
+    )
+    with engine.begin() as connection:
+        source_table = "events" if revision == "0005" else "entities"
+        source_id = "event-one" if revision == "0005" else "entity-one"
+        connection.execute(
+            sa.text(f"CREATE TABLE {source_table} (id VARCHAR(36))")
+        )
+        connection.execute(
+            sa.text(f"INSERT INTO {source_table} VALUES (:source_id)"),
+            {"source_id": source_id},
+        )
+        if revision == "0005":
+            connection.execute(
+                sa.text(
+                    """
+                    CREATE TABLE _compat_0005_request_trace_fields (
+                        app_id VARCHAR(256),
+                        event_id VARCHAR(36) NOT NULL PRIMARY KEY,
+                        user_id VARCHAR(256), agent_id VARCHAR(256),
+                        run_id VARCHAR(256), correlation_id VARCHAR(256),
+                        latency_ms FLOAT, result_count BIGINT NOT NULL,
+                        has_results INTEGER NOT NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO _compat_0005_request_trace_fields
+                    VALUES (NULL, 'event-one', NULL, NULL, NULL, NULL, NULL, 0, 0)
+                    """
+                )
+            )
+        else:
+            connection.execute(
+                sa.text(
+                    """
+                    CREATE TABLE _compat_0006_entity_projection_scope (
+                        app_id VARCHAR(256) NOT NULL,
+                        entity_id VARCHAR(36) NOT NULL PRIMARY KEY
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO _compat_0006_entity_projection_scope
+                    VALUES ('app-a', 'entity-one')
+                    """
+                )
+            )
+        monkeypatch.setattr(
+            migration,
+            "op",
+            SimpleNamespace(get_bind=lambda: connection),
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=rf"invalid {revision} compatibility snapshot structure",
+        ):
+            migration._validate_legacy_compatibility_snapshot()
+
+
+@pytest.mark.parametrize("revision", ["0005", "0006"])
+@pytest.mark.parametrize("schema_object", ["index", "unique", "foreign", "check"])
+def test_exact_legacy_validator_rejects_unexpected_schema_objects(
+    tmp_path,
+    monkeypatch,
+    revision: str,
+    schema_object: str,
+) -> None:
+    engine = sa.create_engine(
+        f"sqlite:///{tmp_path / f'legacy-object-{revision}-{schema_object}.sqlite3'}",
+        future=True,
+    )
+    migration = importlib.import_module(
+        f"migrations.versions.{revision}_"
+        + (
+            "request_trace_fields"
+            if revision == "0005"
+            else "entity_projection_scope"
+        )
+    )
+    with engine.begin() as connection:
+        source_table = "events" if revision == "0005" else "entities"
+        source_id = "event-one" if revision == "0005" else "entity-one"
+        compat_table = (
+            "_compat_0005_request_trace_fields"
+            if revision == "0005"
+            else "_compat_0006_entity_projection_scope"
+        )
+        connection.execute(
+            sa.text(f"CREATE TABLE {source_table} (id VARCHAR(36) PRIMARY KEY)")
+        )
+        connection.execute(
+            sa.text(f"INSERT INTO {source_table} VALUES (:source_id)"),
+            {"source_id": source_id},
+        )
+        foreign_clause = (
+            f"REFERENCES {source_table}(id)" if schema_object == "foreign" else ""
+        )
+        unique_clause = "UNIQUE" if schema_object == "unique" else ""
+        check_clause = "CHECK (app_id <> '')" if schema_object == "check" else ""
+        if revision == "0005":
+            connection.execute(
+                sa.text(
+                    f"""
+                    CREATE TABLE {compat_table} (
+                        event_id VARCHAR(36) NOT NULL PRIMARY KEY {foreign_clause},
+                        app_id VARCHAR(256) {unique_clause} {check_clause},
+                        user_id VARCHAR(256), agent_id VARCHAR(256),
+                        run_id VARCHAR(256), correlation_id VARCHAR(256),
+                        latency_ms FLOAT, result_count BIGINT NOT NULL,
+                        has_results INTEGER NOT NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                sa.text(
+                    f"""
+                    INSERT INTO {compat_table}
+                    VALUES ('event-one', 'app-a', NULL, NULL, NULL, NULL, NULL, 0, 0)
+                    """
+                )
+            )
+        else:
+            connection.execute(
+                sa.text(
+                    f"""
+                    CREATE TABLE {compat_table} (
+                        entity_id VARCHAR(36) NOT NULL PRIMARY KEY {foreign_clause},
+                        app_id VARCHAR(256) NOT NULL {unique_clause} {check_clause}
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                sa.text(
+                    f"INSERT INTO {compat_table} VALUES ('entity-one', 'app-a')"
+                )
+            )
+        if schema_object == "index":
+            connection.execute(
+                sa.text(
+                    f"CREATE INDEX ix_unexpected_compat_app ON {compat_table}(app_id)"
                 )
             )
         monkeypatch.setattr(

@@ -33,6 +33,28 @@ COMPATIBILITY_COLUMNS = {
     "snapshot_row_count",
 }
 LEGACY_COMPATIBILITY_COLUMNS = {"entity_id", "app_id"}
+LEGACY_COMPATIBILITY_DESCRIPTORS = {
+    "sqlite": (
+        ("entity_id", "VARCHAR", 36, False, None),
+        ("app_id", "VARCHAR", 256, False, None),
+    ),
+    "postgresql": (
+        ("entity_id", "VARCHAR", 36, False, None),
+        ("app_id", "VARCHAR", 256, False, None),
+    ),
+}
+
+
+def _has_unexpected_legacy_indexes(
+    bind: sa.engine.Connection,
+    inspector: sa.Inspector,
+) -> bool:
+    if bind.dialect.name == "sqlite":
+        index_rows = bind.execute(
+            sa.text(f"PRAGMA index_list('{COMPATIBILITY_TABLE}')")
+        ).mappings()
+        return any(index["origin"] != "pk" for index in index_rows)
+    return bool(inspector.get_indexes(COMPATIBILITY_TABLE))
 
 
 def _compatibility_table_exists() -> bool | None:
@@ -91,19 +113,28 @@ def _validate_legacy_compatibility_snapshot() -> int:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     column_rows = inspector.get_columns(COMPATIBILITY_TABLE)
-    columns = {column["name"]: column for column in column_rows}
+    expected_descriptor = LEGACY_COMPATIBILITY_DESCRIPTORS.get(bind.dialect.name)
+    actual_descriptor = tuple(
+        (
+            column["name"],
+            type(column["type"]).__name__.upper(),
+            getattr(column["type"], "length", None),
+            column["nullable"],
+            column.get("default"),
+        )
+        for column in column_rows
+    )
     exact_structure = (
-        set(columns) == LEGACY_COMPATIBILITY_COLUMNS
+        expected_descriptor is not None
+        and actual_descriptor == expected_descriptor
         and inspector.get_pk_constraint(COMPATIBILITY_TABLE).get(
             "constrained_columns"
         )
         == ["entity_id"]
-        and isinstance(columns["entity_id"]["type"], sa.String)
-        and columns["entity_id"]["type"].length == 36
-        and isinstance(columns["app_id"]["type"], sa.String)
-        and columns["app_id"]["type"].length == 256
-        and columns["app_id"]["nullable"] is False
-        and all(column.get("default") is None for column in column_rows)
+        and not _has_unexpected_legacy_indexes(bind, inspector)
+        and not inspector.get_unique_constraints(COMPATIBILITY_TABLE)
+        and not inspector.get_foreign_keys(COMPATIBILITY_TABLE)
+        and not inspector.get_check_constraints(COMPATIBILITY_TABLE)
     )
     if not exact_structure:
         raise RuntimeError("invalid 0006 compatibility snapshot structure")

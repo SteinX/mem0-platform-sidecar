@@ -64,11 +64,47 @@ LEGACY_COMPATIBILITY_COLUMNS = COMPATIBILITY_COLUMNS - {
     "snapshot_kind",
     "snapshot_row_count",
 }
+LEGACY_COMPATIBILITY_DESCRIPTORS = {
+    "sqlite": (
+        ("event_id", "VARCHAR", 36, False, None),
+        ("app_id", "VARCHAR", 256, True, None),
+        ("user_id", "VARCHAR", 256, True, None),
+        ("agent_id", "VARCHAR", 256, True, None),
+        ("run_id", "VARCHAR", 256, True, None),
+        ("correlation_id", "VARCHAR", 256, True, None),
+        ("latency_ms", "FLOAT", None, True, None),
+        ("result_count", "BIGINT", None, False, None),
+        ("has_results", "INTEGER", None, False, None),
+    ),
+    "postgresql": (
+        ("event_id", "VARCHAR", 36, False, None),
+        ("app_id", "VARCHAR", 256, True, None),
+        ("user_id", "VARCHAR", 256, True, None),
+        ("agent_id", "VARCHAR", 256, True, None),
+        ("run_id", "VARCHAR", 256, True, None),
+        ("correlation_id", "VARCHAR", 256, True, None),
+        ("latency_ms", "DOUBLE_PRECISION", None, True, None),
+        ("result_count", "BIGINT", None, False, None),
+        ("has_results", "INTEGER", None, False, None),
+    ),
+}
 SOURCE_COLUMNS = COMPATIBILITY_COLUMNS - {
     "event_id",
     "snapshot_kind",
     "snapshot_row_count",
 }
+
+
+def _has_unexpected_legacy_indexes(
+    bind: sa.engine.Connection,
+    inspector: sa.Inspector,
+) -> bool:
+    if bind.dialect.name == "sqlite":
+        index_rows = bind.execute(
+            sa.text(f"PRAGMA index_list('{COMPATIBILITY_TABLE}')")
+        ).mappings()
+        return any(index["origin"] != "pk" for index in index_rows)
+    return bool(inspector.get_indexes(COMPATIBILITY_TABLE))
 
 
 def _compatibility_table_exists() -> bool | None:
@@ -127,32 +163,28 @@ def _validate_legacy_compatibility_snapshot() -> int:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     column_rows = inspector.get_columns(COMPATIBILITY_TABLE)
-    columns = {column["name"]: column for column in column_rows}
-    string_lengths = {
-        "event_id": 36,
-        "app_id": 256,
-        "user_id": 256,
-        "agent_id": 256,
-        "run_id": 256,
-        "correlation_id": 256,
-    }
+    expected_descriptor = LEGACY_COMPATIBILITY_DESCRIPTORS.get(bind.dialect.name)
+    actual_descriptor = tuple(
+        (
+            column["name"],
+            type(column["type"]).__name__.upper(),
+            getattr(column["type"], "length", None),
+            column["nullable"],
+            column.get("default"),
+        )
+        for column in column_rows
+    )
     exact_structure = (
-        set(columns) == LEGACY_COMPATIBILITY_COLUMNS
+        expected_descriptor is not None
+        and actual_descriptor == expected_descriptor
         and inspector.get_pk_constraint(COMPATIBILITY_TABLE).get(
             "constrained_columns"
         )
         == ["event_id"]
-        and all(
-            isinstance(columns[name]["type"], sa.String)
-            and columns[name]["type"].length == length
-            for name, length in string_lengths.items()
-        )
-        and isinstance(columns["latency_ms"]["type"], sa.Float)
-        and isinstance(columns["result_count"]["type"], sa.BigInteger)
-        and isinstance(columns["has_results"]["type"], sa.Integer)
-        and columns["result_count"]["nullable"] is False
-        and columns["has_results"]["nullable"] is False
-        and all(column.get("default") is None for column in column_rows)
+        and not _has_unexpected_legacy_indexes(bind, inspector)
+        and not inspector.get_unique_constraints(COMPATIBILITY_TABLE)
+        and not inspector.get_foreign_keys(COMPATIBILITY_TABLE)
+        and not inspector.get_check_constraints(COMPATIBILITY_TABLE)
     )
     if not exact_structure:
         raise RuntimeError("invalid 0005 compatibility snapshot structure")

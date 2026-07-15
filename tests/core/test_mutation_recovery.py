@@ -97,6 +97,42 @@ class _StatefulRecoveryClient:
         return {"results": list(self.records.values()), "total": len(self.records)}
 
 
+class _EscapingOrdinaryExceptionClient(_StatefulRecoveryClient):
+    """Stateful test double for defense against unclassified await failures."""
+
+    def __init__(self, *, operation: str) -> None:
+        super().__init__()
+        self.operation = operation
+        self.failure_injected = False
+
+    def _raise_after_apply(self, operation: str) -> None:
+        if operation == self.operation and not self.failure_injected:
+            self.failure_injected = True
+            raise RecursionError("decoder recursion escaped the client boundary")
+
+    async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await super().add_memory(payload)
+        self._raise_after_apply("add")
+        return response
+
+    async def update_memory(
+        self,
+        memory_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = await super().update_memory(memory_id, payload)
+        self._raise_after_apply("update")
+        return response
+
+    async def delete_memory(self, memory_id: str) -> dict[str, Any]:
+        response = await super().delete_memory(memory_id)
+        if self.operation == "delete":
+            self._raise_after_apply("delete")
+        elif self.operation == "entity" and len(self.deleted_ids) == 2:
+            self._raise_after_apply("entity")
+        return response
+
+
 class _RealHttpOutcomeClient:
     """Stateful upstream exercised through the production REST client."""
 
@@ -123,6 +159,13 @@ class _RealHttpOutcomeClient:
             raise httpx.RemoteProtocolError(
                 "peer disconnected before response",
                 request=request,
+            )
+        if self.failure_kind == "deep-json":
+            deep_json = "[" * 20_000 + '"sk-deep-body-secret"' + "]" * 20_000
+            return httpx.Response(
+                200,
+                content=deep_json.encode(),
+                headers={"content-type": "application/json"},
             )
         assert self.failure_kind == "invalid-json"
         return httpx.Response(
@@ -390,7 +433,7 @@ async def test_known_upstream_500_is_terminal_and_never_replayed(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_kind",
-    ["read-timeout", "disconnect", "invalid-json"],
+    ["read-timeout", "disconnect", "invalid-json", "deep-json"],
 )
 @pytest.mark.parametrize("operation", ["add", "update", "delete", "entity"])
 async def test_real_http_lost_response_is_unknown_then_converges_by_reads_only(
@@ -443,6 +486,52 @@ async def test_real_http_lost_response_is_unknown_then_converges_by_reads_only(
         assert active == []
     else:
         assert len(active) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["add", "update", "delete", "entity"])
+async def test_unclassified_exception_after_upstream_attempt_defaults_unknown(
+    tmp_path,
+    operation: str,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _EscapingOrdinaryExceptionClient(operation=operation)
+    if operation in {"update", "delete"}:
+        _seed_memory(factory, client, "memory-one")
+    elif operation == "entity":
+        _seed_memory(factory, client, "entity-one")
+        _seed_memory(factory, client, "entity-two")
+
+    with pytest.raises(RecursionError, match="decoder recursion"):
+        await _invoke_mutation(factory, client, operation)
+
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    writes_after_failure = (
+        client.add_calls,
+        list(client.update_ids),
+        list(client.deleted_ids),
+    )
+    if operation == "entity":
+        with factory() as session:
+            local_deleted_at = list(
+                session.scalars(
+                    select(MemoryIndex.deleted_at).order_by(
+                        MemoryIndex.mem0_memory_id
+                    )
+                )
+            )
+        assert local_deleted_at == [None, None]
+
+    result = await _recover(factory, client)
+
+    assert result == {"recovered": 1, "failed": 0}
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert (
+        client.add_calls,
+        client.update_ids,
+        client.deleted_ids,
+    ) == writes_after_failure
+    _assert_recovered(factory, client, operation)
 
 
 @pytest.mark.asyncio

@@ -225,12 +225,12 @@ def _safe_upstream_status_code(exc: Exception) -> int | None:
 
 def _safe_outcome_unknown(exc: Exception) -> bool:
     if type(exc) is not Mem0UpstreamError:
-        return False
+        return True
     try:
         outcome_unknown = object.__getattribute__(exc, "outcome_unknown")
     except BaseException:
-        return _safe_upstream_status_code(exc) is None
-    return outcome_unknown is True
+        return True
+    return outcome_unknown is not False
 
 
 def _safe_delete_error(exc: Exception) -> dict[str, Any]:
@@ -407,6 +407,7 @@ class EntityService:
         )
         self.session.commit()
 
+        upstream_attempted = False
         upstream_completed = False
         upstream_effect_observed = False
         try:
@@ -421,6 +422,7 @@ class EntityService:
             for memory_id in memory_ids:
                 target = targets[memory_id]
                 try:
+                    upstream_attempted = True
                     await self.mem0.delete_memory(memory_id)
                     upstream_effect_observed = True
                 except Exception as exc:
@@ -495,7 +497,10 @@ class EntityService:
                     not isinstance(exc, Exception)
                     or upstream_completed
                     or upstream_effect_observed
-                    or _safe_outcome_unknown(exc)
+                    or (
+                        upstream_attempted
+                        and _safe_outcome_unknown(exc)
+                    )
                 ),
                 mark_event_failed=isinstance(exc, Exception),
             )
