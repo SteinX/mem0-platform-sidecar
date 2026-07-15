@@ -560,11 +560,12 @@ def _is_upstream_not_found(exc: Exception) -> bool:
 
 
 def _is_ambiguous_upstream_failure(exc: Exception) -> bool:
-    if isinstance(exc, MemoryUpstreamProtocolError):
+    if type(exc) is not Mem0UpstreamError:
         return True
-    if not isinstance(exc, Mem0UpstreamError):
-        return False
-    return bool(getattr(exc, "outcome_unknown", exc.status_code is None))
+    try:
+        return object.__getattribute__(exc, "outcome_unknown") is not False
+    except BaseException:
+        return True
 
 
 def _effective_request_app_id(

@@ -624,7 +624,16 @@ async def test_delete_entity_total_failure_and_missing_are_non_destructive(
     _rebuild(db_session)
     db_session.commit()
     mem0 = DeleteMem0(
-        {"one": RuntimeError("one failed"), "two": RuntimeError("two failed")}
+        {
+            memory_id: Mem0UpstreamError(
+                method="DELETE",
+                path=f"/memories/{memory_id}",
+                status_code=503,
+                message="delete rejected",
+                outcome_unknown=False,
+            )
+            for memory_id in ("one", "two")
+        }
     )
     service = EntityService(session=db_session, mem0=mem0)
 
@@ -713,11 +722,20 @@ async def test_delete_entity_contains_hostile_error_rendering_per_memory(
 ) -> None:
     render_calls = 0
 
-    class HostileError(RuntimeError):
+    class HostileMessage:
         def __str__(self) -> str:
             nonlocal render_calls
             render_calls += 1
             raise RuntimeError("error rendering failed")
+
+    def rejected(memory_id: str) -> Mem0UpstreamError:
+        return Mem0UpstreamError(
+            method="DELETE",
+            path=f"/memories/{memory_id}",
+            status_code=503,
+            message=HostileMessage(),  # type: ignore[arg-type]
+            outcome_unknown=False,
+        )
 
     _create_project(db_session, "repo-a")
     _memory(db_session, "one", user_id="alice")
@@ -727,7 +745,7 @@ async def test_delete_entity_contains_hostile_error_rendering_per_memory(
 
     result = await EntityService(
         session=db_session,
-        mem0=DeleteMem0({"one": HostileError(), "two": RuntimeError("no")}),
+        mem0=DeleteMem0({"one": rejected("one"), "two": rejected("two")}),
     ).delete_entity("repo-a", "app-a", "user", "alice")
 
     assert result["status"] == "FAILED"
@@ -738,7 +756,7 @@ async def test_delete_entity_contains_hostile_error_rendering_per_memory(
 
 
 @pytest.mark.asyncio
-async def test_delete_entity_uses_closed_error_types_and_guarded_status_reads(
+async def test_delete_entity_treats_hostile_error_subclass_as_unknown_without_leakage(
     db_session,
 ) -> None:
     secret = "sk_dynamic_exception_secret"
@@ -751,23 +769,12 @@ async def test_delete_entity_uses_closed_error_types_and_guarded_status_reads(
             raise RuntimeError(secret)
         return object.__getattribute__(self, name)
 
-    def hostile_dict_read(self):
-        nonlocal status_reads
-        status_reads += 1
-        raise RuntimeError(secret)
-
     hostile_upstream_type = type(
         f"{secret}_upstream",
         (Mem0UpstreamError,),
         {
             "__getattribute__": hostile_status_read,
-            "__dict__": property(hostile_dict_read),
         },
-    )
-    hostile_runtime_type = type(
-        f"{secret}_runtime",
-        (RuntimeError,),
-        {"__str__": lambda self: secret},
     )
     upstream_error = hostile_upstream_type(
         method="DELETE",
@@ -776,17 +783,52 @@ async def test_delete_entity_uses_closed_error_types_and_guarded_status_reads(
         message=secret,
         response_text=secret,
     )
-    runtime_error = hostile_runtime_type(secret)
+    _create_project(db_session, "repo-a")
+    _memory(db_session, "upstream", user_id="alice")
+    _rebuild(db_session)
+    db_session.commit()
+
+    with pytest.raises(hostile_upstream_type):
+        await EntityService(
+            session=db_session,
+            mem0=DeleteMem0({"upstream": upstream_error}),
+        ).delete_entity("repo-a", "app-a", "user", "alice")
+
+    event = EventRepository(db_session).list_project_events("repo-a")[0]
+    assert secret not in event.error_json
+    assert status_reads == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_entity_uses_closed_exact_upstream_errors_and_safe_status_values(
+    db_session,
+) -> None:
+    secret = "sk_dynamic_exception_secret"
+    upstream_error = Mem0UpstreamError(
+        method="DELETE",
+        path=f"http://mem0.internal/{secret}",
+        status_code=503,
+        message=secret,
+        response_text=secret,
+        outcome_unknown=False,
+    )
+    statusless_rejection = Mem0UpstreamError(
+        method="DELETE",
+        path="/memories/statusless",
+        status_code=None,
+        message=secret,
+        outcome_unknown=False,
+    )
     non_integer_status = Mem0UpstreamError(
         method="DELETE",
         path="/memories/bool-status",
         status_code=True,
         message=secret,
+        outcome_unknown=False,
     )
     _create_project(db_session, "repo-a")
-    _memory(db_session, "upstream", user_id="alice")
-    _memory(db_session, "runtime", user_id="alice")
-    _memory(db_session, "bool-status", user_id="alice")
+    for memory_id in ("upstream", "statusless", "bool-status"):
+        _memory(db_session, memory_id, user_id="alice")
     _rebuild(db_session)
     db_session.commit()
 
@@ -795,7 +837,7 @@ async def test_delete_entity_uses_closed_error_types_and_guarded_status_reads(
         mem0=DeleteMem0(
             {
                 "upstream": upstream_error,
-                "runtime": runtime_error,
+                "statusless": statusless_rejection,
                 "bool-status": non_integer_status,
             }
         ),
@@ -806,9 +848,10 @@ async def test_delete_entity_uses_closed_error_types_and_guarded_status_reads(
         "upstream": {
             "error_type": "Mem0UpstreamError",
             "message": "Upstream memory deletion failed",
+            "upstream_status_code": 503,
         },
-        "runtime": {
-            "error_type": "UpstreamDeleteError",
+        "statusless": {
+            "error_type": "Mem0UpstreamError",
             "message": "Upstream memory deletion failed",
         },
         "bool-status": {
@@ -819,7 +862,6 @@ async def test_delete_entity_uses_closed_error_types_and_guarded_status_reads(
     event = EventRepository(db_session).get(result["event_id"])
     assert secret not in json.dumps(result)
     assert secret not in event.error_json
-    assert status_reads == 0
 
 
 def test_query_uses_bounded_sql_paging_not_unbounded_entity_materialization(

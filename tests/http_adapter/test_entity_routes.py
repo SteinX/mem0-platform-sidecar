@@ -36,6 +36,16 @@ class EntityRouteMem0Client:
         return {"id": memory_id, "message": "deleted"}
 
 
+def _rejected_delete(memory_id: str) -> Mem0UpstreamError:
+    return Mem0UpstreamError(
+        method="DELETE",
+        path=f"/memories/{memory_id}",
+        status_code=503,
+        message="delete rejected",
+        outcome_unknown=False,
+    )
+
+
 def _create_test_app(tmp_path, *, mem0_client: object | None = None):
     return create_app(
         settings=SidecarSettings(
@@ -570,9 +580,12 @@ def test_delete_entity_preserves_literal_percent_encoded_octet(tmp_path) -> None
     ("failures", "expected_status", "expected_deleted", "expected_failed"),
     [
         ({}, "SUCCEEDED", 2, 0),
-        ({"two": RuntimeError("no")}, "PARTIAL", 1, 1),
+        ({"two": _rejected_delete("two")}, "PARTIAL", 1, 1),
         (
-            {"one": RuntimeError("no"), "two": RuntimeError("no")},
+            {
+                "one": _rejected_delete("one"),
+                "two": _rejected_delete("two"),
+            },
             "FAILED",
             0,
             2,

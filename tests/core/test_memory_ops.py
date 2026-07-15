@@ -2620,17 +2620,35 @@ async def test_add_update_delete_and_reconcile_failures_never_run_entity_rebuild
 
     class FailedMutations(ExplorerMem0Client):
         async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
-            raise RuntimeError("add failed")
+            raise Mem0UpstreamError(
+                method="POST",
+                path="/memories",
+                status_code=503,
+                message="add failed",
+                outcome_unknown=False,
+            )
 
         async def update_memory(
             self,
             memory_id: str,
             payload: dict[str, Any],
         ) -> dict[str, Any]:
-            raise RuntimeError("update failed")
+            raise Mem0UpstreamError(
+                method="PUT",
+                path=f"/memories/{memory_id}",
+                status_code=503,
+                message="update failed",
+                outcome_unknown=False,
+            )
 
         async def delete_memory(self, memory_id: str) -> dict[str, Any]:
-            raise RuntimeError("delete failed")
+            raise Mem0UpstreamError(
+                method="DELETE",
+                path=f"/memories/{memory_id}",
+                status_code=503,
+                message="delete failed",
+                outcome_unknown=False,
+            )
 
     mem0 = FailedMutations()
     mem0.list_response = RuntimeError("list failed")

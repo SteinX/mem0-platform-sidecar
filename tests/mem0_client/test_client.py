@@ -398,3 +398,31 @@ async def test_mem0_client_wraps_2xx_invalid_json_as_ambiguous_without_body_leak
     assert error.outcome_unknown is True
     assert error.response_text is None
     assert secret_body not in str(error)
+
+
+@pytest.mark.asyncio
+async def test_mem0_client_wraps_deep_valid_2xx_json_exception_without_body_leak(
+) -> None:
+    secret_body = "sk-deep-response-body-secret"
+    deep_json = ("[" * 20_000 + f'"{secret_body}"' + "]" * 20_000).encode()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=deep_json,
+            headers={"content-type": "application/json"},
+        )
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(client_module.Mem0UpstreamError) as exc_info:
+        await client.update_memory("mem-1", {"text": "updated"})
+
+    error = exc_info.value
+    assert error.status_code == 200
+    assert error.outcome_unknown is True
+    assert error.response_text is None
+    assert secret_body not in str(error)

@@ -156,7 +156,7 @@ class Mem0RestClient:
             duration_ms = round((time.perf_counter() - started_at) * 1000, 3)
             try:
                 data = response.json()
-            except (UnicodeError, ValueError) as exc:
+            except Exception as exc:
                 LOGGER.warning(
                     "mem0_upstream_response_decode_failed",
                     extra=self._log_extra(
