@@ -26,6 +26,12 @@ ENTITY_PROJECTION_INDEXES = (
     ),
 )
 COMPATIBILITY_TABLE = "_compat_0006_entity_projection_scope"
+COMPATIBILITY_COLUMNS = {
+    "entity_id",
+    "app_id",
+    "snapshot_kind",
+    "snapshot_row_count",
+}
 
 
 def _compatibility_table_exists() -> bool | None:
@@ -33,7 +39,97 @@ def _compatibility_table_exists() -> bool | None:
     return sa.inspect(get_bind()).has_table(COMPATIBILITY_TABLE) if get_bind else None
 
 
+def _validate_compatibility_snapshot(
+    *,
+    expected_source_rows: int | None = None,
+    require_ready: bool = True,
+) -> int:
+    bind = op.get_bind()
+    columns = {
+        column["name"]
+        for column in sa.inspect(bind).get_columns(COMPATIBILITY_TABLE)
+    }
+    if not COMPATIBILITY_COLUMNS.issubset(columns):
+        raise RuntimeError("invalid 0006 compatibility snapshot structure")
+    counts = bind.execute(
+        sa.text(
+            f"""
+            SELECT
+                SUM(CASE WHEN snapshot_kind = 'DATA' THEN 1 ELSE 0 END)
+                    AS data_rows,
+                COUNT(DISTINCT CASE WHEN snapshot_kind = 'DATA' THEN entity_id END)
+                    AS distinct_data_ids,
+                SUM(CASE WHEN snapshot_kind = 'READY' THEN 1 ELSE 0 END)
+                    AS ready_rows,
+                SUM(CASE WHEN snapshot_kind NOT IN ('DATA', 'READY') THEN 1 ELSE 0 END)
+                    AS invalid_rows,
+                MAX(CASE WHEN snapshot_kind = 'READY' THEN snapshot_row_count END)
+                    AS ready_row_count
+            FROM {COMPATIBILITY_TABLE}
+            """
+        )
+    ).mappings().one()
+    data_rows = int(counts["data_rows"] or 0)
+    distinct_data_ids = int(counts["distinct_data_ids"] or 0)
+    ready_rows = int(counts["ready_rows"] or 0)
+    invalid_rows = int(counts["invalid_rows"] or 0)
+    if invalid_rows or distinct_data_ids != data_rows:
+        raise RuntimeError("invalid 0006 compatibility snapshot content")
+    if expected_source_rows is not None and data_rows != expected_source_rows:
+        raise RuntimeError("invalid 0006 compatibility snapshot row count")
+    if require_ready and (
+        ready_rows != 1 or counts["ready_row_count"] != data_rows
+    ):
+        raise RuntimeError("invalid 0006 compatibility snapshot READY marker")
+    if not require_ready and ready_rows:
+        raise RuntimeError("invalid 0006 compatibility snapshot staging state")
+    return data_rows
+
+
+def _rebuild_compatibility_snapshot() -> None:
+    bind = op.get_bind()
+    source_columns = {
+        column["name"] for column in sa.inspect(bind).get_columns("entities")
+    }
+    if "app_id" not in source_columns:
+        raise RuntimeError(
+            "cannot rebuild 0006 compatibility snapshot without source columns"
+        )
+    if _compatibility_table_exists():
+        op.drop_table(COMPATIBILITY_TABLE)
+    op.execute(
+        sa.text(
+            f"""
+            CREATE TABLE {COMPATIBILITY_TABLE} AS
+            SELECT
+                id AS entity_id,
+                app_id,
+                CAST('DATA' AS VARCHAR(16)) AS snapshot_kind,
+                CAST(NULL AS BIGINT) AS snapshot_row_count
+            FROM entities
+            """
+        )
+    )
+    source_rows = int(bind.scalar(sa.text("SELECT COUNT(*) FROM entities")) or 0)
+    data_rows = _validate_compatibility_snapshot(
+        expected_source_rows=source_rows,
+        require_ready=False,
+    )
+    op.execute(
+        sa.text(
+            f"""
+            INSERT INTO {COMPATIBILITY_TABLE} (
+                entity_id, app_id, snapshot_kind, snapshot_row_count
+            ) VALUES (NULL, NULL, 'READY', :row_count)
+            """
+        ).bindparams(row_count=data_rows)
+    )
+    _validate_compatibility_snapshot(expected_source_rows=source_rows)
+
+
 def upgrade() -> None:
+    if _compatibility_table_exists() is True:
+        _validate_compatibility_snapshot()
     op.add_column(
         "entities",
         sa.Column("app_id", sa.String(length=256), nullable=True),
@@ -61,12 +157,14 @@ def upgrade() -> None:
                 SET app_id = (
                     SELECT compat.app_id
                     FROM {COMPATIBILITY_TABLE} AS compat
-                    WHERE compat.entity_id = entities.id
+                WHERE compat.entity_id = entities.id
+                  AND compat.snapshot_kind = 'DATA'
                 )
                 WHERE EXISTS (
                     SELECT 1
                     FROM {COMPATIBILITY_TABLE} AS compat
                     WHERE compat.entity_id = entities.id
+                      AND compat.snapshot_kind = 'DATA'
                 )
                 """
             )
@@ -112,20 +210,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    if _compatibility_table_exists() is False:
-        op.create_table(
-            COMPATIBILITY_TABLE,
-            sa.Column("entity_id", sa.String(length=36), primary_key=True),
-            sa.Column("app_id", sa.String(length=256), nullable=False),
-        )
-        op.execute(
-            sa.text(
-                f"""
-                INSERT INTO {COMPATIBILITY_TABLE} (entity_id, app_id)
-                SELECT id, app_id FROM entities
-                """
-            )
-        )
+    if _compatibility_table_exists() is not None:
+        _rebuild_compatibility_snapshot()
     for name, _columns in reversed(ENTITY_PROJECTION_INDEXES):
         op.drop_index(name, table_name="entities")
     with op.batch_alter_table("entities") as batch_op:

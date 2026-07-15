@@ -637,6 +637,138 @@ def _run_interleaving(session_factory, operation: str) -> None:
         )
 
 
+def _verify_intent_downgrade_guard(engine, config: Config) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO events (
+                    id, project_id, app_id, operation, status,
+                    request_json, response_json, error_json, created_at
+                ) VALUES (
+                    'pg-guard-event', :project_id, :app_id,
+                    'memory.delete', 'FAILED', '{}', '{}', '{}', :now
+                )
+                """
+            ),
+            {"project_id": PROJECT_ID, "app_id": APP_ID, "now": now},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO mutation_intents (
+                    id, project_id, app_id, event_id, operation, operation_key,
+                    status, payload_json, result_json, error_json, attempt_count,
+                    created_at, updated_at
+                ) VALUES (
+                    'pg-guard-intent', :project_id, :app_id, 'pg-guard-event',
+                    'memory.delete', 'pg-guard-key', 'UNKNOWN', '{}', '{}', '{}', 2,
+                    :now, :now
+                )
+                """
+            ),
+            {"project_id": PROJECT_ID, "app_id": APP_ID, "now": now},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO mutation_intent_targets (
+                    id, intent_id, memory_id, ordinal, status, error_json,
+                    created_at, updated_at
+                ) VALUES (
+                    'pg-guard-target', 'pg-guard-intent', :memory_id,
+                    0, 'PENDING', '{}', :now, :now
+                )
+                """
+            ),
+            {"memory_id": MEMORY_ID, "now": now},
+        )
+
+    try:
+        _downgrade(config, "0006_entity_projection_scope")
+    except RuntimeError as exc:
+        _require(
+            "nonterminal mutation intents" in str(exc),
+            f"unexpected 0007 downgrade refusal: {exc}",
+        )
+    else:
+        raise AssertionError("0007 downgrade accepted an UNKNOWN intent")
+
+    with engine.connect() as connection:
+        tables = set(inspect(connection).get_table_names())
+        _require(
+            {"mutation_intents", "mutation_intent_targets"}.issubset(tables),
+            "0007 downgrade refusal dropped intent tables",
+        )
+        _require(
+            connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM mutation_intents "
+                    "WHERE id = 'pg-guard-intent' AND status = 'UNKNOWN'"
+                )
+            )
+            == 1,
+            "0007 downgrade refusal changed the unresolved intent",
+        )
+        _require(
+            connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM mutation_intent_targets "
+                    "WHERE id = 'pg-guard-target'"
+                )
+            )
+            == 1,
+            "0007 downgrade refusal changed the target row",
+        )
+        _require(
+            connection.scalar(text("SELECT version_num FROM alembic_version"))
+            == "0007_mutation_intents",
+            "0007 downgrade refusal changed the Alembic revision",
+        )
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                UPDATE mutation_intents
+                SET status = 'FAILED', completed_at = :now
+                WHERE id = 'pg-guard-intent'
+                """
+            ),
+            {"now": now},
+        )
+    _downgrade(config, "0006_entity_projection_scope")
+    _migrate(config, "head")
+
+
+def _seed_interrupted_compatibility_artifacts(engine) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE _compat_0005_request_trace_fields (
+                    event_id VARCHAR(36) PRIMARY KEY,
+                    app_id VARCHAR(256), user_id VARCHAR(256),
+                    agent_id VARCHAR(256), run_id VARCHAR(256),
+                    correlation_id VARCHAR(256), latency_ms DOUBLE PRECISION,
+                    result_count BIGINT NOT NULL, has_results INTEGER NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE _compat_0006_entity_projection_scope (
+                    entity_id VARCHAR(36) PRIMARY KEY,
+                    app_id VARCHAR(256) NOT NULL
+                )
+                """
+            )
+        )
+
+
 def _run(database_url: str) -> None:
     config = _alembic_config(database_url)
     engine = create_engine(database_url, pool_pre_ping=True)
@@ -646,6 +778,8 @@ def _run(database_url: str) -> None:
         _migrate(config, "head")
         _verify_head(engine)
         _seed_head_roundtrip(engine)
+        _verify_intent_downgrade_guard(engine, config)
+        _seed_interrupted_compatibility_artifacts(engine)
         _downgrade(config, "0004_memory_explorer_indexes")
         _verify_downgraded_0004(engine)
         _migrate(config, "head")
@@ -677,8 +811,9 @@ def main() -> int:
             connection.execute(text(f"CREATE DATABASE {quoted_database}"))
         _run(_database_url(maintenance_url, database_name))
         print(
-            "PostgreSQL smoke passed: 0004->head, exact downgrade/re-upgrade, "
-            "ORM/data checks, update/delete and reconcile/delete serialization"
+            "PostgreSQL smoke passed: 0004->head, interruption-safe exact "
+            "downgrade/re-upgrade, 0007 unresolved-intent refusal, ORM/data "
+            "checks, update/delete and reconcile/delete serialization"
         )
     finally:
         with maintenance_engine.connect() as connection:

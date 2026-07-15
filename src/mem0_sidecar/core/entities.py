@@ -397,6 +397,8 @@ class EntityService:
         )
         self.session.commit()
 
+        upstream_completed = False
+        upstream_effect_observed = False
         try:
             ProjectRepository(self.session).lock_for_mutation(project_id)
             intent_repo = MutationIntentRepository(self.session)
@@ -410,6 +412,7 @@ class EntityService:
                 target = targets[memory_id]
                 try:
                     await self.mem0.delete_memory(memory_id)
+                    upstream_effect_observed = True
                 except Exception as exc:
                     if not (
                         isinstance(exc, Mem0UpstreamError)
@@ -419,6 +422,7 @@ class EntityService:
                         failed.append({"id": memory_id, "error": safe_error})
                         intent_repo.mark_target_failed(target, safe_error)
                         continue
+                    upstream_effect_observed = True
                 memory_repo.delete_memory(
                     project_id=project_id,
                     mem0_memory_id=memory_id,
@@ -426,6 +430,7 @@ class EntityService:
                 intent_repo.mark_target_succeeded(target)
                 deleted_count += 1
 
+            upstream_completed = True
             entity_repo.rebuild_project_entities(project_id, app_id)
             failed_count = len(failed)
             if failed_count == 0:
@@ -459,13 +464,26 @@ class EntityService:
                 "failed": failed,
                 "event_id": event.id,
             }
-            intent_repo.complete(intent.id, result=result)
+            if failed_count:
+                intent_repo.fail(
+                    intent.id,
+                    status=status,
+                    error=result,
+                    result=result,
+                )
+            else:
+                intent_repo.complete(intent.id, result=result)
             self.session.commit()
             return result
         except BaseException as exc:
-            recovery_service._release_intent_after_failure(
+            recovery_service._record_intent_failure(
                 intent.id,
                 exc,
+                outcome_unknown=(
+                    not isinstance(exc, Exception)
+                    or upstream_completed
+                    or upstream_effect_observed
+                ),
                 mark_event_failed=isinstance(exc, Exception),
             )
             raise

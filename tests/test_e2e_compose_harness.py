@@ -43,7 +43,8 @@ def test_postgres_smoke_retains_phase2_exact_roundtrip_and_head_parity() -> None
     assert "MutationIntentTarget" in source
     assert "_seed_head_roundtrip(engine)" in source
     assert "_verify_head_roundtrip(engine)" in source
-    assert source.count('_migrate(config, "head")') == 2
+    assert source.count('_migrate(config, "head")') == 3
+    assert "_verify_intent_downgrade_guard(engine, config)" in source
     assert source.index("session.query(MutationIntent)") < source.index(
         "session.query(Event)"
     )

@@ -23,6 +23,7 @@ from mem0_sidecar.store.models import (
     Entity,
     EventStatus,
     MemoryIndex,
+    MutationIntent,
     Project,
 )
 from mem0_sidecar.store.repositories import (
@@ -2164,7 +2165,13 @@ async def test_update_locks_project_before_memory_index_and_entity_mutations(
         payload={"text": "updated"},
     )
 
-    assert operations == ["project", "upstream", "memory", "entity"]
+    assert operations == [
+        "project",  # recovery preflight and blocker reread
+        "project",  # durable intent execution
+        "upstream",
+        "memory",
+        "entity",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2422,7 +2429,8 @@ async def test_update_memory_maps_only_upstream_404_to_stale_not_found(
             self.get_memory_ids.append(memory_id)
             raise missing
 
-    with pytest.raises(KeyError):
+    expected_error = KeyError if failure_stage == "update" else Mem0UpstreamError
+    with pytest.raises(expected_error):
         await MemoryService(
             session=db_session,
             mem0=MissingDuringUpdateClient(),
@@ -2433,9 +2441,11 @@ async def test_update_memory_maps_only_upstream_404_to_stale_not_found(
             payload={"text": "after"},
         )
 
-    assert projection.deleted_at is not None
+    assert (projection.deleted_at is not None) is (failure_stage == "update")
     event = EventRepository(db_session).list_project_events("repo-a")[-1]
     assert event.status is EventStatus.FAILED
+    intent = db_session.query(MutationIntent).one()
+    assert intent.status == ("FAILED" if failure_stage == "update" else "UNKNOWN")
 
 
 def _entity_ids(db_session, *, app_id: str = "app-a") -> set[tuple[str, str, int]]:

@@ -12,7 +12,11 @@ from mem0_sidecar.core.explorer_filters import (
     MEMORY_FILTER_FIELDS,
     parse_explorer_query,
 )
-from mem0_sidecar.core.memory_ops import MemoryService
+from mem0_sidecar.core.memory_ops import (
+    MemoryService,
+    MutationConflictError,
+    validate_idempotency_key,
+)
 from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.http_adapter.dependencies import get_mem0_client, get_session
 from mem0_sidecar.http_adapter.project_scope import (
@@ -82,6 +86,9 @@ async def add_memory(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     try:
+        idempotency_key = validate_idempotency_key(
+            request.headers.get("Idempotency-Key")
+        )
         project_id = validate_scope_id(
             resolve_project_id(request, payload),
             field_name="project_id",
@@ -108,8 +115,12 @@ async def add_memory(
         result = await service.add_memory(
             project_id=project_id,
             payload=normalized_payload_for_project(request, payload),
+            idempotency_key=idempotency_key,
         )
         return result
+    except MutationConflictError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
