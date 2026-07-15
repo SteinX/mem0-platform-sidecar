@@ -154,9 +154,11 @@ class Mem0RestClient:
                 ) from exc
 
             duration_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            decode_failed = False
             try:
                 data = response.json()
             except Exception as exc:
+                decode_failed = True
                 LOGGER.warning(
                     "mem0_upstream_response_decode_failed",
                     extra=self._log_extra(
@@ -167,6 +169,7 @@ class Mem0RestClient:
                         error_type=type(exc).__name__,
                     ),
                 )
+            if decode_failed:
                 raise Mem0UpstreamError(
                     method=method,
                     path=path,
@@ -177,7 +180,7 @@ class Mem0RestClient:
                         f"Mem0 upstream {method} {path} returned an "
                         "undecodable success response"
                     ),
-                ) from exc
+                )
             LOGGER.info(
                 "mem0_upstream_request_completed",
                 extra=self._log_extra(

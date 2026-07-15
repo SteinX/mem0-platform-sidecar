@@ -5,6 +5,86 @@ from mem0_sidecar.mem0_client import client as client_module
 from mem0_sidecar.mem0_client.client import Mem0RestClient
 
 
+def _bounded_value_contains_secret(value: object, secret: str) -> bool:
+    pending: list[tuple[object, int]] = [(value, 0)]
+    seen: set[int] = set()
+    secret_bytes = secret.encode()
+    visited = 0
+    while pending and visited < 256:
+        current, depth = pending.pop()
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        visited += 1
+        if type(current) is str:
+            if secret in current:
+                return True
+            continue
+        if type(current) is bytes:
+            if secret_bytes in current:
+                return True
+            continue
+        if depth >= 4:
+            continue
+        if type(current) is dict:
+            for key, item in list(current.items())[:32]:
+                pending.extend(((key, depth + 1), (item, depth + 1)))
+        elif type(current) in {list, tuple, set, frozenset}:
+            pending.extend((item, depth + 1) for item in list(current)[:32])
+    return False
+
+
+def _linked_exception_graph_contains_secret(
+    error: BaseException,
+    secret: str,
+) -> bool:
+    pending: list[tuple[BaseException, int]] = [
+        (linked, 0)
+        for linked in (error.__cause__, error.__context__)
+        if linked is not None
+    ]
+    seen: set[int] = set()
+    visited = 0
+    while pending and visited < 16:
+        current, depth = pending.pop()
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        visited += 1
+        if _bounded_value_contains_secret((current.args, vars(current)), secret):
+            return True
+
+        traceback = current.__traceback__
+        frame_count = 0
+        while traceback is not None and frame_count < 32:
+            local_values = list(traceback.tb_frame.f_locals.values())[:64]
+            if _bounded_value_contains_secret(local_values, secret):
+                return True
+            traceback = traceback.tb_next
+            frame_count += 1
+
+        if depth < 8:
+            pending.extend(
+                (linked, depth + 1)
+                for linked in (current.__cause__, current.__context__)
+                if linked is not None
+            )
+    return False
+
+
+def _decoder_graph_state(
+    error: BaseException,
+    secret: str,
+) -> tuple[str | None, str | None, bool]:
+    return (
+        type(error.__cause__).__name__ if error.__cause__ is not None else None,
+        type(error.__context__).__name__ if error.__context__ is not None else None,
+        _linked_exception_graph_contains_secret(error, secret),
+    )
+
+
 @pytest.mark.asyncio
 async def test_mem0_client_posts_add_memory_payload_with_text_translation() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -398,6 +478,7 @@ async def test_mem0_client_wraps_2xx_invalid_json_as_ambiguous_without_body_leak
     assert error.outcome_unknown is True
     assert error.response_text is None
     assert secret_body not in str(error)
+    assert _decoder_graph_state(error, secret_body) == (None, None, False)
 
 
 @pytest.mark.asyncio
@@ -426,3 +507,4 @@ async def test_mem0_client_wraps_deep_valid_2xx_json_exception_without_body_leak
     assert error.outcome_unknown is True
     assert error.response_text is None
     assert secret_body not in str(error)
+    assert _decoder_graph_state(error, secret_body) == (None, None, False)
