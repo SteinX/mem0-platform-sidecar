@@ -321,7 +321,6 @@ async def delete_entity(
             decoded_type,
             decoded_id,
         )
-        session.commit()
         return result
     except HTTPException:
         session.rollback()

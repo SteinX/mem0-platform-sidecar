@@ -397,13 +397,16 @@ function installBrowserMocks() {
       });
     }
     if (/\/v1\/memories\/[^/]+\/history/.test(url)) {
-      return json({ results: [] });
+      const id = decodeURIComponent(
+        url.split("/v1/memories/")[1].split(/[/?]/)[0],
+      );
+      return json({ results: [], requested_id: id });
     }
     if (/\/v1\/memories\/[^/]+/.test(url)) {
       const id = decodeURIComponent(
         url.split("/v1/memories/")[1].split(/[/?]/)[0],
       );
-      if (method === "DELETE") return json({ deleted: true });
+      if (method === "DELETE") return json({ id, deleted: true });
       return json(memory(id, id === "mem-1" ? "Memory alpha" : "Memory beta"));
     }
     if (/\/v1\/entities\/[^/]+\/[^/?]+/.test(url)) {
@@ -586,6 +589,48 @@ async function main() {
     );
     await clickButton("Cancel");
     await clickButton("Close");
+
+    const opaqueMemoryIds = ["a/b", "a%b", "a%2Fb"];
+    const opaqueMemoryActions = await evaluate(`(async () => {
+      const ids = ${JSON.stringify(opaqueMemoryIds)};
+      const results = [];
+      for (const id of ids) {
+        const segment = encodeURIComponent(id);
+        const base = "/api/sidecar/v1/memories/" + segment;
+        const detail = await (await fetch(base)).json();
+        const history = await (await fetch(base + "/history")).json();
+        const update = await (await fetch(base, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: "updated " + id }),
+        })).json();
+        const deletion = await (await fetch(base, { method: "DELETE" })).json();
+        results.push({
+          id,
+          segment,
+          detail: detail.id,
+          history: history.requested_id,
+          update: update.id,
+          deletion: deletion.id,
+        });
+      }
+      return results;
+    })()`);
+    check(
+      JSON.stringify(opaqueMemoryActions) ===
+        JSON.stringify(
+          opaqueMemoryIds.map((id) => ({
+            id,
+            segment: encodeURIComponent(id),
+            detail: id,
+            history: id,
+            update: id,
+            deletion: id,
+          })),
+        ) &&
+        new Set(opaqueMemoryActions.map((item) => item.segment)).size === 3,
+      "opaque memory IDs stayed distinct across all item actions",
+    );
 
     await setMode("empty");
     await navigate("/dashboard/entities");

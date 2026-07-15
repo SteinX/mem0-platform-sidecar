@@ -299,6 +299,74 @@ class Entity(Base):
     )
 
 
+class MutationIntent(Base):
+    __tablename__ = "mutation_intents"
+    __table_args__ = (
+        Index(
+            "ix_mutation_intents_scope_status_created",
+            "project_id",
+            "app_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    app_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    event_id: Mapped[str] = mapped_column(ForeignKey("events.id"), nullable=False)
+    operation: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default="PENDING", server_default="PENDING", nullable=False
+    )
+    payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    result_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    error_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MutationIntentTarget(Base):
+    __tablename__ = "mutation_intent_targets"
+    __table_args__ = (
+        UniqueConstraint(
+            "intent_id",
+            "memory_id",
+            name="uq_mutation_intent_targets_intent_memory",
+        ),
+        Index(
+            "ix_mutation_intent_targets_intent_status_ordinal",
+            "intent_id",
+            "status",
+            "ordinal",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    intent_id: Mapped[str] = mapped_column(
+        ForeignKey("mutation_intents.id", ondelete="CASCADE"), nullable=False
+    )
+    memory_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default="PENDING", server_default="PENDING", nullable=False
+    )
+    error_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
 class Job(Base):
     __tablename__ = "jobs"
 

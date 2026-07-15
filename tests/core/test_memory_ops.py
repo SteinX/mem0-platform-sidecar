@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC
 from typing import Any
 
 import pytest
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 from mem0_sidecar.core.explorer_filters import parse_explorer_query
 from mem0_sidecar.core.memory_ops import (
     SIDECAR_APP_ID_METADATA_KEY,
+    SIDECAR_MUTATION_ID_METADATA_KEY,
     SIDECAR_PROJECT_ID_METADATA_KEY,
     MemoryService,
     MemoryUpstreamProtocolError,
@@ -249,6 +251,10 @@ async def test_memory_service_adds_memory_indexes_projection_and_event(
     assert indexed.category == "decision"
     assert mem0.add_payloads[0]["user_id"] == "root"
     assert "app_id" not in mem0.add_payloads[0]
+    mutation_marker = mem0.add_payloads[0]["metadata"].pop(
+        SIDECAR_MUTATION_ID_METADATA_KEY
+    )
+    assert len(mutation_marker) == 64
     assert mem0.add_payloads[0]["metadata"] == {
         "type": "decision",
         SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
@@ -1920,7 +1926,10 @@ async def test_reconcile_does_not_stale_projection_updated_during_scan(
 
     assert result["stale_marked"] == 0
     assert projection.deleted_at is None
-    assert projection.updated_at > original_updated_at
+    projection_updated_at = projection.updated_at
+    if projection_updated_at.tzinfo is None:
+        projection_updated_at = projection_updated_at.replace(tzinfo=UTC)
+    assert projection_updated_at > original_updated_at
 
 
 @pytest.mark.asyncio

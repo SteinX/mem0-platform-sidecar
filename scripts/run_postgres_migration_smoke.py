@@ -23,13 +23,23 @@ from mem0_sidecar.core.memory_ops import (
     SIDECAR_PROJECT_ID_METADATA_KEY,
     MemoryService,
 )
-from mem0_sidecar.store.models import Entity, Event, MemoryIndex, Project
+from mem0_sidecar.store.models import (
+    Entity,
+    Event,
+    MemoryIndex,
+    MutationIntent,
+    MutationIntentTarget,
+    Project,
+)
 from mem0_sidecar.store.repositories import EntityRepository
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ID = "pg-smoke-project"
 APP_ID = "pg-smoke-app"
 MEMORY_ID = "pg-smoke-memory"
+HEAD_EVENT_ID = "head-roundtrip-event"
+HEAD_ENTITY_IDS = ("head-roundtrip-entity-a", "head-roundtrip-entity-b")
+HEAD_APP_IDS = ("head-roundtrip-app-a", "head-roundtrip-app-b")
 
 
 def _require(condition: object, message: str) -> None:
@@ -147,6 +157,59 @@ def _seed_legacy(engine) -> None:
             )
 
 
+def _seed_head_roundtrip(engine) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO events (
+                    id, project_id, app_id, user_id, agent_id, run_id,
+                    operation, status, request_json, response_json, error_json,
+                    correlation_id, latency_ms, result_count, has_results,
+                    created_at
+                ) VALUES (
+                    :id, :project_id, :app_id, 'head-user', 'head-agent',
+                    'head-run', 'memory.list', 'SUCCEEDED', '{}', '{}', '{}',
+                    'head-correlation', 12.5, 7, 1, :now
+                )
+                """
+            ),
+            {
+                "id": HEAD_EVENT_ID,
+                "project_id": PROJECT_ID,
+                "app_id": HEAD_APP_IDS[1],
+                "now": now,
+            },
+        )
+        for row_id, app_id, display_name, memory_count in (
+            (HEAD_ENTITY_IDS[0], HEAD_APP_IDS[0], "Head Alice A", 2),
+            (HEAD_ENTITY_IDS[1], HEAD_APP_IDS[1], "Head Alice B", 3),
+        ):
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO entities (
+                        id, project_id, app_id, entity_type, entity_id,
+                        display_name, metadata_json, memory_count,
+                        created_at, updated_at
+                    ) VALUES (
+                        :id, :project_id, :app_id, 'user', 'head-alice',
+                        :display_name, '{}', :memory_count, :now, :now
+                    )
+                    """
+                ),
+                {
+                    "id": row_id,
+                    "project_id": PROJECT_ID,
+                    "app_id": app_id,
+                    "display_name": display_name,
+                    "memory_count": memory_count,
+                    "now": now,
+                },
+            )
+
+
 def _index_names(inspector, table_name: str) -> set[str]:
     return {item["name"] for item in inspector.get_indexes(table_name)}
 
@@ -197,7 +260,14 @@ def _verify_head(engine) -> None:
         "0006 entity uniqueness missing",
     )
 
-    for model in (Project, MemoryIndex, Event, Entity):
+    for model in (
+        Project,
+        MemoryIndex,
+        Event,
+        Entity,
+        MutationIntent,
+        MutationIntentTarget,
+    ):
         actual = _column_names(database, model.__tablename__)
         expected = set(model.__table__.columns.keys())
         _require(actual == expected, f"ORM parity failed for {model.__tablename__}")
@@ -210,7 +280,15 @@ def _verify_head(engine) -> None:
         entities = list(
             session.scalars(
                 select(Entity)
-                .where(Entity.project_id == PROJECT_ID)
+                .where(
+                    Entity.project_id == PROJECT_ID,
+                    Entity.id.in_(
+                        [
+                            "legacy-entity-new",
+                            "legacy-entity-bob",
+                        ]
+                    ),
+                )
                 .order_by(Entity.entity_id)
             )
         )
@@ -256,6 +334,14 @@ def _verify_downgraded_0004(engine) -> None:
         ),
         "0005 indexes survived downgrade",
     )
+    _require(
+        database.has_table("_compat_0005_request_trace_fields"),
+        "0005 compatibility table missing after downgrade",
+    )
+    _require(
+        database.has_table("_compat_0006_entity_projection_scope"),
+        "0006 compatibility table missing after downgrade",
+    )
     with engine.connect() as connection:
         _require(
             connection.scalar(
@@ -269,9 +355,110 @@ def _verify_downgraded_0004(engine) -> None:
                 text("SELECT count(*) FROM entities WHERE project_id = :project_id"),
                 {"project_id": PROJECT_ID},
             )
-            == 2,
+            == 4,
             "deduped entities unusable after downgrade",
         )
+        _require(
+            connection.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM _compat_0005_request_trace_fields
+                    WHERE event_id = :event_id
+                    """
+                ),
+                {"event_id": HEAD_EVENT_ID},
+            )
+            == 1,
+            "head request trace compatibility row was lost",
+        )
+        _require(
+            connection.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM _compat_0006_entity_projection_scope
+                    WHERE entity_id IN (:entity_a, :entity_b)
+                    """
+                ),
+                {
+                    "entity_a": HEAD_ENTITY_IDS[0],
+                    "entity_b": HEAD_ENTITY_IDS[1],
+                },
+            )
+            == 2,
+            "head entity compatibility rows were lost",
+        )
+
+
+def _verify_head_roundtrip(engine) -> None:
+    database = inspect(engine)
+    _require(
+        not database.has_table("_compat_0005_request_trace_fields"),
+        "0005 compatibility table survived successful restoration",
+    )
+    _require(
+        not database.has_table("_compat_0006_entity_projection_scope"),
+        "0006 compatibility table survived successful restoration",
+    )
+    with engine.connect() as connection:
+        event = connection.execute(
+            text(
+                """
+                SELECT app_id, user_id, agent_id, run_id, correlation_id,
+                       latency_ms, result_count, has_results
+                FROM events WHERE id = :event_id
+                """
+            ),
+            {"event_id": HEAD_EVENT_ID},
+        ).mappings().one()
+        entities = connection.execute(
+            text(
+                """
+                SELECT id, app_id, display_name, memory_count
+                FROM entities
+                WHERE id IN (:entity_a, :entity_b)
+                ORDER BY id
+                """
+            ),
+            {
+                "entity_a": HEAD_ENTITY_IDS[0],
+                "entity_b": HEAD_ENTITY_IDS[1],
+            },
+        ).mappings().all()
+
+    _require(
+        dict(event)
+        == {
+            "app_id": HEAD_APP_IDS[1],
+            "user_id": "head-user",
+            "agent_id": "head-agent",
+            "run_id": "head-run",
+            "correlation_id": "head-correlation",
+            "latency_ms": 12.5,
+            "result_count": 7,
+            "has_results": 1,
+        },
+        "head request trace did not survive exact roundtrip",
+    )
+    _require(
+        [dict(item) for item in entities]
+        == [
+            {
+                "id": HEAD_ENTITY_IDS[0],
+                "app_id": HEAD_APP_IDS[0],
+                "display_name": "Head Alice A",
+                "memory_count": 2,
+            },
+            {
+                "id": HEAD_ENTITY_IDS[1],
+                "app_id": HEAD_APP_IDS[1],
+                "display_name": "Head Alice B",
+                "memory_count": 3,
+            },
+        ],
+        "head multi-app entities did not survive exact roundtrip",
+    )
 
 
 class _BlockingUpdateClient:
@@ -335,6 +522,9 @@ class _DeleteClient:
 
 def _reset_projection(session_factory) -> None:
     with session_factory() as session:
+        session.query(MutationIntent).filter(
+            MutationIntent.project_id == PROJECT_ID
+        ).delete()
         session.query(Event).filter(Event.project_id == PROJECT_ID).delete()
         session.query(Entity).filter(Entity.project_id == PROJECT_ID).delete()
         session.query(MemoryIndex).filter(
@@ -453,13 +643,14 @@ def _run(database_url: str) -> None:
     try:
         _migrate(config, "0004_memory_explorer_indexes")
         _seed_legacy(engine)
-        _migrate(config, "0005_request_trace_fields")
-        _migrate(config, "0006_entity_projection_scope")
+        _migrate(config, "head")
         _verify_head(engine)
+        _seed_head_roundtrip(engine)
         _downgrade(config, "0004_memory_explorer_indexes")
         _verify_downgraded_0004(engine)
-        _migrate(config, "0006_entity_projection_scope")
+        _migrate(config, "head")
         _verify_head(engine)
+        _verify_head_roundtrip(engine)
         session_factory = sessionmaker(bind=engine, expire_on_commit=False)
         _run_interleaving(session_factory, "update")
         _run_interleaving(session_factory, "reconcile")
@@ -486,7 +677,7 @@ def main() -> int:
             connection.execute(text(f"CREATE DATABASE {quoted_database}"))
         _run(_database_url(maintenance_url, database_name))
         print(
-            "PostgreSQL smoke passed: 0004->0005->0006, downgrade/re-upgrade, "
+            "PostgreSQL smoke passed: 0004->head, exact downgrade/re-upgrade, "
             "ORM/data checks, update/delete and reconcile/delete serialization"
         )
     finally:

@@ -46,6 +46,47 @@ REQUEST_TRACE_INDEXES = (
         ["project_id", "has_results", "created_at"],
     ),
 )
+COMPATIBILITY_TABLE = "_compat_0005_request_trace_fields"
+
+
+def _compatibility_table_exists() -> bool | None:
+    get_bind = getattr(op, "get_bind", None)
+    return sa.inspect(get_bind()).has_table(COMPATIBILITY_TABLE) if get_bind else None
+
+
+def _restore_downgraded_trace_fields() -> None:
+    if _compatibility_table_exists() is not True:
+        return
+    assignments = ",\n".join(
+        f"""{field_name} = (
+                SELECT compat.{field_name}
+                FROM {COMPATIBILITY_TABLE} AS compat
+                WHERE compat.event_id = events.id
+            )"""
+        for field_name in (
+            "app_id",
+            "user_id",
+            "agent_id",
+            "run_id",
+            "correlation_id",
+            "latency_ms",
+            "result_count",
+            "has_results",
+        )
+    )
+    op.execute(
+        sa.text(
+            f"""
+            UPDATE events
+            SET {assignments}
+            WHERE EXISTS (
+                SELECT 1
+                FROM {COMPATIBILITY_TABLE} AS compat
+                WHERE compat.event_id = events.id
+            )
+            """
+        )
+    )
 
 
 def upgrade() -> None:
@@ -84,11 +125,41 @@ def upgrade() -> None:
             server_default=sa.text("0"),
         ),
     )
+    _restore_downgraded_trace_fields()
     for name, columns in REQUEST_TRACE_INDEXES:
         op.create_index(name, "events", columns, unique=False)
+    if _compatibility_table_exists():
+        op.drop_table(COMPATIBILITY_TABLE)
 
 
 def downgrade() -> None:
+    if _compatibility_table_exists() is False:
+        op.create_table(
+            COMPATIBILITY_TABLE,
+            sa.Column("event_id", sa.String(length=36), primary_key=True),
+            sa.Column("app_id", sa.String(length=256), nullable=True),
+            sa.Column("user_id", sa.String(length=256), nullable=True),
+            sa.Column("agent_id", sa.String(length=256), nullable=True),
+            sa.Column("run_id", sa.String(length=256), nullable=True),
+            sa.Column("correlation_id", sa.String(length=256), nullable=True),
+            sa.Column("latency_ms", sa.Float(), nullable=True),
+            sa.Column("result_count", sa.BigInteger(), nullable=False),
+            sa.Column("has_results", sa.Integer(), nullable=False),
+        )
+        op.execute(
+            sa.text(
+                f"""
+                INSERT INTO {COMPATIBILITY_TABLE} (
+                    event_id, app_id, user_id, agent_id, run_id,
+                    correlation_id, latency_ms, result_count, has_results
+                )
+                SELECT
+                    id, app_id, user_id, agent_id, run_id,
+                    correlation_id, latency_ms, result_count, has_results
+                FROM events
+                """
+            )
+        )
     for name, _columns in reversed(REQUEST_TRACE_INDEXES):
         op.drop_index(name, table_name="events")
     op.drop_column("events", "has_results")

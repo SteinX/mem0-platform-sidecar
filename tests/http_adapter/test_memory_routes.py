@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.core.memory_ops import (
     SIDECAR_APP_ID_METADATA_KEY,
+    SIDECAR_MUTATION_ID_METADATA_KEY,
     SIDECAR_PROJECT_ID_METADATA_KEY,
     MemoryService,
 )
@@ -230,6 +231,10 @@ def test_memory_routes_round_trip_with_fake_upstream(tmp_path) -> None:
     assert add_body["memory"]["id"] == "mem-1"
     assert add_body["event"]["status"] == "SUCCEEDED"
     assert "app_id" not in mem0.add_payloads[0]
+    mutation_marker = mem0.add_payloads[0]["metadata"].pop(
+        SIDECAR_MUTATION_ID_METADATA_KEY
+    )
+    assert len(mutation_marker) == 64
     assert mem0.add_payloads[0]["metadata"] == {
         "type": "decision",
         SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
@@ -1252,7 +1257,6 @@ def test_memory_route_once_encoded_slash_does_not_match_item_route(tmp_path) -> 
         "%252e%252e%255chealth",
         "%2571uery",
         "safe%2500name",
-        "memory%25252Fone",
     ],
 )
 def test_memory_routes_reject_malicious_encoded_ids(
@@ -1477,6 +1481,73 @@ def test_memory_router_rejects_invalid_raw_paths_without_lossy_aliases(
         assert list(session.scalars(select(Event.id))) == event_ids_before
 
 
+def test_memory_item_routes_preserve_distinct_opaque_ids_for_every_action(
+    tmp_path,
+) -> None:
+    opaque_ids = {
+        "a/b": "a%252Fb",
+        "a%b": "a%2525b",
+        "a%2Fb": "a%25252Fb",
+    }
+    mem0 = ExplorerRouteMem0Client(
+        {
+            memory_id: {
+                "id": memory_id,
+                "memory": f"memory {memory_id}",
+                "app_id": "app-a",
+                "metadata": {},
+            }
+            for memory_id in opaque_ids
+        }
+    )
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'opaque-memory-ids.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    for memory_id in opaque_ids:
+        _index_route_memory(app, memory_id)
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        assert project is not None
+        project.default_app_id = "app-a"
+        session.commit()
+
+    with TestClient(app) as client:
+        for memory_id, transport_id in opaque_ids.items():
+            scope = "?project_id=repo-a&app_id=app-a"
+            detail = client.get(f"/v1/memories/{transport_id}{scope}")
+            history = client.get(
+                f"/v1/memories/{transport_id}/history{scope}"
+            )
+            update = client.patch(
+                f"/v1/memories/{transport_id}{scope}",
+                json={"text": f"updated {memory_id}"},
+            )
+            delete = client.delete(f"/v1/memories/{transport_id}{scope}")
+
+            assert detail.status_code == 200, memory_id
+            assert detail.json()["id"] == memory_id
+            assert history.status_code == 200, memory_id
+            assert update.status_code == 200, memory_id
+            assert update.json()["memory"]["id"] == memory_id
+            assert delete.status_code == 200, memory_id
+
+    assert mem0.get_memory_ids == [
+        memory_id
+        for memory_id in opaque_ids
+        for _action in ("detail", "update-refresh")
+    ]
+    assert mem0.history_calls == list(opaque_ids)
+    assert [memory_id for memory_id, _payload in mem0.update_calls] == list(
+        opaque_ids
+    )
+    assert mem0.deleted_ids == list(opaque_ids)
+
+
 def test_query_memories_commits_stale_cleanup(tmp_path) -> None:
     mem0 = ExplorerRouteMem0Client({"mem-stale": ValueError("malformed")})
     app = create_app(
@@ -1640,7 +1711,7 @@ def test_patch_memory_commits_success(tmp_path, monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["memory"]["memory"] == "after"
     assert mem0.update_calls == [("mem-1", {"text": "after"})]
-    assert len(commit_calls) == 1
+    assert len(commit_calls) == 2
     assert rollback_calls == []
     with app.state.session_factory() as session:
         event = session.scalar(
@@ -1737,8 +1808,8 @@ def test_patch_memory_rolls_back_unexpected_failure(tmp_path, monkeypatch) -> No
     )
 
     assert response.status_code == 500
-    assert len(commit_calls) == 1
-    assert len(rollback_calls) == 1
+    assert len(commit_calls) == 2
+    assert len(rollback_calls) == 2
     with app.state.session_factory() as session:
         event = session.scalar(
             select(Event).where(
@@ -1786,8 +1857,8 @@ def test_patch_memory_persists_failed_event_and_stale_marker_on_upstream_404(
     )
 
     assert response.status_code == 404
-    assert len(commit_calls) == 1
-    assert len(rollback_calls) == 1
+    assert len(commit_calls) == 2
+    assert len(rollback_calls) == 2
     with app.state.session_factory() as session:
         event = session.scalar(
             select(Event).where(
