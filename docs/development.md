@@ -128,3 +128,49 @@ headers, for example `{"X-Mem0-Org":"org-1"}`.
 Set `MEM0_SIDECAR_LOG_FORMAT=json` for container logs. Each request receives or
 propagates the configured request ID header and emits structured request logs;
 Mem0 OSS upstream calls also emit structured success/failure logs.
+
+## Resolve an ambiguous mutation intent
+
+An interrupted upstream mutation can remain `UNKNOWN` or become `EXHAUSTED`.
+Those states intentionally block later writes in the same project/app scope:
+the sidecar will not replay an add whose upstream outcome is ambiguous.
+
+The recovery command is available only as a host/container management CLI. It
+has no HTTP or dashboard route. Shell access to the sidecar container and its
+database is the authentication boundary, so run it only from a trusted
+operator session.
+
+First list blockers for one exact project and app:
+
+```bash
+docker compose exec sidecar mem0-sidecar-admin mutation-intents list \
+  --project-id demo-project \
+  --app-id codex
+```
+
+After investigating the upstream system, copy the current intent ID, status,
+and attempt count from that output. If the upstream outcome still cannot be
+known, explicitly terminalize that one intent:
+
+```bash
+docker compose exec sidecar mem0-sidecar-admin mutation-intents resolve \
+  --project-id demo-project \
+  --app-id codex \
+  --intent-id 11111111-1111-1111-1111-111111111111 \
+  --confirm-intent-id 11111111-1111-1111-1111-111111111111 \
+  --expected-status EXHAUSTED \
+  --expected-attempt-count 3 \
+  --reason "operator accepted the unknowable upstream outcome" \
+  --accept-unknown-outcome
+```
+
+Resolution uses compare-and-resolve under the project mutation lock. It is
+rejected if scope, status, attempt count, confirmation, or lease state changed.
+For an add intent the CLI performs one read-only marker observation and refuses
+resolution if the marker is present. Marker absence is not proof that the add
+did not happen; `--accept-unknown-outcome` is still required.
+
+The operation never sends an upstream write. It marks the original intent and
+event failed, retains the original operation key so that the old
+`Idempotency-Key` remains consumed, and records a sanitized `mutation.resolve`
+audit event. Use a new idempotency key for a new request after resolution.
