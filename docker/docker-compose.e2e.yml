@@ -70,6 +70,31 @@ services:
       timeout: 3s
       retries: 90
 
+  sidecar:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      mem0:
+        condition: service_healthy
+    environment:
+      MEM0_SIDECAR_DATABASE_URL: sqlite:////data/sidecar-e2e.sqlite3
+      MEM0_SIDECAR_MEM0_BASE_URL: http://mem0:8000
+      MEM0_SIDECAR_DEFAULT_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - sidecar-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/readyz', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
   e2e-runner:
     build:
       context: ..
@@ -124,12 +149,16 @@ services:
     build:
       context: ${MEM0_E2E_DASHBOARD_CONTEXT:?set MEM0_E2E_DASHBOARD_CONTEXT}
       dockerfile: Dockerfile.e2e
+    depends_on:
+      sidecar:
+        condition: service_healthy
     environment:
       AUTH_DISABLED: "true"
       NEXT_PUBLIC_API_URL: http://mem0:8000
       NEXT_PUBLIC_INSTANCE_NAME: Browser Smoke
-      SIDECAR_INTERNAL_API_URL: http://mem0:8000
+      SIDECAR_INTERNAL_API_URL: http://sidecar:8765
       SIDECAR_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
+      SIDECAR_APP_ID: ${MEM0_E2E_APP_ID:-sidecar-e2e-app}
     healthcheck:
       test:
         - CMD
@@ -164,7 +193,12 @@ services:
     environment:
       MEM0_E2E_BROWSER_CDP: http://127.0.0.1:9222
       MEM0_E2E_DASHBOARD_URL: http://dashboard:3000
+      MEM0_E2E_SIDECAR_URL: http://sidecar:8765
+      MEM0_E2E_MEM0_URL: http://mem0:8000
+      MEM0_E2E_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
+      MEM0_E2E_APP_ID: ${MEM0_E2E_APP_ID:-sidecar-e2e-app}
     network_mode: service:browser
 
 volumes:
   postgres-data:
+  sidecar-data:

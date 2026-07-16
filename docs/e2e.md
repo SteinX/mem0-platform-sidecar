@@ -90,9 +90,20 @@ Optional controls:
 
 The harness polls Mem0 health until the deadline; it does not use a fixed startup
 sleep. On timeout or test failure it prints Compose status and bounded logs for
-the Mem0, Postgres, stub, and runner services before cleanup. The isolated Mem0
+the Mem0, sidecar, Postgres, stub, and runner services before cleanup. The isolated Mem0
 service sets its list limit to 5000 so the reconciliation contract can request
 the sidecar's bounded scan size.
+
+The browser phase has two deliberately separate checks, and the runner executes
+the real gate first. The **mocked UI behavior smoke** exercises broad page states
+with deterministic browser-side responses;
+it is **not the deployed-proxy acceptance gate**. The **real destructive browser**
+gate seeds one uniquely scoped memory through the live sidecar, then proves the
+full request path `Chromium -> Next /api/sidecar -> sidecar -> Mem0`. It opens the
+real list and detail drawer, types the exact memory ID into the UI delete guard,
+matches the successful DELETE response by CDP request ID, proves the row is gone,
+and verifies absence through both direct sidecar and direct Mem0 reads. Its
+`finally` cleanup retries both deletion paths and fails if the fixture remains.
 
 For manual debugging against an already running compatible backend, set
 `MEM0_E2E_BASE_URL` and run the test directly. Without it, live tests skip; a

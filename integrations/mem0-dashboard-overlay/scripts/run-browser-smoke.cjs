@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 "use strict";
 
+// Mocked UI behavior smoke only; not the deployed proxy acceptance gate.
+
 const cdpBase = process.env.MEM0_E2E_BROWSER_CDP || "http://browser:9222";
 const dashboardBase =
   process.env.MEM0_E2E_DASHBOARD_URL || "http://dashboard:3000";
