@@ -247,6 +247,10 @@ def _compatibility_snapshot_format() -> str | None:
 
 def _rebuild_compatibility_snapshot() -> None:
     bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        op.execute(sa.text("LOCK TABLE events IN ACCESS EXCLUSIVE MODE"))
+    elif bind.dialect.name == "sqlite":
+        op.execute(sa.text("UPDATE events SET id = id WHERE 0"))
     source_columns = {
         column["name"] for column in sa.inspect(bind).get_columns("events")
     }

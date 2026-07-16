@@ -8,6 +8,8 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy.dialects import postgresql
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -1896,6 +1898,340 @@ def test_exact_legacy_validator_rejects_unexpected_schema_objects(
             match=rf"invalid {revision} compatibility snapshot structure",
         ):
             migration._validate_legacy_compatibility_snapshot()
+
+
+def _compat_migration(revision: str):
+    module_name = (
+        "migrations.versions.0005_request_trace_fields"
+        if revision == "0005"
+        else "migrations.versions.0006_entity_projection_scope"
+    )
+    return importlib.import_module(module_name)
+
+
+def _compat_revision_name(revision: str) -> str:
+    return (
+        "0005_request_trace_fields"
+        if revision == "0005"
+        else "0006_entity_projection_scope"
+    )
+
+
+def _compat_down_revision(revision: str) -> str:
+    return (
+        "0004_memory_explorer_indexes"
+        if revision == "0005"
+        else "0005_request_trace_fields"
+    )
+
+
+def _prepare_compat_concurrency_db(tmp_path, revision: str, schedule: str):
+    database_url = f"sqlite:///{tmp_path / f'{revision}-{schedule}.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, _compat_revision_name(revision))
+    engine = sa.create_engine(
+        database_url,
+        future=True,
+        connect_args={"check_same_thread": False, "timeout": 5},
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, default_app_id, mem0_base_url,
+                    created_at, updated_at
+                ) VALUES (
+                    'compat-project', 'Compat Project', 'default-app',
+                    'http://mem0:8000', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+    return config, engine
+
+
+def _insert_compat_source_row(connection, revision: str, row_id: str) -> None:
+    if revision == "0005":
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO events (
+                    id, project_id, app_id, user_id, agent_id, run_id,
+                    operation, status, request_json, response_json, error_json,
+                    correlation_id, latency_ms, result_count, has_results,
+                    created_at
+                ) VALUES (
+                    :row_id, 'compat-project', 'writer-app', 'writer-user',
+                    'writer-agent', 'writer-run', 'memory.search', 'SUCCEEDED',
+                    '{}', '{}', '{}', 'writer-correlation', 17.25, 9, 1,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            ),
+            {"row_id": row_id},
+        )
+        return
+    connection.execute(
+        sa.text(
+            """
+            INSERT INTO entities (
+                id, project_id, app_id, entity_type, entity_id,
+                display_name, metadata_json, memory_count,
+                created_at, updated_at
+            ) VALUES (
+                :row_id, 'compat-project', 'writer-app', 'user', :row_id,
+                'Writer Entity', '{}', 4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """
+        ),
+        {"row_id": row_id},
+    )
+
+
+def _compat_source_values(connection, revision: str, row_id: str):
+    if revision == "0005":
+        return connection.execute(
+            sa.text(
+                """
+                SELECT app_id, user_id, agent_id, run_id, correlation_id,
+                       latency_ms, result_count, has_results
+                FROM events WHERE id = :row_id
+                """
+            ),
+            {"row_id": row_id},
+        ).mappings().one_or_none()
+    return connection.execute(
+        sa.text(
+            """
+            SELECT app_id, display_name, memory_count
+            FROM entities WHERE id = :row_id
+            """
+        ),
+        {"row_id": row_id},
+    ).mappings().one_or_none()
+
+
+def _expected_compat_source_values(revision: str):
+    if revision == "0005":
+        return {
+            "app_id": "writer-app",
+            "user_id": "writer-user",
+            "agent_id": "writer-agent",
+            "run_id": "writer-run",
+            "correlation_id": "writer-correlation",
+            "latency_ms": 17.25,
+            "result_count": 9,
+            "has_results": 1,
+        }
+    return {
+        "app_id": "writer-app",
+        "display_name": "Writer Entity",
+        "memory_count": 4,
+    }
+
+
+def _run_direct_compat_downgrade(engine, migration, target_revision: str) -> None:
+    original_op = migration.op
+    try:
+        with engine.connect() as connection:
+            with connection.begin():
+                migration.op = Operations(MigrationContext.configure(connection))
+                migration.downgrade()
+                connection.execute(
+                    sa.text(
+                        "UPDATE alembic_version SET version_num = :revision"
+                    ),
+                    {"revision": target_revision},
+                )
+    finally:
+        migration.op = original_op
+
+
+@pytest.mark.parametrize("revision", ["0005", "0006"])
+def test_compat_downgrade_writer_first_includes_committed_source_values(
+    tmp_path,
+    monkeypatch,
+    revision: str,
+) -> None:
+    config, engine = _prepare_compat_concurrency_db(
+        tmp_path,
+        revision,
+        "writer-first",
+    )
+    migration = _compat_migration(revision)
+    snapshot_started = threading.Event()
+    snapshot_finished = threading.Event()
+    writer_inserted = threading.Event()
+    release_writer = threading.Event()
+    writer_committed = threading.Event()
+    migration_errors: list[BaseException] = []
+    writer_errors: list[BaseException] = []
+    original_rebuild = migration._rebuild_compatibility_snapshot
+
+    def observed_rebuild() -> None:
+        snapshot_started.set()
+        original_rebuild()
+        snapshot_finished.set()
+
+    monkeypatch.setattr(migration, "_rebuild_compatibility_snapshot", observed_rebuild)
+
+    def writer() -> None:
+        try:
+            with engine.connect() as connection:
+                transaction = connection.begin()
+                _insert_compat_source_row(connection, revision, "writer-first-row")
+                writer_inserted.set()
+                assert release_writer.wait(5)
+                transaction.commit()
+                writer_committed.set()
+        except BaseException as exc:
+            writer_errors.append(exc)
+
+    def downgrade() -> None:
+        try:
+            _run_direct_compat_downgrade(
+                engine,
+                migration,
+                _compat_down_revision(revision),
+            )
+        except BaseException as exc:
+            migration_errors.append(exc)
+
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    migration_thread = threading.Thread(target=downgrade, daemon=True)
+    writer_thread.start()
+    assert writer_inserted.wait(3)
+    migration_thread.start()
+    assert snapshot_started.wait(3)
+    snapshot_finished_before_commit = snapshot_finished.wait(0.35)
+    release_writer.set()
+    writer_thread.join(8)
+    migration_thread.join(8)
+
+    assert not writer_thread.is_alive()
+    assert not migration_thread.is_alive()
+    assert writer_errors == []
+    assert migration_errors == []
+    assert writer_committed.is_set()
+    assert not snapshot_finished_before_commit, (
+        f"{revision} snapshot completed before the earlier writer committed"
+    )
+
+    command.upgrade(config, _compat_revision_name(revision))
+    with engine.connect() as connection:
+        values = _compat_source_values(connection, revision, "writer-first-row")
+    assert values == _expected_compat_source_values(revision)
+
+
+@pytest.mark.parametrize("revision", ["0005", "0006"])
+def test_compat_downgrade_migration_first_blocks_late_source_writer(
+    tmp_path,
+    monkeypatch,
+    revision: str,
+) -> None:
+    config, engine = _prepare_compat_concurrency_db(
+        tmp_path,
+        revision,
+        "migration-first",
+    )
+    migration = _compat_migration(revision)
+    snapshot_ready = threading.Event()
+    release_snapshot = threading.Event()
+    writer_attempted = threading.Event()
+    writer_committed = threading.Event()
+    migration_errors: list[BaseException] = []
+    writer_errors: list[BaseException] = []
+    original_validate = migration._validate_compatibility_snapshot
+
+    def pause_ready_snapshot(*, expected_source_rows=None, require_ready=True):
+        result = original_validate(
+            expected_source_rows=expected_source_rows,
+            require_ready=require_ready,
+        )
+        if require_ready:
+            snapshot_ready.set()
+            assert release_snapshot.wait(5)
+        return result
+
+    monkeypatch.setattr(
+        migration,
+        "_validate_compatibility_snapshot",
+        pause_ready_snapshot,
+    )
+
+    def downgrade() -> None:
+        try:
+            _run_direct_compat_downgrade(
+                engine,
+                migration,
+                _compat_down_revision(revision),
+            )
+        except BaseException as exc:
+            migration_errors.append(exc)
+
+    def writer() -> None:
+        try:
+            with engine.begin() as connection:
+                writer_attempted.set()
+                _insert_compat_source_row(connection, revision, "migration-first-row")
+            writer_committed.set()
+        except BaseException as exc:
+            writer_errors.append(exc)
+
+    migration_thread = threading.Thread(target=downgrade, daemon=True)
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    migration_thread.start()
+    assert snapshot_ready.wait(3)
+    writer_thread.start()
+    assert writer_attempted.wait(3)
+    writer_committed_before_release = writer_committed.wait(0.35)
+    release_snapshot.set()
+    migration_thread.join(8)
+    writer_thread.join(8)
+
+    assert not migration_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert migration_errors == []
+
+    command.upgrade(config, _compat_revision_name(revision))
+    with engine.connect() as connection:
+        values = _compat_source_values(connection, revision, "migration-first-row")
+
+    if writer_committed_before_release:
+        assert values == _expected_compat_source_values(revision), (
+            f"{revision} late writer committed but its scoped values changed: {values}"
+        )
+    assert not writer_committed_before_release, (
+        f"{revision} late writer committed after snapshot but before destructive DDL"
+    )
+    assert not writer_committed.is_set()
+    assert writer_errors
+
+
+@pytest.mark.parametrize(
+    ("revision", "source_table"),
+    [("0005", "events"), ("0006", "entities")],
+)
+def test_compat_snapshot_declares_source_writer_fence_before_snapshot_ddl(
+    revision: str,
+    source_table: str,
+) -> None:
+    migration = _compat_migration(revision)
+    source = Path(migration.__file__).read_text()
+    function_source = source.split(
+        "def _rebuild_compatibility_snapshot() -> None:",
+        1,
+    )[1].split("\ndef ", 1)[0]
+
+    assert f"LOCK TABLE {source_table} IN ACCESS EXCLUSIVE MODE" in function_source
+    assert f"UPDATE {source_table}" in function_source
+    assert function_source.index(f"LOCK TABLE {source_table}") < function_source.index(
+        "CREATE TABLE"
+    )
+    assert function_source.index(f"UPDATE {source_table}") < function_source.index(
+        "CREATE TABLE"
+    )
 
 
 @pytest.mark.parametrize(

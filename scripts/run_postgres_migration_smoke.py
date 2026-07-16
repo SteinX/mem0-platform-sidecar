@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import os
 import threading
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,8 @@ from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import Session, sessionmaker
@@ -656,6 +659,312 @@ def _run_admin_resolution_interleaving(session_factory) -> None:
         _require(audit_count == 1, "admin resolution audit event is missing")
 
 
+def _compat_migration(revision: str):
+    module_name = (
+        "migrations.versions.0005_request_trace_fields"
+        if revision == "0005"
+        else "migrations.versions.0006_entity_projection_scope"
+    )
+    return importlib.import_module(module_name)
+
+
+def _compat_revision_name(revision: str) -> str:
+    return (
+        "0005_request_trace_fields"
+        if revision == "0005"
+        else "0006_entity_projection_scope"
+    )
+
+
+def _compat_down_revision(revision: str) -> str:
+    return (
+        "0004_memory_explorer_indexes"
+        if revision == "0005"
+        else "0005_request_trace_fields"
+    )
+
+
+def _insert_compat_source_row(connection, revision: str, row_id: str) -> None:
+    if revision == "0005":
+        connection.execute(
+            text(
+                """
+                INSERT INTO events (
+                    id, project_id, app_id, user_id, agent_id, run_id,
+                    operation, status, request_json, response_json, error_json,
+                    correlation_id, latency_ms, result_count, has_results,
+                    created_at
+                ) VALUES (
+                    :row_id, :project_id, 'pg-writer-app', 'pg-writer-user',
+                    'pg-writer-agent', 'pg-writer-run', 'memory.search',
+                    'SUCCEEDED', '{}', '{}', '{}', 'pg-writer-correlation',
+                    17.25, 9, 1, :now
+                )
+                """
+            ),
+            {
+                "row_id": row_id,
+                "project_id": PROJECT_ID,
+                "now": datetime.now(UTC),
+            },
+        )
+        return
+    connection.execute(
+        text(
+            """
+            INSERT INTO entities (
+                id, project_id, app_id, entity_type, entity_id,
+                display_name, metadata_json, memory_count,
+                created_at, updated_at
+            ) VALUES (
+                :row_id, :project_id, 'pg-writer-app', 'user', :row_id,
+                'PG Writer Entity', '{}', 4, :now, :now
+            )
+            """
+        ),
+        {
+            "row_id": row_id,
+            "project_id": PROJECT_ID,
+            "now": datetime.now(UTC),
+        },
+    )
+
+
+def _compat_source_values(connection, revision: str, row_id: str):
+    if revision == "0005":
+        return connection.execute(
+            text(
+                """
+                SELECT app_id, user_id, agent_id, run_id, correlation_id,
+                       latency_ms, result_count, has_results
+                FROM events WHERE id = :row_id
+                """
+            ),
+            {"row_id": row_id},
+        ).mappings().one_or_none()
+    return connection.execute(
+        text(
+            """
+            SELECT app_id, display_name, memory_count
+            FROM entities WHERE id = :row_id
+            """
+        ),
+        {"row_id": row_id},
+    ).mappings().one_or_none()
+
+
+def _expected_compat_source_values(revision: str):
+    if revision == "0005":
+        return {
+            "app_id": "pg-writer-app",
+            "user_id": "pg-writer-user",
+            "agent_id": "pg-writer-agent",
+            "run_id": "pg-writer-run",
+            "correlation_id": "pg-writer-correlation",
+            "latency_ms": 17.25,
+            "result_count": 9,
+            "has_results": 1,
+        }
+    return {
+        "app_id": "pg-writer-app",
+        "display_name": "PG Writer Entity",
+        "memory_count": 4,
+    }
+
+
+def _run_direct_compat_downgrade(engine, migration, target_revision: str) -> None:
+    original_op = migration.op
+    try:
+        with engine.connect() as connection:
+            with connection.begin():
+                migration.op = Operations(MigrationContext.configure(connection))
+                migration.downgrade()
+                connection.execute(
+                    text("UPDATE alembic_version SET version_num = :revision"),
+                    {"revision": target_revision},
+                )
+    finally:
+        migration.op = original_op
+
+
+def _run_compat_writer_first_schedule(engine, config: Config, revision: str) -> str:
+    _downgrade(config, _compat_revision_name(revision))
+    migration = _compat_migration(revision)
+    row_id = f"pg-{revision}-writer-first"
+    writer_inserted = threading.Event()
+    release_writer = threading.Event()
+    writer_committed = threading.Event()
+    snapshot_started = threading.Event()
+    snapshot_finished = threading.Event()
+    writer_errors: list[BaseException] = []
+    migration_errors: list[BaseException] = []
+    original_rebuild = migration._rebuild_compatibility_snapshot
+
+    def observed_rebuild() -> None:
+        snapshot_started.set()
+        original_rebuild()
+        snapshot_finished.set()
+
+    migration._rebuild_compatibility_snapshot = observed_rebuild
+
+    def writer() -> None:
+        try:
+            with engine.connect() as connection:
+                transaction = connection.begin()
+                _insert_compat_source_row(connection, revision, row_id)
+                writer_inserted.set()
+                _require(
+                    release_writer.wait(8),
+                    f"{revision} writer-first release timed out",
+                )
+                transaction.commit()
+                writer_committed.set()
+        except BaseException as exc:
+            writer_errors.append(exc)
+
+    def downgrade() -> None:
+        try:
+            _run_direct_compat_downgrade(
+                engine,
+                migration,
+                _compat_down_revision(revision),
+            )
+        except BaseException as exc:
+            migration_errors.append(exc)
+
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    migration_thread = threading.Thread(target=downgrade, daemon=True)
+    try:
+        writer_thread.start()
+        _require(writer_inserted.wait(5), f"{revision} writer did not insert")
+        migration_thread.start()
+        _require(snapshot_started.wait(5), f"{revision} snapshot did not start")
+        snapshot_finished_before_commit = snapshot_finished.wait(0.5)
+        release_writer.set()
+        writer_thread.join(10)
+        migration_thread.join(10)
+    finally:
+        release_writer.set()
+        migration._rebuild_compatibility_snapshot = original_rebuild
+
+    _require(not writer_thread.is_alive(), f"{revision} writer-first deadlocked")
+    _require(not migration_thread.is_alive(), f"{revision} migration deadlocked")
+    _require(not writer_errors, f"{revision} writer errors: {writer_errors!r}")
+    _require(not migration_errors, f"{revision} migration errors: {migration_errors!r}")
+    _require(writer_committed.is_set(), f"{revision} earlier writer did not commit")
+    _migrate(config, "head")
+    with engine.connect() as connection:
+        values = _compat_source_values(connection, revision, row_id)
+    expected = _expected_compat_source_values(revision)
+    if snapshot_finished_before_commit or values != expected:
+        return (
+            f"{revision} writer-first snapshot_before_commit="
+            f"{snapshot_finished_before_commit} values={dict(values or {})!r}"
+        )
+    return ""
+
+
+def _run_compat_migration_first_schedule(engine, config: Config, revision: str) -> str:
+    _downgrade(config, _compat_revision_name(revision))
+    migration = _compat_migration(revision)
+    row_id = f"pg-{revision}-migration-first"
+    snapshot_ready = threading.Event()
+    release_snapshot = threading.Event()
+    writer_attempted = threading.Event()
+    writer_committed = threading.Event()
+    writer_errors: list[BaseException] = []
+    migration_errors: list[BaseException] = []
+    original_validate = migration._validate_compatibility_snapshot
+
+    def pause_ready_snapshot(*, expected_source_rows=None, require_ready=True):
+        result = original_validate(
+            expected_source_rows=expected_source_rows,
+            require_ready=require_ready,
+        )
+        if require_ready:
+            snapshot_ready.set()
+            _require(
+                release_snapshot.wait(8),
+                f"{revision} migration-first release timed out",
+            )
+        return result
+
+    migration._validate_compatibility_snapshot = pause_ready_snapshot
+
+    def downgrade() -> None:
+        try:
+            _run_direct_compat_downgrade(
+                engine,
+                migration,
+                _compat_down_revision(revision),
+            )
+        except BaseException as exc:
+            migration_errors.append(exc)
+
+    def writer() -> None:
+        try:
+            with engine.begin() as connection:
+                writer_attempted.set()
+                _insert_compat_source_row(connection, revision, row_id)
+            writer_committed.set()
+        except BaseException as exc:
+            writer_errors.append(exc)
+
+    migration_thread = threading.Thread(target=downgrade, daemon=True)
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    try:
+        migration_thread.start()
+        _require(snapshot_ready.wait(5), f"{revision} snapshot was not ready")
+        writer_thread.start()
+        _require(writer_attempted.wait(5), f"{revision} writer did not attempt")
+        writer_committed_before_release = writer_committed.wait(0.5)
+        release_snapshot.set()
+        migration_thread.join(10)
+        writer_thread.join(10)
+    finally:
+        release_snapshot.set()
+        migration._validate_compatibility_snapshot = original_validate
+
+    _require(not migration_thread.is_alive(), f"{revision} migration deadlocked")
+    _require(not writer_thread.is_alive(), f"{revision} late writer deadlocked")
+    _require(not migration_errors, f"{revision} migration errors: {migration_errors!r}")
+    _migrate(config, "head")
+    with engine.connect() as connection:
+        values = _compat_source_values(connection, revision, row_id)
+    if writer_committed_before_release:
+        expected = _expected_compat_source_values(revision)
+        return (
+            f"{revision} migration-first committed_before_release=True "
+            f"expected={expected!r} values={dict(values or {})!r}"
+        )
+    if writer_committed.is_set() or values is not None or not writer_errors:
+        return (
+            f"{revision} migration-first late writer outcome was unsafe: "
+            f"committed={writer_committed.is_set()} values={dict(values or {})!r} "
+            f"errors={writer_errors!r}"
+        )
+    return ""
+
+
+def _verify_compat_snapshot_serialization(engine, config: Config) -> None:
+    failures = []
+    for revision in ("0005", "0006"):
+        writer_first = _run_compat_writer_first_schedule(engine, config, revision)
+        if writer_first:
+            failures.append(writer_first)
+        migration_first = _run_compat_migration_first_schedule(
+            engine,
+            config,
+            revision,
+        )
+        if migration_first:
+            failures.append(migration_first)
+    _require(
+        not failures,
+        "compatibility snapshot writer fences failed: " + "; ".join(failures),
+    )
+
+
 def _reset_projection(session_factory) -> None:
     with session_factory() as session:
         session.query(MutationIntent).filter(
@@ -998,6 +1307,7 @@ def _run(database_url: str) -> None:
         _run_interleaving(session_factory, "update")
         _run_interleaving(session_factory, "reconcile")
         _run_admin_resolution_interleaving(session_factory)
+        _verify_compat_snapshot_serialization(engine, config)
     finally:
         engine.dispose()
 
@@ -1024,7 +1334,8 @@ def main() -> int:
             "PostgreSQL smoke passed: 0004->head, interruption-safe and "
             "b502a26-legacy exact downgrade/re-upgrade, 0007 locked "
             "unresolved-intent refusal, ORM/data checks, update/delete and "
-            "reconcile/delete serialization, admin/recovery serialization"
+            "reconcile/delete serialization, admin/recovery serialization, "
+            "0005/0006 compatibility snapshot serialization"
         )
     finally:
         with maintenance_engine.connect() as connection:
