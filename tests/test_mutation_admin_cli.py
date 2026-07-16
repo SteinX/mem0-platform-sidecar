@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from sqlalchemy import select
 
@@ -18,6 +19,7 @@ from mem0_sidecar.core.memory_ops import (
     MemoryService,
     MutationConflictError,
 )
+from mem0_sidecar.mem0_client.client import Mem0RestClient
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base, Event, EventStatus, MutationIntent
 from mem0_sidecar.store.repositories import (
@@ -464,6 +466,41 @@ def test_resolution_refuses_add_when_marker_is_observed(tmp_path) -> None:
         assert session.get(MutationIntent, intent_id).status == "EXHAUSTED"
     assert client.read_calls == [("GET", "/memories")]
     assert client.write_calls == []
+
+
+def test_resolution_uses_default_compatible_bounded_marker_scan(tmp_path) -> None:
+    factory = _session_factory(tmp_path)
+    intent_id = _seed_blocker(factory)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        top_k = int(request.url.params["top_k"])
+        if top_k > 1000:
+            return httpx.Response(
+                422,
+                json={"detail": "top_k must be less than or equal to 1000"},
+            )
+        return httpx.Response(200, json={"results": [], "total": 0})
+
+    client = Mem0RestClient(
+        base_url="http://mem0.invalid",
+        transport=httpx.MockTransport(handler),
+    )
+
+    code, resolved, error = _run_cli(
+        factory,
+        client,
+        *_resolve_args(intent_id),
+    )
+    with factory() as session:
+        status = session.get(MutationIntent, intent_id).status
+    top_k_values = [request.url.params["top_k"] for request in requests]
+
+    assert code == 0 and top_k_values == ["1000"] and status == "FAILED", (
+        f"code={code} error={error!r} top_k={top_k_values!r} status={status}"
+    )
+    assert resolved["intent"]["status"] == "FAILED"
 
 
 @pytest.mark.parametrize(

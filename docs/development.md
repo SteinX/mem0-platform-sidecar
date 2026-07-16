@@ -167,8 +167,10 @@ docker compose exec sidecar mem0-sidecar-admin mutation-intents resolve \
 Resolution uses compare-and-resolve under the project mutation lock. It is
 rejected if scope, status, attempt count, confirmation, or lease state changed.
 For an add intent the CLI performs one read-only marker observation and refuses
-resolution if the marker is present. Marker absence is not proof that the add
-did not happen; `--accept-unknown-outcome` is still required.
+resolution if the marker is present. This best-effort observation scans at most
+1000 memories so it remains compatible with the default Mem0 OSS all-memories
+limit. Marker absence in that bounded result is not proof that the add did not
+happen; `--accept-unknown-outcome` is still required.
 
 The operation never sends an upstream write. It marks the original intent and
 event failed, retains the original operation key so that the old

@@ -17,7 +17,7 @@ from mem0_sidecar.store.repositories import (
     ProjectRepository,
 )
 
-MARKER_SCAN_LIMIT = 5000
+MARKER_SCAN_LIMIT = 1000
 MAX_RESOLUTION_REASON_CHARS = 512
 RESOLVABLE_STATUSES = frozenset({"UNKNOWN", "EXHAUSTED"})
 
