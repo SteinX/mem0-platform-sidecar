@@ -31,6 +31,9 @@ REAL_BROWSER_SMOKE = (
     / "scripts"
     / "run-browser-destructive-e2e.cjs"
 )
+REAL_BROWSER_CONTRACT = (
+    ROOT / "tests" / "e2e" / "test-browser-destructive-contract.cjs"
+)
 
 
 def _compose_service(content: str, service_name: str) -> str:
@@ -181,6 +184,30 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
         "finally",
     ):
         assert contract in source
+
+
+def test_real_browser_delete_finds_action_inside_radix_sheet_dialog() -> None:
+    source = REAL_BROWSER_SMOKE.read_text()
+    confirm_start = source.index("async function confirmExactMemoryId")
+    confirm_end = source.index("\nfunction observeExactDelete", confirm_start)
+    confirm_source = source[confirm_start:confirm_end]
+
+    assert "!item.closest('[role=\"dialog\"]')" not in confirm_source
+    assert "item.innerText.includes(\"Memory details\")" in confirm_source
+    assert "drawer.querySelectorAll(\"button\")" in confirm_source
+
+
+def test_real_browser_direct_mem0_absence_contract_is_executable() -> None:
+    result = subprocess.run(
+        ["node", str(REAL_BROWSER_CONTRACT)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "direct Mem0 absence contract passed" in result.stdout
 
 
 def test_browser_runner_image_contains_mocked_and_real_scripts() -> None:

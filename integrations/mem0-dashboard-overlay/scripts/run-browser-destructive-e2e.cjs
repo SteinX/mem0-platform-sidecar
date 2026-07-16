@@ -215,26 +215,42 @@ async function openMemoryDetails(cdp, memoryId, marker) {
 async function confirmExactMemoryId(cdp, memoryId) {
   const { evaluate, waitFor } = createBrowserDriver(cdp);
   const deleteOpened = await evaluate(`(() => {
-    const button = [...document.querySelectorAll("button")].find(
-      (item) => item.innerText.trim() === "Delete" &&
-        !item.closest('[role="dialog"]'),
+    const drawers = [...document.querySelectorAll('[role="dialog"]')].filter(
+      (item) => item.innerText.includes("Memory details"),
     );
-    if (!button) return false;
-    button.click();
-    return true;
+    if (drawers.length !== 1) {
+      return { clicked: false, drawers: drawers.length, buttons: 0 };
+    }
+    const drawer = drawers[0];
+    const buttons = [...drawer.querySelectorAll("button")].filter(
+      (item) => item.innerText.trim() === "Delete",
+    );
+    if (buttons.length !== 1) {
+      return { clicked: false, drawers: 1, buttons: buttons.length };
+    }
+    buttons[0].click();
+    return { clicked: true, drawers: 1, buttons: 1 };
   })()`);
-  if (!deleteOpened) throw new Error("Memory drawer Delete button was not found");
+  if (!deleteOpened?.clicked) {
+    throw new Error(
+      `Expected one Memory details drawer and one Delete button: ` +
+        JSON.stringify(deleteOpened),
+    );
+  }
   await waitFor(
-    `[...document.querySelectorAll('[role="dialog"]')].some(
+    `[...document.querySelectorAll('[role="dialog"]')].filter(
       (item) => item.innerText.includes("Delete memory"),
-    )`,
+    ).length === 1`,
     "memory delete confirmation",
   );
   const entered = await evaluate(`(() => {
-    const dialog = [...document.querySelectorAll('[role="dialog"]')].find(
+    const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(
       (item) => item.innerText.includes("Delete memory"),
     );
-    const input = dialog?.querySelector('input[placeholder="Enter name to confirm"]');
+    if (dialogs.length !== 1) return false;
+    const input = dialogs[0].querySelector(
+      'input[placeholder="Enter name to confirm"]',
+    );
     if (!input) return false;
     const setter = Object.getOwnPropertyDescriptor(
       HTMLInputElement.prototype,
@@ -247,25 +263,27 @@ async function confirmExactMemoryId(cdp, memoryId) {
   if (!entered) throw new Error("Exact-ID confirmation input was not found");
   await waitFor(
     `(() => {
-      const dialog = [...document.querySelectorAll('[role="dialog"]')].find(
+      const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(
         (item) => item.innerText.includes("Delete memory"),
       );
-      const button = dialog && [...dialog.querySelectorAll("button")].find(
+      if (dialogs.length !== 1) return false;
+      const buttons = [...dialogs[0].querySelectorAll("button")].filter(
         (item) => item.innerText.trim() === "Delete",
       );
-      return Boolean(button && !button.disabled);
+      return buttons.length === 1 && !buttons[0].disabled;
     })()`,
     `exact confirmation ${memoryId}`,
   );
   const confirmed = await evaluate(`(() => {
-    const dialog = [...document.querySelectorAll('[role="dialog"]')].find(
+    const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(
       (item) => item.innerText.includes("Delete memory"),
     );
-    const button = dialog && [...dialog.querySelectorAll("button")].find(
+    if (dialogs.length !== 1) return false;
+    const buttons = [...dialogs[0].querySelectorAll("button")].filter(
       (item) => item.innerText.trim() === "Delete",
     );
-    if (!button || button.disabled) return false;
-    button.click();
+    if (buttons.length !== 1 || buttons[0].disabled) return false;
+    buttons[0].click();
     return true;
   })()`);
   if (!confirmed) throw new Error(`Exact-ID delete was not enabled for ${memoryId}`);
@@ -353,11 +371,37 @@ async function assertSidecarAbsent(memoryId) {
   await waitForDirectAbsence("direct sidecar GET", scopedSidecarUrl(memoryId));
 }
 
+async function classifyDirectMem0Get(response) {
+  if (response.status === 404) return "absent";
+  if (response.status !== 200) {
+    throw new Error(`direct Mem0 GET failed: ${await responseDiagnostic(response)}`);
+  }
+  const mediaType = (response.headers.get("content-type") || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  if (mediaType !== "application/json" && !mediaType.endsWith("+json")) {
+    throw new Error(`direct Mem0 GET returned non-JSON content type: ${mediaType}`);
+  }
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    throw new Error(`direct Mem0 GET returned invalid JSON: ${errorMessage(error)}`);
+  }
+  return payload === null ? "absent" : "present";
+}
+
 async function assertMem0Absent(memoryId) {
-  await waitForDirectAbsence(
-    "direct Mem0 GET",
-    `${mem0Base}/memories/${encodeURIComponent(memoryId)}`,
-  );
+  const url = `${mem0Base}/memories/${encodeURIComponent(memoryId)}`;
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    const response = await fetchWithTimeout(url, { timeout: 5000 });
+    const classification = await classifyDirectMem0Get(response);
+    if (classification === "absent") return;
+    await sleep(200);
+  }
+  throw new Error(`direct Mem0 GET still returned memory ${memoryId}`);
 }
 
 async function cleanupFixture(memoryId) {
@@ -467,7 +511,11 @@ async function main() {
   if (primaryError) throw primaryError;
 }
 
-main().catch((error) => {
-  console.error(errorMessage(error));
-  process.exitCode = 1;
-});
+module.exports = { classifyDirectMem0Get };
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(errorMessage(error));
+    process.exitCode = 1;
+  });
+}
