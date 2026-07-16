@@ -1570,6 +1570,27 @@ class MemoryIndexRepository:
             statement = statement.where(MemoryIndex.deleted_at.is_(None))
         return self.session.scalar(statement)
 
+    def list_memories_by_ids(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        mem0_memory_ids: Iterable[str],
+        include_deleted: bool = False,
+    ) -> list[MemoryIndex]:
+        memory_ids = list(dict.fromkeys(mem0_memory_ids))
+        memories: list[MemoryIndex] = []
+        for offset in range(0, len(memory_ids), 400):
+            statement = select(MemoryIndex).where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.mem0_memory_id.in_(memory_ids[offset : offset + 400]),
+            )
+            if not include_deleted:
+                statement = statement.where(MemoryIndex.deleted_at.is_(None))
+            memories.extend(self.session.scalars(statement))
+        return memories
+
     def list_scoped_memory_ids(
         self,
         *,
@@ -1739,25 +1760,51 @@ class MemoryIndexRepository:
         app_id: str,
         mem0_memory_ids: Iterable[str],
         updated_at_lte: datetime,
+        expected_updated_at: Mapping[str, datetime] | None = None,
     ) -> int:
-        memory_ids = set(mem0_memory_ids)
+        memory_ids = list(dict.fromkeys(mem0_memory_ids))
         if not memory_ids:
             return 0
 
-        result = self.session.execute(
-            update(MemoryIndex)
-            .where(
+        if expected_updated_at is None:
+            batches = [memory_ids]
+        else:
+            batches = [
+                memory_ids[offset : offset + 200]
+                for offset in range(0, len(memory_ids), 200)
+            ]
+
+        marked = 0
+        stale_at = _utc_now()
+        for batch in batches:
+            statement = update(MemoryIndex).where(
                 MemoryIndex.project_id == project_id,
                 MemoryIndex.app_id == app_id,
-                MemoryIndex.mem0_memory_id.in_(memory_ids),
+                MemoryIndex.mem0_memory_id.in_(batch),
                 MemoryIndex.deleted_at.is_(None),
                 MemoryIndex.updated_at <= updated_at_lte,
             )
-            .values(deleted_at=_utc_now())
-            .execution_options(synchronize_session="fetch")
-        )
+            if expected_updated_at is not None:
+                statement = statement.where(
+                    or_(
+                        *(
+                            and_(
+                                MemoryIndex.mem0_memory_id == memory_id,
+                                MemoryIndex.updated_at
+                                == expected_updated_at[memory_id],
+                            )
+                            for memory_id in batch
+                        )
+                    )
+                )
+            result = self.session.execute(
+                statement.values(deleted_at=stale_at).execution_options(
+                    synchronize_session="fetch"
+                )
+            )
+            marked += result.rowcount or 0
         self.session.flush()
-        return result.rowcount or 0
+        return marked
 
     def upsert_memory(
         self,

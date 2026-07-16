@@ -1,10 +1,12 @@
 import asyncio
 import json
-from datetime import UTC
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import create_engine, event, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.explorer_filters import parse_explorer_query
@@ -20,6 +22,7 @@ from mem0_sidecar.core.memory_ops import (
 )
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.store.models import (
+    Base,
     Category,
     Entity,
     EventStatus,
@@ -117,6 +120,45 @@ class ExplorerMem0Client(FakeMem0Client):
         return self.list_response
 
 
+class PausedRefillMem0Client(ExplorerMem0Client):
+    def __init__(self, records: dict[str, Any], *, first_batch_size: int) -> None:
+        super().__init__(records)
+        self.first_batch_size = first_batch_size
+        self.later_batch_started = asyncio.Event()
+        self.release_later_batch = asyncio.Event()
+
+    async def get_memory(self, memory_id: str) -> Any:
+        self.get_memory_ids.append(memory_id)
+        self.current_gets += 1
+        self.max_concurrent_gets = max(
+            self.max_concurrent_gets,
+            self.current_gets,
+        )
+        try:
+            if len(self.get_memory_ids) > self.first_batch_size:
+                self.later_batch_started.set()
+                await self.release_later_batch.wait()
+            value = self.records[memory_id]
+            if isinstance(value, Exception):
+                raise value
+            return value
+        finally:
+            self.current_gets -= 1
+
+
+class PausedFirstHydrationMem0Client(ExplorerMem0Client):
+    def __init__(self, records: dict[str, Any]) -> None:
+        super().__init__(records)
+        self.hydration_started = asyncio.Event()
+        self.release_hydration = asyncio.Event()
+
+    async def get_memory(self, memory_id: str) -> Any:
+        self.get_memory_ids.append(memory_id)
+        self.hydration_started.set()
+        await self.release_hydration.wait()
+        return self.records[memory_id]
+
+
 def _index_memory(
     db_session,
     memory_id: str,
@@ -166,6 +208,84 @@ def _create_project(
         mem0_base_url="http://mem0:8000",
         default_app_id=default_app_id,
     )
+
+
+def _file_sqlite_engine(
+    tmp_path,
+    name: str,
+    *,
+    transactional_selects: bool = False,
+):
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / name}",
+        connect_args={"check_same_thread": False, "timeout": 0.05},
+        future=True,
+    )
+    if transactional_selects:
+
+        @event.listens_for(engine, "connect")
+        def disable_driver_transaction_control(dbapi_connection, _record):
+            dbapi_connection.isolation_level = None
+
+        @event.listens_for(engine, "begin")
+        def emit_begin(connection):
+            connection.exec_driver_sql("BEGIN")
+
+    Base.metadata.create_all(engine)
+    return engine
+
+
+def _project_writer_result(engine, project_id: str) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        with Session(engine) as session:
+            project = session.get(Project, project_id)
+            assert project is not None
+            project.name = f"updated-{project_id}"
+            session.commit()
+        return {
+            "status": "committed",
+            "elapsed": time.monotonic() - started,
+            "error": None,
+        }
+    except OperationalError as exc:
+        return {
+            "status": "locked",
+            "elapsed": time.monotonic() - started,
+            "error": str(exc),
+        }
+
+
+def _projection_writer_result(engine, memory_id: str) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        with Session(engine) as session:
+            result = session.execute(
+                update(MemoryIndex)
+                .where(
+                    MemoryIndex.project_id == "repo-a",
+                    MemoryIndex.app_id == "app-a",
+                    MemoryIndex.mem0_memory_id == memory_id,
+                    MemoryIndex.deleted_at.is_(None),
+                )
+                .values(
+                    metadata_projection_json='{"revision":"new"}',
+                    updated_at=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+            assert result.rowcount == 1
+            session.commit()
+        return {
+            "status": "committed",
+            "elapsed": time.monotonic() - started,
+            "error": None,
+        }
+    except OperationalError as exc:
+        return {
+            "status": "locked",
+            "elapsed": time.monotonic() - started,
+            "error": str(exc),
+        }
 
 
 class FailingAddMem0Client(FakeMem0Client):
@@ -2017,6 +2137,239 @@ async def test_reconcile_uses_atomic_claim_when_competing_projection_appears(
     )
     assert projection is not None
     assert projection.app_id == "app-a"
+
+
+@pytest.mark.asyncio
+async def test_query_memories_releases_sqlite_writer_lock_before_refill_await(
+    tmp_path,
+) -> None:
+    engine = _file_sqlite_engine(tmp_path, "refill-writer-lock.sqlite3")
+    stale_count = 42
+    records: dict[str, Any] = {}
+    query_task: asyncio.Task[dict[str, Any]] | None = None
+    mem0: PausedRefillMem0Client | None = None
+    try:
+        with Session(engine) as seed_session:
+            _create_project(seed_session)
+            _create_project(
+                seed_session,
+                "repo-unrelated",
+                default_app_id="app-unrelated",
+            )
+            for index in range(stale_count):
+                memory_id = f"stale-{index:02d}"
+                _index_memory(seed_session, memory_id)
+                records[memory_id] = Mem0UpstreamError(
+                    method="GET",
+                    path=f"/memories/{memory_id}",
+                    status_code=404,
+                    message="missing",
+                )
+            seed_session.commit()
+
+        mem0 = PausedRefillMem0Client(records, first_batch_size=21)
+        with Session(engine, expire_on_commit=False) as query_session:
+            query_task = asyncio.create_task(
+                MemoryService(session=query_session, mem0=mem0).query_memories(
+                    project_id="repo-a",
+                    app_id="app-a",
+                    query=_explorer_query(page_size=1),
+                )
+            )
+            await asyncio.wait_for(mem0.later_batch_started.wait(), timeout=1)
+            assert len(mem0.get_memory_ids) > 21
+            assert not query_task.done()
+
+            writer_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _project_writer_result,
+                    engine,
+                    "repo-unrelated",
+                ),
+                timeout=0.75,
+            )
+
+            mem0.release_later_batch.set()
+            query_result = await asyncio.wait_for(query_task, timeout=2)
+            query_task = None
+
+        assert writer_result["status"] == "committed", writer_result
+        assert writer_result["elapsed"] < 0.75, writer_result
+        assert query_result["results"] == []
+        assert query_result["stale_skipped"] == stale_count
+    finally:
+        if mem0 is not None:
+            mem0.release_later_batch.set()
+        if query_task is not None:
+            try:
+                await asyncio.wait_for(query_task, timeout=2)
+            except (Exception, asyncio.CancelledError):
+                pass
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_query_memories_releases_sqlite_read_before_first_hydration_await(
+    tmp_path,
+) -> None:
+    engine = _file_sqlite_engine(
+        tmp_path,
+        "first-hydration-read-lock.sqlite3",
+        transactional_selects=True,
+    )
+    memory_id = "mem-first"
+    query_task: asyncio.Task[dict[str, Any]] | None = None
+    mem0 = PausedFirstHydrationMem0Client(
+        {memory_id: {"id": memory_id, "memory": "first"}}
+    )
+    try:
+        with Session(engine) as seed_session:
+            _create_project(seed_session)
+            _create_project(
+                seed_session,
+                "repo-unrelated",
+                default_app_id="app-unrelated",
+            )
+            _index_memory(seed_session, memory_id)
+            seed_session.commit()
+
+        with Session(engine, expire_on_commit=False) as query_session:
+            query_task = asyncio.create_task(
+                MemoryService(session=query_session, mem0=mem0).query_memories(
+                    project_id="repo-a",
+                    app_id="app-a",
+                    query=_explorer_query(page_size=1),
+                )
+            )
+            await asyncio.wait_for(mem0.hydration_started.wait(), timeout=1)
+            assert not query_task.done()
+
+            writer_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _project_writer_result,
+                    engine,
+                    "repo-unrelated",
+                ),
+                timeout=0.75,
+            )
+
+            mem0.release_hydration.set()
+            query_result = await asyncio.wait_for(query_task, timeout=2)
+            query_task = None
+
+        assert writer_result["status"] == "committed", writer_result
+        assert writer_result["elapsed"] < 0.75, writer_result
+        assert [item["id"] for item in query_result["results"]] == [memory_id]
+    finally:
+        mem0.release_hydration.set()
+        if query_task is not None:
+            try:
+                await asyncio.wait_for(query_task, timeout=2)
+            except (Exception, asyncio.CancelledError):
+                pass
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_query_memories_never_returns_cached_payload_after_version_race(
+    tmp_path,
+) -> None:
+    engine = _file_sqlite_engine(tmp_path, "refill-cache-race.sqlite3")
+    cached_id = "mem-cached"
+    first_batch_size = 22
+    records: dict[str, Any] = {}
+    query_task: asyncio.Task[dict[str, Any]] | None = None
+    mem0: PausedRefillMem0Client | None = None
+    try:
+        with Session(engine) as seed_session:
+            _create_project(seed_session)
+            for index in range(21):
+                memory_id = f"stale-first-{index:02d}"
+                _index_memory(seed_session, memory_id)
+                records[memory_id] = Mem0UpstreamError(
+                    method="GET",
+                    path=f"/memories/{memory_id}",
+                    status_code=404,
+                    message="missing",
+                )
+            _index_memory(seed_session, cached_id)
+            records[cached_id] = {"id": cached_id, "memory": "cached-old"}
+            _index_memory(seed_session, "stale-later")
+            records["stale-later"] = Mem0UpstreamError(
+                method="GET",
+                path="/memories/stale-later",
+                status_code=404,
+                message="missing",
+            )
+            _index_memory(seed_session, "mem-tail")
+            records["mem-tail"] = {"id": "mem-tail", "memory": "tail"}
+            seed_session.commit()
+
+        mem0 = PausedRefillMem0Client(
+            records,
+            first_batch_size=first_batch_size,
+        )
+        with Session(engine, expire_on_commit=False) as query_session:
+            query_task = asyncio.create_task(
+                MemoryService(session=query_session, mem0=mem0).query_memories(
+                    project_id="repo-a",
+                    app_id="app-a",
+                    query=_explorer_query(page_size=2),
+                )
+            )
+            await asyncio.wait_for(mem0.later_batch_started.wait(), timeout=1)
+            first_batch_ids = mem0.get_memory_ids[:first_batch_size]
+            assert cached_id in first_batch_ids
+            assert any(
+                memory_id.startswith("stale-first-") for memory_id in first_batch_ids
+            )
+            assert mem0.get_memory_ids.count(cached_id) == 1
+            assert not query_task.done()
+
+            writer_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _projection_writer_result,
+                    engine,
+                    cached_id,
+                ),
+                timeout=0.75,
+            )
+            if writer_result["status"] == "committed":
+                mem0.records[cached_id] = {
+                    "id": cached_id,
+                    "memory": "cache-race-new",
+                }
+
+            mem0.release_later_batch.set()
+            query_result: dict[str, Any] | None = None
+            query_error: MutationConflictError | None = None
+            try:
+                query_result = await asyncio.wait_for(query_task, timeout=2)
+            except MutationConflictError as exc:
+                query_error = exc
+            query_task = None
+
+        assert writer_result["status"] == "committed", writer_result
+        assert writer_result["elapsed"] < 0.75, writer_result
+        if query_error is not None:
+            assert "retry" in str(query_error).lower()
+        else:
+            assert query_result is not None
+            returned = {item["id"]: item["memory"] for item in query_result["results"]}
+            assert returned[cached_id] == "cache-race-new", {
+                "returned": returned,
+                "gets": mem0.get_memory_ids,
+            }
+            assert mem0.get_memory_ids.count(cached_id) >= 2
+    finally:
+        if mem0 is not None:
+            mem0.release_later_batch.set()
+        if query_task is not None:
+            try:
+                await asyncio.wait_for(query_task, timeout=2)
+            except (Exception, asyncio.CancelledError):
+                pass
+        engine.dispose()
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import secrets
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -51,6 +52,46 @@ class MemoryUpstreamProtocolError(RuntimeError):
 
 class MutationConflictError(RuntimeError):
     """A scoped logical mutation cannot safely be issued again."""
+
+
+@dataclass(frozen=True)
+class _MemoryProjectionSnapshot:
+    row_id: str
+    project_id: str
+    mem0_memory_id: str
+    user_id: str | None
+    agent_id: str | None
+    app_id: str | None
+    run_id: str | None
+    category: str | None
+    entity_refs_json: str
+    metadata_projection_json: str
+    created_at: datetime
+    updated_at: datetime
+
+
+def _snapshot_memory_projection(memory: MemoryIndex) -> _MemoryProjectionSnapshot:
+    return _MemoryProjectionSnapshot(
+        row_id=memory.id,
+        project_id=memory.project_id,
+        mem0_memory_id=memory.mem0_memory_id,
+        user_id=memory.user_id,
+        agent_id=memory.agent_id,
+        app_id=memory.app_id,
+        run_id=memory.run_id,
+        category=memory.category,
+        entity_refs_json=memory.entity_refs_json,
+        metadata_projection_json=memory.metadata_projection_json,
+        created_at=memory.created_at,
+        updated_at=memory.updated_at,
+    )
+
+
+def _projection_matches_snapshot(
+    memory: MemoryIndex,
+    snapshot: _MemoryProjectionSnapshot,
+) -> bool:
+    return memory.deleted_at is None and _snapshot_memory_projection(memory) == snapshot
 
 
 def _require_clean_trace_session(session: Session) -> None:
@@ -275,7 +316,7 @@ def _record_categories(record: dict[str, Any]) -> list[str]:
 def _normalize_memory_record(
     record: dict[str, Any],
     *,
-    projection: MemoryIndex | None = None,
+    projection: MemoryIndex | _MemoryProjectionSnapshot | None = None,
 ) -> dict[str, Any]:
     memory_id = _result_memory_id(record)
     if memory_id is None:
@@ -467,7 +508,7 @@ def _query_trace_entities(query: ExplorerQuery) -> dict[str, str]:
 def _hydrated_record_matches_projection(
     raw_record: dict[str, Any],
     normalized_record: dict[str, Any],
-    projection: MemoryIndex,
+    projection: MemoryIndex | _MemoryProjectionSnapshot,
 ) -> bool:
     if not all(
         normalized_record.get(field_name) == getattr(projection, field_name)
@@ -1294,6 +1335,7 @@ class MemoryService:
             subject_type="memory",
             correlation_id=get_request_id(),
         )
+        event_id = event.id
         self.session.commit()
         memory_repo = MemoryIndexRepository(self.session)
         logical_offset = (query.page - 1) * query.page_size
@@ -1303,36 +1345,59 @@ class MemoryService:
             EXPLORER_RECORD_HORIZON,
         )
         window_limit = hydration_batch_size
-        hydration_cutoff = datetime.now(UTC)
         fetched_ids: set[str] = set()
-        hydrated: dict[str, dict[str, Any]] = {}
-        stale_skipped = 0
+        observed: dict[str, _MemoryProjectionSnapshot] = {}
+        hydrated: dict[
+            str,
+            tuple[_MemoryProjectionSnapshot, dict[str, Any]],
+        ] = {}
+        stale: dict[str, _MemoryProjectionSnapshot] = {}
+        observation_changed = False
 
-        def candidate_page() -> tuple[Any, list[MemoryIndex]]:
-            page = memory_repo.query_project_memories(
-                project_id,
-                app_id,
-                query,
-                window_offset=0,
-                window_limit=window_limit,
-            )
-            return page, page.items
-
-        async def hydrate(memory: MemoryIndex) -> tuple[str, dict[str, Any] | None]:
+        def candidate_page() -> tuple[int, int, list[_MemoryProjectionSnapshot]]:
+            nonlocal observation_changed
             try:
-                response = await self.mem0.get_memory(memory.mem0_memory_id)
+                page = memory_repo.query_project_memories(
+                    project_id,
+                    app_id,
+                    query,
+                    window_offset=0,
+                    window_limit=window_limit,
+                )
+                snapshots = [
+                    _snapshot_memory_projection(memory) for memory in page.items
+                ]
+                for snapshot in snapshots:
+                    previous = observed.setdefault(
+                        snapshot.mem0_memory_id,
+                        snapshot,
+                    )
+                    if previous != snapshot:
+                        observation_changed = True
+                return page.total, page.scan_count, snapshots
+            finally:
+                self.session.rollback()
+
+        async def hydrate(
+            snapshot: _MemoryProjectionSnapshot,
+        ) -> tuple[_MemoryProjectionSnapshot, dict[str, Any] | None]:
+            try:
+                response = await self.mem0.get_memory(snapshot.mem0_memory_id)
                 record = _memory_record_from_response(
                     response,
-                    expected_id=memory.mem0_memory_id,
+                    expected_id=snapshot.mem0_memory_id,
                 )
-                normalized = _normalize_memory_record(record, projection=memory)
+                normalized = _normalize_memory_record(
+                    record,
+                    projection=snapshot,
+                )
                 if not _hydrated_record_matches_projection(
                     record,
                     normalized,
-                    memory,
+                    snapshot,
                 ):
-                    return memory.mem0_memory_id, None
-                return memory.mem0_memory_id, normalized
+                    return snapshot, None
+                return snapshot, normalized
             except Exception as exc:
                 if _is_upstream_not_found(exc) or isinstance(
                     exc,
@@ -1343,62 +1408,179 @@ class MemoryService:
                         ValueError,
                     ),
                 ):
-                    return memory.mem0_memory_id, None
+                    return snapshot, None
                 raise
+
+        def finalize_query(
+            *,
+            forced_conflict: str | None = None,
+        ) -> dict[str, Any]:
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            self.session.expire_all()
+
+            conflict = forced_conflict
+            stale_marked = 0
+            if stale:
+                current_stale = {
+                    memory.mem0_memory_id: memory
+                    for memory in memory_repo.list_memories_by_ids(
+                        project_id=project_id,
+                        app_id=app_id,
+                        mem0_memory_ids=stale,
+                        include_deleted=True,
+                    )
+                }
+                unchanged_stale = {
+                    memory_id: snapshot
+                    for memory_id, snapshot in stale.items()
+                    if (
+                        (memory := current_stale.get(memory_id)) is not None
+                        and _projection_matches_snapshot(memory, snapshot)
+                    )
+                }
+                if len(unchanged_stale) != len(stale):
+                    conflict = (
+                        "Memory projection changed during hydration; retry the query"
+                    )
+                if unchanged_stale:
+                    latest_stale_version = max(
+                        (
+                            snapshot.updated_at.replace(tzinfo=UTC)
+                            if snapshot.updated_at.tzinfo is None
+                            else snapshot.updated_at.astimezone(UTC)
+                        )
+                        for snapshot in unchanged_stale.values()
+                    )
+                    stale_marked = memory_repo.mark_stale_if_unchanged(
+                        project_id=project_id,
+                        app_id=app_id,
+                        mem0_memory_ids=unchanged_stale,
+                        updated_at_lte=latest_stale_version,
+                        expected_updated_at={
+                            memory_id: snapshot.updated_at
+                            for memory_id, snapshot in unchanged_stale.items()
+                        },
+                    )
+                    if stale_marked:
+                        EntityRepository(self.session).rebuild_project_entities(
+                            project_id,
+                            app_id,
+                        )
+                    if stale_marked != len(unchanged_stale):
+                        conflict = (
+                            "Memory projection changed during hydration; "
+                            "retry the query"
+                        )
+
+            self.session.expire_all()
+            if hydrated:
+                current_hydrated = {
+                    memory.mem0_memory_id: memory
+                    for memory in memory_repo.list_memories_by_ids(
+                        project_id=project_id,
+                        app_id=app_id,
+                        mem0_memory_ids=hydrated,
+                        include_deleted=True,
+                    )
+                }
+                if any(
+                    (
+                        (memory := current_hydrated.get(memory_id)) is None
+                        or not _projection_matches_snapshot(memory, snapshot)
+                    )
+                    for memory_id, (snapshot, _record) in hydrated.items()
+                ):
+                    conflict = (
+                        "Memory projection changed during hydration; retry the query"
+                    )
+
+            final_page = memory_repo.query_project_memories(
+                project_id,
+                app_id,
+                query,
+                window_offset=0,
+                window_limit=window_limit,
+            )
+            final_candidates = [
+                _snapshot_memory_projection(memory) for memory in final_page.items
+            ]
+            needed_candidates = final_candidates[:logical_end]
+            if observation_changed or any(
+                snapshot.mem0_memory_id not in hydrated
+                or hydrated[snapshot.mem0_memory_id][0] != snapshot
+                for snapshot in needed_candidates
+            ):
+                conflict = (
+                    "Memory projection order changed during hydration; retry the query"
+                )
+
+            if conflict is not None:
+                raise MutationConflictError(conflict)
+
+            ordered_results = [
+                hydrated[snapshot.mem0_memory_id][1]
+                for snapshot in final_candidates
+                if snapshot.mem0_memory_id in hydrated
+            ]
+            response = {
+                "results": ordered_results[logical_offset:logical_end],
+                "total": final_page.total,
+                "page": query.page,
+                "page_size": query.page_size,
+                "scan_count": final_page.scan_count,
+                "stale_skipped": stale_marked,
+            }
+            event_repo.mark_succeeded(event_id, response=response)
+            self.session.commit()
+            return response
 
         try:
             semaphore = asyncio.Semaphore(_HYDRATION_CONCURRENCY)
 
             async def bounded_hydrate(
-                memory: MemoryIndex,
-            ) -> tuple[str, dict[str, Any] | None]:
+                snapshot: _MemoryProjectionSnapshot,
+            ) -> tuple[_MemoryProjectionSnapshot, dict[str, Any] | None]:
                 async with semaphore:
-                    return await hydrate(memory)
+                    return await hydrate(snapshot)
 
             while True:
-                final_page, candidates = candidate_page()
-                candidate_ids = [memory.mem0_memory_id for memory in candidates]
-                page_is_full = len(candidate_ids) >= logical_end and all(
-                    memory_id in hydrated
-                    for memory_id in candidate_ids[:logical_end]
+                candidate_total, _scan_count, candidates = candidate_page()
+                logical_candidates = [
+                    snapshot
+                    for snapshot in candidates
+                    if snapshot.mem0_memory_id not in stale
+                ]
+                page_is_full = len(logical_candidates) >= logical_end and all(
+                    snapshot.mem0_memory_id in hydrated
+                    for snapshot in logical_candidates[:logical_end]
                 )
-                active_set_is_exhausted = (
-                    final_page.total <= len(candidate_ids)
-                    and all(memory_id in hydrated for memory_id in candidate_ids)
+                active_set_is_exhausted = candidate_total <= len(candidates) and all(
+                    snapshot.mem0_memory_id in hydrated
+                    or snapshot.mem0_memory_id in stale
+                    for snapshot in candidates
                 )
                 if page_is_full or active_set_is_exhausted:
-                    ordered_results = [
-                        hydrated[memory_id]
-                        for memory_id in candidate_ids
-                        if memory_id in hydrated
-                    ]
-                    response = {
-                        "results": ordered_results[logical_offset:logical_end],
-                        "total": final_page.total,
-                        "page": query.page,
-                        "page_size": query.page_size,
-                        "scan_count": final_page.scan_count,
-                        "stale_skipped": stale_skipped,
-                    }
-                    event_repo.mark_succeeded(event.id, response=response)
-                    self.session.commit()
-                    return response
+                    return finalize_query()
 
                 remaining_budget = EXPLORER_RECORD_HORIZON - len(fetched_ids)
                 if remaining_budget <= 0:
-                    raise MutationConflictError(
-                        "Memory hydration horizon reached; retry the query"
+                    return finalize_query(
+                        forced_conflict=(
+                            "Memory hydration horizon reached; retry the query"
+                        )
                     )
 
                 unseen_candidates = [
-                    memory
-                    for memory in candidates
-                    if memory.mem0_memory_id not in fetched_ids
+                    snapshot
+                    for snapshot in candidates
+                    if snapshot.mem0_memory_id not in fetched_ids
                 ]
                 if not unseen_candidates:
                     if window_limit >= EXPLORER_RECORD_HORIZON:
-                        raise MutationConflictError(
-                            "Memory hydration horizon reached; retry the query"
+                        return finalize_query(
+                            forced_conflict=(
+                                "Memory hydration horizon reached; retry the query"
+                            )
                         )
                     window_limit = min(
                         window_limit + hydration_batch_size,
@@ -1410,45 +1592,25 @@ class MemoryService:
                     : min(hydration_batch_size, remaining_budget)
                 ]
                 fetched_ids.update(
-                    memory.mem0_memory_id for memory in hydration_batch
+                    snapshot.mem0_memory_id for snapshot in hydration_batch
                 )
                 hydration_results = await asyncio.gather(
-                    *(bounded_hydrate(memory) for memory in hydration_batch)
+                    *(bounded_hydrate(snapshot) for snapshot in hydration_batch)
                 )
-                stale_ids: list[str] = []
-                for memory_id, normalized in hydration_results:
+                for snapshot, normalized in hydration_results:
+                    memory_id = snapshot.mem0_memory_id
                     if normalized is None:
-                        stale_ids.append(memory_id)
+                        stale[memory_id] = snapshot
                     else:
-                        hydrated[memory_id] = normalized
-
-                if stale_ids:
-                    ProjectRepository(self.session).lock_for_mutation(project_id)
-                    stale_marked = memory_repo.mark_stale_if_unchanged(
-                        project_id=project_id,
-                        app_id=app_id,
-                        mem0_memory_ids=stale_ids,
-                        updated_at_lte=hydration_cutoff,
-                    )
-                    stale_skipped += stale_marked
-                    if stale_marked:
-                        EntityRepository(self.session).rebuild_project_entities(
-                            project_id,
-                            app_id,
-                        )
-                    if stale_marked != len(stale_ids):
-                        raise MutationConflictError(
-                            "Memory projection changed during hydration; "
-                            "retry the query"
-                        )
+                        hydrated[memory_id] = (snapshot, normalized)
         except MutationConflictError as exc:
-            event_repo.mark_failed(event.id, error=_error_payload(exc))
+            event_repo.mark_failed(event_id, error=_error_payload(exc))
             self.session.commit()
             raise
         except Exception as exc:
             _persist_failed_trace(
                 self.session,
-                event_id=event.id,
+                event_id=event_id,
                 error=_error_payload(exc),
             )
             raise
