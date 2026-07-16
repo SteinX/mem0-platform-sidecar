@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -31,7 +31,11 @@ from mem0_sidecar.store.models import (
     MutationIntentTarget,
     Project,
 )
-from mem0_sidecar.store.repositories import EntityRepository
+from mem0_sidecar.store.repositories import (
+    EntityRepository,
+    EventRepository,
+    MutationIntentRepository,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ID = "pg-smoke-project"
@@ -520,6 +524,138 @@ class _DeleteClient:
         return {"id": memory_id, "deleted": True}
 
 
+class _BlockingAdminObservationClient:
+    def __init__(self, started: threading.Event, release: threading.Event) -> None:
+        self.started = started
+        self.release = release
+        self.read_calls = 0
+        self.write_calls = 0
+
+    async def list_memories(self, params):
+        self.read_calls += 1
+        self.started.set()
+        if not self.release.wait(8):
+            raise TimeoutError("admin marker observation release timed out")
+        return {"results": [], "total": 0}
+
+
+def _run_admin_resolution_interleaving(session_factory) -> None:
+    try:
+        from mem0_sidecar.core.mutation_admin import MutationAdminService
+    except ModuleNotFoundError as exc:
+        raise AssertionError(
+            "mutation admin service is required for PostgreSQL serialization"
+        ) from exc
+
+    _reset_projection(session_factory)
+    marker = "pg-admin-marker"
+    with session_factory() as session:
+        event = EventRepository(session).create_event(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            operation="memory.add",
+            request={"app_id": APP_ID, "text": "ambiguous"},
+            subject_type="memory",
+        )
+        intent = MutationIntentRepository(session).create(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            event_id=event.id,
+            operation="memory.add",
+            operation_key="pg-admin-operation-key",
+            payload={"mutation_id": marker},
+        )
+        intent.status = "EXHAUSTED"
+        intent.attempt_count = 3
+        intent.lease_expires_at = None
+        session.commit()
+        intent_id = intent.id
+
+    started = threading.Event()
+    release = threading.Event()
+    client = _BlockingAdminObservationClient(started, release)
+    resolution_result: list[dict] = []
+    recovery_result: list[dict] = []
+    failures: list[BaseException] = []
+
+    def resolve() -> None:
+        try:
+            with session_factory() as session:
+                resolution_result.append(
+                    asyncio.run(
+                        MutationAdminService(
+                            session=session,
+                            mem0=client,
+                        ).resolve_intent(
+                            project_id=PROJECT_ID,
+                            app_id=APP_ID,
+                            intent_id=intent_id,
+                            confirmation_intent_id=intent_id,
+                            expected_status="EXHAUSTED",
+                            expected_attempt_count=3,
+                            reason="PostgreSQL serialization acceptance",
+                            accept_unknown_outcome=True,
+                        )
+                    )
+                )
+        except BaseException as exc:
+            failures.append(exc)
+
+    def recover() -> None:
+        try:
+            with session_factory() as session:
+                recovery_result.append(
+                    asyncio.run(
+                        MemoryService(
+                            session=session,
+                            mem0=client,
+                        ).recover_pending_mutations(
+                            project_id=PROJECT_ID,
+                            app_id=APP_ID,
+                        )
+                    )
+                )
+        except BaseException as exc:
+            failures.append(exc)
+
+    resolution_thread = threading.Thread(target=resolve, daemon=True)
+    recovery_thread = threading.Thread(target=recover, daemon=True)
+    resolution_thread.start()
+    _require(started.wait(5), "admin resolution never observed the add marker")
+    recovery_thread.start()
+    recovery_thread.join(0.5)
+    _require(
+        recovery_thread.is_alive(),
+        "PostgreSQL recovery bypassed the admin resolution project lock",
+    )
+    release.set()
+    resolution_thread.join(10)
+    recovery_thread.join(10)
+
+    _require(not resolution_thread.is_alive(), "admin resolution deadlocked")
+    _require(not recovery_thread.is_alive(), "recovery deadlocked")
+    _require(not failures, f"admin resolution concurrency failures: {failures!r}")
+    _require(resolution_result, "admin resolution did not complete")
+    _require(
+        recovery_result == [{"recovered": 0, "failed": 0}],
+        f"unexpected post-resolution recovery result: {recovery_result!r}",
+    )
+    _require(client.read_calls == 1, "admin resolution repeated marker observation")
+    _require(client.write_calls == 0, "admin resolution issued an upstream write")
+    with session_factory() as session:
+        resolved = session.get(MutationIntent, intent_id)
+        _require(
+            resolved is not None and resolved.status == "FAILED",
+            "admin resolution did not terminalize the original intent",
+        )
+        audit_count = session.scalar(
+            select(func.count())
+            .select_from(Event)
+            .where(Event.operation == "mutation.resolve")
+        )
+        _require(audit_count == 1, "admin resolution audit event is missing")
+
+
 def _reset_projection(session_factory) -> None:
     with session_factory() as session:
         session.query(MutationIntent).filter(
@@ -861,6 +997,7 @@ def _run(database_url: str) -> None:
         session_factory = sessionmaker(bind=engine, expire_on_commit=False)
         _run_interleaving(session_factory, "update")
         _run_interleaving(session_factory, "reconcile")
+        _run_admin_resolution_interleaving(session_factory)
     finally:
         engine.dispose()
 
@@ -887,7 +1024,7 @@ def main() -> int:
             "PostgreSQL smoke passed: 0004->head, interruption-safe and "
             "b502a26-legacy exact downgrade/re-upgrade, 0007 locked "
             "unresolved-intent refusal, ORM/data checks, update/delete and "
-            "reconcile/delete serialization"
+            "reconcile/delete serialization, admin/recovery serialization"
         )
     finally:
         with maintenance_engine.connect() as connection:

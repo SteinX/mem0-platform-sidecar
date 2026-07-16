@@ -18,6 +18,9 @@ dependencies = [
   "httpx>=0.27,<1.0",
 ]
 
+[project.scripts]
+mem0-sidecar-admin = "mem0_sidecar.management_cli:entrypoint"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.2,<9.0",
