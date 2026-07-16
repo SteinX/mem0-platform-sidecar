@@ -59,6 +59,25 @@ Common `MEM0_SIDECAR_MEM0_BASE_URL` shapes:
 On Linux, `host.docker.internal` may require an explicit Compose `extra_hosts`
 entry in your deployment file. Prefer a Docker network alias when possible.
 
+## Database migration maintenance window
+
+Schedule sidecar schema downgrades in a maintenance window. In particular,
+the `0005_request_trace_fields` and `0006_entity_projection_scope` downgrade
+paths rebuild compatibility snapshots from the live `events` and `entities`
+tables. Stop or drain sidecar HTTP writers and workers, take a database backup,
+run the Alembic command, and restart traffic only after the target revision and
+service health have been verified.
+
+The snapshot rebuild obtains a writer lock before reading its source rows. On
+PostgreSQL it takes `ACCESS EXCLUSIVE` on the source table for the migration
+transaction; on SQLite it first obtains the database write reservation. This
+serializes the snapshot with concurrent writes and prevents a committed row
+from falling between snapshot validation and schema replacement. The lock is a
+correctness guard, not a zero-downtime migration promise: a live writer can
+block the migration or be blocked until the migration completes, leading to
+request latency or timeouts. Keep the maintenance window even though the
+migration enforces the lock.
+
 ## Dashboard Overlay
 
 Apply the overlay to an upstream dashboard checkout, then verify it before you

@@ -71,6 +71,7 @@ def compose_up_command(project_name: str) -> list[str]:
         "openai-stub",
         "postgres",
         "mem0",
+        "sidecar",
         "dashboard",
         "browser",
     ]
@@ -113,7 +114,7 @@ def postgres_smoke_command(project_name: str) -> list[str]:
     ]
 
 
-def browser_smoke_command(project_name: str) -> list[str]:
+def mocked_browser_smoke_command(project_name: str) -> list[str]:
     return [
         *compose_command(project_name),
         "run",
@@ -122,6 +123,18 @@ def browser_smoke_command(project_name: str) -> list[str]:
         "browser-smoke",
         "node",
         "/app/run-browser-smoke.cjs",
+    ]
+
+
+def browser_destructive_smoke_command(project_name: str) -> list[str]:
+    return [
+        *compose_command(project_name),
+        "run",
+        "--rm",
+        "--no-deps",
+        "browser-smoke",
+        "node",
+        "/app/run-browser-destructive-e2e.cjs",
     ]
 
 
@@ -303,6 +316,7 @@ def dump_diagnostics(base_compose: list[str], *, env: dict[str, str]) -> None:
             "--no-color",
             "--tail=240",
             "mem0",
+            "sidecar",
             "postgres",
             "openai-stub",
             "e2e-runner",
@@ -370,7 +384,10 @@ def main() -> int:
             ),
             env=runner_env,
         )
-        run(browser_smoke_command(project_name), env=compose_env)
+        print("\n=== real destructive browser acceptance gate ===")
+        run(browser_destructive_smoke_command(project_name), env=compose_env)
+        print("\n=== mocked UI behavior smoke (not deployed-proxy acceptance) ===")
+        run(mocked_browser_smoke_command(project_name), env=compose_env)
     except Exception:
         dump_diagnostics(base_compose, env=compose_env)
         raise
