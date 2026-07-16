@@ -29,10 +29,43 @@ async function main() {
     source.includes("if (require.main === module)"),
     "real browser script must be import-safe for executable helper contracts",
   );
-  const { classifyDirectMem0Get } = require(scriptPath);
+  const { classifyDirectMem0Get, setDashboardSessionPrerequisite } =
+    require(scriptPath);
   check(
     typeof classifyDirectMem0Get === "function",
     "classifyDirectMem0Get must be exported",
+  );
+  check(
+    typeof setDashboardSessionPrerequisite === "function",
+    "setDashboardSessionPrerequisite must be exported",
+  );
+
+  const cookieCalls = [];
+  await setDashboardSessionPrerequisite({
+    async send(method, params) {
+      cookieCalls.push({ method, params });
+      return { success: true };
+    },
+  });
+  check(cookieCalls.length === 1, "dashboard session must set exactly one cookie");
+  check(
+    cookieCalls[0].method === "Network.setCookie",
+    "dashboard session must use the CDP cookie API",
+  );
+  check(
+    cookieCalls[0].params.name === "mem0_refresh_token" &&
+      cookieCalls[0].params.httpOnly === true &&
+      cookieCalls[0].params.sameSite === "Lax",
+    "dashboard session cookie must satisfy the upstream middleware contract",
+  );
+  await rejects(
+    () =>
+      setDashboardSessionPrerequisite({
+        async send() {
+          return { success: false };
+        },
+      }),
+    "rejected dashboard session cookie",
   );
 
   check(

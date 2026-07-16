@@ -119,6 +119,19 @@ async function openTarget() {
   return response.json();
 }
 
+async function setDashboardSessionPrerequisite(cdp) {
+  const cookie = await cdp.send("Network.setCookie", {
+    name: "mem0_refresh_token",
+    value: "real-browser-destructive-session",
+    url: dashboardBase,
+    httpOnly: true,
+    sameSite: "Lax",
+  });
+  if (cookie.success === false) {
+    throw new Error("Real browser dashboard session cookie was rejected");
+  }
+}
+
 async function seedFixtureThroughSidecar() {
   const token = `${Date.now()}-${crypto.randomUUID()}`;
   const marker = `real-browser-destructive-${token}`;
@@ -460,6 +473,8 @@ async function main() {
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
     await cdp.send("Network.enable");
+    stage = "install dashboard session prerequisite";
+    await setDashboardSessionPrerequisite(cdp);
     await cdp.send("Emulation.setDeviceMetricsOverride", {
       width: 1440,
       height: 900,
@@ -511,7 +526,7 @@ async function main() {
   if (primaryError) throw primaryError;
 }
 
-module.exports = { classifyDirectMem0Get };
+module.exports = { classifyDirectMem0Get, setDashboardSessionPrerequisite };
 
 if (require.main === module) {
   main().catch((error) => {
