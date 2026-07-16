@@ -1714,6 +1714,58 @@ def test_query_memories_commits_stale_cleanup(tmp_path) -> None:
     assert stale is not None and stale.deleted_at is not None
 
 
+def test_query_memories_never_returns_empty_reachable_page(tmp_path) -> None:
+    stale_count = 23
+    valid_count = 5
+    records: dict[str, Any] = {}
+    for index in range(stale_count + valid_count):
+        memory_id = f"mem-{index:02d}"
+        records[memory_id] = (
+            ValueError("malformed")
+            if index < stale_count
+            else {"id": memory_id, "memory": "valid"}
+        )
+    mem0 = ExplorerRouteMem0Client(records)
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'reachable-page.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    for memory_id in records:
+        _index_route_memory(app, memory_id)
+
+    response = TestClient(app).post(
+        "/v1/memories/query",
+        json={
+            "project_id": "repo-a",
+            "app_id": "app-a",
+            "page": 1,
+            "page_size": 3,
+            "sort": "created_at_asc",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["id"] for item in payload["results"]] == [
+        "mem-23",
+        "mem-24",
+        "mem-25",
+    ]
+    assert payload == {
+        **payload,
+        "page": 1,
+        "page_size": 3,
+        "total": valid_count,
+        "has_more": True,
+        "stale_skipped": stale_count,
+    }
+    assert len(mem0.get_memory_ids) == len(set(mem0.get_memory_ids))
+
+
 def test_query_memories_unknown_project_is_404_without_bootstrap(tmp_path) -> None:
     app = create_app(
         settings=SidecarSettings(

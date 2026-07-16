@@ -14,6 +14,7 @@ from mem0_sidecar.core.memory_ops import (
     SIDECAR_PROJECT_ID_METADATA_KEY,
     MemoryService,
     MemoryUpstreamProtocolError,
+    MutationConflictError,
     extract_memory_id,
     extract_memory_ids,
 )
@@ -30,7 +31,6 @@ from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EntityRepository,
     EventRepository,
-    MemoryIndexPage,
     MemoryIndexRepository,
     ProjectRepository,
 )
@@ -2020,16 +2020,18 @@ async def test_reconcile_uses_atomic_claim_when_competing_projection_appears(
 
 
 @pytest.mark.asyncio
-async def test_query_memories_never_gets_beyond_single_bounded_candidate_buffer(
+async def test_query_memories_refills_after_deep_stale_prefix(
     db_session,
+    monkeypatch,
 ) -> None:
     _create_project(db_session)
     records: dict[str, Any] = {}
-    candidate_limit = 3 + 20
-    for index in range(candidate_limit + 5):
+    stale_count = 23
+    valid_count = 5
+    for index in range(stale_count + valid_count):
         memory_id = f"mem-{index:02d}"
         _index_memory(db_session, memory_id)
-        if index < candidate_limit:
+        if index < stale_count:
             records[memory_id] = Mem0UpstreamError(
                 method="GET",
                 path=f"/memories/{memory_id}",
@@ -2040,6 +2042,23 @@ async def test_query_memories_never_gets_beyond_single_bounded_candidate_buffer(
             records[memory_id] = {"id": memory_id, "memory": "valid"}
     db_session.commit()
     mem0 = ExplorerMem0Client(records)
+    observed_offsets: list[int | None] = []
+    original_query = MemoryIndexRepository.query_project_memories
+
+    def capture_offset(self, *args, window_offset=None, **kwargs):
+        observed_offsets.append(window_offset)
+        return original_query(
+            self,
+            *args,
+            window_offset=window_offset,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        MemoryIndexRepository,
+        "query_project_memories",
+        capture_offset,
+    )
 
     result = await MemoryService(session=db_session, mem0=mem0).query_memories(
         project_id="repo-a",
@@ -2047,68 +2066,248 @@ async def test_query_memories_never_gets_beyond_single_bounded_candidate_buffer(
         query=_explorer_query(page_size=3),
     )
 
-    assert len(mem0.get_memory_ids) == candidate_limit
-    assert mem0.get_memory_ids == [
-        f"mem-{index:02d}" for index in range(candidate_limit)
+    assert [item["id"] for item in result["results"]] == [
+        "mem-23",
+        "mem-24",
+        "mem-25",
     ]
-    assert result["results"] == []
-    assert result["stale_skipped"] == candidate_limit
-    assert result["total"] == 5
+    assert result["stale_skipped"] == stale_count
+    assert result["total"] == valid_count
+    assert observed_offsets and set(observed_offsets) == {0}
+    assert len(mem0.get_memory_ids) == len(set(mem0.get_memory_ids))
+    assert len(mem0.get_memory_ids) <= stale_count + valid_count
+    assert 1 < mem0.max_concurrent_gets <= 8
 
 
 @pytest.mark.asyncio
-async def test_query_memories_high_page_uses_only_requested_window(
+async def test_query_memories_direct_high_page_validates_from_projection_start(
     db_session,
     monkeypatch,
 ) -> None:
     _create_project(db_session)
+    records: dict[str, Any] = {}
+    stale_count = 23
+    valid_count = 8
+    for index in range(stale_count + valid_count):
+        memory_id = f"mem-{index:02d}"
+        _index_memory(db_session, memory_id)
+        if index < stale_count:
+            records[memory_id] = Mem0UpstreamError(
+                method="GET",
+                path=f"/memories/{memory_id}",
+                status_code=404,
+                message="missing",
+            )
+        else:
+            records[memory_id] = {"id": memory_id, "memory": "valid"}
     db_session.commit()
-    observed: list[tuple[int, int, int | None, int | None]] = []
+    observed_offsets: list[int | None] = []
+    original_query = MemoryIndexRepository.query_project_memories
 
-    def capture_window(
-        self,
-        project_id,
-        app_id,
-        query,
-        *,
-        window_offset=None,
-        window_limit=None,
-    ):
-        observed.append(
-            (query.page, query.page_size, window_offset, window_limit)
+    def capture_offset(self, *args, window_offset=None, **kwargs):
+        observed_offsets.append(window_offset)
+        return original_query(
+            self,
+            *args,
+            window_offset=window_offset,
+            **kwargs,
         )
-        return MemoryIndexPage(items=[], total=5000, scan_count=0)
 
     monkeypatch.setattr(
         MemoryIndexRepository,
         "query_project_memories",
-        capture_window,
+        capture_offset,
     )
-    query = parse_explorer_query(
-        {"page": 50, "page_size": 100},
-        allowed_fields={
-            "entity_type",
-            "user_id",
-            "agent_id",
-            "app_id",
-            "run_id",
-            "memory_id",
-            "category",
-            "metadata",
-        },
-    )
+    mem0 = ExplorerMem0Client(records)
 
     result = await MemoryService(
         session=db_session,
-        mem0=ExplorerMem0Client(),
-    ).query_memories(project_id="repo-a", app_id="app-a", query=query)
+        mem0=mem0,
+    ).query_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        query=_explorer_query(page=3, page_size=3),
+    )
 
-    assert observed == [
-        (50, 100, 4900, 100),
-        (50, 100, 4900, 100),
+    assert [item["id"] for item in result["results"]] == [
+        "mem-29",
+        "mem-30",
     ]
-    assert result["total"] == 5000
-    assert result["results"] == []
+    assert result["total"] == valid_count
+    assert result["stale_skipped"] == stale_count
+    assert observed_offsets and set(observed_offsets) == {0}
+    assert len(mem0.get_memory_ids) == len(set(mem0.get_memory_ids))
+    assert len(mem0.get_memory_ids) <= stale_count + valid_count
+    assert 1 < mem0.max_concurrent_gets <= 8
+
+
+@pytest.mark.asyncio
+async def test_query_memories_consecutive_pages_remain_gapless_after_compaction(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    stale_ids = {"mem-00", "mem-03", "mem-07"}
+    records: dict[str, Any] = {}
+    for index in range(11):
+        memory_id = f"mem-{index:02d}"
+        _index_memory(db_session, memory_id)
+        if memory_id in stale_ids:
+            records[memory_id] = Mem0UpstreamError(
+                method="GET",
+                path=f"/memories/{memory_id}",
+                status_code=404,
+                message="missing",
+            )
+        else:
+            records[memory_id] = {"id": memory_id, "memory": "valid"}
+    db_session.commit()
+    mem0 = ExplorerMem0Client(records)
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    first = await service.query_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        query=_explorer_query(page=1, page_size=3),
+    )
+    first_gets = list(mem0.get_memory_ids)
+    second = await service.query_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        query=_explorer_query(page=2, page_size=3),
+    )
+    second_gets = mem0.get_memory_ids[len(first_gets) :]
+
+    first_ids = [item["id"] for item in first["results"]]
+    second_ids = [item["id"] for item in second["results"]]
+    assert first_ids == ["mem-01", "mem-02", "mem-04"]
+    assert second_ids == ["mem-05", "mem-06", "mem-08"]
+    assert len(first_ids + second_ids) == len(set(first_ids + second_ids))
+    assert first["total"] == second["total"] == 8
+    assert len(first_gets) == len(set(first_gets))
+    assert len(second_gets) == len(set(second_gets))
+    assert mem0.max_concurrent_gets <= 8
+
+
+@pytest.mark.asyncio
+async def test_query_memories_horizon_failure_persists_cleanup_and_failed_trace(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    records: dict[str, Any] = {}
+    for index in range(8):
+        memory_id = f"mem-{index:02d}"
+        _index_memory(db_session, memory_id)
+        if index < 5:
+            records[memory_id] = Mem0UpstreamError(
+                method="GET",
+                path=f"/memories/{memory_id}",
+                status_code=404,
+                message="missing",
+            )
+        else:
+            records[memory_id] = {"id": memory_id, "memory": "valid"}
+    db_session.commit()
+    monkeypatch.setattr(
+        "mem0_sidecar.core.memory_ops.EXPLORER_RECORD_HORIZON",
+        5,
+    )
+    mem0 = ExplorerMem0Client(records)
+    result: dict[str, Any] | None = None
+    error: MutationConflictError | None = None
+
+    try:
+        result = await MemoryService(
+            session=db_session,
+            mem0=mem0,
+        ).query_memories(
+            project_id="repo-a",
+            app_id="app-a",
+            query=_explorer_query(page_size=3),
+        )
+    except MutationConflictError as exc:
+        error = exc
+
+    with Session(db_session.get_bind()) as verification_session:
+        stale_count = sum(
+            MemoryIndexRepository(verification_session)
+            .get_memory(
+                project_id="repo-a",
+                mem0_memory_id=f"mem-{index:02d}",
+                app_id="app-a",
+                include_deleted=True,
+            )
+            .deleted_at
+            is not None
+            for index in range(5)
+        )
+        events = EventRepository(verification_session).list_project_events("repo-a")
+
+    assert error is not None and "retry" in str(error).lower(), (
+        f"result={result!r} gets={mem0.get_memory_ids!r} stale={stale_count} "
+        f"event_statuses={[event.status.value for event in events]!r}"
+    )
+    assert len(mem0.get_memory_ids) == 5
+    assert len(mem0.get_memory_ids) == len(set(mem0.get_memory_ids))
+    assert stale_count == 5
+    assert len(events) == 1
+    assert events[0].status is EventStatus.FAILED
+    assert "mem-" not in events[0].error_json
+
+
+@pytest.mark.asyncio
+async def test_query_memories_stale_mark_race_fails_without_loop_or_skip(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-raced")
+    _index_memory(db_session, "mem-next")
+    db_session.commit()
+    mem0 = ExplorerMem0Client(
+        {
+            "mem-raced": Mem0UpstreamError(
+                method="GET",
+                path="/memories/mem-raced",
+                status_code=404,
+                message="missing",
+            ),
+            "mem-next": {"id": "mem-next", "memory": "must not be skipped"},
+        }
+    )
+    stale_mark_calls = 0
+
+    def refuse_stale_mark(self, **kwargs):
+        nonlocal stale_mark_calls
+        stale_mark_calls += 1
+        return 0
+
+    monkeypatch.setattr(
+        MemoryIndexRepository,
+        "mark_stale_if_unchanged",
+        refuse_stale_mark,
+    )
+
+    with pytest.raises(MutationConflictError, match="(?i)retry"):
+        await asyncio.wait_for(
+            MemoryService(session=db_session, mem0=mem0).query_memories(
+                project_id="repo-a",
+                app_id="app-a",
+                query=_explorer_query(page_size=1),
+            ),
+            timeout=1,
+        )
+
+    assert stale_mark_calls == 1
+    assert len(mem0.get_memory_ids) == len(set(mem0.get_memory_ids))
+    assert mem0.get_memory_ids == ["mem-raced", "mem-next"]
+    raced = MemoryIndexRepository(db_session).get_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-raced",
+        app_id="app-a",
+        include_deleted=True,
+    )
+    assert raced is not None and raced.deleted_at is None
 
 
 @pytest.mark.asyncio

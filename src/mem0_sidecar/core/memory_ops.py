@@ -1296,12 +1296,15 @@ class MemoryService:
         )
         self.session.commit()
         memory_repo = MemoryIndexRepository(self.session)
-        offset = (query.page - 1) * query.page_size
-        candidate_limit = min(
+        logical_offset = (query.page - 1) * query.page_size
+        logical_end = logical_offset + query.page_size
+        hydration_batch_size = min(
             query.page_size + _HYDRATION_BUFFER,
-            EXPLORER_RECORD_HORIZON - offset,
+            EXPLORER_RECORD_HORIZON,
         )
+        window_limit = hydration_batch_size
         hydration_cutoff = datetime.now(UTC)
+        fetched_ids: set[str] = set()
         hydrated: dict[str, dict[str, Any]] = {}
         stale_skipped = 0
 
@@ -1310,8 +1313,8 @@ class MemoryService:
                 project_id,
                 app_id,
                 query,
-                window_offset=offset,
-                window_limit=candidate_limit,
+                window_offset=0,
+                window_limit=window_limit,
             )
             return page, page.items
 
@@ -1344,7 +1347,6 @@ class MemoryService:
                 raise
 
         try:
-            _, candidates = candidate_page()
             semaphore = asyncio.Semaphore(_HYDRATION_CONCURRENCY)
 
             async def bounded_hydrate(
@@ -1353,46 +1355,96 @@ class MemoryService:
                 async with semaphore:
                     return await hydrate(memory)
 
-            hydration_results = await asyncio.gather(
-                *(bounded_hydrate(memory) for memory in candidates)
-            )
-            stale_ids: list[str] = []
-            for memory_id, normalized in hydration_results:
-                if normalized is None:
-                    stale_ids.append(memory_id)
-                else:
-                    hydrated[memory_id] = normalized
-
-            if stale_ids:
-                ProjectRepository(self.session).lock_for_mutation(project_id)
-                stale_skipped = memory_repo.mark_stale_if_unchanged(
-                    project_id=project_id,
-                    app_id=app_id,
-                    mem0_memory_ids=stale_ids,
-                    updated_at_lte=hydration_cutoff,
+            while True:
+                final_page, candidates = candidate_page()
+                candidate_ids = [memory.mem0_memory_id for memory in candidates]
+                page_is_full = len(candidate_ids) >= logical_end and all(
+                    memory_id in hydrated
+                    for memory_id in candidate_ids[:logical_end]
                 )
-                EntityRepository(self.session).rebuild_project_entities(
-                    project_id,
-                    app_id,
+                active_set_is_exhausted = (
+                    final_page.total <= len(candidate_ids)
+                    and all(memory_id in hydrated for memory_id in candidate_ids)
                 )
+                if page_is_full or active_set_is_exhausted:
+                    ordered_results = [
+                        hydrated[memory_id]
+                        for memory_id in candidate_ids
+                        if memory_id in hydrated
+                    ]
+                    response = {
+                        "results": ordered_results[logical_offset:logical_end],
+                        "total": final_page.total,
+                        "page": query.page,
+                        "page_size": query.page_size,
+                        "scan_count": final_page.scan_count,
+                        "stale_skipped": stale_skipped,
+                    }
+                    event_repo.mark_succeeded(event.id, response=response)
+                    self.session.commit()
+                    return response
 
-            final_page, final_candidates = candidate_page()
-            results = [
-                hydrated[memory.mem0_memory_id]
-                for memory in final_candidates
-                if memory.mem0_memory_id in hydrated
-            ][: query.page_size]
-            response = {
-                "results": results,
-                "total": final_page.total,
-                "page": query.page,
-                "page_size": query.page_size,
-                "scan_count": final_page.scan_count,
-                "stale_skipped": stale_skipped,
-            }
-            event_repo.mark_succeeded(event.id, response=response)
+                remaining_budget = EXPLORER_RECORD_HORIZON - len(fetched_ids)
+                if remaining_budget <= 0:
+                    raise MutationConflictError(
+                        "Memory hydration horizon reached; retry the query"
+                    )
+
+                unseen_candidates = [
+                    memory
+                    for memory in candidates
+                    if memory.mem0_memory_id not in fetched_ids
+                ]
+                if not unseen_candidates:
+                    if window_limit >= EXPLORER_RECORD_HORIZON:
+                        raise MutationConflictError(
+                            "Memory hydration horizon reached; retry the query"
+                        )
+                    window_limit = min(
+                        window_limit + hydration_batch_size,
+                        EXPLORER_RECORD_HORIZON,
+                    )
+                    continue
+
+                hydration_batch = unseen_candidates[
+                    : min(hydration_batch_size, remaining_budget)
+                ]
+                fetched_ids.update(
+                    memory.mem0_memory_id for memory in hydration_batch
+                )
+                hydration_results = await asyncio.gather(
+                    *(bounded_hydrate(memory) for memory in hydration_batch)
+                )
+                stale_ids: list[str] = []
+                for memory_id, normalized in hydration_results:
+                    if normalized is None:
+                        stale_ids.append(memory_id)
+                    else:
+                        hydrated[memory_id] = normalized
+
+                if stale_ids:
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    stale_marked = memory_repo.mark_stale_if_unchanged(
+                        project_id=project_id,
+                        app_id=app_id,
+                        mem0_memory_ids=stale_ids,
+                        updated_at_lte=hydration_cutoff,
+                    )
+                    stale_skipped += stale_marked
+                    if stale_marked:
+                        EntityRepository(self.session).rebuild_project_entities(
+                            project_id,
+                            app_id,
+                        )
+                    if stale_marked != len(stale_ids):
+                        raise MutationConflictError(
+                            "Memory projection changed during hydration; "
+                            "retry the query"
+                        )
+        except MutationConflictError as exc:
+            event_repo.mark_failed(event.id, error=_error_payload(exc))
             self.session.commit()
-            return response
+            raise
         except Exception as exc:
             _persist_failed_trace(
                 self.session,
