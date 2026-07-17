@@ -13,7 +13,11 @@ from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from mem0_sidecar.core.explorer_filters import ExplorerFilter, ExplorerQuery
+from mem0_sidecar.core.explorer_filters import (
+    EXPLORER_RECORD_HORIZON,
+    ExplorerFilter,
+    ExplorerQuery,
+)
 from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.core.trace_payloads import (
     bounded_trace_document,
@@ -1747,7 +1751,7 @@ class MemoryIndexRepository:
             .select_from(MemoryIndex)
             .where(*candidate_conditions)
         ) or 0
-        if scan_count > 5000:
+        if scan_count > EXPLORER_RECORD_HORIZON:
             raise ValueError("metadata filter scan exceeds 5000 records")
 
         candidates = list(
@@ -1755,8 +1759,12 @@ class MemoryIndexRepository:
                 select(MemoryIndex)
                 .where(*candidate_conditions)
                 .order_by(*_memory_order_by(query))
+                .limit(EXPLORER_RECORD_HORIZON + 1)
             )
         )
+        if len(candidates) > EXPLORER_RECORD_HORIZON:
+            raise ValueError("metadata filter scan exceeds 5000 records")
+        scan_count = len(candidates)
         matches = [
             memory
             for memory in candidates
