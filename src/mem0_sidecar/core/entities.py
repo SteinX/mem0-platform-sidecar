@@ -19,6 +19,7 @@ from mem0_sidecar.store.repositories import (
     EntityRepository,
     EventRepository,
     MemoryIndexRepository,
+    MutationIntentFenceError,
     MutationIntentRepository,
     ProjectRepository,
 )
@@ -348,7 +349,7 @@ class EntityService:
         )
         project_id = _portable_id(project_id, field_name="project_id")
         app_id = _portable_id(app_id, field_name="app_id")
-        from mem0_sidecar.core.memory_ops import MemoryService
+        from mem0_sidecar.core.memory_ops import MemoryService, MutationConflictError
 
         recovery_service = MemoryService(session=self.session, mem0=self.mem0)
         await recovery_service.recover_pending_mutations(
@@ -405,59 +406,106 @@ class EntityService:
             },
             memory_ids=memory_ids,
         )
+        expected_updated_at = {
+            memory.mem0_memory_id: _as_utc(memory.updated_at)
+            for memory in MemoryIndexRepository(self.session).list_memories_by_ids(
+                project_id=project_id,
+                app_id=app_id,
+                mem0_memory_ids=memory_ids,
+            )
+        }
+        event_id = event.id
+        intent_id = intent.id
+        attempt_token = intent.attempt_count
         self.session.commit()
 
         upstream_attempted = False
         upstream_completed = False
         upstream_effect_observed = False
         try:
-            ProjectRepository(self.session).lock_for_mutation(project_id)
-            intent_repo = MutationIntentRepository(self.session)
-            targets = {
-                target.memory_id: target for target in intent_repo.targets(intent.id)
-            }
-            memory_repo = MemoryIndexRepository(self.session)
             failed: list[dict[str, Any]] = []
             deleted_count = 0
-            affected_memories: list[Any] = []
-            for memory_id in memory_ids:
-                target = targets[memory_id]
-                try:
-                    upstream_attempted = True
-                    await self.mem0.delete_memory(memory_id)
-                    upstream_effect_observed = True
-                except Exception as exc:
-                    if _safe_outcome_unknown(exc):
-                        raise
-                    if not (
-                        isinstance(exc, Mem0UpstreamError)
-                        and _safe_upstream_status_code(exc) == 404
-                    ):
+            for offset in range(0, len(memory_ids), 50):
+                outcomes: list[tuple[str, str, dict[str, Any] | None]] = []
+                pending_error: BaseException | None = None
+                for memory_id in memory_ids[offset : offset + 50]:
+                    try:
+                        upstream_attempted = True
+                        await self.mem0.delete_memory(memory_id)
+                        upstream_effect_observed = True
+                        outcomes.append(("deleted", memory_id, None))
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception) or _safe_outcome_unknown(exc):
+                            pending_error = exc
+                            break
+                        if (
+                            isinstance(exc, Mem0UpstreamError)
+                            and _safe_upstream_status_code(exc) == 404
+                        ):
+                            upstream_effect_observed = True
+                            outcomes.append(("deleted", memory_id, None))
+                            continue
                         safe_error = _safe_delete_error(exc)
-                        failed.append({"id": memory_id, "error": safe_error})
-                        intent_repo.mark_target_failed(target, safe_error)
-                        continue
-                    upstream_effect_observed = True
-                deleted_memory = memory_repo.delete_memory(
-                    project_id=project_id,
-                    mem0_memory_id=memory_id,
-                )
-                if deleted_memory is not None:
-                    affected_memories.append(deleted_memory)
-                intent_repo.mark_target_succeeded(target)
-                deleted_count += 1
+                        outcomes.append(("failed", memory_id, safe_error))
+
+                if outcomes:
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    intent_repo = MutationIntentRepository(self.session)
+                    intent_repo.require_active_attempt(intent_id, attempt_token)
+                    targets = {
+                        target.memory_id: target
+                        for target in intent_repo.targets(intent_id)
+                    }
+                    memory_repo = MemoryIndexRepository(self.session)
+                    affected_memories: list[Any] = []
+                    for outcome, memory_id, safe_error in outcomes:
+                        target = targets[memory_id]
+                        if outcome == "failed":
+                            assert safe_error is not None
+                            failed.append({"id": memory_id, "error": safe_error})
+                            intent_repo.mark_target_failed(target, safe_error)
+                            continue
+                        current = memory_repo.get_memory(
+                            project_id=project_id,
+                            mem0_memory_id=memory_id,
+                            app_id=app_id,
+                        )
+                        if (
+                            current is None
+                            or _as_utc(current.updated_at)
+                            != expected_updated_at.get(memory_id)
+                        ):
+                            raise MutationConflictError(
+                                "Entity memory projection changed during delete"
+                            )
+                        deleted_memory = memory_repo.delete_memory(
+                            project_id=project_id,
+                            mem0_memory_id=memory_id,
+                        )
+                        if deleted_memory is not None:
+                            affected_memories.append(deleted_memory)
+                        intent_repo.mark_target_succeeded(target)
+                        deleted_count += 1
+                    entity_repo.refresh_affected_memories(
+                        project_id,
+                        app_id,
+                        affected_memories,
+                    )
+                    intent_repo.renew_active_attempt(intent_id, attempt_token)
+                    self.session.commit()
+                if pending_error is not None:
+                    raise pending_error
 
             upstream_completed = True
-            entity_repo.refresh_affected_memories(
-                project_id,
-                app_id,
-                affected_memories,
-            )
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            intent_repo = MutationIntentRepository(self.session)
+            intent_repo.require_active_attempt(intent_id, attempt_token)
+            event_repo = EventRepository(self.session)
             failed_count = len(failed)
             if failed_count == 0:
                 status = "SUCCEEDED"
                 event_repo.mark_succeeded(
-                    event.id,
+                    event_id,
                     response={
                         "status": status,
                         "total": requested_count,
@@ -468,7 +516,7 @@ class EntityService:
             else:
                 status = "PARTIAL" if deleted_count else "FAILED"
                 event_repo.mark_failed(
-                    event.id,
+                    event_id,
                     error={
                         "status": status,
                         "requested_count": requested_count,
@@ -483,22 +531,24 @@ class EntityService:
                 "deleted_count": deleted_count,
                 "failed_count": failed_count,
                 "failed": failed,
-                "event_id": event.id,
+                "event_id": event_id,
             }
             if failed_count:
                 intent_repo.fail(
-                    intent.id,
+                    intent_id,
                     status=status,
                     error=result,
                     result=result,
                 )
             else:
-                intent_repo.complete(intent.id, result=result)
+                intent_repo.complete(intent_id, result=result)
             self.session.commit()
             return result
         except BaseException as exc:
             recovery_service._record_intent_failure(
-                intent.id,
+                project_id,
+                intent_id,
+                attempt_token,
                 exc,
                 outcome_unknown=(
                     not isinstance(exc, Exception)
@@ -511,4 +561,8 @@ class EntityService:
                 ),
                 mark_event_failed=isinstance(exc, Exception),
             )
+            if isinstance(exc, MutationIntentFenceError):
+                raise MutationConflictError(
+                    "Durable entity deletion attempt was superseded"
+                ) from exc
             raise

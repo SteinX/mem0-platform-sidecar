@@ -2107,12 +2107,17 @@ async def test_reconcile_does_not_stale_projection_updated_during_scan(
     class UpdatingListClient(ExplorerMem0Client):
         async def list_memories(self, params: dict[str, Any]) -> Any:
             self.list_calls.append(params)
-            await MemoryService(session=db_session, mem0=self).update_memory(
+            MemoryIndexRepository(db_session).upsert_memory(
                 project_id="repo-a",
-                memory_id="concurrent-update",
-                request_app_id="app-a",
-                payload={"text": "updated during reconcile"},
+                mem0_memory_id="concurrent-update",
+                user_id="root",
+                agent_id="codex",
+                app_id="app-a",
+                run_id="run-1",
+                category=None,
+                metadata={"updated": "during-reconcile"},
             )
+            db_session.commit()
             return {"results": []}
 
     result = await MemoryService(
@@ -2140,6 +2145,64 @@ async def test_reconcile_does_not_stale_projection_updated_during_scan(
     if projection_updated_at.tzinfo is None:
         projection_updated_at = projection_updated_at.replace(tzinfo=UTC)
     assert projection_updated_at > original_updated_at
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_overwrite_projection_updated_during_scan(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    projection = _index_memory(
+        db_session,
+        "concurrent-accepted",
+        metadata={"version": "before"},
+    )
+
+    class UpdatingListClient(ExplorerMem0Client):
+        async def list_memories(self, params: dict[str, Any]) -> Any:
+            self.list_calls.append(params)
+            MemoryIndexRepository(db_session).upsert_memory(
+                project_id="repo-a",
+                mem0_memory_id="concurrent-accepted",
+                user_id="root",
+                agent_id="codex",
+                app_id="app-a",
+                run_id="run-1",
+                category=None,
+                metadata={"version": "concurrent"},
+            )
+            db_session.commit()
+            return {
+                "results": [
+                    {
+                        "id": "concurrent-accepted",
+                        "memory": "upstream snapshot",
+                        "metadata": {
+                            SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+                            SIDECAR_APP_ID_METADATA_KEY: "app-a",
+                            "version": "stale-upstream-scan",
+                        },
+                    }
+                ],
+                "total": 1,
+            }
+
+    result = await MemoryService(
+        session=db_session,
+        mem0=UpdatingListClient(),
+    ).reconcile_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        adopt_unscoped=False,
+        allow_adopt_unscoped=False,
+        default_project_id="repo-a",
+    )
+
+    assert result["indexed"] == 1
+    assert json.loads(projection.metadata_projection_json) == {
+        "version": "concurrent"
+    }
+    assert projection.deleted_at is None
 
 
 @pytest.mark.asyncio
@@ -2750,7 +2813,7 @@ async def test_query_memories_stale_mark_race_fails_without_loop_or_skip(
 
 
 @pytest.mark.asyncio
-async def test_update_locks_project_before_memory_index_and_entity_mutations(
+async def test_update_fences_projection_mutations_after_upstream_update(
     db_session,
     monkeypatch,
 ) -> None:
@@ -2803,17 +2866,15 @@ async def test_update_locks_project_before_memory_index_and_entity_mutations(
         payload={"text": "updated"},
     )
 
-    assert operations == [
-        "project",  # recovery preflight and blocker reread
-        "project",  # durable intent execution
-        "upstream",
-        "memory",
-        "entity",
-    ]
+    upstream_index = operations.index("upstream")
+    memory_index = operations.index("memory")
+    entity_index = operations.index("entity")
+    assert upstream_index < memory_index < entity_index
+    assert "project" in operations[upstream_index + 1 : memory_index]
 
 
 @pytest.mark.asyncio
-async def test_reconcile_locks_project_before_memory_index_and_entity_mutations(
+async def test_reconcile_fences_projection_mutations_after_upstream_observation(
     db_session,
     monkeypatch,
 ) -> None:
@@ -2868,7 +2929,11 @@ async def test_reconcile_locks_project_before_memory_index_and_entity_mutations(
         default_project_id="repo-a",
     )
 
-    assert operations == ["project", "upstream", "memory", "entity"]
+    upstream_index = operations.index("upstream")
+    memory_index = operations.index("memory")
+    entity_index = operations.index("entity")
+    assert upstream_index < memory_index < entity_index
+    assert "project" in operations[upstream_index + 1 : memory_index]
 
 
 @pytest.mark.asyncio

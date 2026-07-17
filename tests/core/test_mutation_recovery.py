@@ -13,6 +13,7 @@ from mem0_sidecar.store.database import create_engine_from_url, create_session_f
 from mem0_sidecar.store.models import Base, Entity, Event, MemoryIndex, MutationIntent
 from mem0_sidecar.store.repositories import (
     EntityRepository,
+    EventRepository,
     MemoryIndexRepository,
     MutationIntentRepository,
     ProjectRepository,
@@ -322,6 +323,43 @@ async def _recover(factory, client) -> dict[str, int]:
         return await recovery(project_id=PROJECT_ID, app_id=APP_ID)
 
 
+@pytest.mark.asyncio
+async def test_interrupted_reconcile_is_failed_without_replaying_scan(tmp_path) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+    with factory() as session:
+        event = EventRepository(session).create_event(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            operation="memory.reconcile",
+            request={"app_id": APP_ID},
+            subject_type="memory",
+        )
+        intent_repo = MutationIntentRepository(session)
+        intent = intent_repo.create(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            event_id=event.id,
+            operation="memory.reconcile",
+            payload={"app_id": APP_ID},
+        )
+        intent_repo.mark_unresolved(
+            intent.id,
+            error={"message": "worker stopped during reconciliation"},
+        )
+        session.commit()
+
+    result = await _recover(factory, client)
+
+    assert result == {"recovered": 0, "failed": 1}
+    assert client.list_calls == 0
+    with factory() as session:
+        intent = session.scalar(select(MutationIntent))
+        event = session.scalar(select(Event))
+        assert intent is not None and intent.status == "FAILED"
+        assert event is not None and event.status.value == "FAILED"
+
+
 def _assert_recovered(factory, client, operation: str) -> None:
     with factory() as session:
         intents = session.execute(
@@ -363,7 +401,7 @@ def _assert_recovered(factory, client, operation: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_lock_failure_before_delete_is_terminal_and_never_replayed(
+async def test_finalization_lock_failure_is_recovered_without_replaying_delete(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -376,24 +414,24 @@ async def test_lock_failure_before_delete_is_terminal_and_never_replayed(
     def fail_lock(self, project_id: str):
         nonlocal lock_attempts
         lock_attempts += 1
-        if lock_attempts == 1:
-            return real_lock(self, project_id)
-        raise RuntimeError("injected lock timeout before upstream call")
+        if lock_attempts == 2:
+            raise RuntimeError("injected lock timeout during finalization")
+        return real_lock(self, project_id)
 
     monkeypatch.setattr(ProjectRepository, "lock_for_mutation", fail_lock)
     with pytest.raises(RuntimeError, match="lock timeout"):
         await _invoke_mutation(factory, client, "delete")
 
-    assert _intent_state(factory)["status"] == "FAILED"
-    assert client.deleted_ids == []
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    assert client.deleted_ids == ["memory-one"]
     monkeypatch.setattr(ProjectRepository, "lock_for_mutation", real_lock)
     with factory() as session:
         await MemoryService(session=session, mem0=client).add_memory(
             project_id=PROJECT_ID,
             payload={"text": "unrelated", "app_id": APP_ID},
         )
-    assert client.deleted_ids == []
-    assert "memory-one" in client.records
+    assert client.deleted_ids == ["memory-one"]
+    assert "memory-one" not in client.records
 
 
 @pytest.mark.asyncio
@@ -467,7 +505,7 @@ async def test_real_http_lost_response_is_unknown_then_converges_by_reads_only(
                     )
                 )
             )
-        assert local_deleted_at == [None, None]
+        assert sum(value is not None for value in local_deleted_at) == 1
 
     result = await _recover(factory, client)
 
@@ -520,7 +558,7 @@ async def test_unclassified_exception_after_upstream_attempt_defaults_unknown(
                     )
                 )
             )
-        assert local_deleted_at == [None, None]
+        assert sum(value is not None for value in local_deleted_at) == 1
 
     result = await _recover(factory, client)
 
@@ -726,7 +764,8 @@ async def test_entity_recovery_all_targets_missing_completes_without_delete(
     assert result == {"recovered": 1, "failed": 0}
     assert _intent_state(factory)["status"] == "COMPLETED"
     assert set(client.deleted_ids) == {"entity-one", "entity-two"}
-    assert set(client.get_ids) == {"entity-one", "entity-two"}
+    assert len(client.get_ids) == 1
+    assert set(client.get_ids) < {"entity-one", "entity-two"}
 
 
 @pytest.mark.asyncio

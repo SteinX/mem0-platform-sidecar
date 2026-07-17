@@ -3,6 +3,7 @@ import importlib
 import io
 import json
 import threading
+import time
 import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,7 @@ from mem0_sidecar.core.memory_ops import (
     MemoryService,
     MutationConflictError,
 )
+from mem0_sidecar.core.mutation_admin import MutationAdminService
 from mem0_sidecar.mem0_client.client import Mem0RestClient
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base, Event, EventStatus, MutationIntent
@@ -137,6 +139,27 @@ def _run_cli(factory, client, *arguments: str):
     return code, payload, stderr.getvalue()
 
 
+async def _run_cli_async(factory, client, *arguments: str):
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result["value"] = _run_cli(factory, client, *arguments)
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while thread.is_alive() and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
+    if thread.is_alive():
+        raise TimeoutError("mutation admin CLI thread did not finish")
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
 def _seed_blocker(
     factory,
     *,
@@ -248,6 +271,36 @@ def test_pyproject_exposes_container_management_entrypoint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_add_marker_observation_runs_without_database_transaction(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    intent_id = _seed_blocker(factory)
+    with factory() as session:
+
+        class TransactionInspectingClient(_AdminTestClient):
+            async def list_memories(self, params: dict[str, Any]) -> dict[str, Any]:
+                assert not session.in_transaction()
+                return await super().list_memories(params)
+
+        result = await MutationAdminService(
+            session=session,
+            mem0=TransactionInspectingClient(),
+        ).resolve_intent(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            intent_id=intent_id,
+            confirmation_intent_id=intent_id,
+            expected_status="EXHAUSTED",
+            expected_attempt_count=3,
+            reason="operator accepted the unknown outcome",
+            accept_unknown_outcome=True,
+        )
+
+    assert result["intent"]["status"] == "FAILED"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_no_effect_add_can_be_listed_resolved_and_unblocked(
     tmp_path,
 ) -> None:
@@ -255,8 +308,7 @@ async def test_cancelled_no_effect_add_can_be_listed_resolved_and_unblocked(
     client = _AdminTestClient(cancel_first_add_before_effect=True)
     intent_id = await _exhaust_cancelled_no_effect_add(factory, client)
 
-    code, listing, error = await asyncio.to_thread(
-        _run_cli,
+    code, listing, error = await _run_cli_async(
         factory,
         client,
         "mutation-intents",
@@ -285,8 +337,7 @@ async def test_cancelled_no_effect_add_can_be_listed_resolved_and_unblocked(
     assert "payload" not in serialized_listing
 
     writes_before_resolution = list(client.write_calls)
-    code, resolved, error = await asyncio.to_thread(
-        _run_cli,
+    code, resolved, error = await _run_cli_async(
         factory,
         client,
         *_resolve_args(intent_id),
@@ -645,7 +696,9 @@ def test_listing_is_bounded_payload_free_and_one_resolution_leaves_other_blocker
             )
 
 
-def test_sqlite_resolution_holds_project_lock_against_recovery(tmp_path) -> None:
+def test_sqlite_resolution_releases_project_lock_during_marker_observation(
+    tmp_path,
+) -> None:
     _load_cli_main()
     factory = _session_factory(tmp_path)
     intent_id = _seed_blocker(factory)
@@ -676,8 +729,10 @@ def test_sqlite_resolution_holds_project_lock_against_recovery(tmp_path) -> None
                             project_id=PROJECT_ID,
                             app_id=APP_ID,
                         )
+                        )
                     )
-                )
+        except MutationConflictError:
+            recovery_result.append("scope-still-blocked")
         except BaseException as exc:
             failures.append(exc)
 
@@ -687,7 +742,7 @@ def test_sqlite_resolution_holds_project_lock_against_recovery(tmp_path) -> None
     assert entered.wait(3), "resolution did not reach read-only marker observation"
     recovery_thread.start()
     recovery_thread.join(0.35)
-    assert recovery_thread.is_alive(), "recovery bypassed the resolution project lock"
+    progressed_during_observation = not recovery_thread.is_alive()
     release.set()
     resolution_thread.join(8)
     recovery_thread.join(8)
@@ -695,8 +750,9 @@ def test_sqlite_resolution_holds_project_lock_against_recovery(tmp_path) -> None
     assert not resolution_thread.is_alive()
     assert not recovery_thread.is_alive()
     assert failures == []
+    assert progressed_during_observation
     assert resolution_result[0][0] == 0
-    assert recovery_result == [{"recovered": 0, "failed": 0}]
+    assert recovery_result == ["scope-still-blocked"]
     assert client.read_calls == [("GET", "/memories")]
     assert client.write_calls == []
     with factory() as session:

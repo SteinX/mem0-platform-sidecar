@@ -1239,6 +1239,10 @@ class EventRepository:
         )
 
 
+class MutationIntentFenceError(RuntimeError):
+    """A stale durable-mutation worker no longer owns its attempt token."""
+
+
 class MutationIntentRepository:
     """Persist bounded repair state before an upstream mutation can begin."""
 
@@ -1427,6 +1431,40 @@ class MutationIntentRepository:
         intent.updated_at = now
         self.session.flush()
         return True
+
+    def require_active_attempt(
+        self,
+        intent_id: str,
+        expected_attempt_count: int,
+    ) -> MutationIntent:
+        if type(expected_attempt_count) is not int or expected_attempt_count < 1:
+            raise ValueError("expected mutation attempt count is invalid")
+        intent = self.session.scalar(
+            select(MutationIntent)
+            .where(
+                MutationIntent.id == intent_id,
+                MutationIntent.status == "ACTIVE",
+                MutationIntent.attempt_count == expected_attempt_count,
+            )
+            .execution_options(populate_existing=True)
+        )
+        if intent is None:
+            raise MutationIntentFenceError(
+                "durable mutation attempt lost its fence"
+            )
+        return intent
+
+    def renew_active_attempt(
+        self,
+        intent_id: str,
+        expected_attempt_count: int,
+    ) -> MutationIntent:
+        intent = self.require_active_attempt(intent_id, expected_attempt_count)
+        now = _utc_now()
+        intent.lease_expires_at = now + timedelta(seconds=self.LEASE_SECONDS)
+        intent.updated_at = now
+        self.session.flush()
+        return intent
 
     def mark_target_succeeded(self, target: MutationIntentTarget) -> None:
         target.status = "COMPLETED"
