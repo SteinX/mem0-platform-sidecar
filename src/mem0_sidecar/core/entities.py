@@ -419,6 +419,7 @@ class EntityService:
             memory_repo = MemoryIndexRepository(self.session)
             failed: list[dict[str, Any]] = []
             deleted_count = 0
+            affected_memories: list[Any] = []
             for memory_id in memory_ids:
                 target = targets[memory_id]
                 try:
@@ -437,15 +438,21 @@ class EntityService:
                         intent_repo.mark_target_failed(target, safe_error)
                         continue
                     upstream_effect_observed = True
-                memory_repo.delete_memory(
+                deleted_memory = memory_repo.delete_memory(
                     project_id=project_id,
                     mem0_memory_id=memory_id,
                 )
+                if deleted_memory is not None:
+                    affected_memories.append(deleted_memory)
                 intent_repo.mark_target_succeeded(target)
                 deleted_count += 1
 
             upstream_completed = True
-            entity_repo.rebuild_project_entities(project_id, app_id)
+            entity_repo.refresh_affected_memories(
+                project_id,
+                app_id,
+                affected_memories,
+            )
             failed_count = len(failed)
             if failed_count == 0:
                 status = "SUCCEEDED"

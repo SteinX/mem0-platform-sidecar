@@ -12,7 +12,6 @@ from sqlalchemy.orm import Session
 from mem0_sidecar.core.categories import extract_category
 from mem0_sidecar.core.explorer_filters import (
     EXPLORER_RECORD_HORIZON,
-    ExplorerDateRange,
     ExplorerFilter,
     ExplorerQuery,
 )
@@ -894,12 +893,21 @@ class MemoryService:
         )
         memory_repo = MemoryIndexRepository(self.session)
         category = payload.get("category")
+        affected_projections: list[_MemoryProjectionSnapshot] = []
         for item in normalized:
             metadata = dict(item["metadata"])
             metadata.pop(SIDECAR_PROJECT_ID_METADATA_KEY, None)
             metadata.pop(SIDECAR_APP_ID_METADATA_KEY, None)
             metadata.pop(SIDECAR_MUTATION_ID_METADATA_KEY, None)
-            memory_repo.upsert_memory(
+            existing = memory_repo.get_memory(
+                project_id=intent.project_id,
+                mem0_memory_id=item["id"],
+                app_id=intent.app_id,
+                include_deleted=True,
+            )
+            if existing is not None:
+                affected_projections.append(_snapshot_memory_projection(existing))
+            indexed = memory_repo.upsert_memory(
                 project_id=intent.project_id,
                 mem0_memory_id=item["id"],
                 user_id=item["user_id"],
@@ -909,15 +917,17 @@ class MemoryService:
                 category=category if isinstance(category, str) else None,
                 metadata=metadata,
             )
+            affected_projections.append(_snapshot_memory_projection(indexed))
         intent_repo.add_targets(
             intent.id,
             [item["id"] for item in normalized],
         )
         for target in intent_repo.targets(intent.id):
             intent_repo.mark_target_succeeded(target)
-        EntityRepository(self.session).rebuild_project_entities(
+        EntityRepository(self.session).refresh_affected_memories(
             intent.project_id,
             intent.app_id,
+            affected_projections,
         )
         event = EventRepository(self.session).get(intent.event_id)
         event.subject_id = normalized[0]["id"]
@@ -967,7 +977,12 @@ class MemoryService:
                 return
             normalized = _normalize_memory_record(record, projection=projection)
             categories = normalized["categories"]
-            memory_repo.upsert_memory(
+            affected_projections = (
+                [_snapshot_memory_projection(projection)]
+                if projection is not None
+                else []
+            )
+            indexed = memory_repo.upsert_memory(
                 project_id=intent.project_id,
                 mem0_memory_id=target.memory_id,
                 user_id=normalized["user_id"],
@@ -977,6 +992,7 @@ class MemoryService:
                 category=categories[0] if categories else None,
                 metadata=normalized["metadata"],
             )
+            affected_projections.append(_snapshot_memory_projection(indexed))
         except Exception as exc:
             if not _is_upstream_not_found(exc):
                 raise
@@ -991,9 +1007,10 @@ class MemoryService:
             intent_repo.mark_unresolved(intent.id, error=error)
             return
         intent_repo.mark_target_succeeded(target)
-        EntityRepository(self.session).rebuild_project_entities(
+        EntityRepository(self.session).refresh_affected_memories(
             intent.project_id,
             intent.app_id,
+            affected_projections,
         )
         result = {"id": target.memory_id, "recovered": True}
         EventRepository(self.session).mark_succeeded(intent.event_id, response=result)
@@ -1018,15 +1035,24 @@ class MemoryService:
                 continue
             present_targets.append(target)
 
+        affected_projections: list[_MemoryProjectionSnapshot] = []
         for target in missing_targets:
+            memory = memory_repo.get_memory(
+                project_id=intent.project_id,
+                mem0_memory_id=target.memory_id,
+                app_id=intent.app_id,
+            )
+            if memory is not None:
+                affected_projections.append(_snapshot_memory_projection(memory))
             memory_repo.delete_memory(
                 project_id=intent.project_id,
                 mem0_memory_id=target.memory_id,
             )
             intent_repo.mark_target_succeeded(target)
-        EntityRepository(self.session).rebuild_project_entities(
+        EntityRepository(self.session).refresh_affected_memories(
             intent.project_id,
             intent.app_id,
+            affected_projections,
         )
 
         total_targets = len(intent_repo.targets(intent.id))
@@ -1214,8 +1240,17 @@ class MemoryService:
                     f"Could not extract memory id from response: {memory_response!r}"
                 )
             memory_repo = MemoryIndexRepository(self.session)
+            affected_projections: list[_MemoryProjectionSnapshot] = []
             for memory_id in memory_ids:
-                memory_repo.upsert_memory(
+                existing = memory_repo.get_memory(
+                    project_id=project_id,
+                    mem0_memory_id=memory_id,
+                    app_id=scope.app_id,
+                    include_deleted=True,
+                )
+                if existing is not None:
+                    affected_projections.append(_snapshot_memory_projection(existing))
+                indexed = memory_repo.upsert_memory(
                     project_id=project_id,
                     mem0_memory_id=memory_id,
                     user_id=scope.user_id,
@@ -1225,12 +1260,14 @@ class MemoryService:
                     category=category,
                     metadata=metadata,
                 )
+                affected_projections.append(_snapshot_memory_projection(indexed))
             intent_repo = MutationIntentRepository(self.session)
             for target in intent_repo.add_targets(intent.id, memory_ids):
                 intent_repo.mark_target_succeeded(target)
-            EntityRepository(self.session).rebuild_project_entities(
+            EntityRepository(self.session).refresh_affected_memories(
                 project_id,
                 scope.app_id,
+                affected_projections,
             )
             event.subject_id = memory_ids[0]
             event_repo.mark_succeeded(event.id, response=memory_response)
@@ -1462,9 +1499,10 @@ class MemoryService:
                         },
                     )
                     if stale_marked:
-                        EntityRepository(self.session).rebuild_project_entities(
+                        EntityRepository(self.session).refresh_affected_memories(
                             project_id,
                             app_id,
+                            unchanged_stale.values(),
                         )
                     if stale_marked != len(unchanged_stale):
                         conflict = (
@@ -1710,6 +1748,7 @@ class MemoryService:
         self.session.commit()
         upstream_attempted = False
         upstream_completed = False
+        affected_projection_before: _MemoryProjectionSnapshot | None = None
         try:
             ProjectRepository(self.session).lock_for_mutation(project_id)
             memory = memory_repo.get_memory(
@@ -1719,6 +1758,7 @@ class MemoryService:
             )
             if memory is None:
                 raise KeyError(memory_id)
+            affected_projection_before = _snapshot_memory_projection(memory)
             try:
                 upstream_attempted = True
                 update_response = await self.mem0.update_memory(memory_id, patch)
@@ -1740,7 +1780,7 @@ class MemoryService:
             normalized = _normalize_memory_record(record, projection=memory)
             metadata = normalized["metadata"]
             categories = normalized["categories"]
-            memory_repo.upsert_memory(
+            indexed = memory_repo.upsert_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,
                 user_id=normalized["user_id"],
@@ -1750,9 +1790,10 @@ class MemoryService:
                 category=categories[0] if categories else None,
                 metadata=metadata,
             )
-            EntityRepository(self.session).rebuild_project_entities(
+            EntityRepository(self.session).refresh_affected_memories(
                 project_id,
                 effective_app_id,
+                [affected_projection_before, _snapshot_memory_projection(indexed)],
             )
             event_repo.mark_succeeded(event.id, response=update_response)
             intent_repo = MutationIntentRepository(self.session)
@@ -1766,9 +1807,12 @@ class MemoryService:
                 self.session.rollback()
                 ProjectRepository(self.session).lock_for_mutation(project_id)
                 memory_repo.mark_stale(project_id, [memory_id])
-                EntityRepository(self.session).rebuild_project_entities(
+                EntityRepository(self.session).refresh_affected_memories(
                     project_id,
                     effective_app_id,
+                    [affected_projection_before]
+                    if affected_projection_before is not None
+                    else [],
                 )
                 event_repo = EventRepository(self.session)
                 event_repo.mark_failed(event.id, error=_error_payload(exc))
@@ -1880,6 +1924,18 @@ class MemoryService:
         indexed = 0
         skipped_unscoped = 0
         skipped_other_scope = 0
+        entity_repo = EntityRepository(self.session)
+        affected_projections: list[_MemoryProjectionSnapshot] = []
+
+        def flush_affected_projections() -> None:
+            if not affected_projections:
+                return
+            entity_repo.refresh_affected_memories(
+                project_id,
+                app_id,
+                affected_projections,
+            )
+            affected_projections.clear()
 
         for normalized in normalized_records:
             metadata = normalized["metadata"]
@@ -1902,6 +1958,14 @@ class MemoryService:
 
             categories = normalized["categories"]
             memory_id = normalized["id"]
+            existing = memory_repo.get_memory(
+                project_id=project_id,
+                mem0_memory_id=memory_id,
+                include_deleted=True,
+            )
+            existing_snapshot = (
+                _snapshot_memory_projection(existing) if existing is not None else None
+            )
             if is_unscoped:
                 claim = memory_repo.claim_memory(
                     project_id=project_id,
@@ -1916,8 +1980,9 @@ class MemoryService:
                 if claim.status == "conflict":
                     skipped_other_scope += 1
                     continue
+                indexed_memory = claim.memory
             else:
-                memory_repo.upsert_memory(
+                indexed_memory = memory_repo.upsert_memory(
                     project_id=project_id,
                     mem0_memory_id=memory_id,
                     user_id=normalized["user_id"],
@@ -1927,46 +1992,66 @@ class MemoryService:
                     category=categories[0] if categories else None,
                     metadata=metadata,
                 )
+            if indexed_memory is None:
+                raise RuntimeError("Reconciled memory projection is unavailable")
+            if existing_snapshot is not None:
+                affected_projections.append(existing_snapshot)
+            affected_projections.append(
+                _snapshot_memory_projection(indexed_memory)
+            )
+            if len(affected_projections) >= 400:
+                flush_affected_projections()
             accepted_ids.add(memory_id)
             indexed += 1
+        flush_affected_projections()
 
         truncated = len(records) >= _RECONCILE_SCAN_LIMIT or (
             isinstance(response_total, int) and response_total > len(records)
         )
         stale_marked = 0
         if not truncated:
-            active_ids: set[str] = set()
-            page_number = 1
+            after_created_at: datetime | None = None
+            after_memory_id: str | None = None
             while True:
-                active_page = memory_repo.query_project_memories(
+                candidates = memory_repo.list_reconcile_stale_candidates(
+                    project_id=project_id,
+                    app_id=app_id,
+                    updated_at_lte=scan_cutoff,
+                    after_created_at=after_created_at,
+                    after_memory_id=after_memory_id,
+                    limit=200,
+                )
+                if not candidates:
+                    break
+                stale_candidates = [
+                    memory
+                    for memory in candidates
+                    if memory.mem0_memory_id not in accepted_ids
+                ]
+                stale_snapshots = [
+                    _snapshot_memory_projection(memory)
+                    for memory in stale_candidates
+                ]
+                stale_marked += memory_repo.mark_stale_if_unchanged(
+                    project_id=project_id,
+                    app_id=app_id,
+                    mem0_memory_ids=[
+                        memory.mem0_memory_id for memory in stale_candidates
+                    ],
+                    updated_at_lte=scan_cutoff,
+                    expected_updated_at={
+                        memory.mem0_memory_id: memory.updated_at
+                        for memory in stale_candidates
+                    },
+                )
+                entity_repo.refresh_affected_memories(
                     project_id,
                     app_id,
-                    ExplorerQuery(
-                        match="all",
-                        filters=(),
-                        date_range=ExplorerDateRange(from_at=None, to_at=None),
-                        page=page_number,
-                        page_size=100,
-                        sort="created_at_asc",
-                    ),
+                    stale_snapshots,
                 )
-                active_ids.update(
-                    memory.mem0_memory_id for memory in active_page.items
-                )
-                if page_number * 100 >= active_page.total:
-                    break
-                page_number += 1
-            stale_marked = memory_repo.mark_stale_if_unchanged(
-                project_id=project_id,
-                app_id=app_id,
-                mem0_memory_ids=active_ids - accepted_ids,
-                updated_at_lte=scan_cutoff,
-            )
-
-        EntityRepository(self.session).rebuild_project_entities(
-            project_id,
-            app_id,
-        )
+                cursor = candidates[-1]
+                after_created_at = cursor.created_at
+                after_memory_id = cursor.mem0_memory_id
 
         return {
             "scanned": len(records),
@@ -2051,6 +2136,7 @@ class MemoryService:
         self.session.commit()
         upstream_attempted = False
         upstream_completed = False
+        affected_projection_before: _MemoryProjectionSnapshot | None = None
         try:
             ProjectRepository(self.session).lock_for_mutation(project_id)
             memory = memory_repo.get_memory(
@@ -2060,6 +2146,7 @@ class MemoryService:
             )
             if memory is None:
                 raise KeyError(memory_id)
+            affected_projection_before = _snapshot_memory_projection(memory)
             upstream_attempted = True
             response = await self.mem0.delete_memory(memory_id)
             upstream_completed = True
@@ -2067,9 +2154,10 @@ class MemoryService:
                 project_id=project_id,
                 mem0_memory_id=memory_id,
             )
-            EntityRepository(self.session).rebuild_project_entities(
+            EntityRepository(self.session).refresh_affected_memories(
                 project_id,
                 effective_app_id,
+                [affected_projection_before],
             )
             event_repo.mark_succeeded(event.id, response=response)
             intent_repo = MutationIntentRepository(self.session)
@@ -2086,9 +2174,12 @@ class MemoryService:
                     project_id=project_id,
                     mem0_memory_id=memory_id,
                 )
-                EntityRepository(self.session).rebuild_project_entities(
+                EntityRepository(self.session).refresh_affected_memories(
                     project_id,
                     effective_app_id,
+                    [affected_projection_before]
+                    if affected_projection_before is not None
+                    else [],
                 )
                 event_repo = EventRepository(self.session)
                 event_repo.mark_failed(event.id, error=_error_payload(exc))

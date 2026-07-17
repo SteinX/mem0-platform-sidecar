@@ -713,7 +713,7 @@ async def test_delete_entity_locks_project_before_upstream_calls(
         "project_lock",
         "upstream_delete",
     ]
-    assert operations[-1] == "project_lock"
+    assert operations[-1] == "upstream_delete"
 
 
 @pytest.mark.asyncio
