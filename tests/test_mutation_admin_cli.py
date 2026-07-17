@@ -554,6 +554,65 @@ def test_resolution_uses_default_compatible_bounded_marker_scan(tmp_path) -> Non
     assert resolved["intent"]["status"] == "FAILED"
 
 
+def test_resolution_refuses_oversized_add_marker_observation(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    intent_id = _seed_blocker(factory)
+    client = _AdminTestClient()
+
+    async def incomplete_list(params: dict[str, Any]) -> dict[str, Any]:
+        client.read_calls.append(("GET", "/memories"))
+        return {
+            "results": [
+                {"id": f"unrelated-{index}", "metadata": {}}
+                for index in range(1001)
+            ],
+            "total": 1001,
+        }
+
+    client.list_memories = incomplete_list
+    code, _payload, error = _run_cli(
+        factory,
+        client,
+        *_resolve_args(intent_id),
+    )
+
+    assert code != 0
+    assert "observation" in error
+    with factory() as session:
+        assert session.get(MutationIntent, intent_id).status == "EXHAUSTED"
+    assert client.write_calls == []
+
+
+def test_resolution_accepts_bounded_truncated_observation_with_unknown_ack(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    intent_id = _seed_blocker(factory)
+    client = _AdminTestClient()
+
+    async def bounded_list(params: dict[str, Any]) -> dict[str, Any]:
+        client.read_calls.append(("GET", "/memories"))
+        return {
+            "results": [
+                {"id": f"unrelated-{index}", "metadata": {}}
+                for index in range(1000)
+            ],
+            "total": 1001,
+        }
+
+    client.list_memories = bounded_list
+    code, resolved, error = _run_cli(
+        factory,
+        client,
+        *_resolve_args(intent_id),
+    )
+
+    assert code == 0, error
+    assert resolved["intent"]["status"] == "FAILED"
+
+
 @pytest.mark.parametrize(
     "reason",
     ["", "   ", "x" * 513, "contains\x00control"],

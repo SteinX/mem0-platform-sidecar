@@ -447,6 +447,15 @@ def _list_results(response: Any) -> list[Any]:
     )
 
 
+def _bounded_list_results(response: Any, *, limit: int) -> list[Any]:
+    results = _list_results(response)
+    if len(results) > limit:
+        raise MemoryUpstreamProtocolError(
+            f"Upstream list response exceeds the {limit}-record scan limit"
+        )
+    return results
+
+
 def _filter_search_results(
     response: dict[str, Any],
     *,
@@ -953,7 +962,10 @@ class MemoryService:
                 {"top_k": _RECONCILE_SCAN_LIMIT, "show_expired": True}
             )
             records: list[dict[str, Any]] = []
-            for item in _list_results(response):
+            for item in _bounded_list_results(
+                response,
+                limit=_RECONCILE_SCAN_LIMIT,
+            ):
                 if not isinstance(item, dict):
                     continue
                 metadata = item.get("metadata")
@@ -2185,7 +2197,10 @@ class MemoryService:
             raise
 
         try:
-            records = _list_results(response)
+            records = _bounded_list_results(
+                response,
+                limit=_RECONCILE_SCAN_LIMIT,
+            )
             response_total = response.get("total")
             if "total" in response and (
                 isinstance(response_total, bool)

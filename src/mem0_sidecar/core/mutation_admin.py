@@ -215,6 +215,8 @@ class MutationAdminService:
         results = response.get("results") if isinstance(response, dict) else None
         if type(results) is not list:
             raise MutationAdminError("add marker observation is unavailable")
+        if len(results) > MARKER_SCAN_LIMIT:
+            raise MutationAdminError("add marker observation is incomplete")
         for item in results:
             if type(item) is not dict:
                 continue
