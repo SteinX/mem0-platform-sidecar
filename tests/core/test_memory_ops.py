@@ -1982,6 +1982,46 @@ async def test_reconcile_does_not_mark_absent_stale_when_scan_hits_limit(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_rejects_results_beyond_requested_scan_limit(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "must-remain-active")
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [
+            {
+                "id": f"other-{index}",
+                "metadata": {
+                    SIDECAR_PROJECT_ID_METADATA_KEY: "repo-b",
+                    SIDECAR_APP_ID_METADATA_KEY: "app-b",
+                },
+            }
+            for index in range(5001)
+        ],
+        "total": 5001,
+    }
+
+    with pytest.raises(MemoryUpstreamProtocolError, match="scan limit"):
+        await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+            project_id="repo-a",
+            app_id="app-a",
+            adopt_unscoped=False,
+            allow_adopt_unscoped=False,
+            default_project_id="repo-a",
+        )
+
+    assert (
+        MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="must-remain-active",
+            app_id="app-a",
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "envelope",
     [{}, {"results": {}}, {"unexpected": []}],

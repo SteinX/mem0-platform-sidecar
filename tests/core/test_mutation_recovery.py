@@ -797,6 +797,38 @@ async def test_recovery_claim_attempt_survives_observation_failure_and_restart(
 
 
 @pytest.mark.asyncio
+async def test_add_recovery_rejects_results_beyond_observation_limit(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient(cancel_operation="add")
+
+    with pytest.raises(asyncio.CancelledError):
+        await _invoke_mutation(factory, client, "add")
+    applied = dict(client.records["added-1"])
+
+    async def oversized_observation(params: dict[str, Any]) -> dict[str, Any]:
+        client.list_calls += 1
+        return {
+            "results": [applied]
+            + [
+                {"id": f"unrelated-{index}", "metadata": {}}
+                for index in range(5000)
+            ],
+            "total": 5001,
+        }
+
+    client.list_memories = oversized_observation
+    with pytest.raises(MutationConflictError, match="unresolved"):
+        await _recover(factory, client)
+
+    state = _intent_state(factory)
+    assert state["status"] == "UNKNOWN"
+    assert state["attempt_count"] == 2
+    assert client.add_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_recovery_exhaustion_persists_and_continues_blocking_scope(
     tmp_path,
 ) -> None:
