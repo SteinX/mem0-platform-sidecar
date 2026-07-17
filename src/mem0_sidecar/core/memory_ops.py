@@ -92,6 +92,15 @@ def _snapshot_memory_projection(memory: MemoryIndex) -> _MemoryProjectionSnapsho
     )
 
 
+def _append_affected_projection(
+    projections_by_app: dict[str, list[_MemoryProjectionSnapshot]],
+    projection: _MemoryProjectionSnapshot,
+) -> None:
+    app_id = projection.app_id
+    if isinstance(app_id, str) and app_id:
+        projections_by_app.setdefault(app_id, []).append(projection)
+
+
 def _projection_matches_snapshot(
     memory: MemoryIndex,
     snapshot: _MemoryProjectionSnapshot,
@@ -2159,7 +2168,9 @@ class MemoryService:
                 intent_repo.require_active_attempt(intent_id, attempt_token)
                 memory_repo = MemoryIndexRepository(self.session)
                 entity_repo = EntityRepository(self.session)
-                affected_projections: list[_MemoryProjectionSnapshot] = []
+                affected_projections: dict[
+                    str, list[_MemoryProjectionSnapshot]
+                ] = {}
                 for normalized in normalized_records[offset : offset + 200]:
                     metadata = normalized["metadata"]
                     scoped_project_id = metadata.get(
@@ -2194,10 +2205,11 @@ class MemoryService:
                         accepted_ids.add(memory_id)
                         indexed += 1
                         continue
-                    if existing is not None:
-                        affected_projections.append(
-                            _snapshot_memory_projection(existing)
-                        )
+                    existing_projection = (
+                        _snapshot_memory_projection(existing)
+                        if existing is not None
+                        else None
+                    )
                     if is_unscoped:
                         claim = memory_repo.claim_memory(
                             project_id=project_id,
@@ -2210,8 +2222,6 @@ class MemoryService:
                             metadata=metadata,
                         )
                         if claim.status == "conflict":
-                            if existing is not None:
-                                affected_projections.pop()
                             skipped_other_scope += 1
                             continue
                         indexed_memory = claim.memory
@@ -2230,16 +2240,23 @@ class MemoryService:
                         raise RuntimeError(
                             "Reconciled memory projection is unavailable"
                         )
-                    affected_projections.append(
-                        _snapshot_memory_projection(indexed_memory)
+                    if existing_projection is not None:
+                        _append_affected_projection(
+                            affected_projections,
+                            existing_projection,
+                        )
+                    _append_affected_projection(
+                        affected_projections,
+                        _snapshot_memory_projection(indexed_memory),
                     )
                     accepted_ids.add(memory_id)
                     indexed += 1
-                entity_repo.refresh_affected_memories(
-                    project_id,
-                    app_id,
-                    affected_projections,
-                )
+                for affected_app_id, projections in affected_projections.items():
+                    entity_repo.refresh_affected_memories(
+                        project_id,
+                        affected_app_id,
+                        projections,
+                    )
                 intent_repo.renew_active_attempt(intent_id, attempt_token)
                 self.session.commit()
 
