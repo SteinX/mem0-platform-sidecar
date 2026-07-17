@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 from datetime import UTC, datetime, timedelta
+from threading import Thread
 from typing import Any
 
 import pytest
@@ -254,6 +255,27 @@ def _project_writer_result(engine, project_id: str) -> dict[str, Any]:
             "elapsed": time.monotonic() - started,
             "error": str(exc),
         }
+
+
+async def _run_thread_probe(function, *args, timeout: float = 0.75):
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result["value"] = function(*args)
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + timeout
+    while thread.is_alive() and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
+    if thread.is_alive():
+        raise TimeoutError("thread probe did not finish before timeout")
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
 
 
 def _projection_writer_result(engine, memory_id: str) -> dict[str, Any]:
@@ -2179,14 +2201,14 @@ async def test_query_memories_releases_sqlite_writer_lock_before_refill_await(
             await asyncio.wait_for(mem0.later_batch_started.wait(), timeout=1)
             assert len(mem0.get_memory_ids) > 21
             assert not query_task.done()
+            assert not query_session.in_transaction(), (
+                "query session retained a transaction during refill hydration"
+            )
 
-            writer_result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _project_writer_result,
-                    engine,
-                    "repo-unrelated",
-                ),
-                timeout=0.75,
+            writer_result = await _run_thread_probe(
+                _project_writer_result,
+                engine,
+                "repo-unrelated",
             )
 
             mem0.release_later_batch.set()
@@ -2243,14 +2265,14 @@ async def test_query_memories_releases_sqlite_read_before_first_hydration_await(
             )
             await asyncio.wait_for(mem0.hydration_started.wait(), timeout=1)
             assert not query_task.done()
+            assert not query_session.in_transaction(), (
+                "query session retained a transaction during first hydration"
+            )
 
-            writer_result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _project_writer_result,
-                    engine,
-                    "repo-unrelated",
-                ),
-                timeout=0.75,
+            writer_result = await _run_thread_probe(
+                _project_writer_result,
+                engine,
+                "repo-unrelated",
             )
 
             mem0.release_hydration.set()
@@ -2326,13 +2348,10 @@ async def test_query_memories_never_returns_cached_payload_after_version_race(
             assert mem0.get_memory_ids.count(cached_id) == 1
             assert not query_task.done()
 
-            writer_result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _projection_writer_result,
-                    engine,
-                    cached_id,
-                ),
-                timeout=0.75,
+            writer_result = await _run_thread_probe(
+                _projection_writer_result,
+                engine,
+                cached_id,
             )
             if writer_result["status"] == "committed":
                 mem0.records[cached_id] = {
