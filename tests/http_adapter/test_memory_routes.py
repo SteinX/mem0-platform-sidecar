@@ -1461,7 +1461,12 @@ def test_dashboard_proxy_round_trips_encoded_id_through_real_sidecar(
 
     root = Path(__file__).resolve().parents[2]
     overlay = root / "integrations/mem0-dashboard-overlay"
-    upstream = root.parents[2] / "upstream/server/dashboard"
+    upstream = Path(
+        os.environ.get(
+            "MEM0_UPSTREAM_DASHBOARD",
+            root.parents[2] / "upstream/server/dashboard",
+        )
+    )
     dashboard = tmp_path / "dashboard"
     shutil.copytree(
         upstream,
