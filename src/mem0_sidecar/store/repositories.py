@@ -44,6 +44,7 @@ _MAX_RESPONSE_ENVELOPE_FIELDS = 40
 _MAX_PREVIEW_SCAN_ITEMS = 100
 _MAX_CORRELATION_ID_CHARS = 256
 EVENT_SCAN_LIMIT = 5000
+ENTITY_REFRESH_IDENTITY_LIMIT = 800
 _EVENT_QUERY_MAX_ATTEMPTS = 2
 _EVENT_QUERY_UNSTABLE_ERROR = (
     "event query snapshot changed; retry with narrower filters"
@@ -1729,6 +1730,48 @@ class MemoryIndexRepository:
             scan_count=scan_count,
         )
 
+    def list_reconcile_stale_candidates(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        updated_at_lte: datetime,
+        after_created_at: datetime | None = None,
+        after_memory_id: str | None = None,
+        limit: int = 200,
+    ) -> list[MemoryIndex]:
+        if limit < 1 or limit > 200:
+            raise ValueError(
+                "reconcile candidate batch limit must be between 1 and 200"
+            )
+        if (after_created_at is None) != (after_memory_id is None):
+            raise ValueError("reconcile candidate cursor is incomplete")
+
+        statement = select(MemoryIndex).where(
+            MemoryIndex.project_id == project_id,
+            MemoryIndex.app_id == app_id,
+            MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.updated_at <= updated_at_lte,
+        )
+        if after_created_at is not None and after_memory_id is not None:
+            statement = statement.where(
+                or_(
+                    MemoryIndex.created_at > after_created_at,
+                    and_(
+                        MemoryIndex.created_at == after_created_at,
+                        MemoryIndex.mem0_memory_id > after_memory_id,
+                    ),
+                )
+            )
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    MemoryIndex.created_at,
+                    MemoryIndex.mem0_memory_id,
+                ).limit(limit)
+            )
+        )
+
     def mark_stale(
         self,
         project_id: str,
@@ -1766,13 +1809,10 @@ class MemoryIndexRepository:
         if not memory_ids:
             return 0
 
-        if expected_updated_at is None:
-            batches = [memory_ids]
-        else:
-            batches = [
-                memory_ids[offset : offset + 200]
-                for offset in range(0, len(memory_ids), 200)
-            ]
+        batches = [
+            memory_ids[offset : offset + 200]
+            for offset in range(0, len(memory_ids), 200)
+        ]
 
         marked = 0
         stale_at = _utc_now()
@@ -2055,6 +2095,134 @@ class EntityRepository:
             self.session.add_all(entities)
         self.session.flush()
         return entities
+
+    def refresh_affected_entities(
+        self,
+        project_id: str,
+        app_id: str,
+        identities: Iterable[tuple[str, str]],
+    ) -> list[Entity]:
+        """Refresh only entity rows whose source-memory membership changed."""
+        normalized = sorted(set(identities))
+        if len(normalized) > ENTITY_REFRESH_IDENTITY_LIMIT:
+            raise ValueError("Too many entity identities to refresh")
+
+        ids_by_type: dict[str, list[str]] = {}
+        for entity_type, entity_id in normalized:
+            self._memory_id_column(entity_type)
+            if type(entity_id) is not str or not entity_id:
+                raise ValueError("Entity ID must be a non-empty string")
+            ids_by_type.setdefault(entity_type, []).append(entity_id)
+
+        if not ids_by_type:
+            return []
+
+        self.session.flush()
+        aggregates: dict[tuple[str, str], tuple[int, datetime]] = {}
+        existing_by_key: dict[tuple[str, str], Entity] = {}
+        for entity_type, entity_ids in ids_by_type.items():
+            memory_id_column = self._memory_id_column(entity_type)
+            rows = self.session.execute(
+                select(
+                    memory_id_column,
+                    func.count(MemoryIndex.id),
+                    func.max(MemoryIndex.updated_at),
+                )
+                .where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.app_id == app_id,
+                    MemoryIndex.deleted_at.is_(None),
+                    memory_id_column.in_(entity_ids),
+                )
+                .group_by(memory_id_column)
+            )
+            for entity_id, count, last_seen_at in rows:
+                if entity_id is None or last_seen_at is None:
+                    continue
+                aggregates[(entity_type, entity_id)] = (
+                    int(count),
+                    _as_utc(last_seen_at),
+                )
+
+            existing = self.session.scalars(
+                select(Entity).where(
+                    Entity.project_id == project_id,
+                    Entity.app_id == app_id,
+                    Entity.entity_type == entity_type,
+                    Entity.entity_id.in_(entity_ids),
+                )
+            )
+            existing_by_key.update(
+                {(entity.entity_type, entity.entity_id): entity for entity in existing}
+            )
+
+        refreshed: list[Entity] = []
+        for entity_type, entity_id in normalized:
+            key = (entity_type, entity_id)
+            aggregate = aggregates.get(key)
+            entity = existing_by_key.get(key)
+            if aggregate is None:
+                if entity is not None:
+                    self.session.delete(entity)
+                continue
+            if entity is None:
+                entity = Entity(
+                    project_id=project_id,
+                    app_id=app_id,
+                    entity_type=entity_type,
+                    entity_id=entity_id,
+                )
+                self.session.add(entity)
+            entity.display_name = entity_id
+            entity.metadata_json = "{}"
+            entity.memory_count, entity.last_seen_at = aggregate
+            refreshed.append(entity)
+
+        self.session.flush()
+        return refreshed
+
+    @classmethod
+    def memory_identities(cls, memory: Any) -> set[tuple[str, str]]:
+        identities: set[tuple[str, str]] = set()
+        for entity_type, field_name in (
+            ("user", "user_id"),
+            ("agent", "agent_id"),
+            ("app", "app_id"),
+            ("run", "run_id"),
+        ):
+            entity_id = getattr(memory, field_name, None)
+            if isinstance(entity_id, str) and entity_id:
+                identities.add((entity_type, entity_id))
+        return identities
+
+    def refresh_affected_memories(
+        self,
+        project_id: str,
+        app_id: str,
+        memories: Iterable[Any],
+    ) -> list[Entity]:
+        """Refresh identities from old/new memory projections in bounded batches."""
+        pending: set[tuple[str, str]] = set()
+        refreshed_by_key: dict[tuple[str, str], Entity] = {}
+
+        def flush_pending() -> None:
+            if not pending:
+                return
+            for entity in self.refresh_affected_entities(
+                project_id,
+                app_id,
+                pending,
+            ):
+                refreshed_by_key[(entity.entity_type, entity.entity_id)] = entity
+            pending.clear()
+
+        for memory in memories:
+            identities = self.memory_identities(memory)
+            if len(pending | identities) > ENTITY_REFRESH_IDENTITY_LIMIT:
+                flush_pending()
+            pending.update(identities)
+        flush_pending()
+        return [refreshed_by_key[key] for key in sorted(refreshed_by_key)]
 
     def get_project_entity(
         self,

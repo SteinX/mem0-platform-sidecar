@@ -392,6 +392,90 @@ def test_entity_rebuild_is_scoped_complete_and_idempotent(db_session) -> None:
     )
 
 
+def test_entity_refresh_updates_only_requested_identities_at_high_cardinality(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+        default_app_id="app-a",
+    )
+    now = datetime(2026, 7, 17, 12, tzinfo=UTC)
+    db_session.add_all(
+        [
+            MemoryIndex(
+                project_id="alpha",
+                app_id="app-a",
+                mem0_memory_id=f"unrelated-{index:04d}",
+                user_id=f"unrelated-user-{index:04d}",
+                updated_at=now,
+            )
+            for index in range(1000)
+        ]
+        + [
+            MemoryIndex(
+                project_id="alpha",
+                app_id="app-a",
+                mem0_memory_id="target-old",
+                user_id="target-user",
+                updated_at=now - timedelta(minutes=1),
+            ),
+            MemoryIndex(
+                project_id="alpha",
+                app_id="app-a",
+                mem0_memory_id="target-new",
+                user_id="target-user",
+                updated_at=now,
+            ),
+        ]
+    )
+    db_session.add_all(
+        [
+            Entity(
+                project_id="alpha",
+                app_id="app-a",
+                entity_type="user",
+                entity_id="target-user",
+                memory_count=99,
+            ),
+            Entity(
+                project_id="alpha",
+                app_id="app-a",
+                entity_type="user",
+                entity_id="gone-user",
+                memory_count=99,
+            ),
+            Entity(
+                project_id="alpha",
+                app_id="app-a",
+                entity_type="user",
+                entity_id="preserved-sentinel",
+                memory_count=7,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    refreshed = EntityRepository(db_session).refresh_affected_entities(
+        "alpha",
+        "app-a",
+        {("user", "target-user"), ("user", "gone-user")},
+    )
+
+    assert [
+        (item.entity_id, item.memory_count, item.last_seen_at) for item in refreshed
+    ] == [("target-user", 2, now)]
+    assert set(
+        db_session.execute(
+            select(Entity.entity_id, Entity.memory_count).where(
+                Entity.project_id == "alpha",
+                Entity.app_id == "app-a",
+            )
+        )
+    ) == {("target-user", 2), ("preserved-sentinel", 7)}
+
+
 def test_entity_detail_and_memory_ids_are_strictly_scoped_and_ordered(
     db_session,
 ) -> None:

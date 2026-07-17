@@ -1734,6 +1734,73 @@ async def test_reconcile_imports_only_matching_scope_and_marks_absent_stale(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_stale_cleanup_is_keyset_bounded_and_incremental(
+    db_session,
+    monkeypatch,
+) -> None:
+    _create_project(db_session)
+    for index in range(501):
+        _index_memory(db_session, f"local-{index:04d}")
+    EntityRepository(db_session).rebuild_project_entities("repo-a", "app-a")
+    db_session.commit()
+
+    batch_sizes: list[int] = []
+    original_mark_stale = MemoryIndexRepository.mark_stale_if_unchanged
+
+    def bounded_mark_stale(self, **kwargs):
+        memory_ids = list(kwargs["mem0_memory_ids"])
+        batch_sizes.append(len(memory_ids))
+        assert len(memory_ids) <= 200
+        return original_mark_stale(
+            self,
+            **{**kwargs, "mem0_memory_ids": memory_ids},
+        )
+
+    monkeypatch.setattr(
+        MemoryIndexRepository,
+        "mark_stale_if_unchanged",
+        bounded_mark_stale,
+    )
+    monkeypatch.setattr(
+        MemoryIndexRepository,
+        "query_project_memories",
+        lambda *_args, **_kwargs: pytest.fail(
+            "reconcile stale cleanup must use a keyset scan"
+        ),
+    )
+    monkeypatch.setattr(
+        EntityRepository,
+        "rebuild_project_entities",
+        lambda *_args, **_kwargs: pytest.fail(
+            "reconcile must refresh only affected entity identities"
+        ),
+    )
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {"results": [], "total": 0}
+
+    result = await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+        project_id="repo-a",
+        app_id="app-a",
+        adopt_unscoped=False,
+        allow_adopt_unscoped=False,
+        default_project_id="repo-a",
+    )
+
+    assert result["stale_marked"] == 501
+    assert batch_sizes == [200, 200, 101]
+    assert (
+        db_session.query(MemoryIndex)
+        .filter(
+            MemoryIndex.project_id == "repo-a",
+            MemoryIndex.app_id == "app-a",
+            MemoryIndex.deleted_at.is_not(None),
+        )
+        .count()
+        == 501
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("allow_adopt", "project_id", "default_project_id"),
     [(False, "repo-a", "repo-a"), (True, "repo-b", "repo-a")],
@@ -2708,8 +2775,8 @@ async def test_update_locks_project_before_memory_index_and_entity_mutations(
     monkeypatch.setattr(MemoryIndexRepository, "upsert_memory", ordered_upsert)
     monkeypatch.setattr(
         EntityRepository,
-        "rebuild_project_entities",
-        lambda self, project_id, app_id: operations.append("entity") or [],
+        "refresh_affected_memories",
+        lambda self, project_id, app_id, memories: operations.append("entity") or [],
     )
 
     class OrderedUpdateClient(ExplorerMem0Client):
@@ -2769,8 +2836,8 @@ async def test_reconcile_locks_project_before_memory_index_and_entity_mutations(
     monkeypatch.setattr(MemoryIndexRepository, "upsert_memory", ordered_upsert)
     monkeypatch.setattr(
         EntityRepository,
-        "rebuild_project_entities",
-        lambda self, project_id, app_id: operations.append("entity") or [],
+        "refresh_affected_memories",
+        lambda self, project_id, app_id, memories: operations.append("entity") or [],
     )
     class OrderedReconcileClient(ExplorerMem0Client):
         async def list_memories(self, params):
@@ -3032,9 +3099,17 @@ def _entity_ids(db_session, *, app_id: str = "app-a") -> set[tuple[str, str, int
 @pytest.mark.asyncio
 async def test_successful_add_refreshes_all_entity_projections_before_return(
     db_session,
+    monkeypatch,
 ) -> None:
     _create_project(db_session, default_app_id="app-a")
     db_session.commit()
+    monkeypatch.setattr(
+        EntityRepository,
+        "rebuild_project_entities",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ordinary add must not run a full entity rebuild"
+        ),
+    )
 
     await MemoryService(session=db_session, mem0=FakeMem0Client()).add_memory(
         project_id="repo-a",
@@ -3058,11 +3133,19 @@ async def test_successful_add_refreshes_all_entity_projections_before_return(
 @pytest.mark.asyncio
 async def test_successful_update_refreshes_changed_entity_projections_before_commit(
     db_session,
+    monkeypatch,
 ) -> None:
     _create_project(db_session)
     _index_memory(db_session, "mem-1")
     EntityRepository(db_session).rebuild_project_entities("repo-a", "app-a")
     db_session.commit()
+    monkeypatch.setattr(
+        EntityRepository,
+        "rebuild_project_entities",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ordinary update must not run a full entity rebuild"
+        ),
+    )
     mem0 = ExplorerMem0Client(
         {
             "mem-1": {
@@ -3094,11 +3177,19 @@ async def test_successful_update_refreshes_changed_entity_projections_before_com
 @pytest.mark.asyncio
 async def test_successful_delete_refreshes_entity_projections_before_commit(
     db_session,
+    monkeypatch,
 ) -> None:
     _create_project(db_session)
     _index_memory(db_session, "mem-1")
     EntityRepository(db_session).rebuild_project_entities("repo-a", "app-a")
     db_session.commit()
+    monkeypatch.setattr(
+        EntityRepository,
+        "rebuild_project_entities",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ordinary delete must not run a full entity rebuild"
+        ),
+    )
 
     await MemoryService(session=db_session, mem0=FakeMem0Client()).delete_memory(
         project_id="repo-a",
