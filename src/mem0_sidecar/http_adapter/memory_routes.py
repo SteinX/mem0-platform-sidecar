@@ -207,6 +207,7 @@ async def get_memory(
     )
     if request_app_id is None:
         raise HTTPException(status_code=404, detail="Memory not found")
+    session.rollback()
     service = MemoryService(session=session, mem0=mem0)
     try:
         return await service.get_memory(
@@ -275,6 +276,7 @@ async def get_memory_history(
     )
     if request_app_id is None:
         raise HTTPException(status_code=404, detail="Memory not found")
+    session.rollback()
     service = MemoryService(session=session, mem0=mem0)
     try:
         return await service.get_memory_history(

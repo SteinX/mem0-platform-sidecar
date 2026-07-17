@@ -113,6 +113,35 @@ def _require_clean_trace_session(session: Session) -> None:
         raise RuntimeError(_DIRTY_TRACE_SESSION_ERROR)
 
 
+def _release_read_transaction(session: Session) -> None:
+    if session.new or session.dirty or session.deleted:
+        raise RuntimeError("Memory read cannot release a session with pending writes")
+    session.rollback()
+
+
+def _require_unchanged_memory_projection(
+    session: Session,
+    *,
+    snapshot: _MemoryProjectionSnapshot,
+    app_id: str,
+) -> None:
+    try:
+        session.expire_all()
+        current = MemoryIndexRepository(session).get_memory(
+            project_id=snapshot.project_id,
+            mem0_memory_id=snapshot.mem0_memory_id,
+            app_id=app_id,
+        )
+        if current is None:
+            raise KeyError(snapshot.mem0_memory_id)
+        if not _projection_matches_snapshot(current, snapshot):
+            raise MutationConflictError(
+                "Memory projection changed during upstream read"
+            )
+    finally:
+        session.rollback()
+
+
 def _append_memory_id(memory_ids: list[str], candidate: Any) -> None:
     if isinstance(candidate, str) and candidate and candidate not in memory_ids:
         memory_ids.append(candidate)
@@ -1817,6 +1846,7 @@ class MemoryService:
         memory_id: str,
         request_app_id: str | None = None,
     ) -> dict[str, Any]:
+        _require_clean_trace_session(self.session)
         effective_app_id = _effective_request_app_id(
             self.session,
             project_id=project_id,
@@ -1829,7 +1859,10 @@ class MemoryService:
             app_id=effective_app_id,
         )
         if memory is None:
+            self.session.rollback()
             raise KeyError(memory_id)
+        projection_before = _snapshot_memory_projection(memory)
+        _release_read_transaction(self.session)
 
         try:
             response = await self.mem0.get_memory(memory_id)
@@ -1837,7 +1870,13 @@ class MemoryService:
             if _is_upstream_not_found(exc):
                 raise KeyError(memory_id) from exc
             raise
-        return _validate_get_response(memory_id, response)
+        validated_response = _validate_get_response(memory_id, response)
+        _require_unchanged_memory_projection(
+            self.session,
+            snapshot=projection_before,
+            app_id=effective_app_id,
+        )
+        return validated_response
 
     async def update_memory(
         self,
@@ -1864,6 +1903,7 @@ class MemoryService:
             app_id=effective_app_id,
         )
         if memory is None:
+            self.session.rollback()
             raise KeyError(memory_id)
 
         if "metadata" in patch:
@@ -2043,6 +2083,7 @@ class MemoryService:
         memory_id: str,
         request_app_id: str | None,
     ) -> dict[str, Any]:
+        _require_clean_trace_session(self.session)
         effective_app_id = _effective_request_app_id(
             self.session,
             project_id=project_id,
@@ -2054,7 +2095,10 @@ class MemoryService:
             app_id=effective_app_id,
         )
         if memory is None:
+            self.session.rollback()
             raise KeyError(memory_id)
+        projection_before = _snapshot_memory_projection(memory)
+        _release_read_transaction(self.session)
         try:
             response = await self.mem0.get_memory_history(memory_id)
         except ValueError as exc:
@@ -2065,7 +2109,13 @@ class MemoryService:
             if _is_upstream_not_found(exc):
                 raise KeyError(memory_id) from exc
             raise
-        return {"results": _history_results(response)}
+        results = _history_results(response)
+        _require_unchanged_memory_projection(
+            self.session,
+            snapshot=projection_before,
+            app_id=effective_app_id,
+        )
+        return {"results": results}
 
     async def reconcile_memories(
         self,
