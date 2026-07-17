@@ -1901,7 +1901,7 @@ def test_patch_memory_commits_success(tmp_path, monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["memory"]["memory"] == "after"
     assert mem0.update_calls == [("mem-1", {"text": "after"})]
-    assert len(commit_calls) == 2
+    assert len(commit_calls) == 3
     assert rollback_calls == []
     with app.state.session_factory() as session:
         event = session.scalar(

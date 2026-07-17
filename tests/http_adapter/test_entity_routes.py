@@ -620,7 +620,7 @@ def test_delete_entity_commits_success_partial_and_failed_results(
     assert body["failed_count"] == expected_failed
     assert len(body["failed"]) == expected_failed
     assert isinstance(body["event_id"], str)
-    assert len(commit_calls) == 2
+    assert len(commit_calls) == 3
     assert rollback_calls == []
     with app.state.session_factory() as session:
         event = EventRepository(session).get(body["event_id"])
