@@ -141,7 +141,10 @@ Rebuild deletes and recreates only that project/app projection from the active
 memory index. It removes obsolete rows, does not touch other scopes, and is
 idempotent in projected content: repeated rebuilds over an unchanged index
 produce the same types, IDs, counts, and last-seen values without accumulating
-duplicates. Treat it as an operator action; it does not scan or mutate Mem0 OSS.
+duplicates. The repair scan is capped at 5000 active memory-index rows; a larger
+scope returns HTTP 422 before the existing projection is deleted. Treat it as an
+operator action; it does not scan or mutate Mem0 OSS. Normal memory mutations
+continue to maintain affected entity rows incrementally.
 
 ### Entity deletion safety
 

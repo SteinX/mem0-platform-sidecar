@@ -1524,6 +1524,7 @@ async def test_query_memory_failure_persists_one_event_and_discards_partial_stal
         {"text": "   "},
         {"text": 123},
         {"metadata": []},
+        {"metadata": {f"field-{index}": index for index in range(49)}},
     ],
 )
 async def test_update_memory_rejects_empty_scope_and_invalid_patch_fields(

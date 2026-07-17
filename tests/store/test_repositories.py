@@ -672,6 +672,51 @@ def test_entity_rebuild_locks_project_before_snapshot_and_delete(
     assert operations == ["project_lock", "memory_snapshot", "scope_delete"]
 
 
+def test_entity_rebuild_rejects_scope_beyond_memory_scan_limit_before_delete(
+    db_session,
+    monkeypatch,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    project = db_session.get(Project, "alpha")
+    assert project is not None
+    snapshot = [
+        SimpleNamespace(
+            user_id=f"user-{index}",
+            agent_id=None,
+            app_id="app-a",
+            run_id=None,
+            updated_at=datetime(2026, 7, 17, tzinfo=UTC),
+        )
+        for index in range(5001)
+    ]
+    monkeypatch.setattr(
+        ProjectRepository,
+        "lock_for_mutation",
+        lambda repository, project_id: project,
+    )
+    def bounded_snapshot(statement):
+        rendered = str(statement.compile(compile_kwargs={"literal_binds": True}))
+        assert "LIMIT 5001" in rendered
+        return iter(snapshot)
+
+    monkeypatch.setattr(db_session, "scalars", bounded_snapshot)
+
+    def reject_delete(*args, **kwargs):
+        raise AssertionError("entity scope delete must not run after an oversized scan")
+
+    monkeypatch.setattr(db_session, "execute", reject_delete)
+
+    with pytest.raises(
+        ValueError,
+        match="entity rebuild exceeds 5000 active memories",
+    ):
+        EntityRepository(db_session).rebuild_project_entities("alpha", "app-a")
+
+
 def test_entity_rebuild_rejects_unknown_project_before_snapshot_or_delete(
     db_session,
     monkeypatch,

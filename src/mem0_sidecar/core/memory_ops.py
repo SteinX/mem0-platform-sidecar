@@ -37,6 +37,9 @@ SIDECAR_PROJECT_ID_METADATA_KEY = "_mem0_sidecar_project_id"
 SIDECAR_APP_ID_METADATA_KEY = "_mem0_sidecar_app_id"
 SIDECAR_MUTATION_ID_METADATA_KEY = "_mem0_sidecar_mutation_id"
 _MEMORY_PATCH_FIELDS = frozenset({"text", "metadata", "expiration_date"})
+# Leave room for the project/app scope fields added before the recovery intent is
+# sanitized. Mutation-intent trace objects retain at most 50 fields.
+_MAX_UPDATE_METADATA_FIELDS = 48
 _RECONCILE_SCAN_LIMIT = 5000
 _HYDRATION_BUFFER = 20
 _HYDRATION_CONCURRENCY = 8
@@ -250,11 +253,21 @@ def _operation_marker(
 
 
 def _expected_update_effect(patch: dict[str, Any]) -> dict[str, Any]:
+    metadata = patch.get("metadata")
     return {
         "field_fingerprints": {
             field_name: _canonical_fingerprint({"value": value})
             for field_name, value in sorted(patch.items())
+            if field_name != "metadata"
+        },
+        "metadata_fingerprints": {
+            _canonical_fingerprint({"key": key}): _canonical_fingerprint(
+                {"value": value}
+            )
+            for key, value in sorted(metadata.items())
         }
+        if isinstance(metadata, dict)
+        else {},
     }
 
 
@@ -265,13 +278,16 @@ def _update_effect_matches(
     if not isinstance(expected_effect, dict):
         return False
     field_fingerprints = expected_effect.get("field_fingerprints")
-    if not isinstance(field_fingerprints, dict) or not field_fingerprints:
+    metadata_fingerprints = expected_effect.get("metadata_fingerprints")
+    if not isinstance(field_fingerprints, dict) or not isinstance(
+        metadata_fingerprints, dict
+    ):
+        return False
+    if not field_fingerprints and not metadata_fingerprints:
         return False
     for field_name, expected_fingerprint in field_fingerprints.items():
         if field_name == "text":
             observed = record.get("memory", record.get("text"))
-        elif field_name == "metadata":
-            observed = record.get("metadata")
         elif field_name == "expiration_date":
             observed = record.get("expiration_date")
         else:
@@ -280,6 +296,24 @@ def _update_effect_matches(
             _canonical_fingerprint({"value": observed}) != expected_fingerprint
         ):
             return False
+    if metadata_fingerprints:
+        observed_metadata = record.get("metadata")
+        if not isinstance(observed_metadata, dict):
+            return False
+        observed_fingerprints = {
+            _canonical_fingerprint({"key": key}): _canonical_fingerprint(
+                {"value": value}
+            )
+            for key, value in observed_metadata.items()
+        }
+        for key_fingerprint, expected_fingerprint in metadata_fingerprints.items():
+            if (
+                not isinstance(key_fingerprint, str)
+                or not isinstance(expected_fingerprint, str)
+                or observed_fingerprints.get(key_fingerprint)
+                != expected_fingerprint
+            ):
+                return False
     return True
 
 
@@ -406,6 +440,12 @@ def _validate_memory_patch(payload: dict[str, Any]) -> dict[str, Any]:
         payload["metadata"], dict
     ):
         raise ValueError("metadata must be an object or null")
+    if isinstance(payload.get("metadata"), dict) and len(payload["metadata"]) > (
+        _MAX_UPDATE_METADATA_FIELDS
+    ):
+        raise ValueError(
+            f"metadata must contain at most {_MAX_UPDATE_METADATA_FIELDS} fields"
+        )
     return {key: payload[key] for key in _MEMORY_PATCH_FIELDS if key in payload}
 
 
@@ -1217,33 +1257,6 @@ class MemoryService:
             target.status == "COMPLETED" for target in targets.values()
         )
         if present_ids:
-            if operation == "entity.delete" and successful_count:
-                for memory_id in present_ids:
-                    intent_repo.mark_target_failed(
-                        targets[memory_id],
-                        {"message": "Memory still exists upstream"},
-                    )
-                failed_count = sum(
-                    target.status == "FAILED" for target in targets.values()
-                )
-                result = {
-                    "status": "PARTIAL",
-                    "requested_count": total_targets,
-                    "deleted_count": successful_count,
-                    "failed_count": failed_count,
-                    "retry_required": True,
-                }
-                EventRepository(self.session).mark_failed(
-                    intent.event_id,
-                    error=result,
-                )
-                intent_repo.fail(
-                    intent_id,
-                    status="PARTIAL",
-                    error=result,
-                    result=result,
-                )
-                return
             error = {
                 "message": "Delete target still exists upstream",
                 "retry_required": True,
