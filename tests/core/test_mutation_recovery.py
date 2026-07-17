@@ -62,7 +62,7 @@ class _StatefulRecoveryClient:
         if "text" in payload:
             record["memory"] = payload["text"]
         if "metadata" in payload:
-            record["metadata"] = dict(payload["metadata"] or {})
+            record.setdefault("metadata", {}).update(payload["metadata"] or {})
         self._cancel_once("update")
         return {"id": memory_id, "updated": True}
 
@@ -224,7 +224,7 @@ class _RealHttpOutcomeClient:
             if "text" in payload:
                 record["memory"] = payload["text"]
             if "metadata" in payload:
-                record["metadata"] = dict(payload["metadata"] or {})
+                record.setdefault("metadata", {}).update(payload["metadata"] or {})
             self.write_calls.append(("PUT", path))
             if self._should_lose_response("update"):
                 return self._lost_response(request)
@@ -612,6 +612,70 @@ async def test_cancelled_update_after_apply_completes_only_on_effect_match(
 
 
 @pytest.mark.asyncio
+async def test_update_recovery_matches_metadata_patch_after_oss_merge(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient(cancel_operation="update")
+    _seed_memory(factory, client, "memory-one")
+    client.records["memory-one"]["metadata"].update(
+        {
+            "untouched": "keep",
+            MUTATION_MARKER: "original-add-marker",
+        }
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _invoke_mutation(factory, client, "update")
+
+    result = await _recover(factory, client)
+
+    assert result == {"recovered": 1, "failed": 0}
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.update_ids == ["memory-one"]
+    assert client.records["memory-one"]["metadata"]["version"] == "new"
+    assert client.records["memory-one"]["metadata"]["untouched"] == "keep"
+    assert (
+        client.records["memory-one"]["metadata"][MUTATION_MARKER]
+        == "original-add-marker"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_recovery_preserves_maximum_metadata_patch_fingerprints(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient(cancel_operation="update")
+    _seed_memory(factory, client, "memory-one")
+    metadata = {f"field-{index}": index for index in range(48)}
+
+    with factory() as session, pytest.raises(asyncio.CancelledError):
+        await MemoryService(session=session, mem0=client).update_memory(
+            project_id=PROJECT_ID,
+            memory_id="memory-one",
+            request_app_id=APP_ID,
+            payload={"metadata": metadata},
+        )
+
+    expected_fingerprints = _intent_state(factory)["payload"]["expected_effect"][
+        "metadata_fingerprints"
+    ]
+    assert len(expected_fingerprints) == 50
+    assert "_trace_truncated_fields" not in expected_fingerprints
+
+    result = await _recover(factory, client)
+
+    assert result == {"recovered": 1, "failed": 0}
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.update_ids == ["memory-one"]
+    assert all(
+        client.records["memory-one"]["metadata"][key] == value
+        for key, value in metadata.items()
+    )
+
+
+@pytest.mark.asyncio
 async def test_cancelled_update_before_apply_stays_unknown_on_effect_mismatch(
     tmp_path,
 ) -> None:
@@ -696,10 +760,10 @@ async def test_entity_recovery_never_deletes_targets_that_still_exist(tmp_path) 
 
     with pytest.raises(asyncio.CancelledError):
         await _invoke_mutation(factory, client, "entity")
-    result = await _recover(factory, client)
+    with pytest.raises(MutationConflictError, match="unresolved"):
+        await _recover(factory, client)
 
-    assert result == {"recovered": 0, "failed": 1}
-    assert _intent_state(factory)["status"] == "PARTIAL"
+    assert _intent_state(factory)["status"] == "UNKNOWN"
     assert len(client.deleted_ids) == 1
     deleted_id = client.deleted_ids[0]
     remaining_id = ({"entity-one", "entity-two"} - {deleted_id}).pop()
@@ -712,6 +776,79 @@ async def test_entity_recovery_never_deletes_targets_that_still_exist(tmp_path) 
         }
     assert memories[deleted_id] is not None
     assert memories[remaining_id] is None
+
+
+@pytest.mark.asyncio
+async def test_entity_recovery_waits_for_ambiguous_late_completion(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+    _seed_memory(factory, client, "entity-one")
+    _seed_memory(factory, client, "entity-two")
+
+    async def lose_second_delete_response(memory_id: str) -> dict[str, Any]:
+        client.deleted_ids.append(memory_id)
+        if len(client.deleted_ids) == 1:
+            client.records.pop(memory_id, None)
+            return {"id": memory_id, "deleted": True}
+        raise asyncio.CancelledError()
+
+    client.delete_memory = lose_second_delete_response
+    with pytest.raises(asyncio.CancelledError):
+        await _invoke_mutation(factory, client, "entity")
+
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    assert len(client.deleted_ids) == 2
+    writes_after_failure = list(client.deleted_ids)
+    ambiguous_id = client.deleted_ids[-1]
+    with pytest.raises(MutationConflictError, match="unresolved"):
+        await _recover(factory, client)
+
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    assert client.deleted_ids == writes_after_failure
+    client.records.pop(ambiguous_id, None)
+
+    result = await _recover(factory, client)
+
+    assert result == {"recovered": 1, "failed": 0}
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.deleted_ids == writes_after_failure
+    with factory() as session:
+        memories = list(session.scalars(select(MemoryIndex)))
+    assert len(memories) == 2
+    assert all(memory.deleted_at is not None for memory in memories)
+
+
+@pytest.mark.asyncio
+async def test_entity_recovery_keeps_present_target_unknown_with_missing_sibling(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+    _seed_memory(factory, client, "entity-one")
+    _seed_memory(factory, client, "entity-two")
+
+    async def lose_first_delete_response(memory_id: str) -> dict[str, Any]:
+        client.deleted_ids.append(memory_id)
+        raise asyncio.CancelledError()
+
+    client.delete_memory = lose_first_delete_response
+    with pytest.raises(asyncio.CancelledError):
+        await _invoke_mutation(factory, client, "entity")
+
+    assert len(client.deleted_ids) == 1
+    ambiguous_id = client.deleted_ids[0]
+    unattempted_id = ({"entity-one", "entity-two"} - {ambiguous_id}).pop()
+    client.records.pop(unattempted_id)
+    writes_after_failure = list(client.deleted_ids)
+
+    with pytest.raises(MutationConflictError, match="unresolved"):
+        await _recover(factory, client)
+
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    assert client.deleted_ids == writes_after_failure
+    assert ambiguous_id in client.records
 
 
 @pytest.mark.asyncio

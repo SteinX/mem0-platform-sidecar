@@ -2091,8 +2091,15 @@ class EntityRepository:
                         MemoryIndex.app_id == app_id,
                         MemoryIndex.deleted_at.is_(None),
                     )
+                    .order_by(MemoryIndex.id)
+                    .limit(EXPLORER_RECORD_HORIZON + 1)
                 )
             )
+            if len(memories) > EXPLORER_RECORD_HORIZON:
+                raise ValueError(
+                    "entity rebuild exceeds "
+                    f"{EXPLORER_RECORD_HORIZON} active memories"
+                )
             aggregates: dict[tuple[str, str], tuple[int, datetime]] = {}
             identity_fields = (
                 ("user", "user_id"),
