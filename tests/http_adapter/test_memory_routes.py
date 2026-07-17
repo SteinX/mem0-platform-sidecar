@@ -2295,6 +2295,27 @@ def test_reconcile_rejects_path_project_mismatch_without_upstream_access(
     assert mem0.list_calls == []
 
 
+def test_reconcile_unknown_project_is_404_without_upstream_access(tmp_path) -> None:
+    mem0 = ExplorerRouteMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+
+    response = TestClient(app).post(
+        "/v1/projects/repo-missing/memories/reconcile",
+        json={"project_id": "repo-missing", "app_id": "app-a"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Project not found"}
+    assert mem0.list_calls == []
+
+
 def test_reconcile_passes_runtime_adoption_gate(tmp_path) -> None:
     mem0 = ExplorerRouteMem0Client()
     app = create_app(

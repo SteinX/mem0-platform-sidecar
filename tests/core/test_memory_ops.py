@@ -3306,6 +3306,48 @@ async def test_successful_reconcile_refreshes_only_affected_entity_scope(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_app_scope_move_refreshes_old_and_new_entities(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "moved", app_id="app-a")
+    EntityRepository(db_session).rebuild_project_entities("repo-a", "app-a")
+    db_session.commit()
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [
+            {
+                "id": "moved",
+                "user_id": "bob",
+                "agent_id": "agent-2",
+                "app_id": "app-b",
+                "run_id": "run-2",
+                "metadata": {
+                    SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+                    SIDECAR_APP_ID_METADATA_KEY: "app-b",
+                },
+            }
+        ]
+    }
+
+    await MemoryService(session=db_session, mem0=mem0).reconcile_memories(
+        project_id="repo-a",
+        app_id="app-b",
+        adopt_unscoped=False,
+        allow_adopt_unscoped=False,
+        default_project_id="repo-a",
+    )
+
+    assert _entity_ids(db_session, app_id="app-a") == set()
+    assert _entity_ids(db_session, app_id="app-b") == {
+        ("app", "app-b", 1),
+        ("user", "bob", 1),
+        ("agent", "agent-2", 1),
+        ("run", "run-2", 1),
+    }
+
+
+@pytest.mark.asyncio
 async def test_failed_memory_mutations_do_not_refresh_prior_entity_projection(
     db_session,
 ) -> None:

@@ -301,18 +301,36 @@ async def reconcile_memories(
     session: SessionDependency,
     mem0: Mem0Dependency,
 ) -> dict[str, int]:
-    project_id = resolve_project_id(request, payload)
-    if project_id != path_project_id:
-        session.rollback()
-        raise HTTPException(status_code=403, detail="Project scope mismatch")
-
-    app_id = resolve_app_id(request, payload) or project_id
-    adopt_unscoped = payload.get("adopt_unscoped", False)
-    service = MemoryService(session=session, mem0=mem0)
     try:
+        project_id = validate_scope_id(
+            resolve_project_id(request, payload),
+            field_name="project_id",
+        )
+        validated_path_project_id = validate_scope_id(
+            path_project_id,
+            field_name="project_id",
+        )
+        if project_id != validated_path_project_id:
+            raise HTTPException(status_code=403, detail="Project scope mismatch")
+
+        requested_app_id = validate_scope_id(
+            resolve_app_id(request, payload),
+            field_name="app_id",
+            required=False,
+        )
+        app_id = resolve_project_app_id(
+            session,
+            project_id=project_id,
+            request_app_id=requested_app_id,
+        )
+        if app_id is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        app_id = validate_scope_id(app_id, field_name="app_id")
+
+        adopt_unscoped = payload.get("adopt_unscoped", False)
         if not isinstance(adopt_unscoped, bool):
             raise ValueError("adopt_unscoped must be a boolean")
-        result = await service.reconcile_memories(
+        result = await MemoryService(session=session, mem0=mem0).reconcile_memories(
             project_id=project_id,
             app_id=app_id,
             adopt_unscoped=adopt_unscoped,
@@ -323,6 +341,9 @@ async def reconcile_memories(
         )
         session.commit()
         return result
+    except HTTPException:
+        session.rollback()
+        raise
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
