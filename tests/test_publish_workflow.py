@@ -32,6 +32,26 @@ def test_publish_workflow_applies_and_verifies_dashboard_overlay():
     assert "mem0-upstream/server/dashboard" in workflow
 
 
+def test_publish_workflow_exposes_checked_out_dashboard_to_tests():
+    workflow = WORKFLOW.read_text()
+
+    assert (
+        "MEM0_UPSTREAM_DASHBOARD: "
+        "${{ github.workspace }}/mem0-upstream/server/dashboard"
+    ) in workflow
+
+
+def test_publish_workflow_installs_dashboard_dependencies_before_tests():
+    workflow = WORKFLOW.read_text()
+
+    assert workflow.index("- name: Set up Node.js") < workflow.index(
+        "- name: Run sidecar tests"
+    )
+    assert workflow.index("- name: Install dashboard dependencies") < workflow.index(
+        "- name: Run sidecar tests"
+    )
+
+
 def test_publish_workflow_tags_release_manual_latest_and_sha():
     workflow = WORKFLOW.read_text()
 

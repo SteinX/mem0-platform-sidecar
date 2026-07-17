@@ -11,7 +11,12 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 OVERLAY = ROOT / "integrations" / "mem0-dashboard-overlay"
-UPSTREAM_DASHBOARD = ROOT.parents[2] / "upstream" / "server" / "dashboard"
+UPSTREAM_DASHBOARD = Path(
+    os.environ.get(
+        "MEM0_UPSTREAM_DASHBOARD",
+        ROOT.parents[2] / "upstream" / "server" / "dashboard",
+    )
+)
 DASHBOARD_TYPESCRIPT = UPSTREAM_DASHBOARD / "node_modules" / "typescript"
 VERIFY_DASHBOARD_OVERLAY = OVERLAY / "scripts" / "verify-dashboard-overlay"
 NULL_PAGE = "export default function Page() { return null; }\n"
