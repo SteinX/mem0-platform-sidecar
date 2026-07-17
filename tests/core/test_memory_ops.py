@@ -819,6 +819,7 @@ async def test_memory_service_get_memory_uses_project_index(
         category=None,
         metadata={},
     )
+    db_session.commit()
 
     mem0 = FakeMem0Client()
     service = MemoryService(session=db_session, mem0=mem0)
@@ -853,6 +854,7 @@ async def test_memory_service_get_memory_rejects_wrong_project_without_remote_ca
         category=None,
         metadata={},
     )
+    db_session.commit()
 
     mem0 = FakeMem0Client()
     service = MemoryService(session=db_session, mem0=mem0)
@@ -882,6 +884,7 @@ async def test_memory_service_get_memory_rejects_wrong_app_without_remote_call(
         category=None,
         metadata={},
     )
+    db_session.commit()
 
     mem0 = FakeMem0Client()
     service = MemoryService(session=db_session, mem0=mem0)
@@ -915,6 +918,7 @@ async def test_memory_service_get_memory_defaults_to_project_app_scope(
         category=None,
         metadata={},
     )
+    db_session.commit()
 
     mem0 = FakeMem0Client()
     service = MemoryService(session=db_session, mem0=mem0)
@@ -944,6 +948,7 @@ async def test_memory_service_get_memory_rejects_missing_upstream_memory(
         category=None,
         metadata={},
     )
+    db_session.commit()
 
     mem0 = MissingGetMem0Client()
     service = MemoryService(session=db_session, mem0=mem0)
@@ -1638,6 +1643,7 @@ async def test_get_memory_history_checks_scope_and_normalizes_shapes(
 ) -> None:
     _create_project(db_session)
     _index_memory(db_session, "mem-1")
+    db_session.commit()
     mem0 = ExplorerMem0Client()
     mem0.history_response = history_response
     service = MemoryService(session=db_session, mem0=mem0)
@@ -1658,6 +1664,81 @@ async def test_get_memory_history_checks_scope_and_normalizes_shapes(
 
     assert result == {"results": expected}
     assert mem0.history_calls == ["mem-1"]
+
+
+@pytest.mark.asyncio
+async def test_detail_and_history_release_read_transaction_during_upstream_wait(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-1")
+    db_session.commit()
+    transaction_states: list[bool] = []
+
+    class TransactionObservingClient(ExplorerMem0Client):
+        async def get_memory(self, memory_id: str) -> dict[str, Any]:
+            transaction_states.append(db_session.in_transaction())
+            return await super().get_memory(memory_id)
+
+        async def get_memory_history(self, memory_id: str) -> dict[str, Any]:
+            transaction_states.append(db_session.in_transaction())
+            return await super().get_memory_history(memory_id)
+
+    mem0 = TransactionObservingClient(
+        {"mem-1": {"id": "mem-1", "memory": "hello"}}
+    )
+    mem0.history_response = {"results": [{"event": "ADD"}]}
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    await service.get_memory(
+        project_id="repo-a",
+        memory_id="mem-1",
+        request_app_id="app-a",
+    )
+    await service.get_memory_history(
+        project_id="repo-a",
+        memory_id="mem-1",
+        request_app_id="app-a",
+    )
+
+    assert transaction_states == [False, False]
+    assert not db_session.in_transaction()
+
+
+@pytest.mark.asyncio
+async def test_get_memory_rechecks_scope_after_upstream_wait(db_session) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-1", app_id="app-a")
+    db_session.commit()
+
+    class ScopeMovingClient(ExplorerMem0Client):
+        async def get_memory(self, memory_id: str) -> dict[str, Any]:
+            assert not db_session.in_transaction()
+            with Session(db_session.get_bind()) as concurrent_session:
+                MemoryIndexRepository(concurrent_session).upsert_memory(
+                    project_id="repo-a",
+                    mem0_memory_id=memory_id,
+                    user_id="other-user",
+                    agent_id="other-agent",
+                    app_id="app-b",
+                    run_id="other-run",
+                    category=None,
+                    metadata={},
+                )
+                concurrent_session.commit()
+            return {"id": memory_id, "memory": "moved"}
+
+    with pytest.raises((KeyError, MutationConflictError)):
+        await MemoryService(
+            session=db_session,
+            mem0=ScopeMovingClient(),
+        ).get_memory(
+            project_id="repo-a",
+            memory_id="mem-1",
+            request_app_id="app-a",
+        )
+
+    assert not db_session.in_transaction()
 
 
 @pytest.mark.asyncio
@@ -2025,6 +2106,7 @@ async def test_reconcile_rejects_malformed_record_without_stale_cleanup(
 async def test_get_memory_history_rejects_unknown_response_shape(db_session) -> None:
     _create_project(db_session)
     _index_memory(db_session, "mem-1")
+    db_session.commit()
     mem0 = ExplorerMem0Client()
     mem0.history_response = {"unexpected": []}
 
@@ -2042,6 +2124,7 @@ async def test_get_memory_history_wraps_decode_value_error_with_cause(
 ) -> None:
     _create_project(db_session)
     _index_memory(db_session, "mem-1")
+    db_session.commit()
     decode_error = ValueError("history response is not JSON")
     mem0 = ExplorerMem0Client()
     mem0.history_response = decode_error
