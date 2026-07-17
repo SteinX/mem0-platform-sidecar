@@ -165,6 +165,10 @@ def prepare_dashboard_context(upstream_context: Path, target: Path) -> Path:
         target / "src" / "app" / "(root)" / "clientLayout.tsx",
     )
     shutil.copy2(
+        ROOT / "tests" / "e2e" / "dashboard_root_layout.browser-smoke.tsx",
+        target / "src" / "app" / "(root)" / "dashboard-client-layout.tsx",
+    )
+    shutil.copy2(
         ROOT
         / "integrations"
         / "mem0-dashboard-overlay"

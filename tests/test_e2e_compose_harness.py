@@ -241,6 +241,11 @@ def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
     ).read_text()
     assert "AuthLoadingState" not in client_layout
     assert "TooltipProvider" in client_layout
+    dashboard_client_layout = (
+        prepared / "src" / "app" / "(root)" / "dashboard-client-layout.tsx"
+    ).read_text()
+    assert "AuthProvider" not in dashboard_client_layout
+    assert "<ClientLayout>{children}</ClientLayout>" in dashboard_client_layout
     assert (prepared / "Dockerfile.e2e").is_file()
     assert hasattr(compose_runner, "mocked_browser_smoke_command")
     assert compose_runner.mocked_browser_smoke_command("sidecar-e2e-test")[-2:] == [
