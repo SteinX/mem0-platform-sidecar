@@ -1463,6 +1463,49 @@ def test_memory_explorer_rejects_metadata_scans_over_5000_before_loading(
         )
 
 
+def test_memory_explorer_rechecks_metadata_scan_bound_after_count_race(
+    db_session,
+    monkeypatch,
+):
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 7, 1, tzinfo=UTC)
+    db_session.execute(
+        insert(MemoryIndex),
+        [
+            {
+                "project_id": "alpha",
+                "mem0_memory_id": f"mem-{index:04d}",
+                "app_id": "app-a",
+                "metadata_projection_json": '{"source":"codex"}',
+                "created_at": created_at,
+            }
+            for index in range(5001)
+        ],
+    )
+    repository = MemoryIndexRepository(db_session)
+    metadata_filter = {
+        "field": "metadata",
+        "operator": "contains",
+        "value": {"key": "source", "value": "codex"},
+    }
+
+    # Simulate a concurrent insert committed after COUNT but before SELECT.
+    monkeypatch.setattr(db_session, "scalar", lambda *args, **kwargs: 5000)
+
+    with pytest.raises(
+        ValueError, match="^metadata filter scan exceeds 5000 records$"
+    ):
+        repository.query_project_memories(
+            "alpha",
+            "app-a",
+            _explorer_query(filters=[metadata_filter]),
+        )
+
+
 def test_memory_index_repository_mark_stale_never_crosses_projects(db_session):
     projects = ProjectRepository(db_session)
     for project_id in ("alpha", "beta"):
