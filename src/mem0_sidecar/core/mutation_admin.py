@@ -129,8 +129,47 @@ class MutationAdminService:
             raise MutationAdminError("intent status or attempt count changed")
 
         intent_repo = MutationIntentRepository(self.session)
+        marker: str | None = None
         if intent.operation == "memory.add":
-            await self._refuse_observed_add_marker(intent, intent_repo)
+            marker_value = intent_repo.payload(intent).get("mutation_id")
+            if type(marker_value) is not str or not marker_value:
+                raise MutationAdminError("add intent marker is unavailable")
+            marker = marker_value
+        operation = intent.operation
+        self.session.rollback()
+
+        if marker is not None:
+            await self._refuse_observed_add_marker(
+                marker=marker,
+                project_id=project_id,
+                app_id=app_id,
+            )
+
+        ProjectRepository(self.session).lock_for_mutation(project_id)
+        intent = self.session.scalar(
+            select(MutationIntent)
+            .where(
+                MutationIntent.id == intent_id,
+                MutationIntent.project_id == project_id,
+                MutationIntent.app_id == app_id,
+            )
+            .execution_options(populate_existing=True)
+        )
+        if intent is None:
+            raise MutationAdminError("intent does not exist in the exact scope")
+        if intent.status not in RESOLVABLE_STATUSES or _lease_is_live(intent):
+            raise MutationAdminError("intent state cannot be resolved")
+        if (
+            intent.status != expected_status
+            or intent.attempt_count != expected_attempt_count
+            or intent.operation != operation
+        ):
+            raise MutationAdminError("intent status or attempt count changed")
+        intent_repo = MutationIntentRepository(self.session)
+        if marker is not None and (
+            intent_repo.payload(intent).get("mutation_id") != marker
+        ):
+            raise MutationAdminError("intent status or attempt count changed")
 
         audit_repo = EventRepository(self.session)
         audit = audit_repo.create_event(
@@ -165,13 +204,11 @@ class MutationAdminService:
 
     async def _refuse_observed_add_marker(
         self,
-        intent: MutationIntent,
-        intent_repo: MutationIntentRepository,
+        *,
+        marker: str,
+        project_id: str,
+        app_id: str,
     ) -> None:
-        payload = intent_repo.payload(intent)
-        marker = payload.get("mutation_id")
-        if type(marker) is not str or not marker:
-            raise MutationAdminError("add intent marker is unavailable")
         response = await self.mem0.list_memories(
             {"top_k": MARKER_SCAN_LIMIT, "show_expired": True}
         )
@@ -186,8 +223,8 @@ class MutationAdminService:
                 type(metadata) is dict
                 and metadata.get(SIDECAR_MUTATION_ID_METADATA_KEY) == marker
                 and metadata.get(SIDECAR_PROJECT_ID_METADATA_KEY)
-                == intent.project_id
-                and metadata.get(SIDECAR_APP_ID_METADATA_KEY) == intent.app_id
+                == project_id
+                and metadata.get(SIDECAR_APP_ID_METADATA_KEY) == app_id
             ):
                 raise MutationAdminError(
                     "add marker was observed; intent cannot be resolved"

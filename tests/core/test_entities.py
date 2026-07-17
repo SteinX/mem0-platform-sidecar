@@ -655,7 +655,7 @@ async def test_delete_entity_total_failure_and_missing_are_non_destructive(
 
 
 @pytest.mark.asyncio
-async def test_delete_entity_commits_intent_before_side_effect_and_projection_after(
+async def test_delete_entity_commits_intent_batch_progress_and_terminal_state(
     db_session,
     monkeypatch,
 ) -> None:
@@ -677,12 +677,12 @@ async def test_delete_entity_commits_intent_before_side_effect_and_projection_af
         "repo-a", "app-a", "user", "alice"
     )
 
-    assert commits == 2
+    assert commits == 3
     assert not db_session.in_transaction()
 
 
 @pytest.mark.asyncio
-async def test_delete_entity_locks_project_before_upstream_calls(
+async def test_delete_entity_fences_each_batch_after_upstream_calls(
     db_session,
     monkeypatch,
 ) -> None:
@@ -709,11 +709,8 @@ async def test_delete_entity_locks_project_before_upstream_calls(
     )
 
     upstream_index = operations.index("upstream_delete")
-    assert operations[upstream_index - 1 : upstream_index + 1] == [
-        "project_lock",
-        "upstream_delete",
-    ]
-    assert operations[-1] == "upstream_delete"
+    assert operations[upstream_index + 1] == "project_lock"
+    assert operations[-1] == "project_lock"
 
 
 @pytest.mark.asyncio

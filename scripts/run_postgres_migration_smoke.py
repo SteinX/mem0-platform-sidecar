@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise sidecar migrations and mutation locking on disposable PostgreSQL."""
+"""Exercise sidecar migrations and mutation fencing on disposable PostgreSQL."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from mem0_sidecar.core.memory_ops import (
     SIDECAR_APP_ID_METADATA_KEY,
     SIDECAR_PROJECT_ID_METADATA_KEY,
     MemoryService,
+    MutationConflictError,
 )
 from mem0_sidecar.store.models import (
     Entity,
@@ -579,6 +580,7 @@ def _run_admin_resolution_interleaving(session_factory) -> None:
     client = _BlockingAdminObservationClient(started, release)
     resolution_result: list[dict] = []
     recovery_result: list[dict] = []
+    recovery_conflicts: list[str] = []
     failures: list[BaseException] = []
 
     def resolve() -> None:
@@ -618,6 +620,8 @@ def _run_admin_resolution_interleaving(session_factory) -> None:
                         )
                     )
                 )
+        except MutationConflictError as exc:
+            recovery_conflicts.append(str(exc))
         except BaseException as exc:
             failures.append(exc)
 
@@ -627,9 +631,10 @@ def _run_admin_resolution_interleaving(session_factory) -> None:
     _require(started.wait(5), "admin resolution never observed the add marker")
     recovery_thread.start()
     recovery_thread.join(0.5)
+    progressed_during_observation = not recovery_thread.is_alive()
     _require(
-        recovery_thread.is_alive(),
-        "PostgreSQL recovery bypassed the admin resolution project lock",
+        progressed_during_observation,
+        "PostgreSQL recovery was blocked by admin marker observation",
     )
     release.set()
     resolution_thread.join(10)
@@ -640,8 +645,8 @@ def _run_admin_resolution_interleaving(session_factory) -> None:
     _require(not failures, f"admin resolution concurrency failures: {failures!r}")
     _require(resolution_result, "admin resolution did not complete")
     _require(
-        recovery_result == [{"recovered": 0, "failed": 0}],
-        f"unexpected post-resolution recovery result: {recovery_result!r}",
+        recovery_result == [] and len(recovery_conflicts) == 1,
+        "recovery did not observe the still-blocking exhausted intent",
     )
     _require(client.read_calls == 1, "admin resolution repeated marker observation")
     _require(client.write_calls == 0, "admin resolution issued an upstream write")
@@ -994,7 +999,9 @@ def _run_interleaving(session_factory, operation: str) -> None:
     started = threading.Event()
     release = threading.Event()
     delete_called = threading.Event()
-    failures: list[BaseException] = []
+    mutation_failures: list[BaseException] = []
+    delete_conflicts: list[str] = []
+    delete_failures: list[BaseException] = []
 
     def mutate() -> None:
         try:
@@ -1026,7 +1033,7 @@ def _run_interleaving(session_factory, operation: str) -> None:
                     )
                 session.commit()
         except BaseException as exc:
-            failures.append(exc)
+            mutation_failures.append(exc)
 
     def delete_entity() -> None:
         try:
@@ -1038,25 +1045,30 @@ def _run_interleaving(session_factory, operation: str) -> None:
                     ).delete_entity(PROJECT_ID, APP_ID, "user", "alice")
                 )
                 session.commit()
+        except MutationConflictError as exc:
+            delete_conflicts.append(str(exc))
         except BaseException as exc:
-            failures.append(exc)
+            delete_failures.append(exc)
 
     mutation_thread = threading.Thread(target=mutate, daemon=True)
     delete_thread = threading.Thread(target=delete_entity, daemon=True)
     mutation_thread.start()
     _require(started.wait(5), f"{operation} never reached its upstream call")
     delete_thread.start()
+    delete_thread.join(0.5)
     _require(
-        not delete_called.wait(0.5),
-        f"entity delete bypassed the {operation} project lock",
+        not delete_thread.is_alive(),
+        f"entity delete waited on the {operation} upstream call",
     )
     release.set()
     mutation_thread.join(10)
     delete_thread.join(10)
     _require(not mutation_thread.is_alive(), f"{operation} deadlocked")
     _require(not delete_thread.is_alive(), "entity delete deadlocked")
-    _require(not failures, f"concurrency failures: {failures!r}")
-    _require(delete_called.is_set(), "entity delete never reached upstream")
+    _require(not mutation_failures, f"mutation failures: {mutation_failures!r}")
+    _require(not delete_failures, f"entity delete failures: {delete_failures!r}")
+    _require(len(delete_conflicts) == 1, "entity delete bypassed the active intent")
+    _require(not delete_called.is_set(), "blocked entity delete reached upstream")
     with session_factory() as session:
         projection = session.scalar(
             select(MemoryIndex).where(
@@ -1065,8 +1077,8 @@ def _run_interleaving(session_factory, operation: str) -> None:
             )
         )
         _require(
-            projection is not None and projection.deleted_at is not None,
-            f"{operation} resurrected the deleted memory projection",
+            projection is not None and projection.deleted_at is None,
+            f"{operation} lost the active memory projection",
         )
         _require(
             session.scalar(
@@ -1077,8 +1089,8 @@ def _run_interleaving(session_factory, operation: str) -> None:
                     Entity.entity_id == "alice",
                 )
             )
-            is None,
-            f"{operation} resurrected the deleted entity projection",
+            is not None,
+            f"{operation} lost the active entity projection",
         )
 
 
