@@ -1210,6 +1210,35 @@ async function testCategoryCollectionPostForcesConfiguredProject(proxy) {
   assert.deepEqual(JSON.parse(calls[0].init.body), payload);
 }
 
+async function testCategoryMutationRejectsStreamedOversizedBody(proxy) {
+  let fetchCalled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(40_000));
+      controller.enqueue(new Uint8Array(40_000));
+    },
+  });
+  const response = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/projects/forged/categories",
+      {
+        method: "POST",
+        body,
+        duplex: "half",
+      },
+    ),
+    "/v1/projects/forged/categories",
+    proxyOptions(async () => {
+      fetchCalled = true;
+      return Response.json({});
+    }),
+  );
+
+  assert.equal(response.status, 413);
+  assert.deepEqual(await response.json(), { error: "JSON body is too large" });
+  assert.equal(fetchCalled, false);
+}
+
 async function testPatchRewritesProjectEncodesCategoryAndForwardsBody(proxy) {
   const calls = [];
   const payload = { description: "Updated", enabled: false };
@@ -1418,6 +1447,7 @@ async function main() {
   await testUnauthenticatedMemoryRequestIsRejected(proxySidecarRequest);
   await testUpstreamFailureDoesNotLeakInternalDetails(proxySidecarRequest);
   await testCategoryCollectionPostForcesConfiguredProject(proxySidecarRequest);
+  await testCategoryMutationRejectsStreamedOversizedBody(proxySidecarRequest);
   await testPatchRewritesProjectEncodesCategoryAndForwardsBody(
     proxySidecarRequest,
   );
@@ -1428,7 +1458,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 42 contracts passed");
+  console.log("sidecar proxy request harness: 43 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(
@@ -1439,7 +1469,10 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+const keepAlive = setInterval(() => {}, 1_000);
+main()
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  })
+  .finally(() => clearInterval(keepAlive));

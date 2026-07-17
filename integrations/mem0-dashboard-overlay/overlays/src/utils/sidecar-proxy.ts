@@ -314,13 +314,7 @@ function isJsonRequest(request: Request): boolean {
   );
 }
 
-async function readBoundedJsonBody(
-  request: Request,
-): Promise<string | Response> {
-  if (!isJsonRequest(request)) {
-    return jsonError("Content-Type must be application/json", 415);
-  }
-
+async function readBoundedBody(request: Request): Promise<string | Response> {
   const contentLength = request.headers.get("Content-Length")?.trim();
   if (
     contentLength &&
@@ -368,6 +362,15 @@ async function readBoundedJsonBody(
   } catch {
     return jsonError("Invalid JSON body", 400);
   }
+}
+
+async function readBoundedJsonBody(
+  request: Request,
+): Promise<string | Response> {
+  if (!isJsonRequest(request)) {
+    return jsonError("Content-Type must be application/json", 415);
+  }
+  return readBoundedBody(request);
 }
 
 export async function proxySidecarRequest(
@@ -477,7 +480,11 @@ export async function proxySidecarRequest(
       }
       init.body = rewrittenBody;
     } else {
-      init.body = await request.text();
+      const bodyText = await readBoundedBody(request);
+      if (bodyText instanceof Response) {
+        return bodyText;
+      }
+      init.body = bodyText;
     }
   }
 
