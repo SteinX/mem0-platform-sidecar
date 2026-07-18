@@ -54,6 +54,7 @@ interface RefreshCookieLease {
 
 interface RefreshTokenGuard {
   invalidated: boolean;
+  predecessors: Set<RefreshTokenGuard>;
   refreshToken: string;
   successors: Set<RefreshTokenGuard>;
 }
@@ -122,6 +123,7 @@ export function createDashboardSessionRefreshCoordinator({
     }
     const guard: RefreshTokenGuard = {
       invalidated: false,
+      predecessors: new Set(),
       refreshToken,
       successors: new Set(),
     };
@@ -131,9 +133,21 @@ export function createDashboardSessionRefreshCoordinator({
       if (!oldest) break;
       const [oldestToken, oldestGuard] = oldest;
       oldestGuard.invalidated = true;
+      severRefreshTokenGuardLinks(oldestGuard);
       refreshTokenGuards.delete(oldestToken);
     }
     return guard;
+  }
+
+  function severRefreshTokenGuardLinks(guard: RefreshTokenGuard) {
+    for (const predecessor of guard.predecessors) {
+      predecessor.successors.delete(guard);
+    }
+    for (const successor of guard.successors) {
+      successor.predecessors.delete(guard);
+    }
+    guard.predecessors.clear();
+    guard.successors.clear();
   }
 
   function retireRefreshCookieLease(refreshToken: string) {
@@ -150,13 +164,39 @@ export function createDashboardSessionRefreshCoordinator({
   ) {
     if (visited.has(guard)) return;
     visited.add(guard);
+    const successors = [...guard.successors];
     guard.invalidated = true;
     sessions.delete(guard.refreshToken);
     ambiguousTokens.delete(guard.refreshToken);
     retireRefreshCookieLease(guard.refreshToken);
-    for (const successor of guard.successors) {
+    severRefreshTokenGuardLinks(guard);
+    for (const successor of successors) {
       invalidateRefreshTokenGuard(successor, visited);
     }
+  }
+
+  function countReachableTokenGuards() {
+    const roots = new Set<RefreshTokenGuard>(refreshTokenGuards.values());
+    for (const lease of refreshCookieLeases.values()) {
+      roots.add(lease.requestTokenGuard);
+      roots.add(lease.resultTokenGuard);
+    }
+    for (const session of sessions.values()) {
+      if (session.kind !== "authenticated") continue;
+      const lease = resultRefreshCookieLeases.get(session.result);
+      if (!lease) continue;
+      roots.add(lease.requestTokenGuard);
+      roots.add(lease.resultTokenGuard);
+    }
+    const reachable = new Set<RefreshTokenGuard>();
+    const pending = [...roots];
+    while (pending.length > 0) {
+      const guard = pending.pop();
+      if (!guard || reachable.has(guard)) continue;
+      reachable.add(guard);
+      pending.push(...guard.predecessors, ...guard.successors);
+    }
+    return reachable.size;
   }
 
   function cacheRefreshCookieLease(
@@ -280,6 +320,7 @@ export function createDashboardSessionRefreshCoordinator({
       return { status: "unauthorized" };
     }
     requestTokenGuard.successors.add(resultTokenGuard);
+    resultTokenGuard.predecessors.add(requestTokenGuard);
     ambiguousTokens.delete(refreshToken);
     retireRefreshCookieLease(refreshToken);
     const refreshCookieLease = {
@@ -359,6 +400,7 @@ export function createDashboardSessionRefreshCoordinator({
         ambiguousEntries: ambiguousTokens.size,
         cachedEntries: sessions.size,
         inFlight: inFlight.size,
+        reachableTokenGuards: countReachableTokenGuards(),
         tokenGuards: refreshTokenGuards.size,
       };
     },
