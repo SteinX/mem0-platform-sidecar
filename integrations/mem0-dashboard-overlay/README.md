@@ -60,11 +60,17 @@ Authenticated refreshes are coordinated across the dashboard auth route and
 the sidecar proxy because Mem0 refresh tokens are single-use and rotate on every
 successful refresh. Concurrent requests share one upstream rotation, the
 current session is cached briefly, and just-consumed tokens are marked stale
-without exposing their successor credentials. Only a definitive upstream
-`401` clears the cookie. Rate limits and other temporary auth-service failures
-return `503`; the dashboard preserves its session and retries instead of
-redirecting to login. The coordinator is process-local, so multi-replica
-deployments require sticky routing or a shared coordination store.
+without exposing their successor credentials. A response writes a rotated
+cookie only while that rotation remains current, so a slow older response
+cannot overwrite a newer token. Network, timeout, and malformed-success
+responses mark that token ambiguous: retries pause for 10 seconds, then probe
+again, and a subsequent `401` remains retryable for up to five minutes. The
+ambiguity history is process-local, capped at 1024 tokens, and oldest-first
+evicted; after expiry or eviction, a later upstream `401` is definitive and
+clears the cookie. Rate limits and other temporary auth-service failures return
+`503`, so the dashboard preserves its session instead of redirecting to login.
+Multi-replica deployments require sticky routing or a shared coordination
+store.
 
 ## Memory Explorer API
 

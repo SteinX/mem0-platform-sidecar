@@ -27,6 +27,7 @@ def write_dashboard_package(dashboard: Path) -> None:
     (dashboard / "Dockerfile").write_text(
         "FROM node:20-alpine\n"
         "ENV NEXT_PUBLIC_API_URL=NEXT_PUBLIC_API_URL\n"
+        "RUN npm run build\n"
     )
     (dashboard / "package.json").write_text(
         json.dumps(
@@ -1750,7 +1751,7 @@ def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
     proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
 
     assert 'const COOKIE_NAME = "mem0_refresh_token";' in route_content
-    assert "async function validateDashboardSession()" in route_content
+    assert "async function validateDashboardSession(" in route_content
     assert "function isAuthDisabled()" in route_content
     assert 'process.env.AUTH_DISABLED?.toLowerCase()' in route_content
     assert "if (isAuthDisabled()) {" in route_content
@@ -1801,7 +1802,11 @@ def test_apply_dashboard_overlay_serializes_rotating_refresh_tokens(tmp_path):
         assert 'result.status === "unauthorized"' in route_content
         assert 'result.status === "unavailable"' in route_content
         assert "result.refreshToken" in route_content
+        assert "shouldSetRefreshCookie" in route_content
         assert "status: 503" in route_content
+    assert sidecar_route.index("await proxySidecarRequest") < sidecar_route.index(
+        "shouldSetRefreshCookie"
+    )
 
 
 def test_apply_dashboard_overlay_preserves_session_on_transient_refresh_failure(
@@ -1858,7 +1863,65 @@ def test_verify_dashboard_overlay_rejects_missing_public_api_placeholder(
         "FROM node:20-alpine\n"
         "ARG NEXT_PUBLIC_API_URL\n"
         "ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}\n"
+        "RUN npm run build\n"
     )
+
+    apply_result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert apply_result.returncode == 0, apply_result.stderr
+
+    verify_result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1",
+        },
+    )
+
+    assert verify_result.returncode == 1
+    assert "NEXT_PUBLIC_API_URL placeholder" in verify_result.stderr
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        (
+            "FROM node:20-alpine\n"
+            "ENV NEXT_PUBLIC_API_URL=NEXT_PUBLIC_API_URL\n"
+            "ENV NEXT_PUBLIC_API_URL=\n"
+            "RUN npm run build\n"
+        ),
+        (
+            "FROM node:20-alpine AS unused\n"
+            "ENV NEXT_PUBLIC_API_URL=NEXT_PUBLIC_API_URL\n"
+            "FROM node:20-alpine AS builder\n"
+            "RUN npm run build\n"
+        ),
+    ],
+)
+def test_verify_dashboard_overlay_rejects_ineffective_public_api_placeholder(
+    tmp_path, dockerfile
+):
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+    (dashboard / "Dockerfile").write_text(dockerfile)
 
     apply_result = subprocess.run(
         [

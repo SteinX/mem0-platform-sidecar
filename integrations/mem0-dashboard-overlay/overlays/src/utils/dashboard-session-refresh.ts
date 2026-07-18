@@ -14,6 +14,8 @@ interface DashboardSessionRefreshCoordinatorOptions {
   ) => Promise<Response>;
   now?: () => number;
   maxCacheEntries?: number;
+  ambiguityHistoryTtlMs?: number;
+  ambiguousTokenGraceMs?: number;
   oldTokenGraceMs?: number;
   refreshTimeoutMs?: number;
   sessionCacheTtlMs?: number;
@@ -30,9 +32,27 @@ interface CachedStaleToken {
   expiresAt: number;
 }
 
-type CachedSession = CachedAuthenticatedSession | CachedStaleToken;
+interface CachedAmbiguousToken {
+  kind: "ambiguous";
+  expiresAt: number;
+}
+
+type CachedSession =
+  | CachedAuthenticatedSession
+  | CachedStaleToken
+  | CachedAmbiguousToken;
+type AuthenticatedDashboardSessionRefreshResult = Extract<
+  DashboardSessionRefreshResult,
+  { status: "authenticated" }
+>;
+
+interface RefreshCookieLease {
+  active: boolean;
+}
 
 const DEFAULT_MAX_CACHE_ENTRIES = 1024;
+const DEFAULT_AMBIGUITY_HISTORY_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_AMBIGUOUS_TOKEN_GRACE_MS = 10 * 1000;
 const DEFAULT_REFRESH_TIMEOUT_MS = 10 * 1000;
 const DEFAULT_SESSION_CACHE_TTL_MS = 60 * 1000;
 const DEFAULT_OLD_TOKEN_GRACE_MS = 10 * 1000;
@@ -41,12 +61,22 @@ export function createDashboardSessionRefreshCoordinator({
   refreshUpstream,
   now = Date.now,
   maxCacheEntries = DEFAULT_MAX_CACHE_ENTRIES,
+  ambiguityHistoryTtlMs = DEFAULT_AMBIGUITY_HISTORY_TTL_MS,
+  ambiguousTokenGraceMs = DEFAULT_AMBIGUOUS_TOKEN_GRACE_MS,
   oldTokenGraceMs = DEFAULT_OLD_TOKEN_GRACE_MS,
   refreshTimeoutMs = DEFAULT_REFRESH_TIMEOUT_MS,
   sessionCacheTtlMs = DEFAULT_SESSION_CACHE_TTL_MS,
 }: DashboardSessionRefreshCoordinatorOptions) {
   const sessions = new Map<string, CachedSession>();
   const inFlight = new Map<string, Promise<DashboardSessionRefreshResult>>();
+  const refreshCookieLeases = new Map<string, RefreshCookieLease>();
+  // Ambiguity history is deliberately per-token, bounded, and expiring. Once
+  // a record is evicted or expires, a later upstream 401 is definitive again.
+  const ambiguousTokens = new Map<string, number>();
+  const resultRefreshCookieLeases = new WeakMap<
+    AuthenticatedDashboardSessionRefreshResult,
+    RefreshCookieLease
+  >();
   const cacheLimit = Math.max(1, maxCacheEntries);
 
   function pruneExpired() {
@@ -54,6 +84,11 @@ export function createDashboardSessionRefreshCoordinator({
     for (const [token, session] of sessions) {
       if (session.expiresAt <= currentTime) {
         sessions.delete(token);
+      }
+    }
+    for (const [token, expiresAt] of ambiguousTokens) {
+      if (expiresAt <= currentTime) {
+        ambiguousTokens.delete(token);
       }
     }
   }
@@ -66,6 +101,69 @@ export function createDashboardSessionRefreshCoordinator({
       if (typeof oldestToken !== "string") break;
       sessions.delete(oldestToken);
     }
+  }
+
+  function retireRefreshCookieLease(refreshToken: string) {
+    const lease = refreshCookieLeases.get(refreshToken);
+    if (lease) {
+      lease.active = false;
+      refreshCookieLeases.delete(refreshToken);
+    }
+  }
+
+  function cacheRefreshCookieLease(
+    refreshToken: string,
+    lease: RefreshCookieLease,
+  ) {
+    const existing = refreshCookieLeases.get(refreshToken);
+    if (existing && existing !== lease) {
+      existing.active = false;
+    }
+    refreshCookieLeases.delete(refreshToken);
+    refreshCookieLeases.set(refreshToken, lease);
+    while (refreshCookieLeases.size > cacheLimit) {
+      const oldest = refreshCookieLeases.entries().next().value;
+      if (!oldest) break;
+      const [oldestToken, oldestLease] = oldest;
+      oldestLease.active = false;
+      refreshCookieLeases.delete(oldestToken);
+    }
+  }
+
+  function touchRefreshCookieLease(refreshToken: string) {
+    const lease = refreshCookieLeases.get(refreshToken);
+    if (!lease) return;
+    refreshCookieLeases.delete(refreshToken);
+    refreshCookieLeases.set(refreshToken, lease);
+  }
+
+  function quarantineAmbiguousToken(refreshToken: string) {
+    ambiguousTokens.delete(refreshToken);
+    ambiguousTokens.set(refreshToken, now() + ambiguityHistoryTtlMs);
+    while (ambiguousTokens.size > cacheLimit) {
+      const oldestToken = ambiguousTokens.keys().next().value;
+      if (typeof oldestToken !== "string") break;
+      ambiguousTokens.delete(oldestToken);
+    }
+    cache(refreshToken, {
+      kind: "ambiguous",
+      expiresAt: now() + ambiguousTokenGraceMs,
+    });
+  }
+
+  function quarantineKnownAmbiguousToken(refreshToken: string) {
+    const historyExpiresAt = ambiguousTokens.get(refreshToken);
+    if (historyExpiresAt === undefined || historyExpiresAt <= now()) {
+      ambiguousTokens.delete(refreshToken);
+      return false;
+    }
+    ambiguousTokens.delete(refreshToken);
+    ambiguousTokens.set(refreshToken, historyExpiresAt);
+    cache(refreshToken, {
+      kind: "ambiguous",
+      expiresAt: Math.min(now() + ambiguousTokenGraceMs, historyExpiresAt),
+    });
+    return true;
   }
 
   async function refreshWithTimeout(refreshToken: string) {
@@ -95,12 +193,18 @@ export function createDashboardSessionRefreshCoordinator({
     try {
       response = await refreshWithTimeout(refreshToken);
     } catch {
+      quarantineAmbiguousToken(refreshToken);
       return { status: "unavailable" };
     }
     if (!response.ok) {
-      return response.status === 401
-        ? { status: "unauthorized" }
-        : { status: "unavailable" };
+      if (response.status === 401) {
+        if (quarantineKnownAmbiguousToken(refreshToken)) {
+          return { status: "unavailable" };
+        }
+        retireRefreshCookieLease(refreshToken);
+        return { status: "unauthorized" };
+      }
+      return { status: "unavailable" };
     }
 
     const data = await response.json().catch(() => ({}));
@@ -108,13 +212,19 @@ export function createDashboardSessionRefreshCoordinator({
       typeof data.access_token !== "string" ||
       typeof data.refresh_token !== "string"
     ) {
+      quarantineAmbiguousToken(refreshToken);
       return { status: "unavailable" };
     }
-    const result = {
+    const result: AuthenticatedDashboardSessionRefreshResult = {
       status: "authenticated" as const,
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
     };
+    ambiguousTokens.delete(refreshToken);
+    retireRefreshCookieLease(refreshToken);
+    const refreshCookieLease = { active: true };
+    resultRefreshCookieLeases.set(result, refreshCookieLease);
+    cacheRefreshCookieLease(result.refreshToken, refreshCookieLease);
     cache(refreshToken, {
       kind: "stale",
       expiresAt: now() + oldTokenGraceMs,
@@ -136,9 +246,10 @@ export function createDashboardSessionRefreshCoordinator({
       if (cached?.kind === "authenticated") {
         sessions.delete(refreshToken);
         sessions.set(refreshToken, cached);
+        touchRefreshCookieLease(refreshToken);
         return cached.result;
       }
-      if (cached?.kind === "stale") {
+      if (cached?.kind === "stale" || cached?.kind === "ambiguous") {
         return { status: "unavailable" };
       }
 
@@ -152,9 +263,26 @@ export function createDashboardSessionRefreshCoordinator({
       inFlight.set(refreshToken, pending);
       return pending;
     },
+    shouldSetRefreshCookie(
+      requestRefreshToken: string,
+      result: DashboardSessionRefreshResult,
+    ) {
+      if (
+        result.status !== "authenticated" ||
+        result.refreshToken === requestRefreshToken
+      ) {
+        return false;
+      }
+      const lease = resultRefreshCookieLeases.get(result);
+      return (
+        lease?.active === true &&
+        refreshCookieLeases.get(result.refreshToken) === lease
+      );
+    },
     getStats() {
       pruneExpired();
       return {
+        ambiguousEntries: ambiguousTokens.size,
         cachedEntries: sessions.size,
         inFlight: inFlight.size,
       };
