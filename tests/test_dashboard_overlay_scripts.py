@@ -24,6 +24,10 @@ NULL_PAGE = "export default function Page() { return null; }\n"
 
 def write_dashboard_package(dashboard: Path) -> None:
     dashboard.mkdir()
+    (dashboard / "Dockerfile").write_text(
+        "FROM node:20-alpine\n"
+        "ENV NEXT_PUBLIC_API_URL=NEXT_PUBLIC_API_URL\n"
+    )
     (dashboard / "package.json").write_text(
         json.dumps(
             {
