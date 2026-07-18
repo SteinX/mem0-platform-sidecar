@@ -103,6 +103,51 @@ async function testConsumedTokenReplayNeverReturnsSuccessorCredentials(
   );
 }
 
+async function testSupersededRotationCannotOverwriteNewerCookie(
+  createCoordinator,
+) {
+  let now = 0;
+  let sequence = 0;
+  const coordinator = createCoordinator({
+    now: () => now,
+    sessionCacheTtlMs: 100,
+    refreshUpstream: async () => {
+      sequence += 1;
+      return Response.json({
+        access_token: `access-${sequence}`,
+        refresh_token: `refresh-${sequence}`,
+      });
+    },
+  });
+
+  const firstRotation = await coordinator.refresh("refresh-0");
+  assert.equal(
+    coordinator.shouldSetRefreshCookie("refresh-0", firstRotation),
+    true,
+    "a live rotation must publish its successor cookie",
+  );
+
+  const cached = await coordinator.refresh("refresh-1");
+  assert.equal(
+    coordinator.shouldSetRefreshCookie("refresh-1", cached),
+    false,
+    "a current-token cache hit must not re-emit the same cookie",
+  );
+
+  now = 101;
+  const secondRotation = await coordinator.refresh("refresh-1");
+  assert.equal(
+    coordinator.shouldSetRefreshCookie("refresh-1", secondRotation),
+    true,
+    "the next live rotation must publish its successor cookie",
+  );
+  assert.equal(
+    coordinator.shouldSetRefreshCookie("refresh-0", firstRotation),
+    false,
+    "a delayed participant in an older rotation must not overwrite the newer cookie",
+  );
+}
+
 async function testUpstreamFailuresAreClassifiedWithoutFalseLogout(
   createCoordinator,
 ) {
@@ -129,6 +174,54 @@ async function testUpstreamFailuresAreClassifiedWithoutFalseLogout(
     const result = await coordinator.refresh(`token-${name}`);
     assert.equal(result.status, expectedStatus, name);
   }
+}
+
+async function testAmbiguousFailureQuarantinesTheToken(createCoordinator) {
+  let now = 0;
+  let upstreamCalls = 0;
+  const coordinator = createCoordinator({
+    now: () => now,
+    ambiguousTokenGraceMs: 100,
+    refreshUpstream: async () => {
+      upstreamCalls += 1;
+      if (upstreamCalls === 1) {
+        throw new Error("response lost after a possibly committed rotation");
+      }
+      if (upstreamCalls === 2) {
+        return new Response(null, { status: 401 });
+      }
+      return Response.json({
+        access_token: "recovered-access",
+        refresh_token: "recovered-refresh",
+      });
+    },
+  });
+
+  assert.deepEqual(await coordinator.refresh("uncertain-token"), {
+    status: "unavailable",
+  });
+  assert.deepEqual(await coordinator.refresh("uncertain-token"), {
+    status: "unavailable",
+  });
+  assert.equal(
+    upstreamCalls,
+    1,
+    "an ambiguous token must not be retried immediately and misclassified as unauthorized",
+  );
+
+  now = 101;
+  assert.deepEqual(await coordinator.refresh("uncertain-token"), {
+    status: "unavailable",
+  });
+  assert.equal(upstreamCalls, 2);
+
+  now = 202;
+  assert.deepEqual(await coordinator.refresh("uncertain-token"), {
+    status: "authenticated",
+    accessToken: "recovered-access",
+    refreshToken: "recovered-refresh",
+  });
+  assert.equal(upstreamCalls, 3);
 }
 
 async function testExpiredEntriesAreSwept(createCoordinator) {
@@ -183,7 +276,66 @@ async function testCacheIsBoundedAndEvictsOldEntries(createCoordinator) {
   assert.ok(coordinator.getStats().cachedEntries <= 2);
 }
 
-async function testHungRefreshTimesOutAndReleasesSingleflight(createCoordinator) {
+async function testAmbiguityHistoryIsBoundedWithoutPoisoningFresh401s(
+  createCoordinator,
+) {
+  let failAmbiguously = true;
+  const coordinator = createCoordinator({
+    ambiguousTokenGraceMs: 0,
+    maxCacheEntries: 2,
+    refreshUpstream: async () => {
+      if (failAmbiguously) throw new Error("response lost");
+      return new Response(null, { status: 401 });
+    },
+  });
+
+  await coordinator.refresh("uncertain-1");
+  await coordinator.refresh("uncertain-2");
+  await coordinator.refresh("uncertain-3");
+  assert.ok(
+    coordinator.getStats().ambiguousEntries <= 2,
+    "ambiguous-token history must remain bounded",
+  );
+
+  failAmbiguously = false;
+  assert.deepEqual(await coordinator.refresh("fresh-invalid-token"), {
+    status: "unauthorized",
+  });
+}
+
+async function testAmbiguityHistoryEventuallyExpires(createCoordinator) {
+  let now = 0;
+  let upstreamCalls = 0;
+  const coordinator = createCoordinator({
+    now: () => now,
+    ambiguityHistoryTtlMs: 150,
+    ambiguousTokenGraceMs: 100,
+    refreshUpstream: async () => {
+      upstreamCalls += 1;
+      if (upstreamCalls === 1) throw new Error("response lost");
+      return new Response(null, { status: 401 });
+    },
+  });
+
+  assert.equal(
+    (await coordinator.refresh("eventually-invalid")).status,
+    "unavailable",
+  );
+  now = 101;
+  assert.equal(
+    (await coordinator.refresh("eventually-invalid")).status,
+    "unavailable",
+  );
+  now = 151;
+  assert.equal(
+    (await coordinator.refresh("eventually-invalid")).status,
+    "unauthorized",
+  );
+}
+
+async function testHungRefreshTimesOutAndReleasesSingleflight(
+  createCoordinator,
+) {
   const coordinator = createCoordinator({
     refreshTimeoutMs: 10,
     refreshUpstream: async () => new Promise(() => {}),
@@ -194,7 +346,9 @@ async function testHungRefreshTimesOutAndReleasesSingleflight(createCoordinator)
   assert.equal(coordinator.getStats().inFlight, 0);
 }
 
-async function testBrowserRefreshClassification(requestDashboardSessionRefresh) {
+async function testBrowserRefreshClassification(
+  requestDashboardSessionRefresh,
+) {
   const cases = [
     [
       "success",
@@ -231,9 +385,7 @@ async function testBrowserRefreshClassification(requestDashboardSessionRefresh) 
   }
 }
 
-function testClientUnauthorizedRetryStateMachine(
-  dashboardSessionRetryAction,
-) {
+function testClientUnauthorizedRetryStateMachine(dashboardSessionRetryAction) {
   assert.equal(dashboardSessionRetryAction(401, false), "refresh");
   assert.equal(dashboardSessionRetryAction(401, true), "logout");
   assert.equal(dashboardSessionRetryAction(500, false), "ignore");
@@ -282,9 +434,15 @@ async function main() {
   await testConsumedTokenReplayNeverReturnsSuccessorCredentials(
     createCoordinator,
   );
+  await testSupersededRotationCannotOverwriteNewerCookie(createCoordinator);
   await testUpstreamFailuresAreClassifiedWithoutFalseLogout(createCoordinator);
+  await testAmbiguousFailureQuarantinesTheToken(createCoordinator);
   await testExpiredEntriesAreSwept(createCoordinator);
   await testCacheIsBoundedAndEvictsOldEntries(createCoordinator);
+  await testAmbiguityHistoryIsBoundedWithoutPoisoningFresh401s(
+    createCoordinator,
+  );
+  await testAmbiguityHistoryEventuallyExpires(createCoordinator);
   await testHungRefreshTimesOutAndReleasesSingleflight(createCoordinator);
   await testBrowserRefreshClassification(
     clientModule.requestDashboardSessionRefresh,
@@ -292,10 +450,8 @@ async function main() {
   testClientUnauthorizedRetryStateMachine(
     clientModule.dashboardSessionRetryAction,
   );
-  testAxiosRetryMarkerWiring(
-    clientModule.dashboardSessionRequestRetryAction,
-  );
-  console.log("dashboard session refresh harness: 9 contracts passed");
+  testAxiosRetryMarkerWiring(clientModule.dashboardSessionRequestRetryAction);
+  console.log("dashboard session refresh harness: 13 contracts passed");
 }
 
 main().catch((error) => {

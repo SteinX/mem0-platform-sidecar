@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1476,28 +1477,130 @@ def verify_entities_page(dashboard_dir: Path) -> str | None:
     return None
 
 
+def dockerfile_instructions(dockerfile: str) -> list[tuple[str, str]]:
+    instructions: list[tuple[str, str]] = []
+    logical_line = ""
+    for raw_line in dockerfile.splitlines():
+        stripped = raw_line.strip()
+        if not logical_line and (not stripped or stripped.startswith("#")):
+            continue
+        continued = stripped.endswith("\\")
+        fragment = stripped[:-1].rstrip() if continued else stripped
+        logical_line = f"{logical_line} {fragment}".strip()
+        if continued:
+            continue
+        match = re.match(r"^([A-Za-z]+)\s+(.*)$", logical_line)
+        if match:
+            instructions.append((match.group(1).upper(), match.group(2).strip()))
+        logical_line = ""
+    return instructions
+
+
+def is_dashboard_build_command(command: str) -> bool:
+    if command.startswith("["):
+        try:
+            arguments = json.loads(command)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(arguments, list) or not all(
+            isinstance(argument, str) for argument in arguments
+        ):
+            return False
+        executable = Path(arguments[0]).name if arguments else ""
+        build_arguments = arguments[1:]
+        return executable in {"npm", "pnpm", "yarn", "bun"} and (
+            build_arguments == ["build"] or build_arguments == ["run", "build"]
+        )
+    return re.search(
+        r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b",
+        command,
+    ) is not None
+
+
+def expand_docker_value(
+    value: str, environment: dict[str, str], arguments: dict[str, str]
+) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return environment.get(name, arguments.get(name, ""))
+
+    variable = r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+    return re.sub(variable, replace, value)
+
+
+def update_docker_environment(
+    instruction: str,
+    environment: dict[str, str],
+    arguments: dict[str, str],
+) -> None:
+    try:
+        tokens = shlex.split(instruction, posix=True)
+    except ValueError:
+        return
+    if not tokens:
+        return
+    if "=" not in tokens[0]:
+        environment[tokens[0]] = expand_docker_value(
+            " ".join(tokens[1:]), environment, arguments
+        )
+        return
+    for token in tokens:
+        name, separator, value = token.partition("=")
+        if separator:
+            environment[name] = expand_docker_value(value, environment, arguments)
+
+
 def verify_public_api_placeholder(dashboard_dir: Path) -> str | None:
     dockerfile_path = dashboard_dir / DASHBOARD_DOCKERFILE
     if not dockerfile_path.is_file():
         return "Dashboard Dockerfile is missing"
 
-    dockerfile = dockerfile_path.read_text()
-    direct_env = re.search(
-        r"^ENV\s+NEXT_PUBLIC_API_URL=NEXT_PUBLIC_API_URL\s*$",
-        dockerfile,
-        re.MULTILINE,
-    )
-    default_arg = re.search(
-        r"^ARG\s+NEXT_PUBLIC_API_URL=NEXT_PUBLIC_API_URL\s*$",
-        dockerfile,
-        re.MULTILINE,
-    )
-    expanded_env = re.search(
-        r"^ENV\s+NEXT_PUBLIC_API_URL=\$\{NEXT_PUBLIC_API_URL\}\s*$",
-        dockerfile,
-        re.MULTILINE,
-    )
-    if direct_env or (default_arg and expanded_env):
+    global_arguments: dict[str, str] = {}
+    named_stages: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
+    environment: dict[str, str] | None = None
+    arguments: dict[str, str] | None = None
+    found_build = False
+    for directive, instruction in dockerfile_instructions(
+        dockerfile_path.read_text()
+    ):
+        if directive == "FROM":
+            try:
+                tokens = shlex.split(instruction, posix=True)
+            except ValueError:
+                tokens = []
+            tokens = [token for token in tokens if not token.startswith("--")]
+            base = tokens[0] if tokens else ""
+            inherited = named_stages.get(base)
+            environment = dict(inherited[0]) if inherited else {}
+            arguments = dict(inherited[1]) if inherited else {}
+            if len(tokens) >= 3 and tokens[-2].upper() == "AS":
+                named_stages[tokens[-1]] = (environment, arguments)
+            continue
+        if directive == "ARG":
+            name, separator, default = instruction.partition("=")
+            name = name.strip()
+            if environment is None or arguments is None:
+                if separator:
+                    global_arguments[name] = default
+            elif separator:
+                arguments[name] = expand_docker_value(
+                    default, environment, arguments
+                )
+            elif name in global_arguments:
+                arguments[name] = global_arguments[name]
+            continue
+        if environment is None or arguments is None:
+            continue
+        if directive == "ENV":
+            update_docker_environment(instruction, environment, arguments)
+        elif directive == "RUN" and is_dashboard_build_command(instruction):
+            found_build = True
+            if environment.get("NEXT_PUBLIC_API_URL") != "NEXT_PUBLIC_API_URL":
+                return (
+                    "Dashboard Dockerfile must preserve the "
+                    "NEXT_PUBLIC_API_URL placeholder at build time"
+                )
+    if found_build:
         return None
     return "Dashboard Dockerfile must preserve the NEXT_PUBLIC_API_URL placeholder"
 

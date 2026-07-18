@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 import { NextRequest } from "next/server";
 import { dashboardSessionRefreshCoordinator } from "@/lib/dashboard-session";
+import type { DashboardSessionRefreshResult } from "@/utils/dashboard-session-refresh";
 import { proxySidecarRequest } from "@/utils/sidecar-proxy";
 
 const COOKIE_NAME = "mem0_refresh_token";
@@ -51,7 +52,19 @@ function isAuthDisabled() {
   return value === "1" || value === "true" || value === "yes" || value === "on";
 }
 
-async function validateDashboardSession(): Promise<boolean> {
+type AuthenticatedDashboardSession = Extract<
+  DashboardSessionRefreshResult,
+  { status: "authenticated" }
+>;
+
+interface PendingRefreshCookie {
+  requestRefreshToken: string;
+  result: AuthenticatedDashboardSession;
+}
+
+async function validateDashboardSession(
+  onAuthenticated: (pending: PendingRefreshCookie) => void,
+): Promise<boolean> {
   if (isAuthDisabled()) {
     return true;
   }
@@ -71,7 +84,7 @@ async function validateDashboardSession(): Promise<boolean> {
     throw new DashboardSessionUnavailableError();
   }
 
-  cookieStore.set(COOKIE_NAME, result.refreshToken, COOKIE_OPTIONS);
+  onAuthenticated({ requestRefreshToken: refreshToken, result });
   return true;
 }
 
@@ -85,13 +98,32 @@ async function proxy(
   const upstreamPath = params.path.join("/");
   const normalizedPath = `/${upstreamPath}`;
   try {
-    return await proxySidecarRequest(request, normalizedPath, {
+    let pendingRefreshCookie: PendingRefreshCookie | undefined;
+    const response = await proxySidecarRequest(request, normalizedPath, {
       baseUrl: getSidecarBaseUrl(),
       configuredProjectId: getConfiguredProjectId(),
       configuredAppId: getConfiguredAppId(),
-      validateDashboardSession,
+      validateDashboardSession: () =>
+        validateDashboardSession((pending) => {
+          pendingRefreshCookie = pending;
+        }),
       fetchUpstream: fetch,
     });
+    if (
+      pendingRefreshCookie &&
+      dashboardSessionRefreshCoordinator.shouldSetRefreshCookie(
+        pendingRefreshCookie.requestRefreshToken,
+        pendingRefreshCookie.result,
+      )
+    ) {
+      const cookieStore = await cookies();
+      cookieStore.set(
+        COOKIE_NAME,
+        pendingRefreshCookie.result.refreshToken,
+        COOKIE_OPTIONS,
+      );
+    }
+    return response;
   } catch (error) {
     if (error instanceof DashboardSessionUnavailableError) {
       return Response.json(

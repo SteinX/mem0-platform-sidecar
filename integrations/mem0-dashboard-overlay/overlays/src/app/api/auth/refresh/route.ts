@@ -45,7 +45,14 @@ export async function POST() {
     );
   }
 
-  cookieStore.set(COOKIE_NAME, result.refreshToken, COOKIE_OPTIONS);
+  if (
+    dashboardSessionRefreshCoordinator.shouldSetRefreshCookie(
+      refreshToken,
+      result,
+    )
+  ) {
+    cookieStore.set(COOKIE_NAME, result.refreshToken, COOKIE_OPTIONS);
+  }
   return NextResponse.json({ access_token: result.accessToken });
 }
 
