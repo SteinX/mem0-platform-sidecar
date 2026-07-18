@@ -193,6 +193,9 @@ async function testLogoutInvalidatesCompletedSlowResponse(createCoordinator) {
     false,
     "a completed slow response must not restore its successor after logout",
   );
+  assert.deepEqual(await coordinator.refresh("slow-refresh"), {
+    status: "unauthorized",
+  });
 
   const currentCoordinator = createCoordinator({
     refreshUpstream: async () =>
@@ -208,6 +211,36 @@ async function testLogoutInvalidatesCompletedSlowResponse(createCoordinator) {
     false,
     "invalidating the current token must also suppress its pending cookie",
   );
+  assert.deepEqual(await currentCoordinator.refresh("current-refresh"), {
+    status: "unauthorized",
+  });
+}
+
+async function testLogoutInvalidationPropagatesAcrossRotationChain(
+  createCoordinator,
+) {
+  let now = 0;
+  let sequence = 0;
+  const coordinator = createCoordinator({
+    now: () => now,
+    sessionCacheTtlMs: 100,
+    refreshUpstream: async () => {
+      sequence += 1;
+      return Response.json({
+        access_token: `chain-access-${sequence}`,
+        refresh_token: `chain-refresh-${sequence}`,
+      });
+    },
+  });
+
+  await coordinator.refresh("chain-refresh-0");
+  now = 101;
+  await coordinator.refresh("chain-refresh-1");
+  coordinator.invalidateRefreshToken("chain-refresh-0");
+
+  assert.deepEqual(await coordinator.refresh("chain-refresh-2"), {
+    status: "unauthorized",
+  });
 }
 
 async function testUpstreamFailuresAreClassifiedWithoutFalseLogout(
@@ -503,6 +536,7 @@ async function main() {
   await testSupersededRotationCannotOverwriteNewerCookie(createCoordinator);
   await testLogoutInvalidatesInflightRotation(createCoordinator);
   await testLogoutInvalidatesCompletedSlowResponse(createCoordinator);
+  await testLogoutInvalidationPropagatesAcrossRotationChain(createCoordinator);
   await testUpstreamFailuresAreClassifiedWithoutFalseLogout(createCoordinator);
   await testAmbiguousFailureQuarantinesTheToken(createCoordinator);
   await testExpiredEntriesAreSwept(createCoordinator);
@@ -519,7 +553,7 @@ async function main() {
     clientModule.dashboardSessionRetryAction,
   );
   testAxiosRetryMarkerWiring(clientModule.dashboardSessionRequestRetryAction);
-  console.log("dashboard session refresh harness: 15 contracts passed");
+  console.log("dashboard session refresh harness: 16 contracts passed");
 }
 
 main().catch((error) => {

@@ -54,6 +54,8 @@ interface RefreshCookieLease {
 
 interface RefreshTokenGuard {
   invalidated: boolean;
+  refreshToken: string;
+  successors: Set<RefreshTokenGuard>;
 }
 
 const DEFAULT_MAX_CACHE_ENTRIES = 1024;
@@ -118,7 +120,11 @@ export function createDashboardSessionRefreshCoordinator({
       refreshTokenGuards.set(refreshToken, existing);
       return existing;
     }
-    const guard = { invalidated: false };
+    const guard: RefreshTokenGuard = {
+      invalidated: false,
+      refreshToken,
+      successors: new Set(),
+    };
     refreshTokenGuards.set(refreshToken, guard);
     while (refreshTokenGuards.size > tokenGuardLimit) {
       const oldest = refreshTokenGuards.entries().next().value;
@@ -135,6 +141,21 @@ export function createDashboardSessionRefreshCoordinator({
     if (lease) {
       lease.active = false;
       refreshCookieLeases.delete(refreshToken);
+    }
+  }
+
+  function invalidateRefreshTokenGuard(
+    guard: RefreshTokenGuard,
+    visited = new Set<RefreshTokenGuard>(),
+  ) {
+    if (visited.has(guard)) return;
+    visited.add(guard);
+    guard.invalidated = true;
+    sessions.delete(guard.refreshToken);
+    ambiguousTokens.delete(guard.refreshToken);
+    retireRefreshCookieLease(guard.refreshToken);
+    for (const successor of guard.successors) {
+      invalidateRefreshTokenGuard(successor, visited);
     }
   }
 
@@ -258,6 +279,7 @@ export function createDashboardSessionRefreshCoordinator({
     if (requestTokenGuard.invalidated || resultTokenGuard.invalidated) {
       return { status: "unauthorized" };
     }
+    requestTokenGuard.successors.add(resultTokenGuard);
     ambiguousTokens.delete(refreshToken);
     retireRefreshCookieLease(refreshToken);
     const refreshCookieLease = {
@@ -311,10 +333,7 @@ export function createDashboardSessionRefreshCoordinator({
     },
     invalidateRefreshToken(refreshToken: string) {
       const guard = getRefreshTokenGuard(refreshToken);
-      guard.invalidated = true;
-      sessions.delete(refreshToken);
-      ambiguousTokens.delete(refreshToken);
-      retireRefreshCookieLease(refreshToken);
+      invalidateRefreshTokenGuard(guard);
     },
     shouldSetRefreshCookie(
       requestRefreshToken: string,
