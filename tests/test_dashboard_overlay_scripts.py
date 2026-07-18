@@ -1804,6 +1804,16 @@ def test_apply_dashboard_overlay_serializes_rotating_refresh_tokens(tmp_path):
         assert "result.refreshToken" in route_content
         assert "shouldSetRefreshCookie" in route_content
         assert "status: 503" in route_content
+    put_route = auth_route.split("export async function PUT", 1)[1].split(
+        "export async function DELETE", 1
+    )[0]
+    delete_route = auth_route.split("export async function DELETE", 1)[1]
+    assert put_route.index("invalidateRefreshToken") < put_route.index(
+        "cookieStore.set"
+    )
+    assert delete_route.index("invalidateRefreshToken") < delete_route.index(
+        "cookieStore.delete"
+    )
     assert sidecar_route.index("await proxySidecarRequest") < sidecar_route.index(
         "shouldSetRefreshCookie"
     )

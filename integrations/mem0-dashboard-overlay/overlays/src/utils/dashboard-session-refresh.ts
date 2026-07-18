@@ -48,6 +48,12 @@ type AuthenticatedDashboardSessionRefreshResult = Extract<
 
 interface RefreshCookieLease {
   active: boolean;
+  requestTokenGuard: RefreshTokenGuard;
+  resultTokenGuard: RefreshTokenGuard;
+}
+
+interface RefreshTokenGuard {
+  invalidated: boolean;
 }
 
 const DEFAULT_MAX_CACHE_ENTRIES = 1024;
@@ -70,6 +76,7 @@ export function createDashboardSessionRefreshCoordinator({
   const sessions = new Map<string, CachedSession>();
   const inFlight = new Map<string, Promise<DashboardSessionRefreshResult>>();
   const refreshCookieLeases = new Map<string, RefreshCookieLease>();
+  const refreshTokenGuards = new Map<string, RefreshTokenGuard>();
   // Ambiguity history is deliberately per-token, bounded, and expiring. Once
   // a record is evicted or expires, a later upstream 401 is definitive again.
   const ambiguousTokens = new Map<string, number>();
@@ -78,6 +85,7 @@ export function createDashboardSessionRefreshCoordinator({
     RefreshCookieLease
   >();
   const cacheLimit = Math.max(1, maxCacheEntries);
+  const tokenGuardLimit = Math.max(2, cacheLimit * 2);
 
   function pruneExpired() {
     const currentTime = now();
@@ -101,6 +109,25 @@ export function createDashboardSessionRefreshCoordinator({
       if (typeof oldestToken !== "string") break;
       sessions.delete(oldestToken);
     }
+  }
+
+  function getRefreshTokenGuard(refreshToken: string) {
+    const existing = refreshTokenGuards.get(refreshToken);
+    if (existing) {
+      refreshTokenGuards.delete(refreshToken);
+      refreshTokenGuards.set(refreshToken, existing);
+      return existing;
+    }
+    const guard = { invalidated: false };
+    refreshTokenGuards.set(refreshToken, guard);
+    while (refreshTokenGuards.size > tokenGuardLimit) {
+      const oldest = refreshTokenGuards.entries().next().value;
+      if (!oldest) break;
+      const [oldestToken, oldestGuard] = oldest;
+      oldestGuard.invalidated = true;
+      refreshTokenGuards.delete(oldestToken);
+    }
+    return guard;
   }
 
   function retireRefreshCookieLease(refreshToken: string) {
@@ -188,13 +215,20 @@ export function createDashboardSessionRefreshCoordinator({
 
   async function rotate(
     refreshToken: string,
+    requestTokenGuard: RefreshTokenGuard,
   ): Promise<DashboardSessionRefreshResult> {
     let response: Response;
     try {
       response = await refreshWithTimeout(refreshToken);
     } catch {
+      if (requestTokenGuard.invalidated) {
+        return { status: "unauthorized" };
+      }
       quarantineAmbiguousToken(refreshToken);
       return { status: "unavailable" };
+    }
+    if (requestTokenGuard.invalidated) {
+      return { status: "unauthorized" };
     }
     if (!response.ok) {
       if (response.status === 401) {
@@ -220,9 +254,17 @@ export function createDashboardSessionRefreshCoordinator({
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
     };
+    const resultTokenGuard = getRefreshTokenGuard(result.refreshToken);
+    if (requestTokenGuard.invalidated || resultTokenGuard.invalidated) {
+      return { status: "unauthorized" };
+    }
     ambiguousTokens.delete(refreshToken);
     retireRefreshCookieLease(refreshToken);
-    const refreshCookieLease = { active: true };
+    const refreshCookieLease = {
+      active: true,
+      requestTokenGuard,
+      resultTokenGuard,
+    };
     resultRefreshCookieLeases.set(result, refreshCookieLease);
     cacheRefreshCookieLease(result.refreshToken, refreshCookieLease);
     cache(refreshToken, {
@@ -242,6 +284,10 @@ export function createDashboardSessionRefreshCoordinator({
       refreshToken: string,
     ): Promise<DashboardSessionRefreshResult> {
       pruneExpired();
+      const refreshTokenGuard = getRefreshTokenGuard(refreshToken);
+      if (refreshTokenGuard.invalidated) {
+        return { status: "unauthorized" };
+      }
       const cached = sessions.get(refreshToken);
       if (cached?.kind === "authenticated") {
         sessions.delete(refreshToken);
@@ -257,11 +303,18 @@ export function createDashboardSessionRefreshCoordinator({
       if (current) {
         return current;
       }
-      const pending = rotate(refreshToken).finally(() => {
+      const pending = rotate(refreshToken, refreshTokenGuard).finally(() => {
         inFlight.delete(refreshToken);
       });
       inFlight.set(refreshToken, pending);
       return pending;
+    },
+    invalidateRefreshToken(refreshToken: string) {
+      const guard = getRefreshTokenGuard(refreshToken);
+      guard.invalidated = true;
+      sessions.delete(refreshToken);
+      ambiguousTokens.delete(refreshToken);
+      retireRefreshCookieLease(refreshToken);
     },
     shouldSetRefreshCookie(
       requestRefreshToken: string,
@@ -276,6 +329,8 @@ export function createDashboardSessionRefreshCoordinator({
       const lease = resultRefreshCookieLeases.get(result);
       return (
         lease?.active === true &&
+        lease.requestTokenGuard.invalidated === false &&
+        lease.resultTokenGuard.invalidated === false &&
         refreshCookieLeases.get(result.refreshToken) === lease
       );
     },
@@ -285,6 +340,7 @@ export function createDashboardSessionRefreshCoordinator({
         ambiguousEntries: ambiguousTokens.size,
         cachedEntries: sessions.size,
         inFlight: inFlight.size,
+        tokenGuards: refreshTokenGuards.size,
       };
     },
   };

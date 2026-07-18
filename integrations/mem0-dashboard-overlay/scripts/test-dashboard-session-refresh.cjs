@@ -148,6 +148,68 @@ async function testSupersededRotationCannotOverwriteNewerCookie(
   );
 }
 
+async function testLogoutInvalidatesInflightRotation(createCoordinator) {
+  let releaseUpstream;
+  const upstreamGate = new Promise((resolve) => {
+    releaseUpstream = resolve;
+  });
+  const coordinator = createCoordinator({
+    refreshUpstream: async () => {
+      await upstreamGate;
+      return Response.json({
+        access_token: "late-access",
+        refresh_token: "late-refresh",
+      });
+    },
+  });
+
+  const pending = coordinator.refresh("logout-token");
+  await new Promise((resolve) => setImmediate(resolve));
+  coordinator.invalidateRefreshToken("logout-token");
+  releaseUpstream();
+
+  const result = await pending;
+  assert.deepEqual(result, { status: "unauthorized" });
+  assert.equal(
+    coordinator.shouldSetRefreshCookie("logout-token", result),
+    false,
+    "an in-flight rotation must not restore a cookie after logout",
+  );
+}
+
+async function testLogoutInvalidatesCompletedSlowResponse(createCoordinator) {
+  const coordinator = createCoordinator({
+    refreshUpstream: async () =>
+      Response.json({
+        access_token: "slow-access",
+        refresh_token: "slow-refresh",
+      }),
+  });
+
+  const predecessorResult = await coordinator.refresh("predecessor-token");
+  coordinator.invalidateRefreshToken("predecessor-token");
+  assert.equal(
+    coordinator.shouldSetRefreshCookie("predecessor-token", predecessorResult),
+    false,
+    "a completed slow response must not restore its successor after logout",
+  );
+
+  const currentCoordinator = createCoordinator({
+    refreshUpstream: async () =>
+      Response.json({
+        access_token: "current-access",
+        refresh_token: "current-refresh",
+      }),
+  });
+  const currentResult = await currentCoordinator.refresh("current-old");
+  currentCoordinator.invalidateRefreshToken("current-refresh");
+  assert.equal(
+    currentCoordinator.shouldSetRefreshCookie("current-old", currentResult),
+    false,
+    "invalidating the current token must also suppress its pending cookie",
+  );
+}
+
 async function testUpstreamFailuresAreClassifiedWithoutFalseLogout(
   createCoordinator,
 ) {
@@ -274,6 +336,10 @@ async function testCacheIsBoundedAndEvictsOldEntries(createCoordinator) {
     "the oldest cached session must be evicted when the cache is full",
   );
   assert.ok(coordinator.getStats().cachedEntries <= 2);
+  assert.ok(
+    coordinator.getStats().tokenGuards <= 4,
+    "refresh-token invalidation guards must remain bounded",
+  );
 }
 
 async function testAmbiguityHistoryIsBoundedWithoutPoisoningFresh401s(
@@ -435,6 +501,8 @@ async function main() {
     createCoordinator,
   );
   await testSupersededRotationCannotOverwriteNewerCookie(createCoordinator);
+  await testLogoutInvalidatesInflightRotation(createCoordinator);
+  await testLogoutInvalidatesCompletedSlowResponse(createCoordinator);
   await testUpstreamFailuresAreClassifiedWithoutFalseLogout(createCoordinator);
   await testAmbiguousFailureQuarantinesTheToken(createCoordinator);
   await testExpiredEntriesAreSwept(createCoordinator);
@@ -451,7 +519,7 @@ async function main() {
     clientModule.dashboardSessionRetryAction,
   );
   testAxiosRetryMarkerWiring(clientModule.dashboardSessionRequestRetryAction);
-  console.log("dashboard session refresh harness: 13 contracts passed");
+  console.log("dashboard session refresh harness: 15 contracts passed");
 }
 
 main().catch((error) => {
