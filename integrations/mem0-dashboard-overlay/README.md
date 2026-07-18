@@ -56,6 +56,16 @@ The proxy validates the dashboard refresh-token cookie by default.
 an explicitly auth-disabled local Mem0 OSS runtime. It does not authenticate the
 sidecar or make auth-disabled mode suitable for production.
 
+Authenticated refreshes are coordinated across the dashboard auth route and
+the sidecar proxy because Mem0 refresh tokens are single-use and rotate on every
+successful refresh. Concurrent requests share one upstream rotation, the
+current session is cached briefly, and just-consumed tokens are marked stale
+without exposing their successor credentials. Only a definitive upstream
+`401` clears the cookie. Rate limits and other temporary auth-service failures
+return `503`; the dashboard preserves its session and retries instead of
+redirecting to login. The coordinator is process-local, so multi-replica
+deployments require sticky routing or a shared coordination store.
+
 ## Memory Explorer API
 
 The dashboard calls the same-origin `/api/sidecar` proxy. The underlying sidecar

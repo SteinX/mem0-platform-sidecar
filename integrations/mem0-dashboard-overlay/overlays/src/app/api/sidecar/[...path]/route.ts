@@ -1,7 +1,6 @@
 import { cookies } from "next/headers";
 import { NextRequest } from "next/server";
-import { AUTH_ENDPOINTS } from "@/utils/api-endpoints";
-import { getServerApiUrl } from "@/lib/server-api-url";
+import { dashboardSessionRefreshCoordinator } from "@/lib/dashboard-session";
 import { proxySidecarRequest } from "@/utils/sidecar-proxy";
 
 const COOKIE_NAME = "mem0_refresh_token";
@@ -63,31 +62,20 @@ async function validateDashboardSession(): Promise<boolean> {
     return false;
   }
 
-  try {
-    const response = await fetch(
-      `${getServerApiUrl()}${AUTH_ENDPOINTS.REFRESH}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-        cache: "no-store",
-      },
-    );
-
-    if (!response.ok) {
-      cookieStore.delete(COOKIE_NAME);
-      return false;
-    }
-
-    const data = await response.json().catch(() => ({}));
-    if (typeof data.refresh_token === "string") {
-      cookieStore.set(COOKIE_NAME, data.refresh_token, COOKIE_OPTIONS);
-    }
-    return typeof data.access_token === "string";
-  } catch {
+  const result = await dashboardSessionRefreshCoordinator.refresh(refreshToken);
+  if (result.status === "unauthorized") {
+    cookieStore.delete(COOKIE_NAME);
     return false;
   }
+  if (result.status === "unavailable") {
+    throw new DashboardSessionUnavailableError();
+  }
+
+  cookieStore.set(COOKIE_NAME, result.refreshToken, COOKIE_OPTIONS);
+  return true;
 }
+
+class DashboardSessionUnavailableError extends Error {}
 
 async function proxy(
   request: NextRequest,
@@ -96,13 +84,23 @@ async function proxy(
   const params = await context.params;
   const upstreamPath = params.path.join("/");
   const normalizedPath = `/${upstreamPath}`;
-  return proxySidecarRequest(request, normalizedPath, {
-    baseUrl: getSidecarBaseUrl(),
-    configuredProjectId: getConfiguredProjectId(),
-    configuredAppId: getConfiguredAppId(),
-    validateDashboardSession,
-    fetchUpstream: fetch,
-  });
+  try {
+    return await proxySidecarRequest(request, normalizedPath, {
+      baseUrl: getSidecarBaseUrl(),
+      configuredProjectId: getConfiguredProjectId(),
+      configuredAppId: getConfiguredAppId(),
+      validateDashboardSession,
+      fetchUpstream: fetch,
+    });
+  } catch (error) {
+    if (error instanceof DashboardSessionUnavailableError) {
+      return Response.json(
+        { error: "Authentication service temporarily unavailable" },
+        { status: 503 },
+      );
+    }
+    throw error;
+  }
 }
 
 export const GET = proxy;

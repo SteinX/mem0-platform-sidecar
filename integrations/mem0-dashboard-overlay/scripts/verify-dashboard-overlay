@@ -25,6 +25,7 @@ REQUEST_TRACE_DRAWER = (
     "src/app/(root)/dashboard/requests/request-trace-drawer.tsx"
 )
 ENTITIES_PAGE = "src/app/(root)/dashboard/entities/page.tsx"
+DASHBOARD_DOCKERFILE = "Dockerfile"
 SIDECAR_PROXY = "src/utils/sidecar-proxy.ts"
 SIDECAR_ROUTE = "src/app/api/sidecar/[...path]/route.ts"
 DEFAULT_PNPM_PACKAGE = "pnpm@10.34.2"
@@ -64,6 +65,19 @@ def proxy_harness_command(overlay_root: Path, dashboard_dir: Path) -> list[str]:
     return [
         node,
         str(overlay_root / "scripts" / "test-sidecar-proxy.cjs"),
+        str(dashboard_dir),
+    ]
+
+
+def dashboard_session_harness_command(
+    overlay_root: Path, dashboard_dir: Path
+) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-dashboard-session-refresh.cjs"),
         str(dashboard_dir),
     ]
 
@@ -1462,6 +1476,32 @@ def verify_entities_page(dashboard_dir: Path) -> str | None:
     return None
 
 
+def verify_public_api_placeholder(dashboard_dir: Path) -> str | None:
+    dockerfile_path = dashboard_dir / DASHBOARD_DOCKERFILE
+    if not dockerfile_path.is_file():
+        return "Dashboard Dockerfile is missing"
+
+    dockerfile = dockerfile_path.read_text()
+    direct_env = re.search(
+        r"^ENV\s+NEXT_PUBLIC_API_URL=NEXT_PUBLIC_API_URL\s*$",
+        dockerfile,
+        re.MULTILINE,
+    )
+    default_arg = re.search(
+        r"^ARG\s+NEXT_PUBLIC_API_URL=NEXT_PUBLIC_API_URL\s*$",
+        dockerfile,
+        re.MULTILINE,
+    )
+    expanded_env = re.search(
+        r"^ENV\s+NEXT_PUBLIC_API_URL=\$\{NEXT_PUBLIC_API_URL\}\s*$",
+        dockerfile,
+        re.MULTILINE,
+    )
+    if direct_env or (default_arg and expanded_env):
+        return None
+    return "Dashboard Dockerfile must preserve the NEXT_PUBLIC_API_URL placeholder"
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: verify-dashboard-overlay <dashboard-dir>", file=sys.stderr)
@@ -1491,6 +1531,7 @@ def main() -> int:
         verify_proxy_contract(dashboard_dir),
         verify_requests_page(dashboard_dir),
         verify_entities_page(dashboard_dir),
+        verify_public_api_placeholder(dashboard_dir),
     )
     for error in checks:
         if error is not None:
@@ -1504,6 +1545,11 @@ def main() -> int:
         subprocess.run(typecheck_command(dashboard_dir), cwd=dashboard_dir, check=True)
         subprocess.run(
             proxy_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
+        subprocess.run(
+            dashboard_session_harness_command(overlay_root, dashboard_dir),
             cwd=dashboard_dir,
             check=True,
         )

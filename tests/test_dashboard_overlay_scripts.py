@@ -194,6 +194,12 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/config/route.ts",
         "src/app/api/sidecar/[...path]/route.ts",
+        "src/app/api/auth/refresh/route.ts",
+        "src/lib/auth.tsx",
+        "src/lib/dashboard-session.ts",
+        "src/utils/api.ts",
+        "src/utils/dashboard-session-client.ts",
+        "src/utils/dashboard-session-refresh.ts",
         "src/utils/sidecar-project.ts",
         "src/utils/sidecar-api.ts",
         "src/utils/sidecar-proxy.ts",
@@ -1745,8 +1751,142 @@ def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
     assert 'process.env.AUTH_DISABLED?.toLowerCase()' in route_content
     assert "if (isAuthDisabled()) {" in route_content
     assert 'return jsonError("Unauthorized", 401);' in proxy_content
-    assert "AUTH_ENDPOINTS.REFRESH" in route_content
-    assert "getServerApiUrl()" in route_content
+    assert "dashboardSessionRefreshCoordinator.refresh(refreshToken)" in route_content
+    assert 'result.status === "unauthorized"' in route_content
+    assert 'result.status === "unavailable"' in route_content
+
+
+def test_apply_dashboard_overlay_serializes_rotating_refresh_tokens(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    assert "src/utils/dashboard-session-refresh.ts" in manifest["files"]
+    assert "src/lib/dashboard-session.ts" in manifest["files"]
+    assert "src/app/api/auth/refresh/route.ts" in manifest["files"]
+
+    session_content = (dashboard / "src/lib/dashboard-session.ts").read_text()
+    auth_route = (
+        dashboard / "src/app/api/auth/refresh/route.ts"
+    ).read_text()
+    sidecar_route = (
+        dashboard / "src/app/api/sidecar/[...path]/route.ts"
+    ).read_text()
+
+    assert "createDashboardSessionRefreshCoordinator" in session_content
+    assert "globalThis" in session_content
+    for route_content in (auth_route, sidecar_route):
+        assert (
+            "dashboardSessionRefreshCoordinator.refresh(refreshToken)"
+            in route_content
+        )
+        assert 'result.status === "unauthorized"' in route_content
+        assert 'result.status === "unavailable"' in route_content
+        assert "result.refreshToken" in route_content
+        assert "status: 503" in route_content
+
+
+def test_apply_dashboard_overlay_preserves_session_on_transient_refresh_failure(
+    tmp_path,
+):
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    for relative in (
+        "src/lib/auth.tsx",
+        "src/utils/api.ts",
+        "src/utils/dashboard-session-client.ts",
+    ):
+        assert relative in manifest["files"]
+
+    auth_provider = (dashboard / "src/lib/auth.tsx").read_text()
+    api_client = (dashboard / "src/utils/api.ts").read_text()
+    session_client = (
+        dashboard / "src/utils/dashboard-session-client.ts"
+    ).read_text()
+
+    assert "requestDashboardSessionRefresh" in session_client
+    assert 'response.status === 401' in session_client
+    assert 'status: "unavailable"' in session_client
+    assert "scheduleRetry" in auth_provider
+    assert 'result.status === "unauthorized"' in auth_provider
+    assert 'result.status === "unavailable"' in api_client
+    assert 'result.status === "unauthorized"' in api_client
+    assert "__mem0AuthRetry" in api_client
+    assert "dashboardSessionRequestRetryAction" in api_client
+
+
+def test_verify_dashboard_overlay_rejects_missing_public_api_placeholder(
+    tmp_path,
+):
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+    (dashboard / "Dockerfile").write_text(
+        "FROM node:20-alpine\n"
+        "ARG NEXT_PUBLIC_API_URL\n"
+        "ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}\n"
+    )
+
+    apply_result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert apply_result.returncode == 0, apply_result.stderr
+
+    verify_result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "verify-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "MEM0_DASHBOARD_OVERLAY_SKIP_TYPECHECK": "1",
+        },
+    )
+
+    assert verify_result.returncode == 1
+    assert "NEXT_PUBLIC_API_URL placeholder" in verify_result.stderr
 
 
 def test_verify_dashboard_overlay_rejects_locked_pages(tmp_path):
@@ -2572,6 +2712,9 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     assert result.returncode == 0, result.stderr
     harness_args = node_log.read_text().splitlines()
     assert any("test-sidecar-proxy.cjs" in args for args in harness_args)
+    assert any(
+        "test-dashboard-session-refresh.cjs" in args for args in harness_args
+    )
     assert any("test-category-schema.cjs" in args for args in harness_args)
     assert any("test-category-editor-state.cjs" in args for args in harness_args)
     assert any("test-memory-explorer-state.cjs" in args for args in harness_args)
