@@ -64,7 +64,9 @@ without exposing their successor credentials. A response writes a rotated
 cookie only while that rotation remains current, so a slow older response
 cannot overwrite a newer token. Logout and login-time session replacement also
 invalidate both in-flight and completed rotation results before changing the
-cookie. Network, timeout, and malformed-success responses mark that token
+cookie; invalidation follows the rotation chain so an already-emitted successor
+cannot revive the old session. Network, timeout, and malformed-success
+responses mark that token
 ambiguous: retries pause for 10 seconds, then probe again, and a subsequent
 `401` remains retryable for up to five minutes. The
 ambiguity history is process-local, capped at 1024 tokens, and oldest-first
