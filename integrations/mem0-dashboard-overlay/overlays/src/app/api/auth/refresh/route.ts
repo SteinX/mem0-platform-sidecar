@@ -67,12 +67,22 @@ export async function PUT(request: NextRequest) {
     );
   }
 
+  const previousRefreshToken = cookieStore.get(COOKIE_NAME)?.value;
+  if (previousRefreshToken && previousRefreshToken !== body.refresh_token) {
+    dashboardSessionRefreshCoordinator.invalidateRefreshToken(
+      previousRefreshToken,
+    );
+  }
   cookieStore.set(COOKIE_NAME, body.refresh_token, COOKIE_OPTIONS);
   return NextResponse.json({ ok: true });
 }
 
 export async function DELETE() {
   const cookieStore = await cookies();
+  const refreshToken = cookieStore.get(COOKIE_NAME)?.value;
+  if (refreshToken) {
+    dashboardSessionRefreshCoordinator.invalidateRefreshToken(refreshToken);
+  }
   cookieStore.delete(COOKIE_NAME);
   return NextResponse.json({ ok: true });
 }
