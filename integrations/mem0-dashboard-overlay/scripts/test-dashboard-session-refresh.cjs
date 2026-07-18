@@ -243,6 +243,36 @@ async function testLogoutInvalidationPropagatesAcrossRotationChain(
   });
 }
 
+async function testRotationGuardLinksRemainBounded(createCoordinator) {
+  let now = 0;
+  let sequence = 0;
+  const coordinator = createCoordinator({
+    now: () => now,
+    maxCacheEntries: 2,
+    oldTokenGraceMs: 0,
+    sessionCacheTtlMs: 0,
+    refreshUpstream: async () => {
+      sequence += 1;
+      return Response.json({
+        access_token: `branch-access-${sequence}`,
+        refresh_token: `branch-refresh-${sequence}`,
+      });
+    },
+  });
+
+  for (let index = 0; index < 12; index += 1) {
+    now += 1;
+    await coordinator.refresh("hot-root-token");
+  }
+
+  const stats = coordinator.getStats();
+  assert.ok(stats.tokenGuards <= 4);
+  assert.ok(
+    stats.reachableTokenGuards <= 4,
+    "evicted successor guards and raw tokens must not remain reachable from a hot ancestor",
+  );
+}
+
 async function testUpstreamFailuresAreClassifiedWithoutFalseLogout(
   createCoordinator,
 ) {
@@ -537,6 +567,7 @@ async function main() {
   await testLogoutInvalidatesInflightRotation(createCoordinator);
   await testLogoutInvalidatesCompletedSlowResponse(createCoordinator);
   await testLogoutInvalidationPropagatesAcrossRotationChain(createCoordinator);
+  await testRotationGuardLinksRemainBounded(createCoordinator);
   await testUpstreamFailuresAreClassifiedWithoutFalseLogout(createCoordinator);
   await testAmbiguousFailureQuarantinesTheToken(createCoordinator);
   await testExpiredEntriesAreSwept(createCoordinator);
@@ -553,7 +584,7 @@ async function main() {
     clientModule.dashboardSessionRetryAction,
   );
   testAxiosRetryMarkerWiring(clientModule.dashboardSessionRequestRetryAction);
-  console.log("dashboard session refresh harness: 16 contracts passed");
+  console.log("dashboard session refresh harness: 17 contracts passed");
 }
 
 main().catch((error) => {
