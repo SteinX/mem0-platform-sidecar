@@ -23,7 +23,13 @@ from mem0_sidecar.core.memory_ops import (
 from mem0_sidecar.core.mutation_admin import MutationAdminService
 from mem0_sidecar.mem0_client.client import Mem0RestClient
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
-from mem0_sidecar.store.models import Base, Event, EventStatus, MutationIntent
+from mem0_sidecar.store.models import (
+    Base,
+    Event,
+    EventStatus,
+    MemoryIndex,
+    MutationIntent,
+)
 from mem0_sidecar.store.repositories import (
     EventRepository,
     MutationIntentRepository,
@@ -268,6 +274,39 @@ def test_pyproject_exposes_container_management_entrypoint() -> None:
     assert project.get("scripts", {}).get("mem0-sidecar-admin") == (
         "mem0_sidecar.management_cli:entrypoint"
     )
+
+
+def test_cli_runs_one_direct_write_sync_pass(tmp_path) -> None:
+    factory = _session_factory(tmp_path)
+    client = _AdminTestClient()
+    client.records["direct-memory"] = {
+        "id": "direct-memory",
+        "app_id": "source-app",
+        "metadata": {},
+    }
+
+    code, result, error = _run_cli(
+        factory,
+        client,
+        "direct-write-sync",
+        "--once",
+        "--project-id",
+        PROJECT_ID,
+        "--default-app-id",
+        APP_ID,
+        "--scan-limit",
+        "100",
+    )
+
+    assert code == 0
+    assert error == ""
+    assert result["indexed"] == 1
+    with factory() as session:
+        projection = session.query(MemoryIndex).filter_by(
+            project_id=PROJECT_ID,
+            mem0_memory_id="direct-memory",
+        ).one()
+        assert projection.app_id == "source-app"
 
 
 @pytest.mark.asyncio

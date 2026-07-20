@@ -40,6 +40,7 @@ import {
   shouldShowMemoryPagination,
 } from "@/utils/memory-explorer-state";
 import { sidecarQuery } from "@/utils/sidecar-api";
+import { getSidecarProjectConfig } from "@/utils/sidecar-project";
 
 import { MemoryCategories } from "./memory-categories";
 import { MemoryDetailDrawer } from "./memory-detail-drawer";
@@ -89,6 +90,7 @@ export default function MemoriesPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [projectWide, setProjectWide] = useState(false);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const requestGeneration = useRef(0);
   const mountedRef = useRef(true);
@@ -97,6 +99,13 @@ export default function MemoriesPage() {
 
   useEffect(() => {
     mountedRef.current = true;
+    void getSidecarProjectConfig()
+      .then((config) => {
+        if (mountedRef.current) {
+          setProjectWide(config.projectWide);
+        }
+      })
+      .catch(() => undefined);
     return () => {
       mountedRef.current = false;
       requestGeneration.current = nextMemoryRequestGeneration(
@@ -293,7 +302,9 @@ export default function MemoriesPage() {
         <div className="min-w-0 space-y-1">
           <h1 className="font-fustat text-xl font-semibold">Memories</h1>
           <p className="break-words text-sm text-onSurface-default-secondary">
-            Explore, inspect, and update memories stored in this project.
+            {projectWide
+              ? "Showing memories across every app in this project."
+              : "Explore, inspect, and update memories stored in this project."}
           </p>
         </div>
         <Button type="button" variant="outline" disabled={isLoading || isRefreshing} onClick={refresh}>

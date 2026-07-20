@@ -762,6 +762,103 @@ async function testMemoryQueryUsesOnlyConfiguredAppScope(proxy) {
   });
 }
 
+async function testMemoryProjectWideSentinelNeverBecomesLiteralAppScope(proxy) {
+  const calls = [];
+  const options = proxyOptions(
+    async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ results: [] });
+    },
+    { configuredAppId: "*" },
+  );
+
+  const query = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/query?app_id=forged",
+      {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({ app_id: "forged", project_wide: false }),
+      },
+    ),
+    "/v1/memories/query",
+    options,
+  );
+  const detail = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory-one?app_id=forged",
+      { method: "GET" },
+    ),
+    "/v1/memories/memory-one",
+    options,
+  );
+  const history = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory-one/history?app_id=forged",
+      { method: "GET" },
+    ),
+    "/v1/memories/memory-one/history",
+    options,
+  );
+  const patch = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory-one?app_id=forged",
+      {
+        method: "PATCH",
+        headers: jsonHeaders(),
+        body: JSON.stringify({
+          text: "after",
+          app_id: "forged",
+          project_wide: false,
+        }),
+      },
+    ),
+    "/v1/memories/memory-one",
+    options,
+  );
+  const deleted = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/memories/memory-one?app_id=forged",
+      { method: "DELETE" },
+    ),
+    "/v1/memories/memory-one",
+    options,
+  );
+
+  assert.equal(query.status, 200);
+  assert.equal(detail.status, 200);
+  assert.equal(history.status, 200);
+  assert.equal(patch.status, 200);
+  assert.equal(deleted.status, 200);
+  assert.equal(calls.length, 5);
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    project_id: "runtime project",
+    project_wide: true,
+  });
+  assert.equal(
+    calls[1].url,
+    "http://sidecar.internal/v1/memories/memory-one?project_id=runtime+project&project_wide=true",
+  );
+  assert.equal(
+    calls[2].url,
+    "http://sidecar.internal/v1/memories/memory-one/history?project_id=runtime+project&project_wide=true",
+  );
+  assert.equal(
+    calls[3].url,
+    "http://sidecar.internal/v1/memories/memory-one?project_id=runtime+project&project_wide=true",
+  );
+  assert.deepEqual(JSON.parse(calls[3].init.body), {
+    text: "after",
+    project_id: "runtime project",
+    project_wide: true,
+  });
+  assert.equal(
+    calls[4].url,
+    "http://sidecar.internal/v1/memories/memory-one?project_id=runtime+project&project_wide=true",
+  );
+  assert.equal(calls.some((call) => call.url.includes("app_id=%2A")), false);
+}
+
 async function testMemoryQueryRejectsInvalidJson(proxy) {
   let fetchCalled = false;
   const response = await proxy(
@@ -1425,6 +1522,9 @@ async function main() {
   await testEventQueryRejectsInvalidUtf8Json(proxySidecarRequest);
   await testMemoryQueryForcesRuntimeScopeAndPreservesQuery(proxySidecarRequest);
   await testMemoryQueryUsesOnlyConfiguredAppScope(proxySidecarRequest);
+  await testMemoryProjectWideSentinelNeverBecomesLiteralAppScope(
+    proxySidecarRequest,
+  );
   await testMemoryQueryRejectsInvalidJson(proxySidecarRequest);
   await testMemoryQueryRejectsArrayBody(proxySidecarRequest);
   await testMemoryDetailEncodesIdAndForcesRuntimeScope(proxySidecarRequest);
@@ -1458,7 +1558,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 43 contracts passed");
+  console.log("sidecar proxy request harness: 44 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(

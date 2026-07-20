@@ -1,8 +1,13 @@
-let cachedProjectId: string | null = null;
+export type SidecarProjectConfig = {
+  projectId: string;
+  projectWide: boolean;
+};
 
-export async function getSidecarProjectId(): Promise<string> {
-  if (cachedProjectId) {
-    return cachedProjectId;
+let cachedProjectConfig: SidecarProjectConfig | null = null;
+
+export async function getSidecarProjectConfig(): Promise<SidecarProjectConfig> {
+  if (cachedProjectConfig) {
+    return cachedProjectConfig;
   }
 
   const response = await fetch("/api/sidecar/config", {
@@ -11,6 +16,7 @@ export async function getSidecarProjectId(): Promise<string> {
   });
   const data = (await response.json().catch(() => ({}))) as {
     project_id?: unknown;
+    project_wide?: unknown;
   };
   if (
     !response.ok ||
@@ -20,6 +26,13 @@ export async function getSidecarProjectId(): Promise<string> {
     throw new Error("Failed to resolve sidecar project");
   }
 
-  cachedProjectId = data.project_id.trim();
-  return cachedProjectId;
+  cachedProjectConfig = {
+    projectId: data.project_id.trim(),
+    projectWide: data.project_wide === true,
+  };
+  return cachedProjectConfig;
+}
+
+export async function getSidecarProjectId(): Promise<string> {
+  return (await getSidecarProjectConfig()).projectId;
 }

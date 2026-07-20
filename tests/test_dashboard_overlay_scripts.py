@@ -412,6 +412,8 @@ def test_dashboard_overlay_includes_memory_explorer_page_and_drawer_contracts():
         "normalizeMemoryId",
         "shouldShowMemoryPagination",
         "MemoryCategories",
+        "getSidecarProjectConfig",
+        "Showing memories across every app in this project.",
     ):
         assert contract in page_content
 
@@ -1352,6 +1354,7 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
 
     assert "export async function GET()" in config_route_content
     assert "SIDECAR_PROJECT_ID" in config_route_content
+    assert "project_wide" in config_route_content
     assert "export const GET = proxy;" in route_content
     assert "export const POST = proxy;" in route_content
     assert "export async function sidecarGet<T>" in helper_content
@@ -1366,6 +1369,7 @@ def test_apply_dashboard_overlay_copies_sidecar_proxy_and_client_exports(tmp_pat
     assert "response.url" not in helper_content
     assert "export async function proxySidecarRequest(" in proxy_content
     assert "export async function getSidecarProjectId()" in project_helper_content
+    assert "export async function getSidecarProjectConfig()" in project_helper_content
     assert 'fetch("/api/sidecar/config"' in project_helper_content
     assert "NEXT_PUBLIC_MEM0_SIDECAR_PROJECT_ID" not in project_helper_content
     assert "export type SidecarCategory =" in type_content
@@ -1586,7 +1590,7 @@ def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "sidecar proxy request harness: 43 contracts passed" in result.stdout
+    assert "sidecar proxy request harness: 44 contracts passed" in result.stdout
 
 
 def test_sidecar_proxy_harness_rejects_stale_applied_target(tmp_path):
@@ -1692,6 +1696,9 @@ def test_apply_dashboard_overlay_route_restricts_sidecar_paths(tmp_path):
     assert "isMemoryHistoryPath" in proxy_content
     assert "scopedPayload.project_id = configuredProjectId" in proxy_content
     assert "scopedPayload.app_id = configuredAppId" in proxy_content
+    assert 'configuredAppId === "*"' in proxy_content
+    assert "scopedPayload.project_wide = true" in proxy_content
+    assert 'url.searchParams.set("project_wide", "true")' in proxy_content
     assert (
         'method === "DELETE" && /^\\/v1\\/exports\\/[^/]+$/.test(path)'
         not in proxy_content

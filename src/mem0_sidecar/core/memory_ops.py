@@ -126,7 +126,7 @@ def _require_unchanged_memory_projection(
     session: Session,
     *,
     snapshot: _MemoryProjectionSnapshot,
-    app_id: str,
+    app_id: str | None,
 ) -> None:
     try:
         session.expire_all()
@@ -412,7 +412,9 @@ def _normalize_memory_record(
     }
     for field in ("user_id", "agent_id", "app_id", "run_id"):
         value = record.get(field)
-        if value is None and projection is not None:
+        if (
+            value is None or (field == "app_id" and value == "")
+        ) and projection is not None:
             value = getattr(projection, field)
         normalized[field] = value
     for field in ("created_at", "updated_at", "expiration_date"):
@@ -715,6 +717,116 @@ def _effective_request_app_id(
         return project.default_app_id
 
     return project_id
+
+
+def _memory_for_request(
+    session: Session,
+    *,
+    project_id: str,
+    memory_id: str,
+    request_app_id: str | None,
+    project_wide: bool,
+) -> tuple[MemoryIndex | None, str | None]:
+    if project_wide:
+        if request_app_id is not None:
+            raise ValueError("app_id cannot be combined with project_wide")
+        memory = MemoryIndexRepository(session).get_memory(
+            project_id=project_id,
+            mem0_memory_id=memory_id,
+        )
+        return memory, memory.app_id if memory is not None else None
+
+    effective_app_id = _effective_request_app_id(
+        session,
+        project_id=project_id,
+        request_app_id=request_app_id,
+    )
+    memory = MemoryIndexRepository(session).get_memory(
+        project_id=project_id,
+        mem0_memory_id=memory_id,
+        app_id=effective_app_id,
+    )
+    return memory, effective_app_id
+
+
+def _required_projected_app_id(memory: MemoryIndex) -> str:
+    try:
+        return validate_scope_id(memory.app_id, field_name="app_id")
+    except ValueError as exc:
+        raise MutationConflictError(
+            "Indexed memory has no valid app scope"
+        ) from exc
+
+
+def _refresh_affected_projections(
+    session: Session,
+    *,
+    project_id: str,
+    projections: Any,
+) -> None:
+    projections_by_app: dict[str, list[_MemoryProjectionSnapshot]] = {}
+    for projection in projections:
+        _append_affected_projection(projections_by_app, projection)
+    entity_repo = EntityRepository(session)
+    for projected_app_id, app_projections in projections_by_app.items():
+        entity_repo.refresh_affected_memories(
+            project_id,
+            projected_app_id,
+            app_projections,
+        )
+
+
+def _direct_write_app_scope(
+    record: dict[str, Any],
+    *,
+    project_id: str,
+    default_app_id: str,
+) -> tuple[str, str | None]:
+    metadata = _record_metadata(record)
+    has_project_marker = SIDECAR_PROJECT_ID_METADATA_KEY in metadata
+    has_app_marker = SIDECAR_APP_ID_METADATA_KEY in metadata
+    if has_project_marker or has_app_marker:
+        if not has_project_marker or not has_app_marker:
+            return "invalid", None
+        try:
+            marker_project_id = validate_scope_id(
+                metadata[SIDECAR_PROJECT_ID_METADATA_KEY],
+                field_name="project_id",
+            )
+            marker_app_id = validate_scope_id(
+                metadata[SIDECAR_APP_ID_METADATA_KEY],
+                field_name="app_id",
+            )
+        except ValueError:
+            return "invalid", None
+        if marker_project_id != project_id:
+            return "foreign", None
+        return "accepted", marker_app_id
+
+    raw_project_id = record.get("project_id")
+    if raw_project_id is not None:
+        try:
+            normalized_project_id = validate_scope_id(
+                raw_project_id,
+                field_name="project_id",
+            )
+        except ValueError:
+            return "invalid", None
+        if normalized_project_id != project_id:
+            return "foreign", None
+
+    candidate_app_id = record.get("app_id")
+    if candidate_app_id is None or candidate_app_id == "":
+        candidate_app_id = metadata.get("app_id")
+    if candidate_app_id is None or candidate_app_id == "":
+        candidate_app_id = default_app_id
+    try:
+        return (
+            "accepted",
+            validate_scope_id(candidate_app_id, field_name="app_id"),
+        )
+    except ValueError:
+        return "invalid", None
 
 
 def _memory_delete_request(
@@ -1566,9 +1678,15 @@ class MemoryService:
         self,
         *,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
+        project_wide: bool = False,
         query: ExplorerQuery,
     ) -> dict[str, Any]:
+        if project_wide:
+            if app_id is not None:
+                raise ValueError("app_id cannot be combined with project_wide")
+        elif app_id is None:
+            raise ValueError("app_id is required unless project_wide is enabled")
         _require_clean_trace_session(self.session)
         trace_entities = _query_trace_entities(query)
         event_repo = EventRepository(self.session)
@@ -1582,6 +1700,7 @@ class MemoryService:
             request=_query_trace_request(query),
             subject_type="memory",
             correlation_id=get_request_id(),
+            allow_project_scope=project_wide,
         )
         event_id = event.id
         self.session.commit()
@@ -1710,10 +1829,10 @@ class MemoryService:
                         },
                     )
                     if stale_marked:
-                        EntityRepository(self.session).refresh_affected_memories(
-                            project_id,
-                            app_id,
-                            unchanged_stale.values(),
+                        _refresh_affected_projections(
+                            self.session,
+                            project_id=project_id,
+                            projections=unchanged_stale.values(),
                         )
                     if stale_marked != len(unchanged_stale):
                         conflict = (
@@ -1870,18 +1989,15 @@ class MemoryService:
         project_id: str,
         memory_id: str,
         request_app_id: str | None = None,
+        project_wide: bool = False,
     ) -> dict[str, Any]:
         _require_clean_trace_session(self.session)
-        effective_app_id = _effective_request_app_id(
+        memory, effective_app_id = _memory_for_request(
             self.session,
             project_id=project_id,
+            memory_id=memory_id,
             request_app_id=request_app_id,
-        )
-        memory_repo = MemoryIndexRepository(self.session)
-        memory = memory_repo.get_memory(
-            project_id=project_id,
-            mem0_memory_id=memory_id,
-            app_id=effective_app_id,
+            project_wide=project_wide,
         )
         if memory is None:
             self.session.rollback()
@@ -1909,14 +2025,21 @@ class MemoryService:
         project_id: str,
         memory_id: str,
         request_app_id: str | None,
+        project_wide: bool = False,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         patch = _validate_memory_patch(payload)
-        effective_app_id = _effective_request_app_id(
+        memory, effective_app_id = _memory_for_request(
             self.session,
             project_id=project_id,
+            memory_id=memory_id,
             request_app_id=request_app_id,
+            project_wide=project_wide,
         )
+        if memory is None:
+            self.session.rollback()
+            raise KeyError(memory_id)
+        effective_app_id = _required_projected_app_id(memory)
         await self.recover_pending_mutations(
             project_id=project_id,
             app_id=effective_app_id,
@@ -2107,17 +2230,15 @@ class MemoryService:
         project_id: str,
         memory_id: str,
         request_app_id: str | None,
+        project_wide: bool = False,
     ) -> dict[str, Any]:
         _require_clean_trace_session(self.session)
-        effective_app_id = _effective_request_app_id(
+        memory, effective_app_id = _memory_for_request(
             self.session,
             project_id=project_id,
+            memory_id=memory_id,
             request_app_id=request_app_id,
-        )
-        memory = MemoryIndexRepository(self.session).get_memory(
-            project_id=project_id,
-            mem0_memory_id=memory_id,
-            app_id=effective_app_id,
+            project_wide=project_wide,
         )
         if memory is None:
             self.session.rollback()
@@ -2141,6 +2262,197 @@ class MemoryService:
             app_id=effective_app_id,
         )
         return {"results": results}
+
+    async def mirror_direct_writes(
+        self,
+        *,
+        project_id: str,
+        default_app_id: str,
+        scan_limit: int = _RECONCILE_SCAN_LIMIT,
+        legacy_cap: int = 1000,
+    ) -> dict[str, Any]:
+        project_id = validate_scope_id(project_id, field_name="project_id")
+        default_app_id = validate_scope_id(
+            default_app_id,
+            field_name="app_id",
+        )
+        if scan_limit < 1 or scan_limit > _RECONCILE_SCAN_LIMIT:
+            raise ValueError(
+                f"scan_limit must be between 1 and {_RECONCILE_SCAN_LIMIT}"
+            )
+        if legacy_cap < 0 or legacy_cap > _RECONCILE_SCAN_LIMIT:
+            raise ValueError(
+                f"legacy_cap must be between 0 and {_RECONCILE_SCAN_LIMIT}"
+            )
+
+        scan_cutoff = datetime.now(UTC)
+        try:
+            response = await self.mem0.list_memories(
+                {"top_k": scan_limit, "show_expired": True}
+            )
+        except ValueError as exc:
+            raise MemoryUpstreamProtocolError(
+                "Upstream memory list response could not be decoded"
+            ) from exc
+
+        records = _bounded_list_results(response, limit=scan_limit)
+        response_total = response.get("total")
+        if "total" in response and (
+            isinstance(response_total, bool)
+            or not isinstance(response_total, int)
+            or response_total < len(records)
+        ):
+            raise MemoryUpstreamProtocolError(
+                "Upstream list response total is invalid"
+            )
+
+        accepted_records: list[tuple[dict[str, Any], str]] = []
+        accepted_ids: set[str] = set()
+        skipped_foreign = 0
+        skipped_invalid = 0
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                raise MemoryUpstreamProtocolError(
+                    f"Upstream memory record {index} must be an object"
+                )
+            try:
+                normalized = _normalize_memory_record(record)
+            except (MemoryUpstreamProtocolError, TypeError, ValueError) as exc:
+                raise MemoryUpstreamProtocolError(
+                    f"Upstream memory record {index} is malformed"
+                ) from exc
+            status, source_app_id = _direct_write_app_scope(
+                record,
+                project_id=project_id,
+                default_app_id=default_app_id,
+            )
+            if status == "foreign":
+                skipped_foreign += 1
+                continue
+            if status == "invalid" or source_app_id is None:
+                skipped_invalid += 1
+                accepted_ids.add(normalized["id"])
+                continue
+            try:
+                for field_name in ("user_id", "agent_id", "run_id"):
+                    normalized[field_name] = validate_scope_id(
+                        normalized[field_name],
+                        field_name=field_name,
+                        required=False,
+                    )
+            except ValueError:
+                skipped_invalid += 1
+                accepted_ids.add(normalized["id"])
+                continue
+            accepted_records.append((normalized, source_app_id))
+
+        indexed = 0
+        for offset in range(0, len(accepted_records), 200):
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            memory_repo = MemoryIndexRepository(self.session)
+            affected_projections: list[_MemoryProjectionSnapshot] = []
+            for normalized, source_app_id in accepted_records[offset : offset + 200]:
+                memory_id = normalized["id"]
+                existing = memory_repo.get_memory(
+                    project_id=project_id,
+                    mem0_memory_id=memory_id,
+                    include_deleted=True,
+                )
+                if existing is not None and _as_utc(existing.updated_at) > scan_cutoff:
+                    accepted_ids.add(memory_id)
+                    indexed += 1
+                    continue
+                if existing is not None:
+                    affected_projections.append(
+                        _snapshot_memory_projection(existing)
+                    )
+                categories = normalized["categories"]
+                indexed_memory = memory_repo.upsert_memory(
+                    project_id=project_id,
+                    mem0_memory_id=memory_id,
+                    user_id=normalized["user_id"],
+                    agent_id=normalized["agent_id"],
+                    app_id=source_app_id,
+                    run_id=normalized["run_id"],
+                    category=categories[0] if categories else None,
+                    metadata=normalized["metadata"],
+                )
+                affected_projections.append(
+                    _snapshot_memory_projection(indexed_memory)
+                )
+                accepted_ids.add(memory_id)
+                indexed += 1
+            _refresh_affected_projections(
+                self.session,
+                project_id=project_id,
+                projections=affected_projections,
+            )
+            self.session.commit()
+
+        truncated = len(records) >= scan_limit or (
+            isinstance(response_total, int) and response_total > len(records)
+        ) or (
+            response_total is None
+            and 0 < legacy_cap < scan_limit
+            and len(records) == legacy_cap
+        )
+        stale_marked = 0
+        if not truncated:
+            after_created_at: datetime | None = None
+            after_memory_id: str | None = None
+            while True:
+                ProjectRepository(self.session).lock_for_mutation(project_id)
+                memory_repo = MemoryIndexRepository(self.session)
+                candidates = memory_repo.list_reconcile_stale_candidates(
+                    project_id=project_id,
+                    app_id=None,
+                    updated_at_lte=scan_cutoff,
+                    after_created_at=after_created_at,
+                    after_memory_id=after_memory_id,
+                    limit=200,
+                )
+                if not candidates:
+                    self.session.rollback()
+                    break
+                stale_candidates = [
+                    memory
+                    for memory in candidates
+                    if memory.mem0_memory_id not in accepted_ids
+                ]
+                stale_snapshots = [
+                    _snapshot_memory_projection(memory)
+                    for memory in stale_candidates
+                ]
+                stale_marked += memory_repo.mark_stale_if_unchanged(
+                    project_id=project_id,
+                    app_id=None,
+                    mem0_memory_ids=[
+                        memory.mem0_memory_id for memory in stale_candidates
+                    ],
+                    updated_at_lte=scan_cutoff,
+                    expected_updated_at={
+                        memory.mem0_memory_id: memory.updated_at
+                        for memory in stale_candidates
+                    },
+                )
+                _refresh_affected_projections(
+                    self.session,
+                    project_id=project_id,
+                    projections=stale_snapshots,
+                )
+                cursor = candidates[-1]
+                after_created_at = cursor.created_at
+                after_memory_id = cursor.mem0_memory_id
+                self.session.commit()
+
+        return {
+            "scanned": len(records),
+            "indexed": indexed,
+            "skipped_foreign": skipped_foreign,
+            "skipped_invalid": skipped_invalid,
+            "stale_marked": stale_marked,
+            "truncated": truncated,
+        }
 
     async def reconcile_memories(
         self,
@@ -2429,12 +2741,23 @@ class MemoryService:
         project_id: str,
         memory_id: str,
         request_app_id: str | None = None,
+        project_wide: bool = False,
     ) -> dict[str, Any]:
-        effective_app_id = _effective_request_app_id(
+        memory, effective_app_id = _memory_for_request(
             self.session,
             project_id=project_id,
+            memory_id=memory_id,
             request_app_id=request_app_id,
+            project_wide=project_wide,
         )
+        if memory is not None:
+            effective_app_id = _required_projected_app_id(memory)
+        elif effective_app_id is None:
+            effective_app_id = _effective_request_app_id(
+                self.session,
+                project_id=project_id,
+                request_app_id=request_app_id,
+            )
         await self.recover_pending_mutations(
             project_id=project_id,
             app_id=effective_app_id,

@@ -1,3 +1,6 @@
+import asyncio
+from contextlib import asynccontextmanager, suppress
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -14,6 +17,7 @@ from mem0_sidecar.observability import RequestLoggingMiddleware, configure_loggi
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base
 from mem0_sidecar.store.repositories import ProjectRepository
+from mem0_sidecar.workers.direct_write_sync import DirectWriteSyncWorker
 
 
 def create_app(
@@ -53,7 +57,34 @@ def create_app(
             search_path=settings.mem0_search_path,
         )
 
-    app = FastAPI(title="Mem0 Platform Sidecar")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        task = None
+        stop = None
+        if settings.direct_write_sync_enabled:
+            stop = asyncio.Event()
+            worker = DirectWriteSyncWorker(
+                settings=settings,
+                session_factory=session_factory,
+                mem0_client=mem0_client,
+            )
+            task = asyncio.create_task(
+                worker.run_forever(stop),
+                name="mem0-direct-write-sync",
+            )
+            app.state.direct_write_sync_stop = stop
+            app.state.direct_write_sync_task = task
+        try:
+            yield
+        finally:
+            if stop is not None:
+                stop.set()
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    app = FastAPI(title="Mem0 Platform Sidecar", lifespan=lifespan)
     app.state.settings = settings
     app.state.session_factory = session_factory
     app.state.mem0_client = mem0_client

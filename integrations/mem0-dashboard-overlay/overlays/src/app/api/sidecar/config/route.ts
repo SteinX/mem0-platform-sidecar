@@ -7,5 +7,8 @@ function configuredProjectId(): string {
 }
 
 export async function GET() {
-  return Response.json({ project_id: configuredProjectId() });
+  return Response.json({
+    project_id: configuredProjectId(),
+    project_wide: process.env.SIDECAR_APP_ID?.trim() === "*",
+  });
 }
