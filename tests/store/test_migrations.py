@@ -1,4 +1,5 @@
 import importlib
+import logging
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -75,6 +76,18 @@ def _alembic_config(database_url: str) -> Config:
     config.set_main_option("sqlalchemy.url", database_url)
     config.set_main_option("path_separator", "os")
     return config
+
+
+def test_alembic_logging_keeps_existing_application_loggers_enabled(
+    tmp_path,
+) -> None:
+    logger = logging.getLogger("mem0_sidecar.direct_write_sync")
+    logger.disabled = False
+    config = _alembic_config(f"sqlite:///{tmp_path / 'alembic.sqlite3'}")
+
+    command.upgrade(config, "head")
+
+    assert logger.disabled is False
 
 
 class _ThreadLocalMigrationOp:
