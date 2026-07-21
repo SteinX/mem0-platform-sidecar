@@ -27,6 +27,7 @@
     "src/utils/sidecar-proxy.ts",
     "src/utils/category-schema.ts",
     "src/utils/category-editor-state.ts",
+    "src/utils/browser-time.ts",
     "src/utils/explorer-query-state.ts",
     "src/utils/memory-explorer-state.ts",
     "src/utils/request-trace-state.ts",
