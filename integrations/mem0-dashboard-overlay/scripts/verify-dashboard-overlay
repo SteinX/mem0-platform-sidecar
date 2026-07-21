@@ -161,6 +161,19 @@ def request_trace_harness_command(
     ]
 
 
+def browser_time_harness_command(
+    overlay_root: Path, dashboard_dir: Path
+) -> list[str]:
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js is not available on PATH")
+    return [
+        node,
+        str(overlay_root / "scripts" / "test-browser-time.cjs"),
+        str(dashboard_dir),
+    ]
+
+
 def strip_comments(content: str) -> str:
     result: list[str] = []
     index = 0
@@ -1279,6 +1292,18 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
             "onRestoreFocus={restoreRequestFocus}",
             "Requests page must pass focus restoration to the drawer",
         ),
+        (
+            "formatBrowserRelativeTimestamp(value)",
+            "Requests rows must use browser-relative timestamps",
+        ),
+        (
+            "formatBrowserTimelineTick(value)",
+            "Requests timeline must use browser-local timestamps",
+        ),
+        (
+            "formatBrowserLocalTimestamp(String(value))",
+            "Requests timeline tooltip must use browser-local timestamps",
+        ),
     ):
         if contract not in page_content:
             return error
@@ -1345,6 +1370,14 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
         (
             "onRestoreFocus();",
             "Request drawer must invoke the page focus restoration callback",
+        ),
+        (
+            "formatBrowserLocalTimestamp(detail.requested_at)",
+            "Request drawer must use browser-local requested times",
+        ),
+        (
+            "formatBrowserLocalTimestamp(detail.completed_at)",
+            "Request drawer must use browser-local completion times",
         ),
     ):
         if contract not in drawer_content:
@@ -1683,6 +1716,11 @@ def main() -> int:
         )
         subprocess.run(
             request_trace_harness_command(overlay_root, dashboard_dir),
+            cwd=dashboard_dir,
+            check=True,
+        )
+        subprocess.run(
+            browser_time_harness_command(overlay_root, dashboard_dir),
             cwd=dashboard_dir,
             check=True,
         )

@@ -17,6 +17,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/use-toast";
 import type { SidecarTrace } from "@/types/sidecar";
+import { formatBrowserLocalTimestamp } from "@/utils/browser-time";
 import { sidecarGet } from "@/utils/sidecar-api";
 import {
   beginTraceDetailRequest,
@@ -274,11 +275,11 @@ export function RequestTraceDrawer({
                     />
                     <TraceField
                       label="Requested at"
-                      value={formatTimestamp(detail.requested_at)}
+                      value={formatBrowserLocalTimestamp(detail.requested_at)}
                     />
                     <TraceField
                       label="Completed at"
-                      value={formatTimestamp(detail.completed_at)}
+                      value={formatBrowserLocalTimestamp(detail.completed_at)}
                     />
                   </dl>
 
@@ -544,12 +545,4 @@ function formatLatency(value: number | null): string {
   return value === null || !Number.isFinite(value)
     ? "--"
     : `${value.toFixed(2)} ms`;
-}
-
-function formatTimestamp(value: string | null): string {
-  if (value === null) return "--";
-  const date = new Date(value);
-  return Number.isFinite(date.getTime())
-    ? date.toISOString().replace("T", " ").replace(".000Z", " UTC")
-    : value;
 }

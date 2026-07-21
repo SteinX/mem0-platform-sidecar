@@ -29,6 +29,11 @@ import type {
 } from "@/types/dashboard-explorer";
 import type { SidecarTrace, SidecarTracePage } from "@/types/sidecar";
 import {
+  formatBrowserLocalTimestamp,
+  formatBrowserRelativeTimestamp,
+  formatBrowserTimelineTick,
+} from "@/utils/browser-time";
+import {
   createExplorerFilter,
   readExplorerUrlState,
   writeExplorerUrlState,
@@ -498,7 +503,7 @@ export default function RequestsPage() {
                     />
                     <Tooltip
                       labelFormatter={(value) =>
-                        formatTraceTimestamp(String(value))
+                        formatBrowserLocalTimestamp(String(value))
                       }
                     />
                     <Bar
@@ -767,27 +772,22 @@ function formatLatency(value: number | null): string {
 }
 
 function TraceTime({ value }: { value: string | null }) {
-  return value === null ? (
-    <span className="text-onSurface-default-tertiary">Unknown</span>
-  ) : (
-    <time dateTime={value} title={formatTraceTimestamp(value)}>
-      {formatTraceTimestamp(value)}
+  if (value === null) {
+    return <span className="text-onSurface-default-tertiary">Unknown</span>;
+  }
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    return <span title={value}>{value}</span>;
+  }
+  return (
+    <time dateTime={value} title={formatBrowserLocalTimestamp(value)}>
+      {formatBrowserRelativeTimestamp(value)}
     </time>
   );
 }
 
-function formatTraceTimestamp(value: string): string {
-  const date = new Date(value);
-  return Number.isFinite(date.getTime())
-    ? date.toISOString().replace("T", " ").replace(".000Z", " UTC")
-    : value;
-}
-
 function formatTimelineTick(value: string): string {
-  const date = new Date(value);
-  return Number.isFinite(date.getTime())
-    ? date.toISOString().slice(5, 16).replace("T", " ")
-    : value;
+  return formatBrowserTimelineTick(value);
 }
 
 function timelineSummary(page: SidecarTracePage): string {

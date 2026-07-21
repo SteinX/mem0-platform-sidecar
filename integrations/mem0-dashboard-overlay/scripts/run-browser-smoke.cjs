@@ -490,6 +490,12 @@ async function main() {
       deviceScaleFactor: 1,
       mobile: false,
     });
+    await cdp.send("Emulation.setTimezoneOverride", {
+      timezoneId: "America/Los_Angeles",
+    });
+    await cdp.send("Emulation.setLocaleOverride", {
+      locale: "en-US",
+    });
 
     const evaluate = async (expression) => {
       const response = await cdp.send("Runtime.evaluate", {
@@ -699,6 +705,52 @@ async function main() {
     );
     check(replacementIsCurrent, "deferred request replaced the newer result");
 
+    const expectedRequestTimestamp = "7/13/2026, 5:00:00 AM";
+    const requestListTime = await evaluate(`(() => {
+      const timestamp = '2026-07-13T12:00:00Z';
+      const values = [...document.querySelectorAll('time')]
+        .filter((item) => item.getAttribute('datetime') === timestamp);
+      return {
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        titles: values.map((item) => item.getAttribute('title')),
+        labels: values.map((item) => item.textContent.trim()),
+      };
+    })()`);
+    check(
+      requestListTime.timezone === "America/Los_Angeles" &&
+        requestListTime.titles.length > 0 &&
+        requestListTime.titles.every(
+          (value) => value === expectedRequestTimestamp,
+        ) &&
+        requestListTime.labels.every((value) => value.endsWith("days ago")),
+      `request list used browser-local relative time: ${JSON.stringify(requestListTime)}`,
+    );
+
+    const timelineLabels = await evaluate(`
+      [...document.querySelectorAll('.recharts-xAxis .recharts-cartesian-axis-tick-value')]
+        .map((item) => item.textContent.trim())
+    `);
+    check(
+      timelineLabels.includes("Jul 13, 05:00 AM"),
+      `request timeline used browser-local time: ${JSON.stringify(timelineLabels)}`,
+    );
+
+    const barPoint = await evaluate(`(() => {
+      const bar = document.querySelector('.recharts-bar-rectangle path, .recharts-bar-rectangle');
+      const rect = bar?.getBoundingClientRect();
+      return rect && rect.width > 0 && rect.height > 0
+        ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+        : null;
+    })()`);
+    check(barPoint !== null, "request timeline bar was not rendered");
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: barPoint.x,
+      y: barPoint.y,
+    });
+    await waitText(expectedRequestTimestamp);
+    check(true, "request tooltip used browser-local time");
+
     const openerPrepared = await evaluate(`(() => {
       const target = document.querySelector('[aria-label^="Open request trace-add"]');
       if (!target) return false;
@@ -726,6 +778,22 @@ async function main() {
     check(true, "keyboard activation opened the request drawer");
     await waitText("browser-smoke-detail-query-from-response");
     check(true, "request drawer loaded response-derived detail content");
+    const requestDrawerTimes = await evaluate(`(() => {
+      const dialog = [...document.querySelectorAll('[role="dialog"]')].find(
+        (item) => item.innerText.includes('Inspect the sanitized request payload')
+      );
+      return Object.fromEntries(
+        [...(dialog?.querySelectorAll('dt') || [])].map((label) => [
+          label.textContent.trim(),
+          label.parentElement?.querySelector('dd')?.textContent.trim() || null,
+        ])
+      );
+    })()`);
+    check(
+      requestDrawerTimes["Requested at"] === expectedRequestTimestamp &&
+        requestDrawerTimes["Completed at"] === expectedRequestTimestamp,
+      `request drawer used browser-local time: ${JSON.stringify(requestDrawerTimes)}`,
+    );
     await clickButton("Close");
     await waitFor(
       `document.activeElement?.dataset?.smokeOpener === 'true'`,

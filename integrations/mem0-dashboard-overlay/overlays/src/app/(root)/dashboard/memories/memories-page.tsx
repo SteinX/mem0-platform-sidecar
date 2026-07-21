@@ -26,6 +26,10 @@ import type {
   ExplorerQueryPayload,
 } from "@/types/dashboard-explorer";
 import type { SidecarMemory, SidecarMemoryPage } from "@/types/sidecar";
+import {
+  formatBrowserLocalTimestamp,
+  formatBrowserRelativeTimestamp,
+} from "@/utils/browser-time";
 import { createExplorerFilter, readExplorerUrlState, writeExplorerUrlState } from "@/utils/explorer-query-state";
 import {
   closeMemoryUrl,
@@ -427,13 +431,9 @@ function MemoryTime({ value }: { value: string | null }) {
   if (!Number.isFinite(date.getTime())) {
     return <span title={value}>{value}</span>;
   }
-  const difference = date.getTime() - Date.now();
-  const absoluteDifference = Math.abs(difference);
-  const [amount, unit] = absoluteDifference < 60 * 60 * 1000
-    ? [Math.round(difference / (60 * 1000)), "minute" as const]
-    : absoluteDifference < 24 * 60 * 60 * 1000
-      ? [Math.round(difference / (60 * 60 * 1000)), "hour" as const]
-      : [Math.round(difference / (24 * 60 * 60 * 1000)), "day" as const];
-  const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" }).format(amount, unit);
-  return <time dateTime={value} title={date.toLocaleString()}>{relative}</time>;
+  return (
+    <time dateTime={value} title={formatBrowserLocalTimestamp(value)}>
+      {formatBrowserRelativeTimestamp(value)}
+    </time>
+  );
 }

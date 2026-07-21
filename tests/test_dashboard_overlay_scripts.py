@@ -210,6 +210,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/utils/sidecar-proxy.ts",
         "src/utils/category-schema.ts",
         "src/utils/category-editor-state.ts",
+        "src/utils/browser-time.ts",
         "src/utils/explorer-query-state.ts",
         "src/utils/memory-explorer-state.ts",
         "src/utils/request-trace-state.ts",
@@ -598,6 +599,34 @@ def test_dashboard_overlay_includes_request_trace_page_and_drawer_contracts():
         assert contract in drawer_content
 
     assert (OVERLAY / "scripts/test-request-trace-state.cjs").is_file()
+
+
+def test_dashboard_overlay_uses_browser_local_request_times():
+    manifest = json.loads((OVERLAY / "manifest.json").read_text())
+    time_path = "src/utils/browser-time.ts"
+    assert time_path in manifest["files"]
+    assert (OVERLAY / "overlays" / time_path).is_file()
+    assert (OVERLAY / "scripts/test-browser-time.cjs").is_file()
+
+    page = (
+        OVERLAY / "overlays/src/app/(root)/dashboard/requests/page.tsx"
+    ).read_text()
+    drawer = (
+        OVERLAY
+        / "overlays/src/app/(root)/dashboard/requests/request-trace-drawer.tsx"
+    ).read_text()
+    memories = (
+        OVERLAY / "overlays/src/app/(root)/dashboard/memories/memories-page.tsx"
+    ).read_text()
+
+    assert "formatBrowserRelativeTimestamp(value)" in page
+    assert "formatBrowserTimelineTick(value)" in page
+    assert "formatBrowserLocalTimestamp(String(value))" in page
+    assert "formatBrowserLocalTimestamp(detail.requested_at)" in drawer
+    assert "formatBrowserLocalTimestamp(detail.completed_at)" in drawer
+    assert "formatBrowserRelativeTimestamp(value)" in memories
+    assert "toISOString()" not in page
+    assert "toISOString()" not in drawer
 
 
 def test_dashboard_overlay_includes_entity_explorer_contracts():
@@ -2802,6 +2831,7 @@ def test_verify_dashboard_overlay_runs_typecheck_when_unlocked(tmp_path):
     assert any("test-category-schema.cjs" in args for args in harness_args)
     assert any("test-category-editor-state.cjs" in args for args in harness_args)
     assert any("test-memory-explorer-state.cjs" in args for args in harness_args)
+    assert any("test-browser-time.cjs" in args for args in harness_args)
     assert all(args.endswith(str(dashboard)) for args in harness_args)
 
 

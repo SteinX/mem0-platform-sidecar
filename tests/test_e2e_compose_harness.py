@@ -138,6 +138,20 @@ def test_browser_smoke_requires_response_detail_and_zero_browser_errors() -> Non
         assert zero_error_gate in browser_smoke
 
 
+def test_browser_smoke_verifies_browser_local_request_times() -> None:
+    browser_smoke = MOCKED_BROWSER_SMOKE.read_text()
+
+    for contract in (
+        'timezoneId: "America/Los_Angeles"',
+        'locale: "en-US"',
+        "request list used browser-local relative time",
+        "request timeline used browser-local time",
+        "request tooltip used browser-local time",
+        "request drawer used browser-local time",
+    ):
+        assert contract in browser_smoke
+
+
 def test_browser_smoke_retains_opaque_memory_id_action_matrix() -> None:
     browser_smoke = MOCKED_BROWSER_SMOKE.read_text()
 
