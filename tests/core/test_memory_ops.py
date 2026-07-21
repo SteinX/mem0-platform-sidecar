@@ -1470,6 +1470,106 @@ async def test_query_memory_rejects_partial_invalid_or_cross_scope_metadata_mark
 
 
 @pytest.mark.asyncio
+async def test_query_memories_project_wide_preserves_each_projected_app(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-app-a", app_id="app-a")
+    _index_memory(db_session, "mem-app-b", app_id="app-b")
+    db_session.commit()
+    mem0 = ExplorerMem0Client(
+        {
+            "mem-app-a": {
+                "id": "mem-app-a",
+                "memory": "from app a",
+                "user_id": "root",
+                "agent_id": "codex",
+                "app_id": "app-a",
+                "run_id": "run-1",
+                "metadata": {},
+            },
+            "mem-app-b": {
+                "id": "mem-app-b",
+                "memory": "from app b",
+                "user_id": "root",
+                "agent_id": "codex",
+                "app_id": "app-b",
+                "run_id": "run-1",
+                "metadata": {},
+            },
+        }
+    )
+
+    result = await MemoryService(session=db_session, mem0=mem0).query_memories(
+        project_id="repo-a",
+        app_id=None,
+        project_wide=True,
+        query=_explorer_query(),
+    )
+
+    assert [(item["id"], item["app_id"]) for item in result["results"]] == [
+        ("mem-app-a", "app-a"),
+        ("mem-app-b", "app-b"),
+    ]
+    assert result["total"] == 2
+    events = EventRepository(db_session).list_project_events("repo-a")
+    assert len(events) == 1
+    assert events[0].app_id is None
+
+
+@pytest.mark.asyncio
+async def test_project_wide_get_and_update_use_the_memory_projected_app(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "mem-app-b", app_id="app-b")
+    db_session.commit()
+    mem0 = ExplorerMem0Client(
+        {
+            "mem-app-b": {
+                "id": "mem-app-b",
+                "memory": "before",
+                "user_id": "root",
+                "agent_id": "codex",
+                "app_id": "app-b",
+                "run_id": "run-1",
+                "metadata": {},
+            }
+        }
+    )
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    fetched = await service.get_memory(
+        project_id="repo-a",
+        memory_id="mem-app-b",
+        project_wide=True,
+    )
+    updated = await service.update_memory(
+        project_id="repo-a",
+        memory_id="mem-app-b",
+        request_app_id=None,
+        project_wide=True,
+        payload={"text": "after", "metadata": {"type": "decision"}},
+    )
+
+    assert fetched["app_id"] == "app-b"
+    assert updated["memory"]["memory"] == "after"
+    assert mem0.update_calls == [
+        (
+            "mem-app-b",
+            {
+                "text": "after",
+                "metadata": {
+                    "type": "decision",
+                    SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+                    SIDECAR_APP_ID_METADATA_KEY: "app-b",
+                },
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_query_memory_failure_persists_one_event_and_discards_partial_stale(
     db_session,
     monkeypatch,
@@ -1813,6 +1913,255 @@ async def test_reconcile_imports_only_matching_scope_and_marks_absent_stale(
         )
         is not None
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_write_mirror_preserves_source_app_identity_and_repairs_scope(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "raw-app", app_id="wrong-default")
+    db_session.commit()
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [
+            {
+                "id": "marked",
+                "user_id": "root",
+                "metadata": {
+                    SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+                    SIDECAR_APP_ID_METADATA_KEY: "marked-app",
+                },
+            },
+            {"id": "raw-app", "app_id": "raw-source", "metadata": {}},
+            {"id": "metadata-app", "metadata": {"app_id": "metadata-source"}},
+            {
+                "id": "blank-raw-app",
+                "app_id": "",
+                "metadata": {"app_id": "metadata-after-blank"},
+            },
+            {
+                "id": "blank-app-fallback",
+                "app_id": "",
+                "metadata": {"app_id": ""},
+            },
+            {"id": "fallback", "metadata": {}},
+            {
+                "id": "foreign",
+                "metadata": {
+                    SIDECAR_PROJECT_ID_METADATA_KEY: "repo-b",
+                    SIDECAR_APP_ID_METADATA_KEY: "foreign-app",
+                },
+            },
+            {
+                "id": "partial-marker",
+                "metadata": {SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a"},
+            },
+        ],
+        "total": 8,
+    }
+
+    result = await MemoryService(
+        session=db_session,
+        mem0=mem0,
+    ).mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="default-app",
+        scan_limit=100,
+    )
+
+    assert result == {
+        "scanned": 8,
+        "indexed": 6,
+        "skipped_foreign": 1,
+        "skipped_invalid": 1,
+        "stale_marked": 0,
+        "truncated": False,
+    }
+    assert mem0.list_calls == [{"top_k": 100, "show_expired": True}]
+    expected_apps = {
+        "marked": "marked-app",
+        "raw-app": "raw-source",
+        "metadata-app": "metadata-source",
+        "blank-raw-app": "metadata-after-blank",
+        "blank-app-fallback": "default-app",
+        "fallback": "default-app",
+    }
+    for memory_id, app_id in expected_apps.items():
+        projection = MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id=memory_id,
+            app_id=app_id,
+        )
+        assert projection is not None
+    assert (
+        MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="raw-app",
+            app_id="wrong-default",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_write_mirror_blank_app_fallback_hydrates_and_rejects_falsey(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    records = {
+        "blank-metadata": {
+            "id": "blank-metadata",
+            "app_id": "",
+            "metadata": {"app_id": "metadata-app"},
+        },
+        "blank-default": {
+            "id": "blank-default",
+            "app_id": "",
+            "metadata": {"app_id": ""},
+        },
+        "false-app": {"id": "false-app", "app_id": False, "metadata": {}},
+        "list-app": {"id": "list-app", "app_id": [], "metadata": {}},
+    }
+    mem0 = ExplorerMem0Client(records)
+    mem0.list_response = {"results": list(records.values()), "total": 4}
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    mirrored = await service.mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="default-app",
+        scan_limit=100,
+    )
+    listed = await service.query_memories(
+        project_id="repo-a",
+        app_id=None,
+        project_wide=True,
+        query=_explorer_query(),
+    )
+
+    assert mirrored == {
+        "scanned": 4,
+        "indexed": 2,
+        "skipped_foreign": 0,
+        "skipped_invalid": 2,
+        "stale_marked": 0,
+        "truncated": False,
+    }
+    assert sorted(
+        (memory["id"], memory["app_id"]) for memory in listed["results"]
+    ) == [
+        ("blank-default", "default-app"),
+        ("blank-metadata", "metadata-app"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_direct_write_mirror_never_marks_stale_after_truncated_scan(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "must-remain", app_id="app-a")
+    db_session.commit()
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [
+            {"id": "seen-a", "app_id": "app-a", "metadata": {}},
+            {"id": "seen-b", "app_id": "app-b", "metadata": {}},
+        ],
+        "total": 3,
+    }
+
+    result = await MemoryService(
+        session=db_session,
+        mem0=mem0,
+    ).mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="default-app",
+        scan_limit=2,
+    )
+
+    assert result["truncated"] is True
+    assert result["stale_marked"] == 0
+    assert (
+        MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="must-remain",
+            app_id="app-a",
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_write_mirror_treats_legacy_cap_as_incomplete_without_total(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "must-remain", app_id="app-a")
+    db_session.commit()
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [
+            {"id": f"seen-{index}", "app_id": "app-a", "metadata": {}}
+            for index in range(3)
+        ]
+    }
+
+    result = await MemoryService(
+        session=db_session,
+        mem0=mem0,
+    ).mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="default-app",
+        scan_limit=5,
+        legacy_cap=3,
+    )
+
+    assert result["truncated"] is True
+    assert result["stale_marked"] == 0
+    assert (
+        MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id="must-remain",
+            app_id="app-a",
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_write_mirror_complete_scan_stales_missing_across_apps(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    _index_memory(db_session, "keep", app_id="app-a")
+    _index_memory(db_session, "stale-a", app_id="app-a")
+    _index_memory(db_session, "stale-b", app_id="app-b")
+    db_session.commit()
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {
+        "results": [{"id": "keep", "app_id": "app-a", "metadata": {}}],
+        "total": 1,
+    }
+
+    result = await MemoryService(
+        session=db_session,
+        mem0=mem0,
+    ).mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="default-app",
+        scan_limit=100,
+    )
+
+    assert result["truncated"] is False
+    assert result["stale_marked"] == 2
+    for memory_id in ("stale-a", "stale-b"):
+        projection = MemoryIndexRepository(db_session).get_memory(
+            project_id="repo-a",
+            mem0_memory_id=memory_id,
+            include_deleted=True,
+        )
+        assert projection is not None and projection.deleted_at is not None
 
 
 @pytest.mark.asyncio

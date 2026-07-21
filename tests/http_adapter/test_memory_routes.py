@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -205,6 +206,33 @@ def _raw_http_request(
     head, _, response_body = bytes(response).partition(b"\r\n\r\n")
     status = int(head.split(b"\r\n", 1)[0].split()[1])
     return status, response_body
+
+
+@contextmanager
+def _live_app_server(app):
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, log_level="error", lifespan="off")
+    )
+    server_thread = threading.Thread(
+        target=server.run,
+        kwargs={"sockets": [listener]},
+        daemon=True,
+    )
+    server_thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started
+    try:
+        yield port
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=5)
+        assert not server_thread.is_alive()
 
 
 def test_memory_routes_round_trip_with_fake_upstream(tmp_path) -> None:
@@ -1190,6 +1218,123 @@ def test_query_memories_uses_body_scope_and_returns_public_envelope(
     }
     assert mem0.get_memory_ids == ["mem-1"]
     assert transaction_states == [False]
+
+
+def test_project_wide_memory_routes_do_not_collapse_to_default_app(
+    tmp_path,
+) -> None:
+    records = {
+        "mem-app-a": {
+            "id": "mem-app-a",
+            "memory": "from app a",
+            "user_id": "root",
+            "agent_id": "codex",
+            "app_id": "app-a",
+            "run_id": "run-1",
+            "metadata": {},
+        },
+        "mem-app-b": {
+            "id": "mem-app-b",
+            "memory": "from app b",
+            "user_id": "root",
+            "agent_id": "codex",
+            "app_id": "app-b",
+            "run_id": "run-1",
+            "metadata": {},
+        },
+    }
+    mem0 = ExplorerRouteMem0Client(records)
+    mem0.history_response = {"history": [{"event": "ADD"}]}
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=mem0,
+    )
+    _index_route_memory(app, "mem-app-a", app_id="app-a")
+    _index_route_memory(app, "mem-app-b", app_id="app-b")
+    with _live_app_server(app) as port:
+        listed_status, listed_body = _raw_http_request(
+            port,
+            "/v1/memories/query",
+            method="POST",
+            body=json.dumps(
+                {"project_id": "repo-a", "project_wide": True}
+            ).encode(),
+        )
+        fetched_status, fetched_body = _raw_http_request(
+            port,
+            "/v1/memories/mem-app-b?project_id=repo-a&project_wide=true",
+        )
+        history_status, history_body = _raw_http_request(
+            port,
+            "/v1/memories/mem-app-b/history?project_id=repo-a&project_wide=true",
+        )
+        updated_status, updated_body = _raw_http_request(
+            port,
+            "/v1/memories/mem-app-b?project_id=repo-a&project_wide=true",
+            method="PATCH",
+            body=json.dumps({"text": "updated app b"}).encode(),
+        )
+        deleted_status, deleted_body = _raw_http_request(
+            port,
+            "/v1/memories/mem-app-b?project_id=repo-a&project_wide=true",
+            method="DELETE",
+        )
+
+    listed = json.loads(listed_body)
+    fetched = json.loads(fetched_body)
+    history = json.loads(history_body)
+    updated = json.loads(updated_body)
+    deleted = json.loads(deleted_body)
+    assert listed_status == 200
+    assert sorted(
+        (item["id"], item["app_id"]) for item in listed["results"]
+    ) == [
+        ("mem-app-a", "app-a"),
+        ("mem-app-b", "app-b"),
+    ]
+    assert fetched_status == 200
+    assert fetched["app_id"] == "app-b"
+    assert history_status == 200
+    assert history == {"results": [{"event": "ADD"}]}
+    assert updated_status == 200
+    assert updated["memory"]["memory"] == "updated app b"
+    assert deleted_status == 200
+    assert deleted["memory"]["message"] == "Deleted mem-app-b"
+    assert mem0.history_calls == ["mem-app-b"]
+    assert mem0.deleted_ids == ["mem-app-b"]
+
+
+def test_project_wide_memory_route_rejects_explicit_app_scope(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+        ),
+        mem0_client=ExplorerRouteMem0Client(),
+    )
+    with _live_app_server(app) as port:
+        status, body = _raw_http_request(
+            port,
+            "/v1/memories/query",
+            method="POST",
+            body=json.dumps(
+                {
+                    "project_id": "repo-a",
+                    "app_id": "app-a",
+                    "project_wide": True,
+                }
+            ).encode(),
+        )
+
+    assert status == 422
+    assert json.loads(body)["detail"] == (
+        "app_id cannot be combined with project_wide"
+    )
 
 
 def test_query_memories_uses_existing_project_default_app_when_omitted(

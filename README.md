@@ -304,6 +304,11 @@ prefix. `.env.example` is the deployment starting point.
 | `MEM0_SIDECAR_MEM0_VERIFY_TLS` | `true` | Verify TLS certificates for HTTPS upstreams. |
 | `MEM0_SIDECAR_MEM0_CA_BUNDLE` | unset | Optional CA bundle path for private CAs. |
 | `MEM0_SIDECAR_DEFAULT_PROJECT_ID` | `default` | Fallback project when neither `project_id` nor `app_id` is provided. |
+| `MEM0_SIDECAR_DIRECT_WRITE_SYNC_ENABLED` | `false` | Periodically mirror direct Mem0 OSS writes into the sidecar index. Prefer routing writers through the sidecar and enable this as a compatibility safety net. |
+| `MEM0_SIDECAR_DIRECT_WRITE_SYNC_INTERVAL_SECONDS` | `60` | Delay between bounded mirror passes. |
+| `MEM0_SIDECAR_DIRECT_WRITE_SYNC_SCAN_LIMIT` | `5000` | Maximum upstream rows inspected per pass. A full window is treated as truncated and never triggers stale cleanup. |
+| `MEM0_SIDECAR_DIRECT_WRITE_SYNC_LEGACY_CAP` | `1000` | Treat an exact cap-sized response without a total as incomplete. Set `0` only when the upstream has no silent legacy cap. |
+| `MEM0_SIDECAR_DIRECT_WRITE_SYNC_DEFAULT_APP_ID` | `default` | Fallback app only for unmarked records with no top-level or metadata `app_id`. |
 | `MEM0_SIDECAR_WORKER_POLL_INTERVAL_SECONDS` | `1` | Reserved for the worker runner. |
 | `MEM0_SIDECAR_LOG_LEVEL` | `INFO` | Python logging level. |
 | `MEM0_SIDECAR_LOG_FORMAT` | `text` | Use `json` for container logs. |
@@ -331,6 +336,21 @@ MEM0_SIDECAR_MEM0_EXTRA_HEADERS='{"X-Mem0-Org":"org-1"}'
 - `/readyz` checks that the sidecar database can execute a simple query.
 - Every request receives or propagates the configured request ID header.
 - Set `MEM0_SIDECAR_LOG_FORMAT=json` for structured request logs in Docker.
+
+Run one bounded compatibility backfill inside the sidecar container with:
+
+```bash
+mem0-sidecar-admin direct-write-sync --once \
+  --project-id default \
+  --default-app-id default \
+  --scan-limit 5000 \
+  --legacy-cap 1000
+```
+
+Scope precedence is deterministic: complete sidecar project/app markers,
+top-level `app_id`, metadata `app_id`, then the configured fallback. Foreign
+project markers are skipped. Incomplete scans import visible rows but never
+mark unseen projections stale.
 - Upstream Mem0 OSS calls emit structured success/failure logs with method,
   path, status code, latency, and request ID.
 

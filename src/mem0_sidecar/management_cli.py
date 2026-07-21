@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Any, TextIO
 
 from mem0_sidecar.config import SidecarSettings, load_settings
+from mem0_sidecar.core.memory_ops import MemoryService
 from mem0_sidecar.core.mutation_admin import MutationAdminError, MutationAdminService
 from mem0_sidecar.mem0_client.client import Mem0RestClient
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
@@ -43,6 +44,21 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         required=True,
     )
+
+    direct_write_sync = commands.add_parser("direct-write-sync")
+    direct_write_sync.add_argument("--once", action="store_true", required=True)
+    direct_write_sync.add_argument("--project-id", required=True)
+    direct_write_sync.add_argument("--default-app-id", required=True)
+    direct_write_sync.add_argument(
+        "--scan-limit",
+        type=int,
+        default=5000,
+    )
+    direct_write_sync.add_argument(
+        "--legacy-cap",
+        type=int,
+        default=1000,
+    )
     return parser
 
 
@@ -69,8 +85,18 @@ async def _execute(
     mem0_client: Any,
 ) -> dict[str, Any]:
     with session_factory() as session:
-        service = MutationAdminService(session=session, mem0=mem0_client)
         try:
+            if arguments.resource == "direct-write-sync":
+                return await MemoryService(
+                    session=session,
+                    mem0=mem0_client,
+                ).mirror_direct_writes(
+                    project_id=arguments.project_id,
+                    default_app_id=arguments.default_app_id,
+                    scan_limit=arguments.scan_limit,
+                    legacy_cap=arguments.legacy_cap,
+                )
+            service = MutationAdminService(session=session, mem0=mem0_client)
             if arguments.action == "list":
                 return service.list_blocking(
                     project_id=arguments.project_id,

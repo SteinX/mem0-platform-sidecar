@@ -23,6 +23,11 @@ class SidecarSettings(BaseSettings):
         default=False,
         validation_alias="MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED",
     )
+    direct_write_sync_enabled: bool = Field(default=False)
+    direct_write_sync_interval_seconds: float = Field(default=60.0, ge=1.0)
+    direct_write_sync_scan_limit: int = Field(default=5000, ge=1, le=5000)
+    direct_write_sync_legacy_cap: int = Field(default=1000, ge=0, le=5000)
+    direct_write_sync_default_app_id: str = Field(default="default")
     worker_poll_interval_seconds: float = Field(default=1.0, ge=0.1)
     log_level: str = Field(default="INFO")
     log_format: Literal["text", "json"] = Field(default="text")

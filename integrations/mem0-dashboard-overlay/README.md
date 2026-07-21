@@ -38,6 +38,8 @@ SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
 SIDECAR_PROJECT_ID=default
 # Optional: pin Memory, Request Trace, and Entity Explorers to one app.
 SIDECAR_APP_ID=default
+# Or show every app in the project's Memory Explorer without inventing an app named `*`.
+# SIDECAR_APP_ID=*
 # Mirror this only when the Mem0 OSS server itself is intentionally auth-disabled.
 AUTH_DISABLED=false
 ```
@@ -50,6 +52,11 @@ calls, plus Entity Explorer query/detail/delete calls. When it is unset, the
 sidecar uses the existing project's
 `default_app_id`; read routes never create a missing project. Caller-supplied
 project/app values are removed by the same-origin proxy.
+
+`SIDECAR_APP_ID=*` is a Memory Explorer project-wide sentinel. The proxy sends
+`project_wide=true` for Memory query/detail/history/update/delete requests and
+never forwards `*` as a literal `app_id`. Other explorers fall back to their
+project-scoped/default-app behavior when this sentinel is configured.
 
 The proxy validates the dashboard refresh-token cookie by default.
 `AUTH_DISABLED=true` in the dashboard bypasses that cookie check only to mirror
@@ -95,6 +102,10 @@ query is `POST /v1/memories/query`:
   "sort": "created_at_desc"
 }
 ```
+
+With `SIDECAR_APP_ID=*`, the proxy replaces `app_id` in that request with
+`"project_wide": true`; every returned row retains its concrete source
+`app_id`.
 
 Its public envelope is:
 

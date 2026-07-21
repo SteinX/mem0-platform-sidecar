@@ -1617,7 +1617,7 @@ class MemoryIndexRepository:
         self,
         *,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         mem0_memory_ids: Iterable[str],
         include_deleted: bool = False,
     ) -> list[MemoryIndex]:
@@ -1626,9 +1626,10 @@ class MemoryIndexRepository:
         for offset in range(0, len(memory_ids), 400):
             statement = select(MemoryIndex).where(
                 MemoryIndex.project_id == project_id,
-                MemoryIndex.app_id == app_id,
                 MemoryIndex.mem0_memory_id.in_(memory_ids[offset : offset + 400]),
             )
+            if app_id is not None:
+                statement = statement.where(MemoryIndex.app_id == app_id)
             if not include_deleted:
                 statement = statement.where(MemoryIndex.deleted_at.is_(None))
             memories.extend(self.session.scalars(statement))
@@ -1690,7 +1691,7 @@ class MemoryIndexRepository:
     def query_project_memories(
         self,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         query: ExplorerQuery,
         *,
         window_offset: int | None = None,
@@ -1706,9 +1707,10 @@ class MemoryIndexRepository:
             raise ValueError("memory query window is invalid")
         scope_conditions = [
             MemoryIndex.project_id == project_id,
-            MemoryIndex.app_id == app_id,
             MemoryIndex.deleted_at.is_(None),
         ]
+        if app_id is not None:
+            scope_conditions.append(MemoryIndex.app_id == app_id)
         if query.date_range.from_at is not None:
             scope_conditions.append(MemoryIndex.created_at >= query.date_range.from_at)
         if query.date_range.to_at is not None:
@@ -1780,7 +1782,7 @@ class MemoryIndexRepository:
         self,
         *,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         updated_at_lte: datetime,
         after_created_at: datetime | None = None,
         after_memory_id: str | None = None,
@@ -1795,10 +1797,11 @@ class MemoryIndexRepository:
 
         statement = select(MemoryIndex).where(
             MemoryIndex.project_id == project_id,
-            MemoryIndex.app_id == app_id,
             MemoryIndex.deleted_at.is_(None),
             MemoryIndex.updated_at <= updated_at_lte,
         )
+        if app_id is not None:
+            statement = statement.where(MemoryIndex.app_id == app_id)
         if after_created_at is not None and after_memory_id is not None:
             statement = statement.where(
                 or_(
@@ -1846,7 +1849,7 @@ class MemoryIndexRepository:
         self,
         *,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         mem0_memory_ids: Iterable[str],
         updated_at_lte: datetime,
         expected_updated_at: Mapping[str, datetime] | None = None,
@@ -1865,11 +1868,12 @@ class MemoryIndexRepository:
         for batch in batches:
             statement = update(MemoryIndex).where(
                 MemoryIndex.project_id == project_id,
-                MemoryIndex.app_id == app_id,
                 MemoryIndex.mem0_memory_id.in_(batch),
                 MemoryIndex.deleted_at.is_(None),
                 MemoryIndex.updated_at <= updated_at_lte,
             )
+            if app_id is not None:
+                statement = statement.where(MemoryIndex.app_id == app_id)
             if expected_updated_at is not None:
                 statement = statement.where(
                     or_(

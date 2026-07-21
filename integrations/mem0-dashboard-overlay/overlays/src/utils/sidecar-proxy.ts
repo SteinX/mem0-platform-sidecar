@@ -277,6 +277,7 @@ function scopedJsonBody(
   bodyText: string,
   configuredProjectId: string,
   configuredAppId?: string,
+  projectWide = false,
 ): string | Response {
   const payloadText = bodyText.trim() || "{}";
   let payload: unknown;
@@ -297,8 +298,11 @@ function scopedJsonBody(
   const scopedPayload: Record<string, unknown> = { ...payload };
   delete scopedPayload.project_id;
   delete scopedPayload.app_id;
+  delete scopedPayload.project_wide;
   scopedPayload.project_id = configuredProjectId;
-  if (configuredAppId !== undefined) {
+  if (projectWide) {
+    scopedPayload.project_wide = true;
+  } else if (configuredAppId !== undefined) {
     scopedPayload.app_id = configuredAppId;
   }
   return JSON.stringify(scopedPayload);
@@ -384,6 +388,7 @@ export async function proxySidecarRequest(
     configuredAppId,
     validateDashboardSession,
   } = options;
+  const scopedAppId = configuredAppId === "*" ? undefined : configuredAppId;
   const requestPath = sidecarPathFromRequestUrl(request, normalizedPath);
   if (!isAllowedSidecarRequest(request.method, requestPath)) {
     return jsonError("Sidecar route is not allowed", 403);
@@ -398,7 +403,7 @@ export async function proxySidecarRequest(
   const isEventRequest = isEventPath(request.method, requestPath);
   if (
     isEventRequest &&
-    !hasConfiguredTraceScope(configuredProjectId, configuredAppId)
+    !hasConfiguredTraceScope(configuredProjectId, scopedAppId)
   ) {
     return jsonError("Sidecar trace scope is not configured", 500);
   }
@@ -416,6 +421,7 @@ export async function proxySidecarRequest(
     requestPath,
   );
   const isMemoryRequest = isMemoryPath(request.method, requestPath);
+  const projectWideMemoryScope = isMemoryRequest && configuredAppId === "*";
   const isEntityRequest = isEntityPath(request.method, requestPath);
   const url = new URL(`${baseUrl}${scopedPath}`);
   if (!isMemoryRequest && !isEntityRequest && !isEventRequest) {
@@ -430,20 +436,22 @@ export async function proxySidecarRequest(
   }
   if (isMemoryItemRequest || isMemoryHistoryRequest) {
     url.searchParams.set("project_id", configuredProjectId);
-    if (configuredAppId !== undefined) {
-      url.searchParams.set("app_id", configuredAppId);
+    if (projectWideMemoryScope) {
+      url.searchParams.set("project_wide", "true");
+    } else if (scopedAppId !== undefined) {
+      url.searchParams.set("app_id", scopedAppId);
     }
   }
   if (isEntityItemPath(request.method, requestPath)) {
     url.searchParams.set("project_id", configuredProjectId);
-    if (configuredAppId !== undefined) {
-      url.searchParams.set("app_id", configuredAppId);
+    if (scopedAppId !== undefined) {
+      url.searchParams.set("app_id", scopedAppId);
     }
   }
   if (isEventItemPath(request.method, requestPath)) {
     url.searchParams.set("project_id", configuredProjectId);
-    if (configuredAppId !== undefined) {
-      url.searchParams.set("app_id", configuredAppId);
+    if (scopedAppId !== undefined) {
+      url.searchParams.set("app_id", scopedAppId);
     }
   }
 
@@ -474,7 +482,12 @@ export async function proxySidecarRequest(
       const rewrittenBody =
         request.method === "POST" && scopedPath === "/v1/exports"
           ? scopedJsonBody(bodyText, configuredProjectId)
-          : scopedJsonBody(bodyText, configuredProjectId, configuredAppId);
+          : scopedJsonBody(
+              bodyText,
+              configuredProjectId,
+              scopedAppId,
+              projectWideMemoryScope,
+            );
       if (rewrittenBody instanceof Response) {
         return rewrittenBody;
       }
