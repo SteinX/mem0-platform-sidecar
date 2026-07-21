@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 "use strict";
 
+process.env.TZ = "America/Los_Angeles";
+
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -42,9 +44,19 @@ function loadBrowserTime(dashboardDir) {
 function localTimestampContracts(time) {
   const value = "2026-07-13T12:34:56Z";
   assert.equal(
+    Intl.DateTimeFormat().resolvedOptions().timeZone,
+    "America/Los_Angeles",
+    "browser-time contracts must run outside UTC",
+  );
+  assert.equal(
     time.formatBrowserLocalTimestamp(value),
     new Date(value).toLocaleString(),
     "absolute request times must use the browser locale and time zone",
+  );
+  assert.ok(time.formatBrowserLocalTimestamp(value).includes("5:34:56"));
+  assert.equal(
+    time.formatBrowserLocalTimestamp(value).includes("12:34:56"),
+    false,
   );
   assert.equal(time.formatBrowserLocalTimestamp(null), "--");
   assert.equal(time.formatBrowserLocalTimestamp("not-a-date"), "not-a-date");
@@ -64,13 +76,25 @@ function localTimestampContracts(time) {
 function relativeTimestampContracts(time) {
   const now = Date.parse("2026-07-20T12:34:56Z");
   const value = "2026-07-13T12:34:56Z";
+  const formatter = new Intl.RelativeTimeFormat(undefined, {
+    numeric: "auto",
+  });
   assert.equal(
     time.formatBrowserRelativeTimestamp(value, now),
-    new Intl.RelativeTimeFormat(undefined, { numeric: "auto" }).format(
-      -7,
-      "day",
-    ),
+    formatter.format(-7, "day"),
     "request rows must match the relative-time treatment used by Memories",
+  );
+  assert.equal(
+    time.formatBrowserRelativeTimestamp("2026-07-20T11:35:56Z", now),
+    formatter.format(-59, "minute"),
+  );
+  assert.equal(
+    time.formatBrowserRelativeTimestamp("2026-07-20T11:34:56Z", now),
+    formatter.format(-1, "hour"),
+  );
+  assert.equal(
+    time.formatBrowserRelativeTimestamp("2026-07-19T12:34:56Z", now),
+    formatter.format(-1, "day"),
   );
   assert.equal(
     time.formatBrowserRelativeTimestamp("not-a-date", now),
