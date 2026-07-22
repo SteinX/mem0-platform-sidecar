@@ -11,6 +11,11 @@ def test_settings_defaults_use_local_development_values(monkeypatch) -> None:
     assert settings.mem0_base_url == "http://127.0.0.1:8000"
     assert settings.default_project_id == "default"
     assert settings.allow_adopt_unscoped_memories is False
+    assert settings.consolidation_enabled is False
+    assert settings.consolidation_scheduler_interval_seconds == 300.0
+    assert settings.consolidation_job_lease_seconds == 300
+    assert settings.consolidation_hard_delete_enabled is False
+    assert settings.consolidation_bridge_routing_required is True
 
 
 def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
@@ -31,6 +36,17 @@ def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("MEM0_SIDECAR_LOG_FORMAT", "json")
     monkeypatch.setenv("MEM0_SIDECAR_REQUEST_ID_HEADER", "X-Correlation-ID")
     monkeypatch.setenv("MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED", "true")
+    monkeypatch.setenv("MEM0_SIDECAR_CONSOLIDATION_ENABLED", "true")
+    monkeypatch.setenv(
+        "MEM0_SIDECAR_CONSOLIDATION_SCHEDULER_INTERVAL_SECONDS", "120"
+    )
+    monkeypatch.setenv("MEM0_SIDECAR_CONSOLIDATION_JOB_LEASE_SECONDS", "90")
+    monkeypatch.setenv(
+        "MEM0_SIDECAR_CONSOLIDATION_HARD_DELETE_ENABLED", "true"
+    )
+    monkeypatch.setenv(
+        "MEM0_SIDECAR_CONSOLIDATION_BRIDGE_ROUTING_REQUIRED", "false"
+    )
 
     settings = SidecarSettings()
 
@@ -51,3 +67,8 @@ def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
     assert settings.log_format == "json"
     assert settings.request_id_header == "X-Correlation-ID"
     assert settings.allow_adopt_unscoped_memories is True
+    assert settings.consolidation_enabled is True
+    assert settings.consolidation_scheduler_interval_seconds == 120.0
+    assert settings.consolidation_job_lease_seconds == 90
+    assert settings.consolidation_hard_delete_enabled is True
+    assert settings.consolidation_bridge_routing_required is False

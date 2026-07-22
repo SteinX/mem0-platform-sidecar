@@ -852,6 +852,137 @@ class ProjectRepository:
         return project
 
 
+class ServiceCapabilityRepository:
+    _BRIDGE_KEY = "bridge_routing"
+    _FRESH_FOR = timedelta(minutes=10)
+    _MAX_INSTANCES = 32
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    @staticmethod
+    def _settings(project: Project) -> dict[str, Any]:
+        try:
+            value = json.loads(project.settings_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def record_bridge_heartbeat(
+        self,
+        *,
+        project_id: str,
+        instance_id: str,
+        bridge_version: str,
+        routes_reads: bool,
+        routes_writes: bool,
+        observed_at: datetime | None = None,
+    ) -> dict[str, object]:
+        validate_scope_id(instance_id, field_name="instance_id")
+        if not isinstance(bridge_version, str) or not 1 <= len(bridge_version) <= 128:
+            raise ValueError("bridge_version must contain 1-128 characters")
+        if type(routes_reads) is not bool or type(routes_writes) is not bool:
+            raise ValueError("bridge routing capabilities must be booleans")
+        observed_at = observed_at or _utc_now()
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        else:
+            observed_at = observed_at.astimezone(UTC)
+
+        project = ProjectRepository(self.session).lock_for_mutation(project_id)
+        settings = self._settings(project)
+        capabilities = settings.get("service_capabilities")
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+        bridge = capabilities.get(self._BRIDGE_KEY)
+        if not isinstance(bridge, dict):
+            bridge = {}
+        instances = bridge.get("instances")
+        if not isinstance(instances, dict):
+            instances = {}
+        instances[instance_id] = {
+            "bridge_version": bridge_version,
+            "routes_reads": routes_reads,
+            "routes_writes": routes_writes,
+            "last_seen_at": observed_at.isoformat(),
+        }
+        ordered_instances = sorted(
+            instances.items(),
+            key=lambda item: str(
+                item[1].get("last_seen_at", "")
+                if isinstance(item[1], dict)
+                else ""
+            ),
+            reverse=True,
+        )[: self._MAX_INSTANCES]
+        bridge["instances"] = dict(ordered_instances)
+        capabilities[self._BRIDGE_KEY] = bridge
+        settings["service_capabilities"] = capabilities
+        project.settings_json = _json(settings)
+        self.session.flush()
+        return self.bridge_routing_status(project_id, now=observed_at)
+
+    def bridge_routing_status(
+        self,
+        project_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        project = self.session.get(Project, project_id)
+        if project is None:
+            raise KeyError(project_id)
+        now = now or _utc_now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        else:
+            now = now.astimezone(UTC)
+        settings = self._settings(project)
+        capabilities = settings.get("service_capabilities")
+        bridge = (
+            capabilities.get(self._BRIDGE_KEY)
+            if isinstance(capabilities, dict)
+            else None
+        )
+        instances = bridge.get("instances") if isinstance(bridge, dict) else None
+        ready_instances: list[tuple[str, datetime]] = []
+        if isinstance(instances, dict):
+            for instance_id, raw in instances.items():
+                if not isinstance(instance_id, str) or not isinstance(raw, dict):
+                    continue
+                raw_seen = raw.get("last_seen_at")
+                if not isinstance(raw_seen, str):
+                    continue
+                try:
+                    seen = datetime.fromisoformat(raw_seen.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if seen.tzinfo is None:
+                    seen = seen.replace(tzinfo=UTC)
+                else:
+                    seen = seen.astimezone(UTC)
+                if (
+                    raw.get("routes_reads") is True
+                    and raw.get("routes_writes") is True
+                    and seen >= now - self._FRESH_FOR
+                    and seen <= now + timedelta(minutes=1)
+                ):
+                    ready_instances.append((instance_id, seen))
+        last_seen = max((seen for _instance, seen in ready_instances), default=None)
+        return {
+            "ready": bool(ready_instances),
+            "ready_instance_count": len(ready_instances),
+            "last_seen_at": last_seen,
+        }
+
+    def bridge_routing_ready(
+        self,
+        project_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        return bool(self.bridge_routing_status(project_id, now=now)["ready"])
+
+
 class CategoryRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -2797,6 +2928,59 @@ class JobRepository:
         self.session.flush()
         return job
 
+    def consolidation_status(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        now = now or _utc_now()
+        jobs = self.session.scalars(
+            select(Job)
+            .where(
+                Job.project_id == project_id,
+                Job.job_type.in_(("consolidation.scan", "consolidation.finalize")),
+            )
+            .order_by(Job.created_at.desc())
+            .limit(5000)
+        )
+        matching = [
+            job
+            for job in jobs
+            if self.payload(job).get("app_id") == app_id
+        ]
+        succeeded = [
+            job
+            for job in matching
+            if job.status == JobStatus.SUCCEEDED and job.completed_at is not None
+        ]
+        pending = [job for job in matching if job.status == JobStatus.PENDING]
+        last_success = max(
+            (job.completed_at for job in succeeded if job.completed_at is not None),
+            default=None,
+        )
+        oldest_pending = min(
+            (job.created_at for job in pending),
+            default=None,
+        )
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        if oldest_pending is not None:
+            if oldest_pending.tzinfo is None:
+                oldest_pending = oldest_pending.replace(tzinfo=UTC)
+            else:
+                oldest_pending = oldest_pending.astimezone(UTC)
+        return {
+            "last_success_at": last_success,
+            "pending_count": len(pending),
+            "oldest_pending_age_seconds": (
+                max((now - oldest_pending).total_seconds(), 0.0)
+                if oldest_pending is not None
+                else None
+            ),
+        }
+
 
 class ConsolidationPolicyRepository:
     def __init__(self, session: Session) -> None:
@@ -2883,6 +3067,17 @@ class ConsolidationRunRepository:
                 ConsolidationRun.status == "SUCCEEDED",
             )
             .order_by(ConsolidationRun.completed_at.desc())
+            .limit(1)
+        )
+
+    def last(self, project_id: str, app_id: str) -> ConsolidationRun | None:
+        return self.session.scalar(
+            select(ConsolidationRun)
+            .where(
+                ConsolidationRun.project_id == project_id,
+                ConsolidationRun.app_id == app_id,
+            )
+            .order_by(ConsolidationRun.created_at.desc(), ConsolidationRun.id.desc())
             .limit(1)
         )
 
@@ -3081,6 +3276,25 @@ class ConsolidationProposalRepository:
                 )
                 .offset(offset)
                 .limit(limit)
+            )
+        )
+
+    def list_actionable_for_run(
+        self,
+        run_id: str,
+    ) -> list[ConsolidationProposal]:
+        return list(
+            self.session.scalars(
+                select(ConsolidationProposal)
+                .where(
+                    ConsolidationProposal.run_id == run_id,
+                    ConsolidationProposal.status == "PENDING",
+                )
+                .order_by(
+                    ConsolidationProposal.created_at,
+                    ConsolidationProposal.id,
+                )
+                .limit(1000)
             )
         )
 

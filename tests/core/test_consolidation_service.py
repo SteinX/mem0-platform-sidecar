@@ -16,6 +16,7 @@ from mem0_sidecar.store.models import (
 )
 from mem0_sidecar.store.repositories import (
     ConsolidationPolicyRepository,
+    ConsolidationProposalRepository,
     ConsolidationRunRepository,
     MemoryIndexRepository,
     ProjectRepository,
@@ -95,6 +96,20 @@ class SemanticMem0:
         if query == self.records["near-b"]["memory"]:
             return {"results": [{"id": "near-a", "score": 0.95}]}
         return {"results": []}
+
+
+class ReplacementMem0:
+    def __init__(self) -> None:
+        self.add_payloads: list[dict[str, object]] = []
+
+    async def add_memory(self, payload: dict[str, object]):
+        self.add_payloads.append(payload)
+        content = payload["text"]
+        return {
+            "id": "replacement",
+            "memory": content,
+            "metadata": payload.get("metadata", {}),
+        }
 
 
 class WriteRejectingMem0:
@@ -324,7 +339,7 @@ async def test_approval_marks_changed_or_pinned_proposal_stale_without_upstream_
     db_session.commit()
     mem0 = StatefulMem0()
 
-    result = ConsolidationService(
+    result = await ConsolidationService(
         session=db_session,
         mem0=mem0,
         bridge_routing_ready=True,
@@ -341,6 +356,77 @@ async def test_approval_marks_changed_or_pinned_proposal_stale_without_upstream_
 
 
 @pytest.mark.asyncio
+async def test_manual_semantic_approval_can_create_text_free_replacement_decision(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    policy = ConsolidationPolicyRepository(db_session).upsert(
+        project_id="repo-a",
+        app_id="app-a",
+        policy={"enabled": True, "mode": "MANUAL"},
+    )
+    source_texts = {"semantic-a": "use v1", "semantic-b": "use v2"}
+    hashes: dict[str, str] = {}
+    for memory_id, text_value in source_texts.items():
+        content_hash, length = memory_content_fingerprint({"memory": text_value})
+        assert content_hash is not None
+        hashes[memory_id] = content_hash
+        MemoryIndexRepository(db_session).upsert_memory(
+            project_id="repo-a",
+            mem0_memory_id=memory_id,
+            user_id="root",
+            app_id="app-a",
+            category="decision",
+            content_hash=content_hash,
+            content_length=length,
+            normalized_type="decision",
+            source="manual",
+            pinned=False,
+            observed_at=NOW,
+        )
+    run = ConsolidationRunRepository(db_session).create(policy, now=NOW)
+    run.status = "SUCCEEDED"
+    proposal = ConsolidationProposalRepository(db_session).create(
+        run=run,
+        proposal_key="semantic-key",
+        kind="CONTRADICTION",
+        source_ids=("semantic-a", "semantic-b"),
+        canonical_id=None,
+        score=0.97,
+        evidence={"reason_codes": ["version_change"], "safe_action": False},
+        status="REVIEW_REQUIRED",
+    )
+    db_session.commit()
+    mem0 = ReplacementMem0()
+    replacement = "use v3"
+
+    result = await ConsolidationService(
+        session=db_session,
+        mem0=mem0,
+        bridge_routing_ready=True,
+        now=lambda: NOW,
+    ).approve_proposal(
+        proposal.id,
+        expected_status="REVIEW_REQUIRED",
+        expected_source_hashes=hashes,
+        replacement_text=replacement,
+    )
+
+    db_session.expire_all()
+    persisted = db_session.get(ConsolidationProposal, proposal.id)
+    assert result["status"] == "APPROVED"
+    assert persisted.canonical_memory_id == "replacement"
+    assert replacement not in persisted.evidence_json
+    assert json.loads(persisted.evidence_json)["operator_decision"] == (
+        "replacement_created"
+    )
+
+
+@pytest.mark.asyncio
 async def test_incomplete_export_blocks_shadowing(db_session) -> None:
     proposal = await seed_pending_proposal(db_session)
     mem0 = StatefulMem0()
@@ -350,7 +436,7 @@ async def test_incomplete_export_blocks_shadowing(db_session) -> None:
         bridge_routing_ready=True,
         now=lambda: NOW,
     )
-    service.approve_proposal(
+    await service.approve_proposal(
         proposal.id,
         expected_status="PENDING",
         expected_source_hashes=expected_hashes(),
@@ -380,7 +466,7 @@ async def test_shadow_exact_duplicate_excludes_canonical_and_rolls_back(db_sessi
         bridge_routing_ready=True,
         now=lambda: NOW,
     )
-    service.approve_proposal(
+    await service.approve_proposal(
         proposal.id,
         expected_status="PENDING",
         expected_source_hashes=expected_hashes(),
@@ -439,7 +525,7 @@ async def test_finalize_enforces_grace_and_hard_delete_gate(db_session) -> None:
         bridge_routing_ready=True,
         now=lambda: NOW,
     )
-    service.approve_proposal(
+    await service.approve_proposal(
         proposal.id,
         expected_status="PENDING",
         expected_source_hashes=expected_hashes(),
@@ -468,7 +554,7 @@ async def test_finalize_deletes_redundant_one_at_a_time_and_records_lineage(
         hard_delete_enabled=True,
         now=lambda: NOW,
     )
-    service.approve_proposal(
+    await service.approve_proposal(
         proposal.id,
         expected_status="PENDING",
         expected_source_hashes=expected_hashes(),
@@ -502,7 +588,7 @@ async def test_ambiguous_delete_never_marks_proposal_applied(db_session) -> None
         hard_delete_enabled=True,
         now=lambda: NOW,
     )
-    service.approve_proposal(
+    await service.approve_proposal(
         proposal.id,
         expected_status="PENDING",
         expected_source_hashes=expected_hashes(),

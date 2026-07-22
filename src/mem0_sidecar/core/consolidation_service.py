@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -18,6 +18,7 @@ from mem0_sidecar.core.consolidation_policy import ConsolidationPolicySpec
 from mem0_sidecar.core.exports import ExportService
 from mem0_sidecar.core.memory_ops import (
     MemoryService,
+    extract_memory_id,
     extract_memory_ids,
     memory_content_fingerprint,
 )
@@ -33,8 +34,10 @@ from mem0_sidecar.store.repositories import (
     ConsolidationProposalRepository,
     ConsolidationRunRepository,
     ExportJobRepository,
+    JobRepository,
     MemoryIndexRepository,
     ProjectRepository,
+    ServiceCapabilityRepository,
 )
 
 
@@ -150,12 +153,14 @@ class ConsolidationService:
         ConsolidationProposalRepository(self.session).set_status(proposal, "STALE")
         return {"proposal_id": proposal.id, "status": "STALE"}
 
-    def approve_proposal(
+    async def approve_proposal(
         self,
         proposal_id: str,
         *,
         expected_status: str,
-        expected_source_hashes: dict[str, str],
+        expected_source_hashes: Mapping[str, str],
+        canonical_id: str | None = None,
+        replacement_text: str | None = None,
     ) -> dict[str, object]:
         proposals = ConsolidationProposalRepository(self.session)
         proposal = proposals.get(proposal_id)
@@ -174,25 +179,105 @@ class ConsolidationService:
             raise ConsolidationConflictError("policy does not allow approval")
         if not self.bridge_routing_ready:
             raise ConsolidationConflictError("bridge routing is not verified")
-        if proposal.kind not in policy.safe_actions:
+        semantic = proposal.kind in {"NEAR_DUPLICATE", "CONTRADICTION"}
+        if semantic:
+            if policy.mode != "MANUAL" or expected_status != "REVIEW_REQUIRED":
+                raise ConsolidationConflictError(
+                    "semantic proposals require manual review"
+                )
+            if (canonical_id is None) == (replacement_text is None):
+                raise ConsolidationConflictError(
+                    "choose one existing canonical or replacement text"
+                )
+        elif proposal.kind not in policy.safe_actions:
             raise ConsolidationConflictError("proposal action is not allow-listed")
+        elif replacement_text is not None:
+            raise ConsolidationConflictError(
+                "replacement text is only valid for semantic proposals"
+            )
+        elif canonical_id is not None and canonical_id != proposal.canonical_memory_id:
+            raise ConsolidationConflictError("canonical memory does not match proposal")
         normalized_hashes = {
             key: value
             for key, value in expected_source_hashes.items()
             if isinstance(key, str) and isinstance(value, str)
         }
-        if normalized_hashes != expected_source_hashes or self._proposal_sources(
+        if normalized_hashes != dict(expected_source_hashes) or (
+            sources := self._proposal_sources(
             proposal,
             expected_hashes=normalized_hashes,
             required_state="ACTIVE",
+            )
         ) is None:
             return self._mark_stale(proposal)
+        source_ids = proposals.source_ids(proposal)
+        if canonical_id is not None and canonical_id not in source_ids:
+            raise ConsolidationConflictError(
+                "canonical memory is not a proposal source"
+            )
+        if replacement_text is not None:
+            if not replacement_text.strip() or len(replacement_text) > 20_000:
+                raise ConsolidationConflictError("replacement text is invalid")
+            source = min(sources, key=lambda item: item.mem0_memory_id)
+            replacement_type = source.normalized_type or "unknown"
+            replacement_user = source.user_id
+            replacement_agent = source.agent_id
+            project_id = proposal.project_id
+            app_id = proposal.app_id
+            self.session.commit()
+            replacement_payload: dict[str, Any] = {
+                "text": replacement_text,
+                "app_id": app_id,
+                "metadata": {
+                    "type": replacement_type,
+                    "source": "consolidation_replacement",
+                    "consolidation_proposal_id": proposal_id,
+                },
+            }
+            if replacement_user is not None:
+                replacement_payload["user_id"] = replacement_user
+            if replacement_agent is not None:
+                replacement_payload["agent_id"] = replacement_agent
+            added = await MemoryService(
+                session=self.session,
+                mem0=self.mem0,
+            ).add_memory(
+                project_id=project_id,
+                payload=replacement_payload,
+                idempotency_key=f"consolidation-replacement-{proposal_id}",
+            )
+            memory_payload = added.get("memory")
+            if not isinstance(memory_payload, dict):
+                raise ConsolidationConflictError("replacement memory add failed")
+            canonical_id = extract_memory_id(memory_payload)
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            proposal = proposals.get(proposal_id)
+            if self._proposal_sources(
+                proposal,
+                expected_hashes=normalized_hashes,
+                required_state="ACTIVE",
+            ) is None:
+                return self._mark_stale(proposal)
         proposal.expected_hashes_json = json.dumps(
             normalized_hashes,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
         )
+        if semantic:
+            proposal.canonical_memory_id = canonical_id
+            evidence = _json_object(proposal.evidence_json)
+            evidence["operator_decision"] = (
+                "replacement_created"
+                if replacement_text is not None
+                else "existing_canonical"
+            )
+            proposal.evidence_json = json.dumps(
+                evidence,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         proposals.set_status(proposal, "APPROVED")
         return {"proposal_id": proposal.id, "status": "APPROVED"}
 
@@ -301,7 +386,7 @@ class ConsolidationService:
             return result
 
         target_ids = set(source_ids)
-        if proposal.kind == "EXACT_DUPLICATE":
+        if proposal.canonical_memory_id in target_ids:
             target_ids.remove(str(proposal.canonical_memory_id))
         sources = MemoryIndexRepository(self.session).list_memories_by_ids(
             project_id=proposal.project_id,
@@ -322,7 +407,7 @@ class ConsolidationService:
             "proposal_id": proposal.id,
             "status": "SHADOWED",
             "shadowed_count": len(target_ids),
-            "not_before": proposal.not_before,
+            "not_before": proposal.not_before.isoformat(),
         }
         self.session.commit()
         return result
@@ -392,7 +477,7 @@ class ConsolidationService:
         expected_hashes = proposals.expected_hashes(proposal)
         source_ids = proposals.source_ids(proposal)
         target_ids = list(source_ids)
-        if proposal.kind == "EXACT_DUPLICATE":
+        if proposal.canonical_memory_id in target_ids:
             target_ids.remove(str(proposal.canonical_memory_id))
 
         lineages = ConsolidationLineageRepository(self.session)
@@ -441,11 +526,7 @@ class ConsolidationService:
                 proposal=proposal,
                 source_memory_id=memory_id,
                 canonical_memory_id=proposal.canonical_memory_id,
-                action=(
-                    "EXACT_DUPLICATE_DELETE"
-                    if proposal.kind == "EXACT_DUPLICATE"
-                    else "RETENTION_EXPIRED_DELETE"
-                ),
+                action=f"{proposal.kind}_DELETE",
                 source_content_hash=expected_hashes[memory_id],
                 export_job_id=proposal.export_job_id,
                 applied_at=self._as_utc(now),
@@ -798,6 +879,9 @@ class ConsolidationService:
             project_id=project_id,
             app_id=app_id,
         )
+        bridge_status = ServiceCapabilityRepository(
+            self.session
+        ).bridge_routing_status(project_id)
         return {
             "project_id": project_id,
             "app_id": app_id,
@@ -807,7 +891,14 @@ class ConsolidationService:
             "current_run": _run_payload(current) if current else None,
             "last_run": _run_payload(last) if last else None,
             "proposal_counts": proposals.counts_for_scope(project_id, app_id),
-            "bridge_routing_ready": self.bridge_routing_ready,
+            "bridge_routing_ready": (
+                self.bridge_routing_ready or bool(bridge_status["ready"])
+            ),
+            "bridge": bridge_status,
+            "worker": JobRepository(self.session).consolidation_status(
+                project_id=project_id,
+                app_id=app_id,
+            ),
         }
 
     def get_run(

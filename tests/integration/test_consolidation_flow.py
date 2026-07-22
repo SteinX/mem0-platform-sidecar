@@ -84,7 +84,7 @@ async def test_exact_duplicate_checkpoint_shadow_search_and_finalize(db_session)
 
     await consolidation.run_scan(run.id)
     proposal = db_session.query(ConsolidationProposal).one()
-    consolidation.approve_proposal(
+    await consolidation.approve_proposal(
         proposal.id,
         expected_status="PENDING",
         expected_source_hashes={
