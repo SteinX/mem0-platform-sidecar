@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -27,6 +27,7 @@ from mem0_sidecar.core.trace_payloads import (
 )
 from mem0_sidecar.store.models import (
     Category,
+    ConsolidationLineage,
     Entity,
     Event,
     EventStatus,
@@ -1821,6 +1822,83 @@ class MemoryIndexRepository:
             )
         )
 
+    def mark_scope_dirty(
+        self,
+        project_id: str,
+        app_id: str,
+        observed_at: datetime,
+    ) -> None:
+        self.session.execute(
+            update(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.consolidation_state == "ACTIVE",
+                MemoryIndex.last_observed_at.is_(None),
+            )
+            .values(last_observed_at=observed_at)
+            .execution_options(synchronize_session="fetch")
+        )
+        self.session.flush()
+
+    def list_dirty_anchors(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        after_last_observed_at: datetime | None = None,
+        after_memory_id: str | None = None,
+        limit: int = 100,
+    ) -> list[MemoryIndex]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("dirty anchor limit must be between 1 and 1000")
+        if (after_last_observed_at is None) != (after_memory_id is None):
+            raise ValueError("dirty anchor cursor is incomplete")
+
+        latest_lineage = (
+            select(func.max(ConsolidationLineage.applied_at))
+            .where(
+                ConsolidationLineage.project_id == project_id,
+                ConsolidationLineage.app_id == app_id,
+                ConsolidationLineage.source_memory_id
+                == MemoryIndex.mem0_memory_id,
+            )
+            .correlate(MemoryIndex)
+            .scalar_subquery()
+        )
+        statement = select(MemoryIndex).where(
+            MemoryIndex.project_id == project_id,
+            MemoryIndex.app_id == app_id,
+            MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
+            MemoryIndex.pinned == 0,
+            MemoryIndex.content_hash.is_not(None),
+            MemoryIndex.last_observed_at.is_not(None),
+            or_(
+                latest_lineage.is_(None),
+                MemoryIndex.last_observed_at > latest_lineage,
+            ),
+        )
+        if after_last_observed_at is not None and after_memory_id is not None:
+            statement = statement.where(
+                or_(
+                    MemoryIndex.last_observed_at > after_last_observed_at,
+                    and_(
+                        MemoryIndex.last_observed_at == after_last_observed_at,
+                        MemoryIndex.mem0_memory_id > after_memory_id,
+                    ),
+                )
+            )
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    MemoryIndex.last_observed_at,
+                    MemoryIndex.mem0_memory_id,
+                ).limit(limit)
+            )
+        )
+
     def mark_stale(
         self,
         project_id: str,
@@ -1907,6 +1985,13 @@ class MemoryIndexRepository:
         agent_id: str | None = None,
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        content_hash: str | None = None,
+        content_length: int | None = None,
+        normalized_type: str | None = None,
+        source: str | None = None,
+        pinned: bool | int | None = None,
+        expires_at: datetime | None = None,
+        observed_at: datetime | None = None,
     ) -> MemoryIndex:
         projection_now = _utc_now()
         memory = self.session.scalar(
@@ -1919,12 +2004,25 @@ class MemoryIndexRepository:
             memory = MemoryIndex(project_id=project_id, mem0_memory_id=mem0_memory_id)
             self.session.add(memory)
 
+        previous_hash = memory.content_hash
+
         memory.user_id = user_id
         memory.agent_id = agent_id
         memory.app_id = app_id
         memory.run_id = run_id
         memory.category = category
         memory.metadata_projection_json = _json(metadata or {})
+        if observed_at is not None:
+            if memory.deleted_at is not None or previous_hash != content_hash:
+                memory.consolidation_state = "ACTIVE"
+                memory.shadowed_by_proposal_id = None
+            memory.content_hash = content_hash
+            memory.content_length = content_length
+            memory.normalized_type = normalized_type
+            memory.source = source
+            memory.pinned = int(bool(pinned))
+            memory.expires_at = expires_at
+            memory.last_observed_at = observed_at
         memory.deleted_at = None
         memory.updated_at = projection_now
         self.session.flush()
@@ -1941,6 +2039,13 @@ class MemoryIndexRepository:
         agent_id: str | None = None,
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        content_hash: str | None = None,
+        content_length: int | None = None,
+        normalized_type: str | None = None,
+        source: str | None = None,
+        pinned: bool | int | None = None,
+        expires_at: datetime | None = None,
+        observed_at: datetime | None = None,
     ) -> MemoryClaimResult:
         projection_now = _utc_now()
         values = {
@@ -1953,8 +2058,36 @@ class MemoryIndexRepository:
             "deleted_at": None,
             "updated_at": projection_now,
         }
+        if observed_at is not None:
+            values.update(
+                {
+                    "content_hash": content_hash,
+                    "content_length": content_length,
+                    "normalized_type": normalized_type,
+                    "source": source,
+                    "pinned": int(bool(pinned)),
+                    "expires_at": expires_at,
+                    "last_observed_at": observed_at,
+                    "consolidation_state": "ACTIVE",
+                    "shadowed_by_proposal_id": None,
+                }
+            )
 
         def update_claimable() -> int:
+            update_values = dict(values)
+            if observed_at is not None:
+                same_hash = and_(
+                    MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.content_hash == content_hash,
+                )
+                update_values["consolidation_state"] = case(
+                    (same_hash, MemoryIndex.consolidation_state),
+                    else_="ACTIVE",
+                )
+                update_values["shadowed_by_proposal_id"] = case(
+                    (same_hash, MemoryIndex.shadowed_by_proposal_id),
+                    else_=None,
+                )
             result = self.session.execute(
                 update(MemoryIndex)
                 .where(
@@ -1965,7 +2098,7 @@ class MemoryIndexRepository:
                         MemoryIndex.deleted_at.is_not(None),
                     ),
                 )
-                .values(**values)
+                .values(**update_values)
                 .execution_options(synchronize_session="fetch")
             )
             return result.rowcount or 0

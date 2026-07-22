@@ -20,6 +20,8 @@ from mem0_sidecar.core.memory_ops import (
     MutationConflictError,
     extract_memory_id,
     extract_memory_ids,
+    memory_content_fingerprint,
+    normalize_memory_type,
 )
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.store.models import (
@@ -352,6 +354,76 @@ def test_extract_memory_ids_collects_top_level_and_results_ids() -> None:
             ],
         }
     ) == ["mem-1", "mem-2", "mem-3", "mem-4"]
+
+
+def test_fingerprint_normalizes_equivalent_text() -> None:
+    left = memory_content_fingerprint({"memory": "Fix\r\n  cache"})
+    right = memory_content_fingerprint({"data": "Fix\n cache"})
+
+    assert left == right
+    assert left[0] is not None and len(left[0]) == 64
+    assert left[1] == len("Fix cache")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("BUGFIX", "bug_fix"),
+        ("bugfix", "bug_fix"),
+        ("Bug Fix", "bug_fix"),
+        ("autoCapture", "auto_capture"),
+        (None, "unknown"),
+    ],
+)
+def test_normalize_memory_type_is_stable(value: object, expected: str) -> None:
+    assert normalize_memory_type(value) == expected
+
+
+@pytest.mark.asyncio
+async def test_inferred_multi_memory_add_hydrates_each_fingerprint(
+    db_session,
+) -> None:
+    class InferredMem0Client(FakeMem0Client):
+        async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+            self.add_payloads.append(payload)
+            return {"results": [{"id": "mem-a"}, {"id": "mem-b"}]}
+
+        async def get_memory(self, memory_id: str) -> dict[str, Any]:
+            self.get_memory_ids.append(memory_id)
+            return {
+                "id": memory_id,
+                "memory": f"fact for {memory_id}",
+                "metadata": {
+                    "type": "BUGFIX",
+                    "source": "opencode",
+                    "confidence": "0.7",
+                },
+            }
+
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    db_session.commit()
+    mem0 = InferredMem0Client()
+
+    await MemoryService(session=db_session, mem0=mem0).add_memory(
+        project_id="repo-a",
+        payload={"text": "derive facts", "user_id": "root", "app_id": "app-a"},
+    )
+
+    projections = {
+        item.mem0_memory_id: item
+        for item in db_session.query(MemoryIndex).order_by(
+            MemoryIndex.mem0_memory_id
+        )
+    }
+    assert mem0.get_memory_ids == ["mem-a", "mem-b"]
+    assert projections["mem-a"].content_hash != projections["mem-b"].content_hash
+    assert {item.normalized_type for item in projections.values()} == {"bug_fix"}
+    assert {item.source for item in projections.values()} == {"opencode"}
+    assert all(item.last_observed_at is not None for item in projections.values())
 
 
 @pytest.mark.asyncio

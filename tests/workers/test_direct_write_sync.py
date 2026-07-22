@@ -19,8 +19,9 @@ class _ListClient:
             "results": [
                 {
                     "id": "direct-memory",
+                    "memory": "Direct write fact",
                     "app_id": "source-app",
-                    "metadata": {},
+                    "metadata": {"type": "auto_capture", "source": "opencode"},
                 }
             ],
             "total": 1,
@@ -66,6 +67,11 @@ async def test_direct_write_sync_worker_runs_one_bounded_mirror(
             mem0_memory_id="direct-memory",
         ).one()
         assert projection.app_id == "source-app"
+        assert projection.content_hash is not None
+        assert projection.content_length == len("Direct write fact")
+        assert projection.normalized_type == "auto_capture"
+        assert projection.source == "opencode"
+        assert projection.last_observed_at is not None
 
 
 @pytest.mark.asyncio
