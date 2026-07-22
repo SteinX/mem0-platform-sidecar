@@ -1,7 +1,10 @@
 import json
 from datetime import UTC, datetime, timedelta
 
-from mem0_sidecar.core.consolidation_analysis import ConsolidationAnalyzer
+from mem0_sidecar.core.consolidation_analysis import (
+    ConsolidationAnalyzer,
+    MemorySnapshot,
+)
 from mem0_sidecar.core.consolidation_policy import ConsolidationPolicySpec
 from mem0_sidecar.store.models import MemoryIndex
 
@@ -198,3 +201,84 @@ def test_proposal_keys_are_stable_and_output_is_bounded() -> None:
     assert len(forward) == 1
     assert forward[0].proposal_key == reverse[0].proposal_key
     assert forward[0].source_ids == ("expired-a",)
+
+
+def snapshot(
+    memory_id: str,
+    text: str,
+    *,
+    project_id: str = "project",
+    app_id: str = "app",
+    user_id: str | None = "root",
+    normalized_type: str = "decision",
+) -> MemorySnapshot:
+    return MemorySnapshot(
+        project_id=project_id,
+        app_id=app_id,
+        memory_id=memory_id,
+        user_id=user_id,
+        agent_id=None,
+        normalized_type=normalized_type,
+        content_hash=f"hash-{memory_id}",
+        content_length=len(text),
+        text=text,
+    )
+
+
+def test_semantic_neighbor_classification_is_scoped_and_never_auto_safe() -> None:
+    analyzer = ConsolidationAnalyzer()
+    anchor = snapshot("a", "Use PostgreSQL as the primary production datastore")
+
+    assert analyzer.classify_neighbor(
+        anchor,
+        snapshot(
+            "other-app",
+            "Use PostgreSQL as the primary production datastore",
+            app_id="other",
+        ),
+        0.99,
+    ) is None
+    assert analyzer.classify_neighbor(
+        anchor,
+        snapshot(
+            "other-user",
+            "Use PostgreSQL as the primary production datastore",
+            user_id="alice",
+        ),
+        0.99,
+    ) is None
+    assert analyzer.classify_neighbor(
+        anchor,
+        snapshot(
+            "other-type",
+            "Use PostgreSQL as the primary production datastore",
+            normalized_type="project_profile",
+        ),
+        0.99,
+    ) is None
+
+    draft = analyzer.classify_neighbor(
+        anchor,
+        snapshot(
+            "b",
+            "Use PostgreSQL for the primary production data store",
+        ),
+        0.95,
+    )
+
+    assert draft is not None and draft.kind == "NEAR_DUPLICATE"
+    assert draft.evidence["safe_action"] is False
+    assert draft.evidence["reason_codes"] == ["high_similarity_shared_terms"]
+    assert {"memory", "text", "data"}.isdisjoint(draft.evidence)
+
+
+def test_opposing_normalized_statements_are_manual_contradictions() -> None:
+    draft = ConsolidationAnalyzer().classify_neighbor(
+        snapshot("a", "Feature flags are enabled for production"),
+        snapshot("b", "Feature flags are not enabled for production"),
+        0.97,
+    )
+
+    assert draft is not None and draft.kind == "CONTRADICTION"
+    assert draft.evidence["reason_codes"] == ["negation_flip"]
+    assert draft.evidence["safe_action"] is False

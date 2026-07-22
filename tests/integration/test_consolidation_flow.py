@@ -82,7 +82,7 @@ async def test_exact_duplicate_checkpoint_shadow_search_and_finalize(db_session)
         now=lambda: NOW,
     )
 
-    consolidation.run_scan(run.id)
+    await consolidation.run_scan(run.id)
     proposal = db_session.query(ConsolidationProposal).one()
     consolidation.approve_proposal(
         proposal.id,

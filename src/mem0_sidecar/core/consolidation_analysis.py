@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
+import unicodedata
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -24,6 +26,63 @@ class ProposalDraft:
     score: float | None
     evidence: dict[str, object]
     proposal_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySnapshot:
+    project_id: str
+    app_id: str
+    memory_id: str
+    user_id: str | None
+    agent_id: str | None
+    normalized_type: str
+    content_hash: str
+    content_length: int
+    text: str
+
+
+_NEGATION_TOKENS = frozenset({"not", "no", "never", "without", "false"})
+_DATE_PATTERN = re.compile(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b")
+_VERSION_PATTERN = re.compile(r"\bv?\d+\.\d+(?:\.\d+)?\b", re.IGNORECASE)
+
+
+def _tokens(text: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return tuple(re.findall(r"[a-z0-9]+", normalized))
+
+
+def _replacement_conflict(
+    left: str,
+    right: str,
+    pattern: re.Pattern[str],
+) -> bool:
+    left_values = pattern.findall(left)
+    right_values = pattern.findall(right)
+    if not left_values or not right_values or left_values == right_values:
+        return False
+    return pattern.sub("<value>", left.casefold()) == pattern.sub(
+        "<value>", right.casefold()
+    )
+
+
+def _contradiction_reason(left: str, right: str) -> str | None:
+    left_tokens = _tokens(left)
+    right_tokens = _tokens(right)
+    left_negated = any(token in _NEGATION_TOKENS for token in left_tokens)
+    right_negated = any(token in _NEGATION_TOKENS for token in right_tokens)
+    left_base = tuple(
+        token for token in left_tokens if token not in _NEGATION_TOKENS
+    )
+    right_base = tuple(
+        token for token in right_tokens if token not in _NEGATION_TOKENS
+    )
+    if left_negated != right_negated and left_base == right_base:
+        return "negation_flip"
+    if _replacement_conflict(left, right, _DATE_PATTERN):
+        return "date_change"
+    if _replacement_conflict(left, right, _VERSION_PATTERN):
+        return "version_change"
+    return None
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -96,6 +155,65 @@ def _proposal_key(
 
 
 class ConsolidationAnalyzer:
+    def classify_neighbor(
+        self,
+        anchor: MemorySnapshot,
+        candidate: MemorySnapshot,
+        score: float,
+        *,
+        policy_version: int = 1,
+    ) -> ProposalDraft | None:
+        if (
+            anchor.memory_id == candidate.memory_id
+            or anchor.project_id != candidate.project_id
+            or anchor.app_id != candidate.app_id
+            or anchor.user_id != candidate.user_id
+            or anchor.agent_id != candidate.agent_id
+            or anchor.normalized_type != candidate.normalized_type
+            or anchor.content_hash == candidate.content_hash
+            or not math.isfinite(score)
+        ):
+            return None
+        anchor_terms = set(_tokens(anchor.text))
+        candidate_terms = set(_tokens(candidate.text))
+        shared_terms = anchor_terms & candidate_terms
+        reason = _contradiction_reason(anchor.text, candidate.text)
+        if reason is not None:
+            kind = "CONTRADICTION"
+            reason_codes = [reason]
+        elif len(shared_terms) >= 2:
+            kind = "NEAR_DUPLICATE"
+            reason_codes = ["high_similarity_shared_terms"]
+        else:
+            return None
+        source_ids = tuple(sorted((anchor.memory_id, candidate.memory_id)))
+        return ProposalDraft(
+            kind=kind,
+            source_ids=source_ids,
+            canonical_id=None,
+            score=score,
+            evidence={
+                "score": score,
+                "shared_term_count": len(shared_terms),
+                "normalized_type": anchor.normalized_type,
+                "content_hash_prefixes": sorted(
+                    {anchor.content_hash[:12], candidate.content_hash[:12]}
+                ),
+                "content_lengths": sorted(
+                    [anchor.content_length, candidate.content_length]
+                ),
+                "reason_codes": reason_codes,
+                "safe_action": False,
+            },
+            proposal_key=_proposal_key(
+                project_id=anchor.project_id,
+                app_id=anchor.app_id,
+                kind=kind,
+                source_ids=source_ids,
+                policy_version=policy_version,
+            ),
+        )
+
     def analyze_scope(
         self,
         project_id: str,

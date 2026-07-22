@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import math
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from mem0_sidecar.core.consolidation_analysis import ConsolidationAnalyzer
+from mem0_sidecar.core.consolidation_analysis import (
+    ConsolidationAnalyzer,
+    MemorySnapshot,
+    ProposalDraft,
+)
 from mem0_sidecar.core.consolidation_policy import ConsolidationPolicySpec
 from mem0_sidecar.core.exports import ExportService
 from mem0_sidecar.core.memory_ops import (
@@ -457,12 +463,201 @@ class ConsolidationService:
         self.session.commit()
         return result
 
-    def run_scan(self, run_id: str) -> dict[str, object]:
+    @staticmethod
+    def _snapshot_header(memory: MemoryIndex) -> MemorySnapshot:
+        return MemorySnapshot(
+            project_id=memory.project_id,
+            app_id=memory.app_id or "",
+            memory_id=memory.mem0_memory_id,
+            user_id=memory.user_id,
+            agent_id=memory.agent_id,
+            normalized_type=memory.normalized_type or "unknown",
+            content_hash=memory.content_hash or "",
+            content_length=memory.content_length or 0,
+            text="",
+        )
+
+    @staticmethod
+    def _record_text(record: dict[str, Any]) -> str | None:
+        for key in ("memory", "text", "content"):
+            value = record.get(key)
+            if isinstance(value, str):
+                return value
+        return None
+
+    async def _semantic_drafts(
+        self,
+        *,
+        policy: ConsolidationPolicySpec,
+        anchor_headers: list[MemorySnapshot],
+    ) -> list[ProposalDraft]:
+        search = getattr(self.mem0, "search_memories", None)
+        get_memory = getattr(self.mem0, "get_memory", None)
+        if not callable(search) or not callable(get_memory):
+            return []
+        semaphore = asyncio.Semaphore(8)
+
+        async def hydrate(header: MemorySnapshot) -> MemorySnapshot | None:
+            async with semaphore:
+                try:
+                    response = await get_memory(header.memory_id)
+                except Mem0UpstreamError as exc:
+                    if exc.status_code == 404:
+                        return None
+                    raise
+            if (
+                not isinstance(response, dict)
+                or header.memory_id not in extract_memory_ids(response)
+                or self._record_is_pinned(response)
+            ):
+                return None
+            content_hash, content_length = memory_content_fingerprint(response)
+            text = self._record_text(response)
+            if content_hash != header.content_hash or text is None:
+                return None
+            return MemorySnapshot(
+                project_id=header.project_id,
+                app_id=header.app_id,
+                memory_id=header.memory_id,
+                user_id=header.user_id,
+                agent_id=header.agent_id,
+                normalized_type=header.normalized_type,
+                content_hash=content_hash,
+                content_length=content_length or 0,
+                text=text,
+            )
+
+        hydrated_anchors = [
+            snapshot
+            for snapshot in await asyncio.gather(
+                *(hydrate(header) for header in anchor_headers)
+            )
+            if snapshot is not None
+        ]
+
+        async def neighbors(
+            anchor: MemorySnapshot,
+        ) -> tuple[MemorySnapshot, list[dict[str, Any]]]:
+            payload: dict[str, Any] = {
+                "query": anchor.text,
+                "app_id": anchor.app_id,
+                "top_k": 10,
+                "threshold": policy.near_duplicate_threshold,
+                "filters": {
+                    "normalized_type": anchor.normalized_type,
+                    "sidecar_app_id": anchor.app_id,
+                    "sidecar_project_id": anchor.project_id,
+                },
+            }
+            if anchor.user_id is not None:
+                payload["user_id"] = anchor.user_id
+            if anchor.agent_id is not None:
+                payload["agent_id"] = anchor.agent_id
+            async with semaphore:
+                response = await search(payload)
+            results = response.get("results") if isinstance(response, dict) else None
+            return (
+                anchor,
+                [item for item in results if isinstance(item, dict)]
+                if isinstance(results, list)
+                else [],
+            )
+
+        search_results = await asyncio.gather(
+            *(neighbors(anchor) for anchor in hydrated_anchors)
+        )
+        candidate_refs: list[tuple[tuple[str, str], MemorySnapshot, str, float]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for anchor, results in search_results:
+            for item in results[:10]:
+                ids = extract_memory_ids(item)
+                if not ids or ids[0] == anchor.memory_id:
+                    continue
+                score_value = item.get("score")
+                if isinstance(score_value, bool):
+                    continue
+                try:
+                    score = float(score_value)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    not math.isfinite(score)
+                    or score < policy.near_duplicate_threshold
+                ):
+                    continue
+                pair = tuple(sorted((anchor.memory_id, ids[0])))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                candidate_refs.append((pair, anchor, ids[0], score))
+
+        candidate_ids = list(
+            dict.fromkeys(ref[2] for ref in sorted(candidate_refs))
+        )
+        candidate_projections = MemoryIndexRepository(
+            self.session
+        ).list_memories_by_ids(
+            project_id=anchor_headers[0].project_id if anchor_headers else "",
+            app_id=anchor_headers[0].app_id if anchor_headers else "",
+            mem0_memory_ids=candidate_ids,
+        )
+        candidate_headers = {
+            memory.mem0_memory_id: self._snapshot_header(memory)
+            for memory in candidate_projections
+            if not memory.pinned
+        }
+        self.session.rollback()
+
+        valid_refs = [
+            ref
+            for ref in sorted(candidate_refs)
+            if (header := candidate_headers.get(ref[2])) is not None
+            and header.project_id == ref[1].project_id
+            and header.app_id == ref[1].app_id
+            and header.user_id == ref[1].user_id
+            and header.agent_id == ref[1].agent_id
+            and header.normalized_type == ref[1].normalized_type
+            and header.content_hash != ref[1].content_hash
+        ]
+        hydration_ids = list(dict.fromkeys(ref[2] for ref in valid_refs))[:20]
+        anchor_cache = {anchor.memory_id: anchor for anchor in hydrated_anchors}
+        missing_headers = [
+            candidate_headers[memory_id]
+            for memory_id in hydration_ids
+            if memory_id not in anchor_cache
+        ]
+        candidate_cache = dict(anchor_cache)
+        for snapshot in await asyncio.gather(
+            *(hydrate(header) for header in missing_headers)
+        ):
+            if snapshot is not None:
+                candidate_cache[snapshot.memory_id] = snapshot
+
+        drafts: list[ProposalDraft] = []
+        analyzer = ConsolidationAnalyzer()
+        for _pair, anchor, candidate_id, score in valid_refs:
+            if candidate_id not in hydration_ids:
+                continue
+            candidate = candidate_cache.get(candidate_id)
+            if candidate is None:
+                continue
+            draft = analyzer.classify_neighbor(
+                anchor,
+                candidate,
+                score,
+                policy_version=policy.policy_version,
+            )
+            if draft is not None:
+                drafts.append(draft)
+        return drafts
+
+    async def run_scan(self, run_id: str) -> dict[str, object]:
         runs = ConsolidationRunRepository(self.session)
         policies = ConsolidationPolicyRepository(self.session)
         proposals = ConsolidationProposalRepository(self.session)
         memories = MemoryIndexRepository(self.session)
         run = runs.get(run_id)
+        project_id = run.project_id
         if run.status == "SUCCEEDED":
             return {
                 "run_id": run.id,
@@ -479,6 +674,7 @@ class ConsolidationService:
                 error={"error_type": "IncompleteSourceSnapshot"},
                 completed_at=self.now(),
             )
+            self.session.commit()
             return {"run_id": run.id, "status": "FAILED", "proposal_count": 0}
 
         policy_row = policies.get(run.project_id, run.app_id)
@@ -489,6 +685,7 @@ class ConsolidationService:
                 error={"error_type": "PolicyNotFound"},
                 completed_at=self.now(),
             )
+            self.session.commit()
             return {"run_id": run.id, "status": "FAILED", "proposal_count": 0}
 
         try:
@@ -526,24 +723,63 @@ class ConsolidationService:
                     evidence=draft.evidence,
                     status=status,
                 )
+            remaining = max(policy.max_proposals_per_run - len(drafts), 0)
+            if remaining and anchors:
+                covered_ids = {
+                    memory_id
+                    for draft in drafts
+                    for memory_id in draft.source_ids
+                }
+                anchor_headers = [
+                    self._snapshot_header(anchor)
+                    for anchor in anchors
+                    if anchor.mem0_memory_id not in covered_ids
+                ]
+            else:
+                anchor_headers = []
+            if anchor_headers:
+                self.session.commit()
+                semantic_drafts = await self._semantic_drafts(
+                    policy=policy,
+                    anchor_headers=anchor_headers,
+                )
+                ProjectRepository(self.session).lock_for_mutation(project_id)
+                run = runs.get(run_id)
+                if run.status != "RUNNING":
+                    raise ConsolidationConflictError("scan run is no longer active")
+                for draft in semantic_drafts[:remaining]:
+                    proposals.create(
+                        run=run,
+                        proposal_key=draft.proposal_key,
+                        kind=draft.kind,
+                        source_ids=draft.source_ids,
+                        canonical_id=draft.canonical_id,
+                        score=draft.score,
+                        evidence=draft.evidence,
+                        status="REVIEW_REQUIRED",
+                    )
             counts = proposals.summary_for_run(run.id)
             runs.mark_succeeded(
                 run.id,
                 counts=counts,
                 completed_at=self.now(),
             )
-            return {
+            result = {
                 "run_id": run.id,
                 "status": "SUCCEEDED",
                 "proposal_count": counts["total"],
             }
+            self.session.commit()
+            return result
         except Exception as exc:
+            self.session.rollback()
             runs.mark_failed(
-                run.id,
+                run_id,
                 error_code="SCAN_FAILED",
                 error={"error_type": type(exc).__name__},
                 completed_at=self.now(),
             )
+            self.session.commit()
             raise
 
     def get_status(self, project_id: str, app_id: str) -> dict[str, object]:

@@ -158,6 +158,34 @@ async def test_mem0_client_posts_search_memory_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mem0_client_normalizes_nested_search_hits_and_preserves_score() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "memory": {"id": "mem-1", "memory": "hello"},
+                        "score": 0.94,
+                    }
+                ]
+            },
+        )
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.search_memories({"query": "hello"})
+
+    assert result == {
+        "results": [{"id": "mem-1", "memory": "hello", "score": 0.94}],
+        "total": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_mem0_client_gets_memory_by_id() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
