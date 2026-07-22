@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -11,8 +12,19 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from mem0_sidecar.config import SidecarSettings
+from mem0_sidecar.core.consolidation_service import ConsolidationService
 from mem0_sidecar.http_adapter.app import create_app
-from mem0_sidecar.store.models import Event, MemoryIndex
+from mem0_sidecar.mem0_client.client import Mem0UpstreamError
+from mem0_sidecar.store.models import (
+    ConsolidationLineage,
+    ConsolidationProposal,
+    Event,
+    MemoryIndex,
+)
+from mem0_sidecar.store.repositories import (
+    ConsolidationPolicyRepository,
+    ConsolidationRunRepository,
+)
 
 pytestmark = pytest.mark.e2e
 
@@ -1321,4 +1333,211 @@ def test_live_categories_and_export_flow(tmp_path) -> None:
                 cleanup_errors.append(
                     f"Category cleanup raised {type(exc).__name__}: {exc}"
                 )
+        _report_cleanup_failures(cleanup_errors)
+
+
+@pytest.mark.asyncio
+async def test_live_consolidation_survives_restart_and_preserves_pinned(
+    tmp_path,
+) -> None:
+    token = uuid4().hex
+    project_id = f"consolidation-project-{token}"
+    app_id = f"consolidation-app-{token}"
+    user_id = f"consolidation-user-{token}"
+    marker = f"exact consolidation marker {token}"
+    settings = _live_settings(
+        tmp_path,
+        project_id=project_id,
+        database_name="consolidation-e2e.sqlite3",
+    )
+    app = create_app(settings=settings)
+    client = TestClient(app)
+    created_ids: list[str] = []
+    canonical_id: str | None = None
+    pinned_id: str | None = None
+
+    try:
+        for pinned in (False, False, True):
+            response = client.post(
+                "/v3/memories/add/",
+                json={
+                    "project_id": project_id,
+                    "app_id": app_id,
+                    "user_id": user_id,
+                    "infer": False,
+                    "metadata": {
+                        "type": "decision",
+                        "source": "consolidation_e2e",
+                        "pinned": pinned,
+                    },
+                    "messages": [{"role": "user", "content": marker}],
+                },
+            )
+            assert response.status_code == 200, response.text
+            created_ids.append(response.json()["event"]["subject_id"])
+        pinned_id = created_ids[-1]
+
+        with app.state.session_factory() as session:
+            policy = ConsolidationPolicyRepository(session).upsert(
+                project_id=project_id,
+                app_id=app_id,
+                policy={"enabled": True, "mode": "OBSERVE"},
+            )
+            run = ConsolidationRunRepository(session).create(
+                policy, now=datetime.now(UTC)
+            )
+            session.commit()
+            service = ConsolidationService(
+                session=session,
+                mem0=app.state.mem0_client,
+                bridge_routing_ready=True,
+            )
+            observed = await service.run_scan(run.id)
+            proposals = session.scalars(
+                select(ConsolidationProposal).where(
+                    ConsolidationProposal.run_id == run.id
+                )
+            ).all()
+            assert observed["proposal_count"] == 1
+            assert len(proposals) == 1
+            proposal = proposals[0]
+            source_ids = json.loads(proposal.source_ids_json)
+            assert pinned_id not in source_ids
+            canonical_id = proposal.canonical_memory_id
+            hashes = {
+                memory.mem0_memory_id: memory.content_hash
+                for memory in session.scalars(
+                    select(MemoryIndex).where(
+                        MemoryIndex.mem0_memory_id.in_(source_ids)
+                    )
+                )
+            }
+            ConsolidationPolicyRepository(session).upsert(
+                project_id=project_id,
+                app_id=app_id,
+                policy={"enabled": True, "mode": "MANUAL"},
+            )
+            session.commit()
+            await service.approve_proposal(
+                proposal.id,
+                expected_status="PENDING",
+                expected_source_hashes=hashes,
+            )
+            await service.shadow_approved(proposal.id)
+
+        query = client.post(
+            "/v1/memories/query",
+            json={"project_id": project_id, "app_id": app_id, "page_size": 20},
+        )
+        assert query.status_code == 200, query.text
+        assert {item["id"] for item in query.json()["results"]} == {
+            canonical_id,
+            pinned_id,
+        }
+
+        with app.state.session_factory() as session:
+            service = ConsolidationService(
+                session=session,
+                mem0=app.state.mem0_client,
+                bridge_routing_ready=True,
+            )
+            service.rollback_shadowed(proposal.id)
+        restored = client.post(
+            "/v1/memories/query",
+            json={"project_id": project_id, "app_id": app_id, "page_size": 20},
+        )
+        assert {item["id"] for item in restored.json()["results"]} == set(
+            created_ids
+        )
+
+        with app.state.session_factory() as session:
+            policy = ConsolidationPolicyRepository(session).get(project_id, app_id)
+            assert policy is not None
+            rerun = ConsolidationRunRepository(session).create(
+                policy, now=datetime.now(UTC)
+            )
+            session.commit()
+            service = ConsolidationService(
+                session=session,
+                mem0=app.state.mem0_client,
+                bridge_routing_ready=True,
+            )
+            await service.run_scan(rerun.id)
+            second = session.scalar(
+                select(ConsolidationProposal).where(
+                    ConsolidationProposal.run_id == rerun.id
+                )
+            )
+            assert second is not None
+            second_sources = json.loads(second.source_ids_json)
+            second_hashes = {
+                memory.mem0_memory_id: memory.content_hash
+                for memory in session.scalars(
+                    select(MemoryIndex).where(
+                        MemoryIndex.mem0_memory_id.in_(second_sources)
+                    )
+                )
+            }
+            await service.approve_proposal(
+                second.id,
+                expected_status="PENDING",
+                expected_source_hashes=second_hashes,
+            )
+            await service.shadow_approved(second.id)
+            redundant_id = next(
+                memory_id
+                for memory_id in second_sources
+                if memory_id != second.canonical_memory_id
+            )
+
+        restarted_app = create_app(
+            settings=settings.model_copy(
+                update={"consolidation_hard_delete_enabled": True}
+            )
+        )
+        client = TestClient(restarted_app)
+        with restarted_app.state.session_factory() as session:
+            persisted = session.get(ConsolidationProposal, second.id)
+            assert persisted is not None and persisted.not_before is not None
+            applied = await ConsolidationService(
+                session=session,
+                mem0=restarted_app.state.mem0_client,
+                bridge_routing_ready=True,
+                hard_delete_enabled=True,
+            ).finalize_shadowed(
+                second.id,
+                now=persisted.not_before + timedelta(seconds=1),
+            )
+            assert applied["status"] == "APPLIED"
+            assert session.scalar(
+                select(ConsolidationLineage).where(
+                    ConsolidationLineage.proposal_id == second.id,
+                    ConsolidationLineage.source_memory_id == redundant_id,
+                )
+            ) is not None
+            assert session.scalar(
+                select(Event).where(
+                    Event.project_id == project_id,
+                    Event.operation == "memory.delete",
+                    Event.subject_id == redundant_id,
+                )
+            ) is not None
+
+        await restarted_app.state.mem0_client.get_memory(canonical_id)
+        await restarted_app.state.mem0_client.get_memory(pinned_id)
+        with pytest.raises(Mem0UpstreamError) as deleted:
+            await restarted_app.state.mem0_client.get_memory(redundant_id)
+        assert deleted.value.status_code == 404
+    finally:
+        cleanup_errors = []
+        for memory_id in created_ids:
+            cleanup_errors.append(
+                _cleanup_memory_fixture(
+                    client,
+                    settings,
+                    memory_id=memory_id,
+                    project_id=project_id,
+                    app_id=app_id,
+                )
+            )
         _report_cleanup_failures(cleanup_errors)

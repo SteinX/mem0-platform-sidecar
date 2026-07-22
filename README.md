@@ -55,7 +55,7 @@ Important modules:
 | `src/mem0_sidecar/mem0_client/` | REST client for the Mem0 OSS data plane |
 | `src/mem0_sidecar/store/` | SQLAlchemy models, database setup, repositories |
 | `src/mem0_sidecar/observability.py` | request ID handling and structured logs |
-| `src/mem0_sidecar/workers/` | worker runner skeleton for later async jobs |
+| `src/mem0_sidecar/workers/` | durable async jobs, consolidation scheduler, and worker lifecycle |
 | `docker/` | Dockerfile plus sidecar-only and E2E compose files |
 | `tests/e2e/` | Live Mem0 OSS E2E harness and OpenAI-compatible test stub |
 
@@ -310,6 +310,11 @@ prefix. `.env.example` is the deployment starting point.
 | `MEM0_SIDECAR_DIRECT_WRITE_SYNC_LEGACY_CAP` | `1000` | Treat an exact cap-sized response without a total as incomplete. Set `0` only when the upstream has no silent legacy cap. |
 | `MEM0_SIDECAR_DIRECT_WRITE_SYNC_DEFAULT_APP_ID` | `default` | Fallback app only for unmarked records with no top-level or metadata `app_id`. |
 | `MEM0_SIDECAR_WORKER_POLL_INTERVAL_SECONDS` | `1` | Reserved for the worker runner. |
+| `MEM0_SIDECAR_CONSOLIDATION_ENABLED` | `false` | Start the consolidation scheduler and worker. Leave off during initial deployment. |
+| `MEM0_SIDECAR_CONSOLIDATION_SCHEDULER_INTERVAL_SECONDS` | `300` | Seconds between bounded due-scope scans. |
+| `MEM0_SIDECAR_CONSOLIDATION_JOB_LEASE_SECONDS` | `300` | Lease for recoverable consolidation jobs. |
+| `MEM0_SIDECAR_CONSOLIDATION_HARD_DELETE_ENABLED` | `false` | Permit final deletion only after export, shadow grace, and read-back verification. |
+| `MEM0_SIDECAR_CONSOLIDATION_BRIDGE_ROUTING_REQUIRED` | `true` | Require a current MCP bridge read/write routing heartbeat before `AUTO_SAFE`. |
 | `MEM0_SIDECAR_LOG_LEVEL` | `INFO` | Python logging level. |
 | `MEM0_SIDECAR_LOG_FORMAT` | `text` | Use `json` for container logs. |
 | `MEM0_SIDECAR_REQUEST_ID_HEADER` | `X-Request-ID` | Header propagated into request and upstream logs. |
@@ -336,6 +341,10 @@ MEM0_SIDECAR_MEM0_EXTRA_HEADERS='{"X-Mem0-Org":"org-1"}'
 - `/readyz` checks that the sidecar database can execute a simple query.
 - Every request receives or propagates the configured request ID header.
 - Set `MEM0_SIDECAR_LOG_FORMAT=json` for structured request logs in Docker.
+
+Server-side memory consolidation is disabled by default. See
+[docs/consolidation.md](docs/consolidation.md) for policy, CLI, staged rollout,
+rollback, and restore-drill guidance.
 
 Run one bounded compatibility backfill inside the sidecar container with:
 

@@ -16,6 +16,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import Session, sessionmaker
@@ -1096,6 +1097,7 @@ def _run_interleaving(session_factory, operation: str) -> None:
 
 def _verify_intent_downgrade_guard(engine, config: Config) -> None:
     now = datetime.now(UTC)
+    head_revision = ScriptDirectory.from_config(config).get_current_head()
     with engine.begin() as connection:
         connection.execute(
             text(
@@ -1180,8 +1182,8 @@ def _verify_intent_downgrade_guard(engine, config: Config) -> None:
         )
         _require(
             connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0007_mutation_intents",
-            "0007 downgrade refusal changed the Alembic revision",
+            == head_revision,
+            "0007 downgrade refusal changed the transactional Alembic revision",
         )
 
     with engine.begin() as connection:

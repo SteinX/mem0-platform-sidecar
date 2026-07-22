@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from mem0_sidecar.mem0_client import client as client_module
-from mem0_sidecar.mem0_client.client import Mem0RestClient
+from mem0_sidecar.mem0_client.client import Mem0RestClient, Mem0UpstreamError
 
 
 def _bounded_value_contains_secret(value: object, secret: str) -> bool:
@@ -200,6 +200,29 @@ async def test_mem0_client_gets_memory_by_id() -> None:
     result = await client.get_memory("mem-1")
 
     assert result == {"id": "mem-1", "memory": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_mem0_client_normalizes_null_memory_to_not_found() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/memories/missing"
+        return httpx.Response(
+            200,
+            content=b"null",
+            headers={"content-type": "application/json"},
+        )
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(Mem0UpstreamError) as error_info:
+        await client.get_memory("missing")
+
+    assert error_info.value.status_code == 404
+    assert error_info.value.outcome_unknown is False
 
 
 @pytest.mark.asyncio

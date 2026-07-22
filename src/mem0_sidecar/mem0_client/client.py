@@ -260,7 +260,18 @@ class Mem0RestClient:
         )
 
     async def get_memory(self, memory_id: str) -> dict[str, Any]:
-        return await self._request("GET", self._memory_item_path(memory_id))
+        path = self._memory_item_path(memory_id)
+        response = await self._request("GET", path)
+        if response == {"results": None}:
+            raise Mem0UpstreamError(
+                method="GET",
+                path=path,
+                status_code=404,
+                response_text=None,
+                outcome_unknown=False,
+                message=f"Mem0 upstream GET {path} returned no memory",
+            )
+        return response
 
     async def update_memory(
         self,
