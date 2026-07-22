@@ -153,6 +153,20 @@ class MemoryIndex(Base):
             "project_id",
             "category",
         ),
+        Index(
+            "ix_memories_index_consolidation_exact",
+            "project_id",
+            "app_id",
+            "normalized_type",
+            "content_hash",
+        ),
+        Index(
+            "ix_memories_index_consolidation_dirty",
+            "project_id",
+            "app_id",
+            "consolidation_state",
+            "last_observed_at",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -167,6 +181,24 @@ class MemoryIndex(Base):
     metadata_projection_json: Mapped[str] = mapped_column(
         Text, default="{}", nullable=False
     )
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    content_length: Mapped[int | None] = mapped_column(Integer)
+    normalized_type: Mapped[str | None] = mapped_column(String(128))
+    source: Mapped[str | None] = mapped_column(String(128))
+    pinned: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    consolidation_state: Mapped[str] = mapped_column(
+        String(32),
+        default="ACTIVE",
+        server_default=text("'ACTIVE'"),
+        nullable=False,
+    )
+    shadowed_by_proposal_id: Mapped[str | None] = mapped_column(String(36))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -372,6 +404,192 @@ class MutationIntentTarget(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ConsolidationPolicy(Base):
+    __tablename__ = "consolidation_policies"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "app_id",
+            name="uq_consolidation_policy_scope",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id"), nullable=False
+    )
+    app_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    enabled: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    mode: Mapped[str] = mapped_column(
+        String(32),
+        default="OBSERVE",
+        server_default=text("'OBSERVE'"),
+        nullable=False,
+    )
+    policy_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ConsolidationRun(Base):
+    __tablename__ = "consolidation_runs"
+    __table_args__ = (
+        Index(
+            "ix_consolidation_runs_scope_status_created",
+            "project_id",
+            "app_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id"), nullable=False
+    )
+    app_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    policy_id: Mapped[str | None] = mapped_column(
+        ForeignKey("consolidation_policies.id")
+    )
+    policy_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
+    mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="PENDING",
+        server_default=text("'PENDING'"),
+        nullable=False,
+    )
+    scan_cutoff: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    counts_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ConsolidationProposal(Base):
+    __tablename__ = "consolidation_proposals"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "proposal_key",
+            name="uq_consolidation_proposals_run_key",
+        ),
+        Index(
+            "ix_consolidation_proposals_scope_status",
+            "project_id",
+            "app_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("consolidation_runs.id"), nullable=False
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id"), nullable=False
+    )
+    app_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    proposal_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="PENDING",
+        server_default=text("'PENDING'"),
+        nullable=False,
+    )
+    source_ids_json: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_memory_id: Mapped[str | None] = mapped_column(String(256))
+    score: Mapped[float | None] = mapped_column(Float)
+    evidence_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
+    expected_hashes_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
+    export_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("export_jobs.id")
+    )
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ConsolidationLineage(Base):
+    __tablename__ = "consolidation_lineage"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_memory_id",
+            "proposal_id",
+            name="uq_consolidation_lineage_source_proposal",
+        ),
+        Index(
+            "ix_consolidation_lineage_scope_applied",
+            "project_id",
+            "app_id",
+            "applied_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id"), nullable=False
+    )
+    app_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("consolidation_runs.id"), nullable=False
+    )
+    proposal_id: Mapped[str] = mapped_column(
+        ForeignKey("consolidation_proposals.id"), nullable=False
+    )
+    source_memory_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    canonical_memory_id: Mapped[str | None] = mapped_column(String(256))
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_content_hash: Mapped[str | None] = mapped_column(String(64))
+    export_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("export_jobs.id")
+    )
+    metadata_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
+    applied_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
 
 

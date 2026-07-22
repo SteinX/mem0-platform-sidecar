@@ -69,6 +69,167 @@ ENTITY_PROJECTION_INDEX_COLUMNS = {
     ),
 }
 
+CONSOLIDATION_TABLES = {
+    "consolidation_policies",
+    "consolidation_runs",
+    "consolidation_proposals",
+    "consolidation_lineage",
+}
+
+CONSOLIDATION_MEMORY_COLUMNS = {
+    "content_hash",
+    "content_length",
+    "normalized_type",
+    "source",
+    "pinned",
+    "expires_at",
+    "last_observed_at",
+    "consolidation_state",
+    "shadowed_by_proposal_id",
+}
+
+
+def test_consolidation_migration_upgrades_from_mutation_intents(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'consolidation.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0007_mutation_intents")
+    engine = sa.create_engine(database_url, future=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO memories_index (
+                    id, project_id, mem0_memory_id, entity_refs_json,
+                    metadata_projection_json, created_at, updated_at
+                ) VALUES (
+                    'index-1', 'repo-a', 'mem-1', '[]', '{}',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    command.upgrade(config, "head")
+
+    inspector = sa.inspect(engine)
+    assert CONSOLIDATION_TABLES.issubset(inspector.get_table_names())
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("memories_index")
+    }
+    assert CONSOLIDATION_MEMORY_COLUMNS.issubset(columns)
+    with engine.connect() as connection:
+        row = connection.execute(
+            sa.text(
+                """
+                SELECT pinned, consolidation_state
+                FROM memories_index WHERE id = 'index-1'
+                """
+            )
+        ).mappings().one()
+        revision = connection.scalar(
+            sa.text("SELECT version_num FROM alembic_version")
+        )
+    assert row == {"pinned": 0, "consolidation_state": "ACTIVE"}
+    assert revision == "0008_memory_consolidation"
+
+    index_names = {
+        index["name"]
+        for table in (
+            "memories_index",
+            "consolidation_runs",
+            "consolidation_proposals",
+            "consolidation_lineage",
+        )
+        for index in inspector.get_indexes(table)
+    }
+    assert {
+        "ix_memories_index_consolidation_exact",
+        "ix_memories_index_consolidation_dirty",
+        "ix_consolidation_runs_scope_status_created",
+        "ix_consolidation_proposals_scope_status",
+        "ix_consolidation_lineage_scope_applied",
+    }.issubset(index_names)
+
+
+@pytest.mark.parametrize(
+    ("table", "status"),
+    [
+        ("consolidation_runs", "PENDING"),
+        ("consolidation_runs", "RUNNING"),
+        ("consolidation_proposals", "APPROVED"),
+        ("consolidation_proposals", "SHADOWED"),
+    ],
+)
+def test_consolidation_downgrade_refuses_nonterminal_work(
+    tmp_path, table: str, status: str
+) -> None:
+    database_url = f"sqlite:///{tmp_path / f'consolidation-{table}-{status}.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "head")
+    engine = sa.create_engine(database_url, future=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO consolidation_runs (
+                    id, project_id, app_id, mode, status, counts_json,
+                    error_json, created_at, updated_at
+                ) VALUES (
+                    'run-1', 'repo-a', 'app-a', 'OBSERVE',
+                    :run_status, '{}', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            ),
+            {"run_status": status if table == "consolidation_runs" else "SUCCEEDED"},
+        )
+        if table == "consolidation_proposals":
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO consolidation_proposals (
+                        id, run_id, project_id, app_id, proposal_key, kind,
+                        status, source_ids_json, evidence_json, created_at,
+                        updated_at
+                    ) VALUES (
+                        'proposal-1', 'run-1', 'repo-a', 'app-a', 'key-1',
+                        'EXACT_DUPLICATE', :status, '["mem-1","mem-2"]',
+                        '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
+                    """
+                ),
+                {"status": status},
+            )
+
+    with pytest.raises(RuntimeError, match="nonterminal consolidation"):
+        command.downgrade(config, "0007_mutation_intents")
+
+    assert CONSOLIDATION_TABLES.issubset(sa.inspect(engine).get_table_names())
+
 
 def _alembic_config(database_url: str) -> Config:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
