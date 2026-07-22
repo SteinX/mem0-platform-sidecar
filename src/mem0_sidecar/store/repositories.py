@@ -1899,6 +1899,39 @@ class MemoryIndexRepository:
             )
         )
 
+    def list_exact_group_peers(
+        self,
+        anchor: MemoryIndex,
+        *,
+        limit: int = 100,
+    ) -> list[MemoryIndex]:
+        if limit < 1 or limit > 100:
+            raise ValueError("exact peer limit must be between 1 and 100")
+        if not anchor.app_id or not anchor.content_hash:
+            return []
+
+        statement = select(MemoryIndex).where(
+            MemoryIndex.project_id == anchor.project_id,
+            MemoryIndex.app_id == anchor.app_id,
+            MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
+            MemoryIndex.pinned == 0,
+            MemoryIndex.normalized_type == anchor.normalized_type,
+            MemoryIndex.content_hash == anchor.content_hash,
+        )
+        for column, value in (
+            (MemoryIndex.user_id, anchor.user_id),
+            (MemoryIndex.agent_id, anchor.agent_id),
+        ):
+            statement = statement.where(
+                column.is_(None) if value is None else column == value
+            )
+        return list(
+            self.session.scalars(
+                statement.order_by(MemoryIndex.mem0_memory_id).limit(limit)
+            )
+        )
+
     def mark_stale(
         self,
         project_id: str,

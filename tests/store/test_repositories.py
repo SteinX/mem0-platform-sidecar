@@ -1086,6 +1086,62 @@ def test_memory_index_changed_hash_reactivates_shadow_but_same_hash_does_not(
     assert changed.shadowed_by_proposal_id is None
 
 
+def test_memory_index_repository_exact_peers_respect_all_identity_boundaries(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a", name="repo-a", mem0_base_url="http://mem0:8000"
+    )
+    repository = MemoryIndexRepository(db_session)
+    observed = datetime(2026, 7, 23, 1, tzinfo=UTC)
+    shared = {
+        "category": "decision",
+        "content_hash": "same",
+        "content_length": 10,
+        "normalized_type": "decision",
+        "source": "manual",
+        "pinned": False,
+        "observed_at": observed,
+    }
+    anchor = repository.upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="anchor",
+        user_id="alice",
+        agent_id="agent-a",
+        app_id="app-a",
+        **shared,
+    )
+    repository.upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="peer",
+        user_id="alice",
+        agent_id="agent-a",
+        app_id="app-a",
+        **shared,
+    )
+    repository.upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="other-agent",
+        user_id="alice",
+        agent_id="agent-b",
+        app_id="app-a",
+        **shared,
+    )
+    repository.upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="other-app",
+        user_id="alice",
+        agent_id="agent-a",
+        app_id="app-b",
+        **shared,
+    )
+    db_session.commit()
+
+    peers = repository.list_exact_group_peers(anchor, limit=100)
+
+    assert [memory.mem0_memory_id for memory in peers] == ["anchor", "peer"]
+
+
 def test_export_job_repository_lifecycle(db_session):
     ProjectRepository(db_session).upsert_default_project(
         project_id="default",
