@@ -30,6 +30,7 @@ from mem0_sidecar.store.models import (
     Category,
     ConsolidationLineage,
     ConsolidationPolicy,
+    ConsolidationProposal,
     ConsolidationRun,
     Entity,
     Event,
@@ -1902,6 +1903,39 @@ class MemoryIndexRepository:
             )
         )
 
+    def count_dirty_anchors(self, *, project_id: str, app_id: str) -> int:
+        latest_lineage = (
+            select(func.max(ConsolidationLineage.applied_at))
+            .where(
+                ConsolidationLineage.project_id == project_id,
+                ConsolidationLineage.app_id == app_id,
+                ConsolidationLineage.source_memory_id
+                == MemoryIndex.mem0_memory_id,
+            )
+            .correlate(MemoryIndex)
+            .scalar_subquery()
+        )
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(MemoryIndex)
+                .where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.app_id == app_id,
+                    MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.consolidation_state == "ACTIVE",
+                    MemoryIndex.pinned == 0,
+                    MemoryIndex.content_hash.is_not(None),
+                    MemoryIndex.last_observed_at.is_not(None),
+                    or_(
+                        latest_lineage.is_(None),
+                        MemoryIndex.last_observed_at > latest_lineage,
+                    ),
+                )
+            )
+            or 0
+        )
+
     def list_exact_group_peers(
         self,
         anchor: MemoryIndex,
@@ -2849,3 +2883,182 @@ class ConsolidationRunRepository:
         self.session.add(run)
         self.session.flush()
         return run
+
+    def get(
+        self,
+        run_id: str,
+        *,
+        project_id: str | None = None,
+        app_id: str | None = None,
+    ) -> ConsolidationRun:
+        statement = select(ConsolidationRun).where(
+            ConsolidationRun.id == run_id
+        )
+        if project_id is not None:
+            statement = statement.where(
+                ConsolidationRun.project_id == project_id
+            )
+        if app_id is not None:
+            statement = statement.where(ConsolidationRun.app_id == app_id)
+        run = self.session.scalar(statement)
+        if run is None:
+            raise KeyError(run_id)
+        return run
+
+    def mark_running(
+        self, run_id: str, *, scan_cutoff: datetime
+    ) -> ConsolidationRun:
+        run = self.get(run_id)
+        run.status = "RUNNING"
+        run.scan_cutoff = scan_cutoff
+        run.started_at = run.started_at or scan_cutoff
+        run.updated_at = scan_cutoff
+        self.session.flush()
+        return run
+
+    def mark_succeeded(
+        self,
+        run_id: str,
+        *,
+        counts: Mapping[str, object],
+        completed_at: datetime,
+    ) -> ConsolidationRun:
+        run = self.get(run_id)
+        run.status = "SUCCEEDED"
+        run.counts_json = _json(counts)
+        run.error_code = None
+        run.error_json = "{}"
+        run.completed_at = completed_at
+        run.updated_at = completed_at
+        self.session.flush()
+        return run
+
+    def mark_failed(
+        self,
+        run_id: str,
+        *,
+        error_code: str,
+        error: Mapping[str, object],
+        completed_at: datetime,
+    ) -> ConsolidationRun:
+        run = self.get(run_id)
+        run.status = "FAILED"
+        run.error_code = error_code
+        run.error_json = _json(dict(error))
+        run.completed_at = completed_at
+        run.updated_at = completed_at
+        self.session.flush()
+        return run
+
+
+class ConsolidationProposalRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        run: ConsolidationRun,
+        proposal_key: str,
+        kind: str,
+        source_ids: tuple[str, ...],
+        canonical_id: str | None,
+        score: float | None,
+        evidence: Mapping[str, object],
+        status: str,
+    ) -> ConsolidationProposal:
+        existing = self.session.scalar(
+            select(ConsolidationProposal).where(
+                ConsolidationProposal.run_id == run.id,
+                ConsolidationProposal.proposal_key == proposal_key,
+            )
+        )
+        if existing is not None:
+            return existing
+        proposal = ConsolidationProposal(
+            run_id=run.id,
+            project_id=run.project_id,
+            app_id=run.app_id,
+            proposal_key=proposal_key,
+            kind=kind,
+            status=status,
+            source_ids_json=_json(list(source_ids)),
+            canonical_memory_id=canonical_id,
+            score=score,
+            evidence_json=_json(dict(evidence)),
+        )
+        self.session.add(proposal)
+        self.session.flush()
+        return proposal
+
+    def list_for_run(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        run_id: str,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> list[ConsolidationProposal]:
+        if offset < 0 or limit < 1 or limit > 100:
+            raise ValueError("proposal page is invalid")
+        return list(
+            self.session.scalars(
+                select(ConsolidationProposal)
+                .where(
+                    ConsolidationProposal.project_id == project_id,
+                    ConsolidationProposal.app_id == app_id,
+                    ConsolidationProposal.run_id == run_id,
+                )
+                .order_by(
+                    ConsolidationProposal.created_at,
+                    ConsolidationProposal.id,
+                )
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+
+    def count_for_run(self, run_id: str) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(ConsolidationProposal)
+                .where(ConsolidationProposal.run_id == run_id)
+            )
+            or 0
+        )
+
+    def summary_for_run(self, run_id: str) -> dict[str, object]:
+        by_kind = {
+            kind: int(count)
+            for kind, count in self.session.execute(
+                select(ConsolidationProposal.kind, func.count())
+                .where(ConsolidationProposal.run_id == run_id)
+                .group_by(ConsolidationProposal.kind)
+            )
+        }
+        by_status = {
+            status: int(count)
+            for status, count in self.session.execute(
+                select(ConsolidationProposal.status, func.count())
+                .where(ConsolidationProposal.run_id == run_id)
+                .group_by(ConsolidationProposal.status)
+            )
+        }
+        return {
+            "by_kind": dict(sorted(by_kind.items())),
+            "by_status": dict(sorted(by_status.items())),
+            "total": sum(by_kind.values()),
+        }
+
+    def counts_for_scope(self, project_id: str, app_id: str) -> dict[str, int]:
+        rows = self.session.execute(
+            select(ConsolidationProposal.status, func.count())
+            .where(
+                ConsolidationProposal.project_id == project_id,
+                ConsolidationProposal.app_id == app_id,
+            )
+            .group_by(ConsolidationProposal.status)
+        )
+        return {status: int(count) for status, count in rows}
