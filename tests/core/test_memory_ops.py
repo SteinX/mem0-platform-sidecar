@@ -675,6 +675,38 @@ async def test_memory_service_search_filters_upstream_results_by_indexed_scope(
 
 
 @pytest.mark.asyncio
+async def test_memory_service_search_omits_shadowed_projection(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    memory = MemoryIndexRepository(db_session).upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="mem-app-a",
+        user_id="root",
+        agent_id=None,
+        app_id="app-a",
+        run_id=None,
+        category=None,
+        metadata={},
+    )
+    memory.consolidation_state = "SHADOWED"
+    memory.shadowed_by_proposal_id = "proposal-a"
+    db_session.commit()
+
+    result = await MemoryService(
+        session=db_session,
+        mem0=ScopedSearchMem0Client(),
+    ).search_memories(
+        project_id="repo-a",
+        payload={"query": "hello", "user_id": "root", "app_id": "app-a"},
+    )
+
+    assert result["results"] == []
+
+
+@pytest.mark.asyncio
 async def test_search_memory_trace_is_filtered_correlated_and_durable(
     db_session,
     monkeypatch,

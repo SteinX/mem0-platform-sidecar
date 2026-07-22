@@ -1625,6 +1625,7 @@ class MemoryIndexRepository:
         app_id: str | None,
         mem0_memory_ids: Iterable[str],
         include_deleted: bool = False,
+        include_shadowed: bool = False,
     ) -> list[MemoryIndex]:
         memory_ids = list(dict.fromkeys(mem0_memory_ids))
         memories: list[MemoryIndex] = []
@@ -1637,6 +1638,10 @@ class MemoryIndexRepository:
                 statement = statement.where(MemoryIndex.app_id == app_id)
             if not include_deleted:
                 statement = statement.where(MemoryIndex.deleted_at.is_(None))
+            if not include_shadowed:
+                statement = statement.where(
+                    MemoryIndex.consolidation_state == "ACTIVE"
+                )
             memories.extend(self.session.scalars(statement))
         return memories
 
@@ -1656,6 +1661,7 @@ class MemoryIndexRepository:
         statement = select(MemoryIndex.mem0_memory_id).where(
             MemoryIndex.project_id == project_id,
             MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
             MemoryIndex.mem0_memory_id.in_(mem0_memory_ids),
         )
         if user_id is not None:
@@ -1680,6 +1686,7 @@ class MemoryIndexRepository:
             .where(
                 MemoryIndex.project_id == project_id,
                 MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.consolidation_state == "ACTIVE",
             )
             .order_by(MemoryIndex.created_at, MemoryIndex.mem0_memory_id)
         )
@@ -1691,6 +1698,17 @@ class MemoryIndexRepository:
             statement = statement.where(MemoryIndex.agent_id == agent_id)
         if (run_id := filters.get("run_id")) is not None:
             statement = statement.where(MemoryIndex.run_id == run_id)
+        if (memory_ids := filters.get("memory_ids")) is not None:
+            if (
+                not isinstance(memory_ids, list)
+                or not memory_ids
+                or len(memory_ids) > 1000
+                or any(not isinstance(item, str) or not item for item in memory_ids)
+            ):
+                raise ValueError("memory_ids export filter is invalid")
+            statement = statement.where(
+                MemoryIndex.mem0_memory_id.in_(list(dict.fromkeys(memory_ids)))
+            )
         return list(self.session.scalars(statement))
 
     def query_project_memories(
@@ -1713,6 +1731,7 @@ class MemoryIndexRepository:
         scope_conditions = [
             MemoryIndex.project_id == project_id,
             MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
         ]
         if app_id is not None:
             scope_conditions.append(MemoryIndex.app_id == app_id)
@@ -2297,6 +2316,7 @@ class EntityRepository:
                         MemoryIndex.project_id == project_id,
                         MemoryIndex.app_id == app_id,
                         MemoryIndex.deleted_at.is_(None),
+                        MemoryIndex.consolidation_state == "ACTIVE",
                     )
                     .order_by(MemoryIndex.id)
                     .limit(EXPLORER_RECORD_HORIZON + 1)
@@ -2392,6 +2412,7 @@ class EntityRepository:
                     MemoryIndex.project_id == project_id,
                     MemoryIndex.app_id == app_id,
                     MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.consolidation_state == "ACTIVE",
                     memory_id_column.in_(entity_ids),
                 )
                 .group_by(memory_id_column)
@@ -2518,6 +2539,7 @@ class EntityRepository:
                 MemoryIndex.project_id == project_id,
                 MemoryIndex.app_id == app_id,
                 MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.consolidation_state == "ACTIVE",
                 identity_column == entity_id,
             )
             .order_by(
@@ -2991,6 +3013,49 @@ class ConsolidationProposalRepository:
         self.session.flush()
         return proposal
 
+    def get(self, proposal_id: str) -> ConsolidationProposal:
+        proposal = self.session.get(ConsolidationProposal, proposal_id)
+        if proposal is None:
+            raise KeyError(proposal_id)
+        return proposal
+
+    def source_ids(self, proposal: ConsolidationProposal) -> tuple[str, ...]:
+        try:
+            value = json.loads(proposal.source_ids_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("stored proposal source IDs are invalid") from exc
+        if (
+            not isinstance(value, list)
+            or not value
+            or any(not isinstance(item, str) or not item for item in value)
+        ):
+            raise ValueError("stored proposal source IDs are invalid")
+        return tuple(dict.fromkeys(value))
+
+    def expected_hashes(
+        self, proposal: ConsolidationProposal
+    ) -> dict[str, str]:
+        try:
+            value = json.loads(proposal.expected_hashes_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("stored proposal hashes are invalid") from exc
+        if not isinstance(value, dict) or any(
+            not isinstance(key, str) or not isinstance(item, str)
+            for key, item in value.items()
+        ):
+            raise ValueError("stored proposal hashes are invalid")
+        return value
+
+    def set_status(
+        self,
+        proposal: ConsolidationProposal,
+        status: str,
+    ) -> ConsolidationProposal:
+        proposal.status = status
+        proposal.updated_at = _utc_now()
+        self.session.flush()
+        return proposal
+
     def list_for_run(
         self,
         *,
@@ -3062,3 +3127,55 @@ class ConsolidationProposalRepository:
             .group_by(ConsolidationProposal.status)
         )
         return {status: int(count) for status, count in rows}
+
+
+class ConsolidationLineageRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get_source(
+        self,
+        *,
+        proposal_id: str,
+        source_memory_id: str,
+    ) -> ConsolidationLineage | None:
+        return self.session.scalar(
+            select(ConsolidationLineage).where(
+                ConsolidationLineage.proposal_id == proposal_id,
+                ConsolidationLineage.source_memory_id == source_memory_id,
+            )
+        )
+
+    def create(
+        self,
+        *,
+        proposal: ConsolidationProposal,
+        source_memory_id: str,
+        canonical_memory_id: str | None,
+        action: str,
+        source_content_hash: str | None,
+        export_job_id: str,
+        applied_at: datetime,
+    ) -> ConsolidationLineage:
+        existing = self.get_source(
+            proposal_id=proposal.id,
+            source_memory_id=source_memory_id,
+        )
+        if existing is not None:
+            return existing
+        lineage = ConsolidationLineage(
+            project_id=proposal.project_id,
+            app_id=proposal.app_id,
+            run_id=proposal.run_id,
+            proposal_id=proposal.id,
+            source_memory_id=source_memory_id,
+            canonical_memory_id=canonical_memory_id,
+            action=action,
+            source_content_hash=source_content_hash,
+            export_job_id=export_job_id,
+            metadata_json="{}",
+            applied_at=applied_at,
+        )
+        self.session.add(lineage)
+        self.session.flush()
+        return lineage
