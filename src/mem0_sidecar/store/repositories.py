@@ -13,6 +13,7 @@ from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from mem0_sidecar.core.consolidation_policy import ConsolidationPolicySpec
 from mem0_sidecar.core.explorer_filters import (
     EXPLORER_RECORD_HORIZON,
     ExplorerFilter,
@@ -28,6 +29,8 @@ from mem0_sidecar.core.trace_payloads import (
 from mem0_sidecar.store.models import (
     Category,
     ConsolidationLineage,
+    ConsolidationPolicy,
+    ConsolidationRun,
     Entity,
     Event,
     EventStatus,
@@ -2586,28 +2589,263 @@ class JobRepository:
         event_id: str | None,
         job_type: str,
         payload: dict[str, Any],
+        run_after: datetime | None = None,
+        max_attempts: int = 3,
+        dedupe_key: str | None = None,
     ) -> Job:
+        if max_attempts < 1 or max_attempts > 100:
+            raise ValueError("max_attempts must be between 1 and 100")
         job = Job(
             project_id=project_id,
             event_id=event_id,
             job_type=job_type,
             payload_json=_json(payload),
+            run_after=run_after,
+            max_attempts=max_attempts,
+            dedupe_key=dedupe_key,
         )
         self.session.add(job)
         self.session.flush()
         return job
 
-    def claim_next(self) -> Job | None:
-        job = self.session.scalar(
-            select(Job)
-            .where(Job.status == JobStatus.PENDING)
-            .order_by(Job.created_at)
+    def _claim_candidate_statement(
+        self,
+        *,
+        job_types: tuple[str, ...],
+        now: datetime,
+        skip_locked: bool,
+    ):
+        eligible = or_(
+            and_(
+                Job.status == JobStatus.PENDING,
+                or_(Job.run_after.is_(None), Job.run_after <= now),
+            ),
+            and_(
+                Job.status == JobStatus.RUNNING,
+                Job.lease_expires_at.is_not(None),
+                Job.lease_expires_at <= now,
+            ),
         )
-        if job is None:
-            return None
+        statement = (
+            select(Job.id)
+            .where(eligible, Job.attempt_count < Job.max_attempts)
+            .order_by(
+                func.coalesce(Job.run_after, Job.created_at),
+                Job.created_at,
+                Job.id,
+            )
+            .limit(1)
+        )
+        if job_types:
+            statement = statement.where(Job.job_type.in_(job_types))
+        if skip_locked:
+            statement = statement.with_for_update(skip_locked=True)
+        return statement
 
-        job.status = JobStatus.RUNNING
-        job.locked_at = _utc_now()
-        job.attempt_count += 1
+    def claim_next(
+        self,
+        job_types: tuple[str, ...] = (),
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> Job | None:
+        if lease_seconds < 1 or lease_seconds > 86_400:
+            raise ValueError("lease_seconds must be between 1 and 86400")
+        now = now or _utc_now()
+        self.session.execute(
+            update(Job)
+            .where(
+                Job.status == JobStatus.RUNNING,
+                Job.lease_expires_at.is_not(None),
+                Job.lease_expires_at <= now,
+                Job.attempt_count >= Job.max_attempts,
+            )
+            .values(
+                status=JobStatus.FAILED,
+                lease_expires_at=None,
+                completed_at=now,
+                error_json=_json({"error_type": "AttemptsExhausted"}),
+                updated_at=now,
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        candidate = self._claim_candidate_statement(
+            job_types=job_types,
+            now=now,
+            skip_locked=self.session.get_bind().dialect.name == "postgresql",
+        )
+        claimed_id = self.session.scalar(
+            update(Job)
+            .where(Job.id == candidate.scalar_subquery())
+            .values(
+                status=JobStatus.RUNNING,
+                locked_at=now,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+                attempt_count=Job.attempt_count + 1,
+                completed_at=None,
+                updated_at=now,
+            )
+            .returning(Job.id)
+            .execution_options(synchronize_session="fetch")
+        )
+        if claimed_id is None:
+            return None
+        return self.session.scalar(
+            select(Job)
+            .where(Job.id == claimed_id)
+            .execution_options(populate_existing=True)
+        )
+
+    def payload(self, job: Job) -> dict[str, Any]:
+        try:
+            payload = json.loads(job.payload_json)
+        except (TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def mark_succeeded(
+        self,
+        job_id: str,
+        result: dict[str, object],
+    ) -> Job:
+        job = self.session.get(Job, job_id)
+        if job is None:
+            raise KeyError(job_id)
+        now = _utc_now()
+        job.status = JobStatus.SUCCEEDED
+        job.result_json = _json(result)
+        job.error_json = "{}"
+        job.lease_expires_at = None
+        job.completed_at = now
+        job.updated_at = now
         self.session.flush()
         return job
+
+    def mark_failed(
+        self,
+        job_id: str,
+        error: dict[str, object],
+        retry_at: datetime | None,
+    ) -> Job:
+        job = self.session.get(Job, job_id)
+        if job is None:
+            raise KeyError(job_id)
+        now = _utc_now()
+        should_retry = retry_at is not None and job.attempt_count < job.max_attempts
+        job.status = JobStatus.PENDING if should_retry else JobStatus.FAILED
+        job.error_json = _json(error)
+        job.run_after = retry_at if should_retry else job.run_after
+        job.locked_at = None
+        job.lease_expires_at = None
+        job.completed_at = None if should_retry else now
+        job.updated_at = now
+        self.session.flush()
+        return job
+
+
+class ConsolidationPolicyRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        policy: Mapping[str, object],
+    ) -> ConsolidationPolicy:
+        spec = ConsolidationPolicySpec.from_mapping(policy)
+        row = self.session.scalar(
+            select(ConsolidationPolicy).where(
+                ConsolidationPolicy.project_id == project_id,
+                ConsolidationPolicy.app_id == app_id,
+            )
+        )
+        if row is None:
+            row = ConsolidationPolicy(project_id=project_id, app_id=app_id)
+            self.session.add(row)
+        row.enabled = int(spec.enabled)
+        row.mode = spec.mode
+        row.version = spec.policy_version
+        row.policy_json = _json(spec.to_mapping())
+        row.updated_at = _utc_now()
+        self.session.flush()
+        return row
+
+    def get(self, project_id: str, app_id: str) -> ConsolidationPolicy | None:
+        return self.session.scalar(
+            select(ConsolidationPolicy).where(
+                ConsolidationPolicy.project_id == project_id,
+                ConsolidationPolicy.app_id == app_id,
+            )
+        )
+
+    def list_enabled(self) -> list[ConsolidationPolicy]:
+        return list(
+            self.session.scalars(
+                select(ConsolidationPolicy)
+                .where(ConsolidationPolicy.enabled == 1)
+                .order_by(
+                    ConsolidationPolicy.project_id,
+                    ConsolidationPolicy.app_id,
+                )
+            )
+        )
+
+    def spec(self, row: ConsolidationPolicy) -> ConsolidationPolicySpec:
+        try:
+            value = json.loads(row.policy_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("stored consolidation policy is invalid") from exc
+        if not isinstance(value, dict):
+            raise ValueError("stored consolidation policy is invalid")
+        return ConsolidationPolicySpec.from_mapping(value)
+
+
+class ConsolidationRunRepository:
+    NONTERMINAL = ("PENDING", "RUNNING")
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def active(self, project_id: str, app_id: str) -> ConsolidationRun | None:
+        return self.session.scalar(
+            select(ConsolidationRun).where(
+                ConsolidationRun.project_id == project_id,
+                ConsolidationRun.app_id == app_id,
+                ConsolidationRun.status.in_(self.NONTERMINAL),
+            )
+        )
+
+    def last_succeeded(
+        self, project_id: str, app_id: str
+    ) -> ConsolidationRun | None:
+        return self.session.scalar(
+            select(ConsolidationRun)
+            .where(
+                ConsolidationRun.project_id == project_id,
+                ConsolidationRun.app_id == app_id,
+                ConsolidationRun.status == "SUCCEEDED",
+            )
+            .order_by(ConsolidationRun.completed_at.desc())
+            .limit(1)
+        )
+
+    def create(
+        self,
+        policy: ConsolidationPolicy,
+        *,
+        now: datetime,
+    ) -> ConsolidationRun:
+        run = ConsolidationRun(
+            project_id=policy.project_id,
+            app_id=policy.app_id,
+            policy_id=policy.id,
+            policy_version=policy.version,
+            mode=policy.mode,
+            status="PENDING",
+            created_at=now,
+            updated_at=now,
+        )
+        self.session.add(run)
+        self.session.flush()
+        return run

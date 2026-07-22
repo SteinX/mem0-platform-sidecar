@@ -595,6 +595,14 @@ class ConsolidationLineage(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "job_type",
+            "dedupe_key",
+            name="uq_jobs_project_type_dedupe",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
@@ -604,10 +612,17 @@ class Job(Base):
         SAEnum(JobStatus), default=JobStatus.PENDING, nullable=False
     )
     payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    result_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"), nullable=False
+    )
+    dedupe_key: Mapped[str | None] = mapped_column(String(256))
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     run_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
