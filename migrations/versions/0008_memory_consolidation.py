@@ -60,6 +60,20 @@ def upgrade() -> None:
         )
         batch_op.add_column(
             sa.Column(
+                "scope_marker_backfill_status",
+                sa.String(length=32),
+                nullable=False,
+                server_default="PENDING",
+            )
+        )
+        batch_op.add_column(
+            sa.Column(
+                "scope_marker_backfill_attempted_at",
+                sa.DateTime(timezone=True),
+            )
+        )
+        batch_op.add_column(
+            sa.Column(
                 "consolidation_state",
                 sa.String(length=32),
                 nullable=False,
@@ -87,7 +101,13 @@ def upgrade() -> None:
         )
         batch_op.create_index(
             "ix_memories_index_scope_marker_backfill",
-            ["project_id", "app_id", "scope_markers_verified", "created_at"],
+            [
+                "project_id",
+                "app_id",
+                "scope_markers_verified",
+                "scope_marker_backfill_attempted_at",
+                "created_at",
+            ],
             unique=False,
         )
 
@@ -332,6 +352,8 @@ def downgrade() -> None:
         batch_op.drop_column("last_observed_at")
         batch_op.drop_column("last_consolidation_scan_at")
         batch_op.drop_column("scope_markers_verified")
+        batch_op.drop_column("scope_marker_backfill_status")
+        batch_op.drop_column("scope_marker_backfill_attempted_at")
         batch_op.drop_column("expires_at")
         batch_op.drop_column("pinned")
         batch_op.drop_column("source")

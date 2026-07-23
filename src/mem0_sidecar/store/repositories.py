@@ -2001,6 +2001,7 @@ class MemoryIndexRepository:
         *,
         project_id: str,
         app_id: str,
+        retry_before: datetime,
         limit: int = 200,
     ) -> list[MemoryIndex]:
         if limit < 1 or limit > 1000:
@@ -2013,8 +2014,24 @@ class MemoryIndexRepository:
                     MemoryIndex.app_id == app_id,
                     MemoryIndex.deleted_at.is_(None),
                     MemoryIndex.scope_markers_verified == 0,
+                    or_(
+                        MemoryIndex.scope_marker_backfill_attempted_at.is_(None),
+                        MemoryIndex.scope_marker_backfill_attempted_at
+                        <= retry_before,
+                    ),
                 )
-                .order_by(MemoryIndex.created_at, MemoryIndex.mem0_memory_id)
+                .order_by(
+                    case(
+                        (
+                            MemoryIndex.scope_marker_backfill_attempted_at.is_(None),
+                            0,
+                        ),
+                        else_=1,
+                    ),
+                    MemoryIndex.scope_marker_backfill_attempted_at,
+                    MemoryIndex.created_at,
+                    MemoryIndex.mem0_memory_id,
+                )
                 .limit(limit)
             )
         )
@@ -2045,6 +2062,7 @@ class MemoryIndexRepository:
         project_id: str,
         app_id: str,
         memory_id: str,
+        verified_at: datetime | None = None,
     ) -> bool:
         result = self.session.execute(
             update(MemoryIndex)
@@ -2054,11 +2072,62 @@ class MemoryIndexRepository:
                 MemoryIndex.mem0_memory_id == memory_id,
                 MemoryIndex.deleted_at.is_(None),
             )
-            .values(scope_markers_verified=1)
+            .values(
+                scope_markers_verified=1,
+                scope_marker_backfill_status="VERIFIED",
+                scope_marker_backfill_attempted_at=verified_at or _utc_now(),
+            )
             .execution_options(synchronize_session="fetch")
         )
         self.session.flush()
         return bool(result.rowcount)
+
+    def mark_scope_marker_backfill_outcome(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        memory_id: str,
+        status: str,
+        attempted_at: datetime,
+    ) -> bool:
+        if status not in {"CONFLICT", "MISSING"}:
+            raise ValueError("invalid scope marker backfill outcome")
+        result = self.session.execute(
+            update(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.mem0_memory_id == memory_id,
+                MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.scope_markers_verified == 0,
+            )
+            .values(
+                scope_marker_backfill_status=status,
+                scope_marker_backfill_attempted_at=attempted_at,
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        self.session.flush()
+        return bool(result.rowcount)
+
+    def scope_marker_backfill_counts(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+    ) -> dict[str, int]:
+        rows = self.session.execute(
+            select(MemoryIndex.scope_marker_backfill_status, func.count())
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.scope_markers_verified == 0,
+            )
+            .group_by(MemoryIndex.scope_marker_backfill_status)
+        )
+        return {status: int(count) for status, count in rows}
 
     def list_dirty_anchors(
         self,
@@ -2293,11 +2362,13 @@ class MemoryIndexRepository:
                 MemoryIndex.mem0_memory_id == mem0_memory_id,
             )
         )
+        is_new = memory is None
         if memory is None:
             memory = MemoryIndex(project_id=project_id, mem0_memory_id=mem0_memory_id)
             self.session.add(memory)
 
         previous_hash = memory.content_hash
+        previously_verified = memory.scope_markers_verified == 1
 
         memory.user_id = user_id
         memory.agent_id = agent_id
@@ -2316,6 +2387,12 @@ class MemoryIndexRepository:
             memory.pinned = int(bool(pinned))
             memory.expires_at = expires_at
             memory.scope_markers_verified = int(bool(scope_markers_verified))
+            if memory.scope_markers_verified == 1:
+                memory.scope_marker_backfill_status = "VERIFIED"
+                memory.scope_marker_backfill_attempted_at = observed_at
+            elif is_new or previously_verified:
+                memory.scope_marker_backfill_status = "PENDING"
+                memory.scope_marker_backfill_attempted_at = None
             memory.last_observed_at = observed_at
         memory.deleted_at = None
         memory.updated_at = projection_now
@@ -2354,6 +2431,7 @@ class MemoryIndexRepository:
             "updated_at": projection_now,
         }
         if observed_at is not None:
+            verified = int(bool(scope_markers_verified))
             values.update(
                 {
                     "content_hash": content_hash,
@@ -2362,8 +2440,12 @@ class MemoryIndexRepository:
                     "source": source,
                     "pinned": int(bool(pinned)),
                     "expires_at": expires_at,
-                    "scope_markers_verified": int(
-                        bool(scope_markers_verified)
+                    "scope_markers_verified": verified,
+                    "scope_marker_backfill_status": (
+                        "VERIFIED" if verified else "PENDING"
+                    ),
+                    "scope_marker_backfill_attempted_at": (
+                        observed_at if verified else None
                     ),
                     "last_observed_at": observed_at,
                     "consolidation_state": "ACTIVE",

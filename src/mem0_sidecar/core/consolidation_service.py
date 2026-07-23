@@ -100,6 +100,7 @@ class ConsolidationService:
         bridge_routing_ready: bool = False,
         hard_delete_enabled: bool = False,
         shadow_lease_seconds: int = 600,
+        scope_backfill_writes_paused: bool = False,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.session = session
@@ -110,6 +111,7 @@ class ConsolidationService:
         self.bridge_routing_ready = bridge_routing_ready
         self.hard_delete_enabled = hard_delete_enabled
         self.shadow_lease_seconds = shadow_lease_seconds
+        self.scope_backfill_writes_paused = scope_backfill_writes_paused
         self.now = now or (lambda: datetime.now(UTC))
 
     @staticmethod
@@ -475,6 +477,16 @@ class ConsolidationService:
             release_before_upstream=True,
         )
         self.session.commit()
+        post_export_sources_match = await self._upstream_sources_match(
+            source_ids,
+            expected_hashes,
+            project_id=proposal.project_id,
+            app_id=proposal.app_id,
+        )
+        post_export_canonical_matches = await self._upstream_canonical_matches(
+            proposal,
+            expected_hashes,
+        )
 
         ProjectRepository(self.session).lock_for_mutation(proposal.project_id)
         proposal = proposals.get(proposal_id)
@@ -495,6 +507,11 @@ class ConsolidationService:
             self._clear_shadow_attempt(proposal)
             proposals.set_status(proposal, status)
             result = {"proposal_id": proposal.id, "status": status}
+            self.session.commit()
+            return result
+        if not post_export_sources_match or not post_export_canonical_matches:
+            self._clear_shadow_attempt(proposal)
+            result = self._mark_stale(proposal)
             self.session.commit()
             return result
         if self._proposal_sources(
@@ -870,13 +887,21 @@ class ConsolidationService:
         project_id: str,
         app_id: str,
         limit: int = 200,
-    ) -> dict[str, int]:
+    ) -> dict[str, object]:
         if self.mem0 is None:
             raise ConsolidationConflictError("Mem0 client is unavailable")
+        if not self.bridge_routing_ready:
+            raise ConsolidationConflictError("bridge routing is not verified")
+        if not self.scope_backfill_writes_paused:
+            raise ConsolidationConflictError(
+                "scope marker backfill requires a confirmed write pause"
+            )
+        attempted_at = self._as_utc(self.now())
         memories = MemoryIndexRepository(self.session)
         candidates = memories.list_scope_marker_backfill_candidates(
             project_id=project_id,
             app_id=app_id,
+            retry_before=attempted_at - timedelta(hours=1),
             limit=limit,
         )
         candidate_ids = [candidate.mem0_memory_id for candidate in candidates]
@@ -891,6 +916,14 @@ class ConsolidationService:
             except Mem0UpstreamError as exc:
                 if exc.status_code == 404:
                     missing += 1
+                    memories.mark_scope_marker_backfill_outcome(
+                        project_id=project_id,
+                        app_id=app_id,
+                        memory_id=memory_id,
+                        status="MISSING",
+                        attempted_at=attempted_at,
+                    )
+                    self.session.commit()
                     continue
                 raise
             if (
@@ -898,6 +931,14 @@ class ConsolidationService:
                 or memory_id not in extract_memory_ids(response)
             ):
                 skipped_conflict += 1
+                memories.mark_scope_marker_backfill_outcome(
+                    project_id=project_id,
+                    app_id=app_id,
+                    memory_id=memory_id,
+                    status="CONFLICT",
+                    attempted_at=attempted_at,
+                )
+                self.session.commit()
                 continue
             metadata_value = response.get("metadata")
             metadata = (
@@ -909,15 +950,32 @@ class ConsolidationService:
             app_marker = metadata.get(SIDECAR_APP_ID_METADATA_KEY)
             if has_project and project_marker != project_id:
                 skipped_conflict += 1
+                memories.mark_scope_marker_backfill_outcome(
+                    project_id=project_id,
+                    app_id=app_id,
+                    memory_id=memory_id,
+                    status="CONFLICT",
+                    attempted_at=attempted_at,
+                )
+                self.session.commit()
                 continue
             if has_app and app_marker != app_id:
                 skipped_conflict += 1
+                memories.mark_scope_marker_backfill_outcome(
+                    project_id=project_id,
+                    app_id=app_id,
+                    memory_id=memory_id,
+                    status="CONFLICT",
+                    attempted_at=attempted_at,
+                )
+                self.session.commit()
                 continue
             if project_marker == project_id and app_marker == app_id:
                 memories.mark_scope_markers_verified(
                     project_id=project_id,
                     app_id=app_id,
                     memory_id=memory_id,
+                    verified_at=attempted_at,
                 )
                 self.session.commit()
                 already_scoped += 1
@@ -933,6 +991,10 @@ class ConsolidationService:
             project_id=project_id,
             app_id=app_id,
         )
+        outcomes = memories.scope_marker_backfill_counts(
+            project_id=project_id,
+            app_id=app_id,
+        )
         self.session.rollback()
         return {
             "scanned": len(candidate_ids),
@@ -941,6 +1003,7 @@ class ConsolidationService:
             "skipped_conflict": skipped_conflict,
             "missing": missing,
             "remaining": remaining,
+            "unresolved": outcomes,
         }
 
     async def run_scan(self, run_id: str) -> dict[str, object]:
@@ -1103,6 +1166,12 @@ class ConsolidationService:
             project_id=project_id,
             app_id=app_id,
         )
+        scope_marker_backfill_outcomes = MemoryIndexRepository(
+            self.session
+        ).scope_marker_backfill_counts(
+            project_id=project_id,
+            app_id=app_id,
+        )
         bridge_status = ServiceCapabilityRepository(
             self.session
         ).bridge_routing_status(project_id)
@@ -1113,6 +1182,7 @@ class ConsolidationService:
             "configured": policy_row is not None,
             "dirty_count": dirty_count,
             "scope_marker_backfill_required": scope_marker_backfill_required,
+            "scope_marker_backfill_outcomes": scope_marker_backfill_outcomes,
             "current_run": _run_payload(current) if current else None,
             "last_run": _run_payload(last) if last else None,
             "proposal_counts": proposals.counts_for_scope(project_id, app_id),

@@ -93,6 +93,9 @@ def _parser() -> argparse.ArgumentParser:
     scope_backfill.add_argument("--project-id", required=True)
     scope_backfill.add_argument("--app-id", required=True)
     scope_backfill.add_argument("--confirm-app-id", required=True)
+    scope_backfill.add_argument(
+        "--confirm-writes-paused", action="store_true", required=True
+    )
     scope_backfill.add_argument("--limit", type=int, default=200)
 
     proposals = consolidation_resources.add_parser("proposals")
@@ -186,6 +189,11 @@ async def _execute(
                     bridge_routing_ready=bridge_ready,
                     hard_delete_enabled=(
                         settings.consolidation_hard_delete_enabled
+                    ),
+                    scope_backfill_writes_paused=getattr(
+                        arguments,
+                        "confirm_writes_paused",
+                        False,
                     ),
                 )
                 if arguments.consolidation_resource == "scope-backfill":

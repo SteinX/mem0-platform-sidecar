@@ -173,6 +173,7 @@ class MemoryIndex(Base):
             "project_id",
             "app_id",
             "scope_markers_verified",
+            "scope_marker_backfill_attempted_at",
             "created_at",
         ),
     )
@@ -205,6 +206,12 @@ class MemoryIndex(Base):
     )
     scope_markers_verified: Mapped[int] = mapped_column(
         Integer, default=0, server_default=text("0"), nullable=False
+    )
+    scope_marker_backfill_status: Mapped[str] = mapped_column(
+        String(32), default="PENDING", server_default=text("'PENDING'"), nullable=False
+    )
+    scope_marker_backfill_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
     )
     consolidation_state: Mapped[str] = mapped_column(
         String(32),

@@ -179,6 +179,7 @@ async def test_scope_backfill_enables_legacy_exact_consolidation(db_session):
         mem0=mem0,
         bridge_routing_ready=True,
         hard_delete_enabled=True,
+        scope_backfill_writes_paused=True,
         now=lambda: NOW,
     )
 

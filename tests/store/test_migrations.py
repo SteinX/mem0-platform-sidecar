@@ -86,6 +86,8 @@ CONSOLIDATION_MEMORY_COLUMNS = {
     "last_observed_at",
     "last_consolidation_scan_at",
     "scope_markers_verified",
+    "scope_marker_backfill_status",
+    "scope_marker_backfill_attempted_at",
     "consolidation_state",
     "shadowed_by_proposal_id",
 }

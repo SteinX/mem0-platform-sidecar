@@ -137,6 +137,8 @@ class ReplacementMem0:
     def __init__(self) -> None:
         self.add_payloads: list[dict[str, object]] = []
         self.delete_calls: list[str] = []
+        self.mutate_replacement_during_export = False
+        self.semantic_a_gets = 0
         scope_metadata = {
             "_mem0_sidecar_project_id": "repo-a",
             "_mem0_sidecar_app_id": "app-a",
@@ -174,6 +176,13 @@ class ReplacementMem0:
                 response_text="not found",
                 message="not found",
             )
+        if memory_id == "semantic-a":
+            self.semantic_a_gets += 1
+            if (
+                self.mutate_replacement_during_export
+                and self.semantic_a_gets == 2
+            ):
+                self.records["replacement"]["memory"] = "raced replacement"
         return self.records[memory_id]
 
     async def delete_memory(self, memory_id: str):
@@ -563,6 +572,8 @@ async def test_scope_marker_backfill_is_explicit_audited_and_counted(
     service = ConsolidationService(
         session=db_session,
         mem0=mem0,
+        bridge_routing_ready=True,
+        scope_backfill_writes_paused=True,
         now=lambda: NOW,
     )
 
@@ -586,6 +597,7 @@ async def test_scope_marker_backfill_is_explicit_audited_and_counted(
         "skipped_conflict": 0,
         "missing": 0,
         "remaining": 0,
+        "unresolved": {},
     }
     assert mem0.update_calls[0][0] == "legacy"
     assert mem0.records["legacy"]["metadata"] == {
@@ -602,6 +614,117 @@ async def test_scope_marker_backfill_is_explicit_audited_and_counted(
     assert service.get_status("repo-a", "app-a")[
         "scope_marker_backfill_required"
     ] == 0
+
+
+@pytest.mark.parametrize(
+    ("bridge_ready", "writes_paused", "message"),
+    [
+        (False, True, "bridge routing"),
+        (True, False, "write pause"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_scope_backfill_requires_full_routing_and_write_pause(
+    db_session,
+    bridge_ready: bool,
+    writes_paused: bool,
+    message: str,
+) -> None:
+    with pytest.raises(ConsolidationConflictError, match=message):
+        await ConsolidationService(
+            session=db_session,
+            mem0=ScopeBackfillMem0(),
+            bridge_routing_ready=bridge_ready,
+            scope_backfill_writes_paused=writes_paused,
+            now=lambda: NOW,
+        ).backfill_scope_markers(
+            project_id="repo-a",
+            app_id="app-a",
+            limit=10,
+        )
+
+
+@pytest.mark.asyncio
+async def test_scope_backfill_persists_unresolved_outcome_and_advances_batch(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    for memory_id in ("conflict", "later"):
+        content_hash, length = memory_content_fingerprint(
+            {"memory": memory_id}
+        )
+        MemoryIndexRepository(db_session).upsert_memory(
+            project_id="repo-a",
+            mem0_memory_id=memory_id,
+            user_id="root",
+            app_id="app-a",
+            category="decision",
+            metadata={},
+            content_hash=content_hash,
+            content_length=length,
+            normalized_type="decision",
+            source="legacy",
+            pinned=False,
+            scope_markers_verified=False,
+            observed_at=NOW,
+        )
+    db_session.commit()
+
+    class PagedBackfillMem0:
+        def __init__(self) -> None:
+            self.records = {
+                "conflict": {
+                    "id": "conflict",
+                    "memory": "conflict",
+                    "metadata": {
+                        "_mem0_sidecar_project_id": "repo-b",
+                        "_mem0_sidecar_app_id": "app-b",
+                    },
+                },
+                "later": {"id": "later", "memory": "later", "metadata": {}},
+            }
+
+        async def get_memory(self, memory_id: str):
+            return self.records[memory_id]
+
+        async def update_memory(self, memory_id: str, payload):
+            self.records[memory_id]["metadata"] = payload["metadata"]
+            return {"id": memory_id, "updated": True}
+
+    service = ConsolidationService(
+        session=db_session,
+        mem0=PagedBackfillMem0(),
+        bridge_routing_ready=True,
+        scope_backfill_writes_paused=True,
+        now=lambda: NOW,
+    )
+
+    first = await service.backfill_scope_markers(
+        project_id="repo-a",
+        app_id="app-a",
+        limit=1,
+    )
+    second = await service.backfill_scope_markers(
+        project_id="repo-a",
+        app_id="app-a",
+        limit=1,
+    )
+
+    assert first["skipped_conflict"] == 1
+    assert second["backfilled"] == 1
+    assert second["remaining"] == 1
+    conflict = MemoryIndexRepository(db_session).get_memory(
+        project_id="repo-a",
+        mem0_memory_id="conflict",
+        app_id="app-a",
+    )
+    assert conflict is not None
+    assert conflict.scope_marker_backfill_status == "CONFLICT"
+    assert conflict.scope_marker_backfill_attempted_at is not None
 
 
 @pytest.mark.parametrize("change", ["pinned", "hash"])
@@ -792,6 +915,77 @@ async def test_finalize_revalidates_semantic_replacement_canonical(
         )
 
     assert mem0.delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_revalidates_replacement_after_export(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    policy = ConsolidationPolicyRepository(db_session).upsert(
+        project_id="repo-a",
+        app_id="app-a",
+        policy={"enabled": True, "mode": "MANUAL"},
+    )
+    hashes: dict[str, str] = {}
+    for memory_id, text_value in {
+        "semantic-a": "use v1",
+        "semantic-b": "use v2",
+    }.items():
+        content_hash, length = memory_content_fingerprint({"memory": text_value})
+        assert content_hash is not None
+        hashes[memory_id] = content_hash
+        MemoryIndexRepository(db_session).upsert_memory(
+            project_id="repo-a",
+            mem0_memory_id=memory_id,
+            user_id="root",
+            app_id="app-a",
+            category="decision",
+            content_hash=content_hash,
+            content_length=length,
+            normalized_type="decision",
+            source="manual",
+            pinned=False,
+            observed_at=NOW,
+        )
+    run = ConsolidationRunRepository(db_session).create(policy, now=NOW)
+    run.status = "SUCCEEDED"
+    proposal = ConsolidationProposalRepository(db_session).create(
+        run=run,
+        proposal_key="semantic-export-race",
+        kind="CONTRADICTION",
+        source_ids=("semantic-a", "semantic-b"),
+        canonical_id=None,
+        score=0.97,
+        evidence={"reason_codes": ["version_change"], "safe_action": False},
+        status="REVIEW_REQUIRED",
+    )
+    db_session.commit()
+    mem0 = ReplacementMem0()
+    service = ConsolidationService(
+        session=db_session,
+        mem0=mem0,
+        bridge_routing_ready=True,
+        now=lambda: NOW,
+    )
+    await service.approve_proposal(
+        proposal.id,
+        expected_status="REVIEW_REQUIRED",
+        expected_source_hashes=hashes,
+        replacement_text="use v3",
+    )
+    mem0.mutate_replacement_during_export = True
+
+    result = await service.shadow_approved(proposal.id)
+
+    db_session.expire_all()
+    assert result["status"] == "STALE"
+    assert db_session.get(ConsolidationProposal, proposal.id).status == "STALE"
+    assert {
+        item.consolidation_state for item in db_session.query(MemoryIndex).all()
+    } == {"ACTIVE"}
 
 
 @pytest.mark.asyncio

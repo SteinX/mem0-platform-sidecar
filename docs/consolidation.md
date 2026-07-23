@@ -86,7 +86,7 @@ mem0-sidecar-admin consolidation run --dry-run \
 
 mem0-sidecar-admin consolidation scope-backfill \
   --project-id PROJECT --app-id APP --confirm-app-id APP \
-  --limit 200
+  --confirm-writes-paused --limit 200
 
 mem0-sidecar-admin consolidation proposals list \
   --project-id PROJECT --app-id APP --run-id RUN
@@ -112,6 +112,11 @@ manual `NEAR_DUPLICATE` or `CONTRADICTION`, pass exactly one of
 legacy upstream records. It goes through the normal durable `memory.update`
 intent/event path, preserves existing metadata, refuses conflicting markers,
 and is deliberately operator-triggered rather than part of `OBSERVE` scans.
+It refuses to run without a current full-routing bridge heartbeat and an
+explicit confirmation that application writes are paused for the maintenance
+window. `CONFLICT` and `MISSING` outcomes are persisted per memory and cooled
+down before retry, so unresolved records cannot monopolize the front of a
+bounded batch. Resume normal writes only after the command finishes.
 
 ## Rollback
 
