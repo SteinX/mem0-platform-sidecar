@@ -48,6 +48,9 @@ def upgrade() -> None:
             sa.Column("last_observed_at", sa.DateTime(timezone=True))
         )
         batch_op.add_column(
+            sa.Column("last_consolidation_scan_at", sa.DateTime(timezone=True))
+        )
+        batch_op.add_column(
             sa.Column(
                 "consolidation_state",
                 sa.String(length=32),
@@ -70,6 +73,7 @@ def upgrade() -> None:
                 "app_id",
                 "consolidation_state",
                 "last_observed_at",
+                "last_consolidation_scan_at",
             ],
             unique=False,
         )
@@ -264,7 +268,7 @@ def downgrade() -> None:
                     (SELECT COUNT(*) FROM consolidation_runs
                      WHERE status IN ('PENDING', 'RUNNING'))
                   + (SELECT COUNT(*) FROM consolidation_proposals
-                     WHERE status IN ('APPROVED', 'SHADOWED'))
+                     WHERE status IN ('APPROVED', 'EXPORTING', 'SHADOWED'))
                 """
             )
         )
@@ -307,6 +311,7 @@ def downgrade() -> None:
         batch_op.drop_column("shadowed_by_proposal_id")
         batch_op.drop_column("consolidation_state")
         batch_op.drop_column("last_observed_at")
+        batch_op.drop_column("last_consolidation_scan_at")
         batch_op.drop_column("expires_at")
         batch_op.drop_column("pinned")
         batch_op.drop_column("source")

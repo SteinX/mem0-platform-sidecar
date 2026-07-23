@@ -166,6 +166,7 @@ class MemoryIndex(Base):
             "app_id",
             "consolidation_state",
             "last_observed_at",
+            "last_consolidation_scan_at",
         ),
     )
 
@@ -190,6 +191,9 @@ class MemoryIndex(Base):
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_consolidation_scan_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
     consolidation_state: Mapped[str] = mapped_column(

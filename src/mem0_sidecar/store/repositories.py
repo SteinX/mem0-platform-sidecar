@@ -2010,17 +2010,6 @@ class MemoryIndexRepository:
         if (after_last_observed_at is None) != (after_memory_id is None):
             raise ValueError("dirty anchor cursor is incomplete")
 
-        latest_lineage = (
-            select(func.max(ConsolidationLineage.applied_at))
-            .where(
-                ConsolidationLineage.project_id == project_id,
-                ConsolidationLineage.app_id == app_id,
-                ConsolidationLineage.source_memory_id
-                == MemoryIndex.mem0_memory_id,
-            )
-            .correlate(MemoryIndex)
-            .scalar_subquery()
-        )
         statement = select(MemoryIndex).where(
             MemoryIndex.project_id == project_id,
             MemoryIndex.app_id == app_id,
@@ -2030,8 +2019,9 @@ class MemoryIndexRepository:
             MemoryIndex.content_hash.is_not(None),
             MemoryIndex.last_observed_at.is_not(None),
             or_(
-                latest_lineage.is_(None),
-                MemoryIndex.last_observed_at > latest_lineage,
+                MemoryIndex.last_consolidation_scan_at.is_(None),
+                MemoryIndex.last_observed_at
+                > MemoryIndex.last_consolidation_scan_at,
             ),
         )
         if after_last_observed_at is not None and after_memory_id is not None:
@@ -2053,18 +2043,32 @@ class MemoryIndexRepository:
             )
         )
 
-    def count_dirty_anchors(self, *, project_id: str, app_id: str) -> int:
-        latest_lineage = (
-            select(func.max(ConsolidationLineage.applied_at))
+    def mark_anchors_scanned(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        memory_ids: list[str],
+        scan_cutoff: datetime,
+    ) -> int:
+        if not memory_ids:
+            return 0
+        result = self.session.execute(
+            update(MemoryIndex)
             .where(
-                ConsolidationLineage.project_id == project_id,
-                ConsolidationLineage.app_id == app_id,
-                ConsolidationLineage.source_memory_id
-                == MemoryIndex.mem0_memory_id,
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.mem0_memory_id.in_(memory_ids),
+                MemoryIndex.last_observed_at.is_not(None),
+                MemoryIndex.last_observed_at <= scan_cutoff,
             )
-            .correlate(MemoryIndex)
-            .scalar_subquery()
+            .values(last_consolidation_scan_at=scan_cutoff)
+            .execution_options(synchronize_session="fetch")
         )
+        self.session.flush()
+        return int(result.rowcount or 0)
+
+    def count_dirty_anchors(self, *, project_id: str, app_id: str) -> int:
         return int(
             self.session.scalar(
                 select(func.count())
@@ -2078,8 +2082,9 @@ class MemoryIndexRepository:
                     MemoryIndex.content_hash.is_not(None),
                     MemoryIndex.last_observed_at.is_not(None),
                     or_(
-                        latest_lineage.is_(None),
-                        MemoryIndex.last_observed_at > latest_lineage,
+                        MemoryIndex.last_consolidation_scan_at.is_(None),
+                        MemoryIndex.last_observed_at
+                        > MemoryIndex.last_consolidation_scan_at,
                     ),
                 )
             )

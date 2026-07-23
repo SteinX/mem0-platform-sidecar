@@ -19,8 +19,22 @@ NOW = datetime(2026, 7, 23, 12, tzinfo=UTC)
 class FlowMem0:
     def __init__(self) -> None:
         self.memories = {
-            "canonical": {"id": "canonical", "memory": "same"},
-            "redundant": {"id": "redundant", "memory": "same"},
+            "canonical": {
+                "id": "canonical",
+                "memory": "same",
+                "metadata": {
+                    "_mem0_sidecar_project_id": "repo-a",
+                    "_mem0_sidecar_app_id": "app-a",
+                },
+            },
+            "redundant": {
+                "id": "redundant",
+                "memory": "same",
+                "metadata": {
+                    "_mem0_sidecar_project_id": "repo-a",
+                    "_mem0_sidecar_app_id": "app-a",
+                },
+            },
         }
 
     async def get_memory(self, memory_id: str):
@@ -109,10 +123,11 @@ async def test_exact_duplicate_checkpoint_shadow_search_and_finalize(db_session)
     )
 
     assert shadowed["status"] == "SHADOWED"
-    assert shadowed_detail == {"id": "redundant", "memory": "same"}
-    assert search["results"] == [{"id": "canonical", "memory": "same"}]
+    assert shadowed_detail["id"] == "redundant"
+    assert shadowed_detail["memory"] == "same"
+    assert [item["id"] for item in search["results"]] == ["canonical"]
     assert applied["status"] == "APPLIED"
-    assert mem0.memories == {"canonical": {"id": "canonical", "memory": "same"}}
+    assert list(mem0.memories) == ["canonical"]
     assert db_session.query(ConsolidationLineage).one().source_memory_id == (
         "redundant"
     )

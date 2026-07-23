@@ -9,6 +9,7 @@ from mem0_sidecar.core.consolidation_service import (
 )
 from mem0_sidecar.core.memory_ops import memory_content_fingerprint
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
+from mem0_sidecar.store.database import create_session_factory
 from mem0_sidecar.store.models import (
     ConsolidationLineage,
     ConsolidationProposal,
@@ -29,8 +30,22 @@ SAME_HASH = memory_content_fingerprint({"memory": "same"})[0]
 class StatefulMem0:
     def __init__(self) -> None:
         self.memories = {
-            "duplicate-a": {"id": "duplicate-a", "memory": "same"},
-            "duplicate-b": {"id": "duplicate-b", "memory": "same"},
+            "duplicate-a": {
+                "id": "duplicate-a",
+                "memory": "same",
+                "metadata": {
+                    "_mem0_sidecar_project_id": "repo-a",
+                    "_mem0_sidecar_app_id": "app-a",
+                },
+            },
+            "duplicate-b": {
+                "id": "duplicate-b",
+                "memory": "same",
+                "metadata": {
+                    "_mem0_sidecar_project_id": "repo-a",
+                    "_mem0_sidecar_app_id": "app-a",
+                },
+            },
         }
         self.get_calls: list[str] = []
         self.delete_calls: list[str] = []
@@ -56,6 +71,19 @@ class StatefulMem0:
         if not self.keep_after_delete:
             self.memories.pop(memory_id, None)
         return {"id": memory_id, "deleted": True}
+
+
+class ReentrantMem0(StatefulMem0):
+    def __init__(self, on_first_get) -> None:
+        super().__init__()
+        self.on_first_get = on_first_get
+        self.reentered = False
+
+    async def get_memory(self, memory_id: str):
+        if not self.reentered:
+            self.reentered = True
+            await self.on_first_get()
+        return await super().get_memory(memory_id)
 
 
 class SemanticMem0:
@@ -84,6 +112,13 @@ class SemanticMem0:
 
     async def search_memories(self, payload: dict[str, object]):
         self.search_payloads.append(payload)
+        if "app_id" in payload:
+            raise AssertionError("raw OSS search received unsupported app_id")
+        filters = payload.get("filters")
+        if isinstance(filters, dict) and "normalized_type" in filters:
+            raise AssertionError(
+                "raw OSS search filtered on projection-only normalized_type"
+            )
         query = payload["query"]
         if query == self.records["near-a"]["memory"]:
             return {
@@ -223,6 +258,119 @@ async def test_incomplete_source_fails_scan_without_proposals(db_session) -> Non
 
 
 @pytest.mark.asyncio
+async def test_successful_scan_advances_past_clean_anchor_batch(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    policy = ConsolidationPolicyRepository(db_session).upsert(
+        project_id="repo-a",
+        app_id="app-a",
+        policy={
+            "enabled": True,
+            "mode": "OBSERVE",
+            "max_anchors_per_run": 1,
+        },
+    )
+    memories = MemoryIndexRepository(db_session)
+    for offset, memory_id in enumerate(("clean-a", "clean-b")):
+        content_hash, length = memory_content_fingerprint(
+            {"memory": f"unique-{memory_id}"}
+        )
+        memories.upsert_memory(
+            project_id="repo-a",
+            mem0_memory_id=memory_id,
+            user_id="root",
+            app_id="app-a",
+            category="decision",
+            content_hash=content_hash,
+            content_length=length,
+            normalized_type="decision",
+            source="manual",
+            pinned=False,
+            observed_at=NOW + timedelta(seconds=offset),
+        )
+    first_run = ConsolidationRunRepository(db_session).create(policy, now=NOW)
+    db_session.commit()
+
+    service = ConsolidationService(
+        session=db_session,
+        mem0=WriteRejectingMem0(),
+        now=lambda: NOW + timedelta(seconds=2),
+    )
+    await service.run_scan(first_run.id)
+
+    remaining = memories.list_dirty_anchors(
+        project_id="repo-a",
+        app_id="app-a",
+        limit=10,
+    )
+    assert [memory.mem0_memory_id for memory in remaining] == ["clean-b"]
+
+
+@pytest.mark.asyncio
+async def test_scan_does_not_consume_anchor_updated_after_cutoff(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    policy = ConsolidationPolicyRepository(db_session).upsert(
+        project_id="repo-a",
+        app_id="app-a",
+        policy={"enabled": True, "mode": "OBSERVE"},
+    )
+    content_hash, length = memory_content_fingerprint(
+        {"memory": "unique-clean-memory"}
+    )
+    memories = MemoryIndexRepository(db_session)
+    memories.upsert_memory(
+        project_id="repo-a",
+        mem0_memory_id="clean-a",
+        user_id="root",
+        app_id="app-a",
+        category="decision",
+        content_hash=content_hash,
+        content_length=length,
+        normalized_type="decision",
+        source="manual",
+        pinned=False,
+        observed_at=NOW,
+    )
+    run = ConsolidationRunRepository(db_session).create(policy, now=NOW)
+    db_session.commit()
+
+    class UpdatingMem0:
+        async def get_memory(self, memory_id: str):
+            return {"id": memory_id, "memory": "unique-clean-memory"}
+
+        async def search_memories(self, _payload):
+            memory = memories.get_memory(
+                project_id="repo-a",
+                mem0_memory_id="clean-a",
+                app_id="app-a",
+            )
+            assert memory is not None
+            memory.last_observed_at = NOW + timedelta(seconds=1)
+            db_session.commit()
+            return {"results": []}
+
+    await ConsolidationService(
+        session=db_session,
+        mem0=UpdatingMem0(),
+        now=lambda: NOW,
+    ).run_scan(run.id)
+
+    remaining = memories.list_dirty_anchors(
+        project_id="repo-a",
+        app_id="app-a",
+        limit=10,
+    )
+    assert [memory.mem0_memory_id for memory in remaining] == ["clean-a"]
+
+
+@pytest.mark.asyncio
 async def test_scan_expands_dirty_anchor_to_clean_exact_peer(db_session) -> None:
     run = seed_scope(db_session)
     clean_peer = db_session.query(MemoryIndex).filter_by(
@@ -313,12 +461,11 @@ async def test_scan_adds_bounded_scoped_semantic_pair_once(db_session) -> None:
     assert len(mem0.search_payloads) == 3
     assert mem0.search_payloads[0]["top_k"] == 10
     assert mem0.search_payloads[0]["threshold"] == 0.92
-    assert mem0.search_payloads[0]["app_id"] == "app-a"
+    assert "app_id" not in mem0.search_payloads[0]
     assert mem0.search_payloads[0]["user_id"] == "root"
     assert mem0.search_payloads[0]["filters"] == {
-        "normalized_type": "decision",
-        "sidecar_app_id": "app-a",
-        "sidecar_project_id": "repo-a",
+        "_mem0_sidecar_app_id": "app-a",
+        "_mem0_sidecar_project_id": "repo-a",
     }
 
 
@@ -516,6 +663,74 @@ async def test_shadow_exact_duplicate_excludes_canonical_and_rolls_back(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_shadow_replay_does_not_downgrade_completed_proposal(db_session) -> None:
+    proposal = await seed_pending_proposal(db_session)
+    approval_mem0 = StatefulMem0()
+    approval_service = ConsolidationService(
+        session=db_session,
+        mem0=approval_mem0,
+        bridge_routing_ready=True,
+        now=lambda: NOW,
+    )
+    await approval_service.approve_proposal(
+        proposal.id,
+        expected_status="PENDING",
+        expected_source_hashes=expected_hashes(),
+    )
+    db_session.commit()
+
+    factory = create_session_factory(db_session.get_bind())
+    replay_results: list[dict[str, object]] = []
+
+    async def replay_shadow() -> None:
+        with factory() as replay_session:
+            replay_results.append(
+                await ConsolidationService(
+                    session=replay_session,
+                    mem0=StatefulMem0(),
+                    bridge_routing_ready=True,
+                    now=lambda: NOW,
+                ).shadow_approved(proposal.id)
+            )
+
+    outer_result = await ConsolidationService(
+        session=db_session,
+        mem0=ReentrantMem0(replay_shadow),
+        bridge_routing_ready=True,
+        now=lambda: NOW,
+    ).shadow_approved(proposal.id)
+
+    db_session.expire_all()
+    persisted = db_session.get(ConsolidationProposal, proposal.id)
+    assert replay_results[0]["status"] == "SHADOWED"
+    assert outer_result["status"] == "SHADOWED"
+    assert persisted.status == "SHADOWED"
+
+
+@pytest.mark.asyncio
+async def test_shadow_retries_exporting_proposal_after_interruption(db_session) -> None:
+    proposal = await seed_pending_proposal(db_session)
+    service = ConsolidationService(
+        session=db_session,
+        mem0=StatefulMem0(),
+        bridge_routing_ready=True,
+        now=lambda: NOW,
+    )
+    await service.approve_proposal(
+        proposal.id,
+        expected_status="PENDING",
+        expected_source_hashes=expected_hashes(),
+    )
+    proposal.status = "EXPORTING"
+    db_session.commit()
+
+    result = await service.shadow_approved(proposal.id)
+
+    assert result["status"] == "SHADOWED"
+    assert db_session.get(ConsolidationProposal, proposal.id).status == "SHADOWED"
+
+
+@pytest.mark.asyncio
 async def test_finalize_enforces_grace_and_hard_delete_gate(db_session) -> None:
     proposal = await seed_pending_proposal(db_session)
     mem0 = StatefulMem0()
@@ -539,6 +754,75 @@ async def test_finalize_enforces_grace_and_hard_delete_gate(db_session) -> None:
     gated = await service.finalize_shadowed(proposal.id, now=after_grace)
     assert gated == {"proposal_id": proposal.id, "status": "SHADOWED"}
     assert mem0.delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_finalize_requires_current_bridge_routing_heartbeat(db_session) -> None:
+    proposal = await seed_pending_proposal(db_session)
+    mem0 = StatefulMem0()
+    service = ConsolidationService(
+        session=db_session,
+        mem0=mem0,
+        bridge_routing_ready=True,
+        hard_delete_enabled=True,
+        now=lambda: NOW,
+    )
+    await service.approve_proposal(
+        proposal.id,
+        expected_status="PENDING",
+        expected_source_hashes=expected_hashes(),
+    )
+    await service.shadow_approved(proposal.id)
+    service.bridge_routing_ready = False
+
+    with pytest.raises(ConsolidationConflictError, match="bridge routing"):
+        await service.finalize_shadowed(
+            proposal.id,
+            now=NOW + timedelta(days=8),
+        )
+
+    assert mem0.delete_calls == []
+
+
+@pytest.mark.parametrize("change", ["pinned", "hash", "scope"])
+@pytest.mark.asyncio
+async def test_finalize_revalidates_upstream_source_before_delete(
+    db_session,
+    change: str,
+) -> None:
+    proposal = await seed_pending_proposal(db_session)
+    mem0 = StatefulMem0()
+    service = ConsolidationService(
+        session=db_session,
+        mem0=mem0,
+        bridge_routing_ready=True,
+        hard_delete_enabled=True,
+        now=lambda: NOW,
+    )
+    await service.approve_proposal(
+        proposal.id,
+        expected_status="PENDING",
+        expected_source_hashes=expected_hashes(),
+    )
+    await service.shadow_approved(proposal.id)
+    if change == "pinned":
+        mem0.memories["duplicate-b"]["metadata"]["pinned"] = True
+    elif change == "hash":
+        mem0.memories["duplicate-b"]["memory"] = "changed"
+    else:
+        mem0.memories["duplicate-b"]["metadata"][
+            "_mem0_sidecar_project_id"
+        ] = "repo-b"
+
+    with pytest.raises(ConsolidationConflictError, match="upstream source changed"):
+        await service.finalize_shadowed(
+            proposal.id,
+            now=NOW + timedelta(days=8),
+        )
+
+    db_session.expire_all()
+    assert mem0.delete_calls == []
+    assert db_session.get(ConsolidationProposal, proposal.id).status == "SHADOWED"
 
 
 @pytest.mark.asyncio

@@ -28,8 +28,22 @@ from mem0_sidecar.workers.consolidation import (
 class RuntimeMem0:
     def __init__(self) -> None:
         self.records = {
-            "mem-a": {"id": "mem-a", "memory": "same"},
-            "mem-b": {"id": "mem-b", "memory": "same"},
+            "mem-a": {
+                "id": "mem-a",
+                "memory": "same",
+                "metadata": {
+                    "_mem0_sidecar_project_id": "repo-a",
+                    "_mem0_sidecar_app_id": "app-a",
+                },
+            },
+            "mem-b": {
+                "id": "mem-b",
+                "memory": "same",
+                "metadata": {
+                    "_mem0_sidecar_project_id": "repo-a",
+                    "_mem0_sidecar_app_id": "app-a",
+                },
+            },
         }
 
     async def get_memory(self, memory_id: str):

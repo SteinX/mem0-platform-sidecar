@@ -84,6 +84,7 @@ CONSOLIDATION_MEMORY_COLUMNS = {
     "pinned",
     "expires_at",
     "last_observed_at",
+    "last_consolidation_scan_at",
     "consolidation_state",
     "shadowed_by_proposal_id",
 }
@@ -170,6 +171,7 @@ def test_consolidation_migration_upgrades_from_mutation_intents(tmp_path) -> Non
         ("consolidation_runs", "PENDING"),
         ("consolidation_runs", "RUNNING"),
         ("consolidation_proposals", "APPROVED"),
+        ("consolidation_proposals", "EXPORTING"),
         ("consolidation_proposals", "SHADOWED"),
     ],
 )

@@ -17,6 +17,8 @@ from mem0_sidecar.core.consolidation_analysis import (
 from mem0_sidecar.core.consolidation_policy import ConsolidationPolicySpec
 from mem0_sidecar.core.exports import ExportService
 from mem0_sidecar.core.memory_ops import (
+    SIDECAR_APP_ID_METADATA_KEY,
+    SIDECAR_PROJECT_ID_METADATA_KEY,
     MemoryService,
     extract_memory_id,
     extract_memory_ids,
@@ -152,6 +154,24 @@ class ConsolidationService:
     def _mark_stale(self, proposal: ConsolidationProposal) -> dict[str, object]:
         ConsolidationProposalRepository(self.session).set_status(proposal, "STALE")
         return {"proposal_id": proposal.id, "status": "STALE"}
+
+    def _shadowed_result(
+        self, proposal: ConsolidationProposal
+    ) -> dict[str, object]:
+        source_ids = ConsolidationProposalRepository(self.session).source_ids(
+            proposal
+        )
+        shadowed_count = len(source_ids) - int(
+            proposal.canonical_memory_id in source_ids
+        )
+        result: dict[str, object] = {
+            "proposal_id": proposal.id,
+            "status": "SHADOWED",
+            "shadowed_count": shadowed_count,
+        }
+        if proposal.not_before is not None:
+            result["not_before"] = proposal.not_before.isoformat()
+        return result
 
     async def approve_proposal(
         self,
@@ -293,6 +313,9 @@ class ConsolidationService:
         self,
         source_ids: tuple[str, ...],
         expected_hashes: dict[str, str],
+        *,
+        project_id: str,
+        app_id: str,
     ) -> bool:
         if self.mem0 is None:
             raise ConsolidationConflictError("Mem0 client is unavailable")
@@ -308,9 +331,13 @@ class ConsolidationService:
             ):
                 return False
             content_hash, _length = memory_content_fingerprint(response)
+            metadata = response.get("metadata")
             if (
                 content_hash != expected_hashes[memory_id]
                 or self._record_is_pinned(response)
+                or not isinstance(metadata, dict)
+                or metadata.get(SIDECAR_PROJECT_ID_METADATA_KEY) != project_id
+                or metadata.get(SIDECAR_APP_ID_METADATA_KEY) != app_id
             ):
                 return False
         return True
@@ -321,7 +348,9 @@ class ConsolidationService:
         ProjectRepository(self.session).lock_for_mutation(proposal.project_id)
         self.session.expire(proposal)
         proposal = proposals.get(proposal_id)
-        if proposal.status != "APPROVED":
+        if proposal.status == "SHADOWED":
+            return self._shadowed_result(proposal)
+        if proposal.status not in {"APPROVED", "EXPORTING"}:
             raise ConsolidationConflictError("proposal is not approved")
         if not self.bridge_routing_ready:
             raise ConsolidationConflictError("bridge routing is not verified")
@@ -341,10 +370,22 @@ class ConsolidationService:
             self.session.commit()
             return result
         source_ids = proposals.source_ids(proposal)
+        proposals.set_status(proposal, "EXPORTING")
         self.session.commit()
 
-        if not await self._upstream_sources_match(source_ids, expected_hashes):
+        if not await self._upstream_sources_match(
+            source_ids,
+            expected_hashes,
+            project_id=proposal.project_id,
+            app_id=proposal.app_id,
+        ):
+            ProjectRepository(self.session).lock_for_mutation(proposal.project_id)
             proposal = proposals.get(proposal_id)
+            self.session.refresh(proposal)
+            if proposal.status == "SHADOWED":
+                return self._shadowed_result(proposal)
+            if proposal.status != "EXPORTING":
+                return {"proposal_id": proposal.id, "status": proposal.status}
             result = self._mark_stale(proposal)
             self.session.commit()
             return result
@@ -363,6 +404,11 @@ class ConsolidationService:
 
         ProjectRepository(self.session).lock_for_mutation(proposal.project_id)
         proposal = proposals.get(proposal_id)
+        self.session.refresh(proposal)
+        if proposal.status == "SHADOWED":
+            return self._shadowed_result(proposal)
+        if proposal.status != "EXPORTING":
+            return {"proposal_id": proposal.id, "status": proposal.status}
         proposal.export_job_id = str(export["id"])
         complete_export = (
             export["status"] == "SUCCEEDED"
@@ -403,12 +449,7 @@ class ConsolidationService:
             source.shadowed_by_proposal_id = proposal.id
         proposal.not_before = self.now() + timedelta(days=policy.shadow_grace_days)
         proposals.set_status(proposal, "SHADOWED")
-        result = {
-            "proposal_id": proposal.id,
-            "status": "SHADOWED",
-            "shadowed_count": len(target_ids),
-            "not_before": proposal.not_before.isoformat(),
-        }
+        result = self._shadowed_result(proposal)
         self.session.commit()
         return result
 
@@ -472,6 +513,8 @@ class ConsolidationService:
             raise ConsolidationConflictError("shadow grace period has not elapsed")
         if not self.hard_delete_enabled:
             return {"proposal_id": proposal.id, "status": "SHADOWED"}
+        if not self.bridge_routing_ready:
+            raise ConsolidationConflictError("bridge routing is not verified")
         if not proposal.export_job_id:
             raise ConsolidationConflictError("export checkpoint is missing")
         expected_hashes = proposals.expected_hashes(proposal)
@@ -507,6 +550,20 @@ class ConsolidationService:
                     proposals.set_status(proposal, "FAILED")
                     self.session.commit()
                     raise ConsolidationConflictError("shadowed source changed")
+                verification_ids = [memory_id]
+                canonical_id = proposal.canonical_memory_id
+                if (
+                    canonical_id in expected_hashes
+                    and canonical_id not in verification_ids
+                ):
+                    verification_ids.append(str(canonical_id))
+                if not await self._upstream_sources_match(
+                    tuple(verification_ids),
+                    expected_hashes,
+                    project_id=proposal.project_id,
+                    app_id=proposal.app_id,
+                ):
+                    raise ConsolidationConflictError("upstream source changed")
                 await MemoryService(session=self.session, mem0=self.mem0).delete_memory(
                     project_id=proposal.project_id,
                     memory_id=memory_id,
@@ -621,13 +678,11 @@ class ConsolidationService:
         ) -> tuple[MemorySnapshot, list[dict[str, Any]]]:
             payload: dict[str, Any] = {
                 "query": anchor.text,
-                "app_id": anchor.app_id,
                 "top_k": 10,
                 "threshold": policy.near_duplicate_threshold,
                 "filters": {
-                    "normalized_type": anchor.normalized_type,
-                    "sidecar_app_id": anchor.app_id,
-                    "sidecar_project_id": anchor.project_id,
+                    SIDECAR_APP_ID_METADATA_KEY: anchor.app_id,
+                    SIDECAR_PROJECT_ID_METADATA_KEY: anchor.project_id,
                 },
             }
             if anchor.user_id is not None:
@@ -776,6 +831,7 @@ class ConsolidationService:
                 app_id=run.app_id,
                 limit=policy.max_anchors_per_run,
             )
+            anchor_ids = [anchor.mem0_memory_id for anchor in anchors]
             expanded = {}
             for anchor in anchors:
                 expanded[anchor.mem0_memory_id] = anchor
@@ -839,6 +895,12 @@ class ConsolidationService:
                         evidence=draft.evidence,
                         status="REVIEW_REQUIRED",
                     )
+            memories.mark_anchors_scanned(
+                project_id=run.project_id,
+                app_id=run.app_id,
+                memory_ids=anchor_ids,
+                scan_cutoff=scan_cutoff,
+            )
             counts = proposals.summary_for_run(run.id)
             runs.mark_succeeded(
                 run.id,
