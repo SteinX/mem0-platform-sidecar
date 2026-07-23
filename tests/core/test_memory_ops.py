@@ -2109,6 +2109,94 @@ async def test_direct_write_mirror_preserves_source_app_identity_and_repairs_sco
 
 
 @pytest.mark.asyncio
+async def test_direct_write_mirror_does_not_redirty_unchanged_projection(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    record = {
+        "id": "stable-memory",
+        "memory": "The deployment uses the stable release tag.",
+        "user_id": "root",
+        "agent_id": "codex",
+        "app_id": "app-a",
+        "metadata": {
+            SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+            SIDECAR_APP_ID_METADATA_KEY: "app-a",
+            "type": "decision",
+            "source": "manual",
+        },
+    }
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {"results": [record], "total": 1}
+    service = MemoryService(session=db_session, mem0=mem0)
+
+    await service.mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="default-app",
+        scan_limit=100,
+    )
+    repository = MemoryIndexRepository(db_session)
+    projection = repository.get_memory(
+        project_id="repo-a",
+        mem0_memory_id="stable-memory",
+        app_id="app-a",
+    )
+    assert projection is not None
+    first_observed_at = projection.last_observed_at
+    assert first_observed_at is not None
+    repository.mark_anchors_scanned(
+        project_id="repo-a",
+        app_id="app-a",
+        memory_ids=["stable-memory"],
+        scan_cutoff=datetime.now(UTC),
+    )
+    db_session.commit()
+    assert repository.count_dirty_anchors(
+        project_id="repo-a",
+        app_id="app-a",
+    ) == 0
+
+    await service.mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="default-app",
+        scan_limit=100,
+    )
+
+    db_session.expire_all()
+    unchanged = repository.get_memory(
+        project_id="repo-a",
+        mem0_memory_id="stable-memory",
+        app_id="app-a",
+    )
+    assert unchanged is not None
+    assert unchanged.last_observed_at == first_observed_at
+    assert repository.count_dirty_anchors(
+        project_id="repo-a",
+        app_id="app-a",
+    ) == 0
+
+    record["memory"] = "The deployment uses the next stable release tag."
+    await service.mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="default-app",
+        scan_limit=100,
+    )
+
+    db_session.expire_all()
+    changed = repository.get_memory(
+        project_id="repo-a",
+        mem0_memory_id="stable-memory",
+        app_id="app-a",
+    )
+    assert changed is not None
+    assert changed.last_observed_at > first_observed_at
+    assert repository.count_dirty_anchors(
+        project_id="repo-a",
+        app_id="app-a",
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_direct_write_mirror_blank_app_fallback_hydrates_and_rejects_falsey(
     db_session,
 ) -> None:
