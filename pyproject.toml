@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mem0-platform-sidecar"
-version = "0.3.0"
+version = "0.3.1"
 description = "Control-plane sidecar for Mem0 OSS Platform compatibility"
 readme = "README.md"
 requires-python = ">=3.11"

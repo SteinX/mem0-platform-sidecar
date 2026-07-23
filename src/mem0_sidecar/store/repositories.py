@@ -2354,6 +2354,7 @@ class MemoryIndexRepository:
         expires_at: datetime | None = None,
         scope_markers_verified: bool | int | None = True,
         observed_at: datetime | None = None,
+        preserve_observed_at_on_noop: bool = False,
     ) -> MemoryIndex:
         projection_now = _utc_now()
         memory = self.session.scalar(
@@ -2367,6 +2368,33 @@ class MemoryIndexRepository:
             memory = MemoryIndex(project_id=project_id, mem0_memory_id=mem0_memory_id)
             self.session.add(memory)
 
+        metadata_projection_json = _json(metadata or {})
+        verified = int(bool(scope_markers_verified))
+        expires_at_changed = (
+            (memory.expires_at is None) != (expires_at is None)
+            or (
+                memory.expires_at is not None
+                and expires_at is not None
+                and _as_utc(memory.expires_at) != _as_utc(expires_at)
+            )
+        )
+        observed_projection_changed = (
+            is_new
+            or memory.deleted_at is not None
+            or memory.user_id != user_id
+            or memory.agent_id != agent_id
+            or memory.app_id != app_id
+            or memory.run_id != run_id
+            or memory.category != category
+            or memory.metadata_projection_json != metadata_projection_json
+            or memory.content_hash != content_hash
+            or memory.content_length != content_length
+            or memory.normalized_type != normalized_type
+            or memory.source != source
+            or memory.pinned != int(bool(pinned))
+            or expires_at_changed
+            or memory.scope_markers_verified != verified
+        )
         previous_hash = memory.content_hash
         previously_verified = memory.scope_markers_verified == 1
 
@@ -2375,7 +2403,7 @@ class MemoryIndexRepository:
         memory.app_id = app_id
         memory.run_id = run_id
         memory.category = category
-        memory.metadata_projection_json = _json(metadata or {})
+        memory.metadata_projection_json = metadata_projection_json
         if observed_at is not None:
             if memory.deleted_at is not None or previous_hash != content_hash:
                 memory.consolidation_state = "ACTIVE"
@@ -2386,14 +2414,15 @@ class MemoryIndexRepository:
             memory.source = source
             memory.pinned = int(bool(pinned))
             memory.expires_at = expires_at
-            memory.scope_markers_verified = int(bool(scope_markers_verified))
+            memory.scope_markers_verified = verified
             if memory.scope_markers_verified == 1:
                 memory.scope_marker_backfill_status = "VERIFIED"
                 memory.scope_marker_backfill_attempted_at = observed_at
             elif is_new or previously_verified:
                 memory.scope_marker_backfill_status = "PENDING"
                 memory.scope_marker_backfill_attempted_at = None
-            memory.last_observed_at = observed_at
+            if not preserve_observed_at_on_noop or observed_projection_changed:
+                memory.last_observed_at = observed_at
         memory.deleted_at = None
         memory.updated_at = projection_now
         self.session.flush()

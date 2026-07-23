@@ -2543,6 +2543,7 @@ class MemoryService:
                         normalized,
                         observed_at=scan_cutoff,
                     ),
+                    preserve_observed_at_on_noop=True,
                 )
                 affected_projections.append(
                     _snapshot_memory_projection(indexed_memory)
