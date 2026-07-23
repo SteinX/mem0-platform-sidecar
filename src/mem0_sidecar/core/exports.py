@@ -60,6 +60,7 @@ class ExportService:
         project_id: str,
         export_format: str,
         filters: dict[str, Any],
+        release_before_upstream: bool = False,
     ) -> dict[str, Any]:
         if export_format != "json":
             raise ExportValidationError("Only json export format is supported")
@@ -75,18 +76,23 @@ class ExportService:
             project_id=project_id,
             filters=filters,
         )
+        candidate_ids = [candidate.mem0_memory_id for candidate in candidates]
+        if release_before_upstream:
+            # Consolidation checkpoints must not hold scope/row locks while
+            # awaiting the upstream data plane.
+            self.exports.session.commit()
         exported: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
 
         try:
-            for candidate in candidates:
+            for memory_id in candidate_ids:
                 try:
-                    response = await self.mem0.get_memory(candidate.mem0_memory_id)
+                    response = await self.mem0.get_memory(memory_id)
                 except Mem0UpstreamError as exc:
                     if exc.status_code == 404:
                         skipped.append(
                             {
-                                "id": candidate.mem0_memory_id,
+                                "id": memory_id,
                                 "reason": "upstream_not_found",
                             }
                         )
@@ -94,12 +100,12 @@ class ExportService:
                     raise
                 try:
                     exported.append(
-                        _validate_get_response(candidate.mem0_memory_id, response)
+                        _validate_get_response(memory_id, response)
                     )
                 except KeyError:
                     skipped.append(
                         {
-                            "id": candidate.mem0_memory_id,
+                            "id": memory_id,
                             "reason": "upstream_mismatch",
                         }
                     )
@@ -115,7 +121,7 @@ class ExportService:
                 project_id,
                 job.id,
                 result=result,
-                total_count=len(candidates),
+                total_count=len(candidate_ids),
                 exported_count=len(exported),
                 skipped_count=len(skipped),
             )

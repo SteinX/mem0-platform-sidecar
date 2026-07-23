@@ -226,7 +226,29 @@ class Mem0RestClient:
         return await self._request("POST", self.memories_path, payload=request_payload)
 
     async def search_memories(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", self.search_path, payload=payload)
+        response = await self._request("POST", self.search_path, payload=payload)
+        results = response.get("results")
+        if not isinstance(results, list):
+            return response
+        normalized: list[Any] = []
+        changed = False
+        for item in results:
+            if not isinstance(item, dict) or not isinstance(
+                item.get("memory"), dict
+            ):
+                normalized.append(item)
+                continue
+            record = dict(item["memory"])
+            if "score" in item:
+                record["score"] = item["score"]
+            normalized.append(record)
+            changed = True
+        if not changed:
+            return response
+        normalized_response = dict(response)
+        normalized_response["results"] = normalized
+        normalized_response.setdefault("total", len(normalized))
+        return normalized_response
 
     async def list_memories(self, params: dict[str, Any]) -> dict[str, Any]:
         return await self._request("GET", self.memories_path, params=params)
@@ -238,7 +260,18 @@ class Mem0RestClient:
         )
 
     async def get_memory(self, memory_id: str) -> dict[str, Any]:
-        return await self._request("GET", self._memory_item_path(memory_id))
+        path = self._memory_item_path(memory_id)
+        response = await self._request("GET", path)
+        if response == {"results": None}:
+            raise Mem0UpstreamError(
+                method="GET",
+                path=path,
+                status_code=404,
+                response_text=None,
+                outcome_unknown=False,
+                message=f"Mem0 upstream GET {path} returned no memory",
+            )
+        return response
 
     async def update_memory(
         self,

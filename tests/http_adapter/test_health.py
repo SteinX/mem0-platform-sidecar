@@ -114,3 +114,56 @@ def test_create_app_configures_mem0_client_from_settings(tmp_path) -> None:
     assert mem0.request_timeout_seconds == 14.0
     assert mem0.connect_timeout_seconds == 2.0
     assert mem0.verify_tls is False
+
+
+def test_consolidation_lifespan_starts_named_scheduler_and_worker(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            consolidation_enabled=True,
+        ),
+        mem0_client=object(),
+    )
+
+    with TestClient(app):
+        scheduler_task = app.state.consolidation_scheduler_task
+        worker_task = app.state.consolidation_worker_task
+        assert scheduler_task.get_name() == "mem0-consolidation-scheduler"
+        assert worker_task.get_name() == "mem0-consolidation-worker"
+        assert not scheduler_task.done()
+        assert not worker_task.done()
+
+    assert scheduler_task.done()
+    assert worker_task.done()
+
+
+def test_bridge_routing_heartbeat_is_persisted_for_consolidation_status(
+    tmp_path,
+) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+        )
+    )
+
+    with TestClient(app) as client:
+        heartbeat = client.post(
+            "/v1/projects/default/capabilities/bridge-routing/heartbeat",
+            json={
+                "instance_id": "bridge-a",
+                "bridge_version": "0.1.1",
+                "routes_reads": True,
+                "routes_writes": True,
+            },
+        )
+        status = client.get(
+            "/v1/projects/default/apps/default/consolidation"
+        )
+
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["ready"] is True
+    assert status.status_code == 200
+    assert status.json()["bridge_routing_ready"] is True
+    assert "worker" in status.json()

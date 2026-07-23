@@ -7,7 +7,9 @@ from sqlalchemy import text
 
 from mem0_sidecar.config import SidecarSettings, load_settings
 from mem0_sidecar.core.memory_ops import MutationConflictError
+from mem0_sidecar.http_adapter.capability_routes import capability_router
 from mem0_sidecar.http_adapter.category_routes import category_router
+from mem0_sidecar.http_adapter.consolidation_routes import consolidation_router
 from mem0_sidecar.http_adapter.entity_routes import entity_router
 from mem0_sidecar.http_adapter.event_routes import event_router
 from mem0_sidecar.http_adapter.export_routes import export_router
@@ -17,6 +19,7 @@ from mem0_sidecar.observability import RequestLoggingMiddleware, configure_loggi
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base
 from mem0_sidecar.store.repositories import ProjectRepository
+from mem0_sidecar.workers.consolidation import ConsolidationRuntime
 from mem0_sidecar.workers.direct_write_sync import DirectWriteSyncWorker
 
 
@@ -61,6 +64,8 @@ def create_app(
     async def lifespan(app: FastAPI):
         task = None
         stop = None
+        consolidation_tasks: list[asyncio.Task] = []
+        consolidation_stop = None
         if settings.direct_write_sync_enabled:
             stop = asyncio.Event()
             worker = DirectWriteSyncWorker(
@@ -74,6 +79,25 @@ def create_app(
             )
             app.state.direct_write_sync_stop = stop
             app.state.direct_write_sync_task = task
+        if settings.consolidation_enabled:
+            consolidation_stop = asyncio.Event()
+            runtime = ConsolidationRuntime(
+                settings=settings,
+                session_factory=session_factory,
+                mem0_client=mem0_client,
+            )
+            scheduler_task = asyncio.create_task(
+                runtime.scheduler_loop(consolidation_stop),
+                name="mem0-consolidation-scheduler",
+            )
+            worker_task = asyncio.create_task(
+                runtime.worker_loop(consolidation_stop),
+                name="mem0-consolidation-worker",
+            )
+            consolidation_tasks.extend((scheduler_task, worker_task))
+            app.state.consolidation_stop = consolidation_stop
+            app.state.consolidation_scheduler_task = scheduler_task
+            app.state.consolidation_worker_task = worker_task
         try:
             yield
         finally:
@@ -83,6 +107,13 @@ def create_app(
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
+            if consolidation_stop is not None:
+                consolidation_stop.set()
+            for consolidation_task in consolidation_tasks:
+                consolidation_task.cancel()
+            for consolidation_task in consolidation_tasks:
+                with suppress(asyncio.CancelledError):
+                    await consolidation_task
 
     app = FastAPI(title="Mem0 Platform Sidecar", lifespan=lifespan)
     app.state.settings = settings
@@ -93,9 +124,11 @@ def create_app(
         request_id_header=settings.request_id_header,
     )
     app.include_router(memory_router)
+    app.include_router(capability_router)
     app.include_router(event_router)
     app.include_router(entity_router)
     app.include_router(category_router)
+    app.include_router(consolidation_router)
     app.include_router(export_router)
 
     @app.exception_handler(MutationConflictError)

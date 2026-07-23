@@ -1,7 +1,9 @@
 import asyncio
 import hashlib
 import json
+import re
 import secrets
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -388,6 +390,145 @@ def _record_categories(record: dict[str, Any]) -> list[str]:
     for key in ("category", "custom_category", "type"):
         _append_categories(categories, metadata.get(key))
     return categories
+
+
+def _memory_text(record: dict[str, Any]) -> str | None:
+    for field_name in ("memory", "data", "text"):
+        value = record.get(field_name)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def memory_content_fingerprint(
+    record: dict[str, Any],
+) -> tuple[str | None, int | None]:
+    text_value = _memory_text(record)
+    if text_value is None:
+        return None, None
+    normalized = unicodedata.normalize("NFKC", text_value)
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest(), len(normalized)
+
+
+def normalize_memory_type(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return "unknown"
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
+    aliases = {
+        "bugfix": "bug_fix",
+        "debuggingnote": "debugging_note",
+        "userpreference": "user_preference",
+        "projectprofile": "project_profile",
+        "sessionstate": "session_state",
+        "compactsummary": "compact_summary",
+        "autocapture": "auto_capture",
+    }
+    return aliases.get(normalized, normalized or "unknown")
+
+
+def _parse_projection_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        return _as_utc(datetime.fromisoformat(candidate))
+    except ValueError:
+        return None
+
+
+def _memory_projection_fields(
+    record: dict[str, Any],
+    *,
+    observed_at: datetime,
+) -> dict[str, Any]:
+    metadata = _record_metadata(record)
+    content_hash, content_length = memory_content_fingerprint(record)
+    type_value = metadata.get(
+        "type",
+        metadata.get(
+            "memory_type",
+            record.get("memory_type", record.get("type")),
+        ),
+    )
+    text_value = _memory_text(record) or ""
+    pinned = metadata.get("pinned") is True or text_value.lstrip().startswith(
+        "[PINNED]"
+    )
+    expiration_value = record.get(
+        "expiration_date",
+        record.get("expires_at", metadata.get("expiration_date")),
+    )
+    source = metadata.get("source", record.get("source"))
+    scope_markers_verified = isinstance(
+        metadata.get(SIDECAR_PROJECT_ID_METADATA_KEY), str
+    ) and isinstance(metadata.get(SIDECAR_APP_ID_METADATA_KEY), str)
+    return {
+        "content_hash": content_hash,
+        "content_length": content_length,
+        "normalized_type": normalize_memory_type(type_value),
+        "source": source if isinstance(source, str) and source else None,
+        "pinned": pinned,
+        "expires_at": _parse_projection_datetime(expiration_value),
+        "scope_markers_verified": scope_markers_verified,
+        "observed_at": _as_utc(observed_at),
+    }
+
+
+def _projection_record_with_metadata_fallback(
+    record: dict[str, Any],
+    fallback_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(record)
+    metadata = dict(fallback_metadata)
+    metadata.update(_record_metadata(record))
+    merged["metadata"] = metadata
+    return merged
+
+
+def _response_memory_records(response: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(response, dict):
+        return {}
+    records: list[dict[str, Any]] = []
+    if _result_memory_id(response) is not None:
+        records.append(response)
+    results = response.get("results")
+    if isinstance(results, list):
+        records.extend(item for item in results if isinstance(item, dict))
+    return {
+        memory_id: record
+        for record in records
+        if (memory_id := _result_memory_id(record)) is not None
+    }
+
+
+async def _hydrate_memory_records(
+    mem0: Any,
+    response: Any,
+    memory_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    embedded = _response_memory_records(response)
+    semaphore = asyncio.Semaphore(_HYDRATION_CONCURRENCY)
+
+    async def hydrate(memory_id: str) -> tuple[str, dict[str, Any]]:
+        record = embedded.get(memory_id)
+        if record is not None and _memory_text(record) is not None:
+            return memory_id, record
+        async with semaphore:
+            hydrated = await mem0.get_memory(memory_id)
+        return memory_id, _memory_record_from_response(
+            hydrated,
+            expected_id=memory_id,
+        )
+
+    return dict(await asyncio.gather(*(hydrate(memory_id) for memory_id in memory_ids)))
 
 
 def _normalize_memory_record(
@@ -1142,6 +1283,7 @@ class MemoryService:
             (_normalize_memory_record(record) for record in records),
             key=lambda item: item["id"],
         )
+        observed_at = datetime.now(UTC)
         ProjectRepository(self.session).lock_for_mutation(project_id)
         intent_repo = MutationIntentRepository(self.session)
         intent = intent_repo.require_active_attempt(
@@ -1172,6 +1314,7 @@ class MemoryService:
                 run_id=item["run_id"],
                 category=category if isinstance(category, str) else None,
                 metadata=metadata,
+                **_memory_projection_fields(item, observed_at=observed_at),
             )
             affected_projections.append(_snapshot_memory_projection(indexed))
         intent_repo.add_targets(
@@ -1266,6 +1409,7 @@ class MemoryService:
             app_id=app_id,
         )
         normalized = _normalize_memory_record(record, projection=projection)
+        observed_at = datetime.now(UTC)
         categories = normalized["categories"]
         affected_projections = (
             [_snapshot_memory_projection(projection)]
@@ -1281,6 +1425,7 @@ class MemoryService:
             run_id=normalized["run_id"],
             category=categories[0] if categories else None,
             metadata=normalized["metadata"],
+            **_memory_projection_fields(normalized, observed_at=observed_at),
         )
         affected_projections.append(_snapshot_memory_projection(indexed))
         target = intent_repo.targets(intent_id)[0]
@@ -1552,6 +1697,12 @@ class MemoryService:
                 raise MemoryUpstreamProtocolError(
                     f"Could not extract memory id from response: {memory_response!r}"
                 )
+            observed_at = datetime.now(UTC)
+            hydrated_records = await _hydrate_memory_records(
+                self.mem0,
+                memory_response,
+                memory_ids,
+            )
             ProjectRepository(self.session).lock_for_mutation(project_id)
             intent_repo = MutationIntentRepository(self.session)
             intent_repo.require_active_attempt(intent_id, attempt_token)
@@ -1575,6 +1726,13 @@ class MemoryService:
                     run_id=scope.run_id,
                     category=category,
                     metadata=metadata,
+                    **_memory_projection_fields(
+                        _projection_record_with_metadata_fallback(
+                            hydrated_records[memory_id],
+                            metadata,
+                        ),
+                        observed_at=observed_at,
+                    ),
                 )
                 affected_projections.append(_snapshot_memory_projection(indexed))
             for target in intent_repo.add_targets(intent_id, memory_ids):
@@ -2126,6 +2284,7 @@ class MemoryService:
                 record,
                 projection=projection_before,
             )
+            observed_at = datetime.now(UTC)
             ProjectRepository(self.session).lock_for_mutation(project_id)
             intent_repo = MutationIntentRepository(self.session)
             intent_repo.require_active_attempt(intent_id, attempt_token)
@@ -2152,6 +2311,10 @@ class MemoryService:
                 run_id=normalized["run_id"],
                 category=categories[0] if categories else None,
                 metadata=metadata,
+                **_memory_projection_fields(
+                    normalized,
+                    observed_at=observed_at,
+                ),
             )
             EntityRepository(self.session).refresh_affected_memories(
                 project_id,
@@ -2376,6 +2539,10 @@ class MemoryService:
                     run_id=normalized["run_id"],
                     category=categories[0] if categories else None,
                     metadata=normalized["metadata"],
+                    **_memory_projection_fields(
+                        normalized,
+                        observed_at=scan_cutoff,
+                    ),
                 )
                 affected_projections.append(
                     _snapshot_memory_projection(indexed_memory)
@@ -2610,6 +2777,10 @@ class MemoryService:
                             run_id=normalized["run_id"],
                             category=categories[0] if categories else None,
                             metadata=metadata,
+                            **_memory_projection_fields(
+                                normalized,
+                                observed_at=scan_cutoff,
+                            ),
                         )
                         if claim.status == "conflict":
                             skipped_other_scope += 1
@@ -2625,6 +2796,10 @@ class MemoryService:
                             run_id=normalized["run_id"],
                             category=categories[0] if categories else None,
                             metadata=metadata,
+                            **_memory_projection_fields(
+                                normalized,
+                                observed_at=scan_cutoff,
+                            ),
                         )
                     if indexed_memory is None:
                         raise RuntimeError(

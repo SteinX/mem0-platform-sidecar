@@ -72,6 +72,7 @@ flowchart LR
     Store --> Events["events"]
     Store --> Entities["entities"]
     Store --> Jobs["jobs"]
+    Store --> Consolidation["policies / runs / proposals / lineage"]
 ```
 
 Request flow:
@@ -95,7 +96,7 @@ Request flow:
 | `mem0_client` | The only module that calls Mem0 OSS REST |
 | `store` | SQLAlchemy models, database setup, repositories |
 | `observability` | request ID handling, request logs, upstream call logs |
-| `workers` | worker runner skeleton for future async jobs |
+| `workers` | durable job runner plus consolidation scheduler and worker loops |
 
 HTTP route functions should stay thin. Core services should remain usable from
 future MCP handlers or worker jobs without calling HTTP adapters.
@@ -113,7 +114,11 @@ Platform-like control plane.
 | `memories_index` | scoped projection of Mem0 OSS memory IDs and metadata |
 | `events` | durable external operation log for mutating operations |
 | `entities` | future derived entity index for users, agents, apps, runs, and custom entities |
-| `jobs` | future internal background work queue |
+| `jobs` | durable background work queue with leases and bounded retries |
+| `consolidation_policies` | project/app policy and rollout mode |
+| `consolidation_runs` | bounded scan lifecycle and text-free counts |
+| `consolidation_proposals` | exact, retention, semantic, and contradiction candidates |
+| `consolidation_lineage` | applied source-to-canonical actions and export checkpoints |
 
 The memory text remains owned by Mem0 OSS. `memories_index` exists to support
 scoping, filtering, category projection, management workflows, and future
@@ -130,6 +135,13 @@ Project scope is resolved in this order:
 5. `MEM0_SIDECAR_DEFAULT_PROJECT_ID`.
 
 `app_id` is resolved independently from payload first, then query string.
+
+Consolidation is incremental: writes refresh a text-free fingerprint projection,
+the worker scans only dirty anchors, and semantic analysis uses one scoped
+top-10 neighbor search per eligible anchor. It never loads an entire project
+into one model call. Exact duplicates and configured expired ephemeral types are
+the only auto-safe classes; semantic and contradiction proposals require manual
+review. Pinned memories are excluded from every proposal and apply path.
 
 When adding memories, the sidecar forwards internal scope metadata to Mem0 OSS:
 

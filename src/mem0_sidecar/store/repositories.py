@@ -9,10 +9,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from mem0_sidecar.core.consolidation_policy import ConsolidationPolicySpec
 from mem0_sidecar.core.explorer_filters import (
     EXPLORER_RECORD_HORIZON,
     ExplorerFilter,
@@ -27,6 +28,10 @@ from mem0_sidecar.core.trace_payloads import (
 )
 from mem0_sidecar.store.models import (
     Category,
+    ConsolidationLineage,
+    ConsolidationPolicy,
+    ConsolidationProposal,
+    ConsolidationRun,
     Entity,
     Event,
     EventStatus,
@@ -847,6 +852,137 @@ class ProjectRepository:
         return project
 
 
+class ServiceCapabilityRepository:
+    _BRIDGE_KEY = "bridge_routing"
+    _FRESH_FOR = timedelta(minutes=10)
+    _MAX_INSTANCES = 32
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    @staticmethod
+    def _settings(project: Project) -> dict[str, Any]:
+        try:
+            value = json.loads(project.settings_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def record_bridge_heartbeat(
+        self,
+        *,
+        project_id: str,
+        instance_id: str,
+        bridge_version: str,
+        routes_reads: bool,
+        routes_writes: bool,
+        observed_at: datetime | None = None,
+    ) -> dict[str, object]:
+        validate_scope_id(instance_id, field_name="instance_id")
+        if not isinstance(bridge_version, str) or not 1 <= len(bridge_version) <= 128:
+            raise ValueError("bridge_version must contain 1-128 characters")
+        if type(routes_reads) is not bool or type(routes_writes) is not bool:
+            raise ValueError("bridge routing capabilities must be booleans")
+        observed_at = observed_at or _utc_now()
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        else:
+            observed_at = observed_at.astimezone(UTC)
+
+        project = ProjectRepository(self.session).lock_for_mutation(project_id)
+        settings = self._settings(project)
+        capabilities = settings.get("service_capabilities")
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+        bridge = capabilities.get(self._BRIDGE_KEY)
+        if not isinstance(bridge, dict):
+            bridge = {}
+        instances = bridge.get("instances")
+        if not isinstance(instances, dict):
+            instances = {}
+        instances[instance_id] = {
+            "bridge_version": bridge_version,
+            "routes_reads": routes_reads,
+            "routes_writes": routes_writes,
+            "last_seen_at": observed_at.isoformat(),
+        }
+        ordered_instances = sorted(
+            instances.items(),
+            key=lambda item: str(
+                item[1].get("last_seen_at", "")
+                if isinstance(item[1], dict)
+                else ""
+            ),
+            reverse=True,
+        )[: self._MAX_INSTANCES]
+        bridge["instances"] = dict(ordered_instances)
+        capabilities[self._BRIDGE_KEY] = bridge
+        settings["service_capabilities"] = capabilities
+        project.settings_json = _json(settings)
+        self.session.flush()
+        return self.bridge_routing_status(project_id, now=observed_at)
+
+    def bridge_routing_status(
+        self,
+        project_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        project = self.session.get(Project, project_id)
+        if project is None:
+            raise KeyError(project_id)
+        now = now or _utc_now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        else:
+            now = now.astimezone(UTC)
+        settings = self._settings(project)
+        capabilities = settings.get("service_capabilities")
+        bridge = (
+            capabilities.get(self._BRIDGE_KEY)
+            if isinstance(capabilities, dict)
+            else None
+        )
+        instances = bridge.get("instances") if isinstance(bridge, dict) else None
+        ready_instances: list[tuple[str, datetime]] = []
+        if isinstance(instances, dict):
+            for instance_id, raw in instances.items():
+                if not isinstance(instance_id, str) or not isinstance(raw, dict):
+                    continue
+                raw_seen = raw.get("last_seen_at")
+                if not isinstance(raw_seen, str):
+                    continue
+                try:
+                    seen = datetime.fromisoformat(raw_seen.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if seen.tzinfo is None:
+                    seen = seen.replace(tzinfo=UTC)
+                else:
+                    seen = seen.astimezone(UTC)
+                if (
+                    raw.get("routes_reads") is True
+                    and raw.get("routes_writes") is True
+                    and seen >= now - self._FRESH_FOR
+                    and seen <= now + timedelta(minutes=1)
+                ):
+                    ready_instances.append((instance_id, seen))
+        last_seen = max((seen for _instance, seen in ready_instances), default=None)
+        return {
+            "ready": bool(ready_instances),
+            "ready_instance_count": len(ready_instances),
+            "last_seen_at": last_seen,
+        }
+
+    def bridge_routing_ready(
+        self,
+        project_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        return bool(self.bridge_routing_status(project_id, now=now)["ready"])
+
+
 class CategoryRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -1620,6 +1756,7 @@ class MemoryIndexRepository:
         app_id: str | None,
         mem0_memory_ids: Iterable[str],
         include_deleted: bool = False,
+        include_shadowed: bool = False,
     ) -> list[MemoryIndex]:
         memory_ids = list(dict.fromkeys(mem0_memory_ids))
         memories: list[MemoryIndex] = []
@@ -1632,6 +1769,10 @@ class MemoryIndexRepository:
                 statement = statement.where(MemoryIndex.app_id == app_id)
             if not include_deleted:
                 statement = statement.where(MemoryIndex.deleted_at.is_(None))
+            if not include_shadowed:
+                statement = statement.where(
+                    MemoryIndex.consolidation_state == "ACTIVE"
+                )
             memories.extend(self.session.scalars(statement))
         return memories
 
@@ -1651,6 +1792,7 @@ class MemoryIndexRepository:
         statement = select(MemoryIndex.mem0_memory_id).where(
             MemoryIndex.project_id == project_id,
             MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
             MemoryIndex.mem0_memory_id.in_(mem0_memory_ids),
         )
         if user_id is not None:
@@ -1675,6 +1817,7 @@ class MemoryIndexRepository:
             .where(
                 MemoryIndex.project_id == project_id,
                 MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.consolidation_state == "ACTIVE",
             )
             .order_by(MemoryIndex.created_at, MemoryIndex.mem0_memory_id)
         )
@@ -1686,6 +1829,17 @@ class MemoryIndexRepository:
             statement = statement.where(MemoryIndex.agent_id == agent_id)
         if (run_id := filters.get("run_id")) is not None:
             statement = statement.where(MemoryIndex.run_id == run_id)
+        if (memory_ids := filters.get("memory_ids")) is not None:
+            if (
+                not isinstance(memory_ids, list)
+                or not memory_ids
+                or len(memory_ids) > 1000
+                or any(not isinstance(item, str) or not item for item in memory_ids)
+            ):
+                raise ValueError("memory_ids export filter is invalid")
+            statement = statement.where(
+                MemoryIndex.mem0_memory_id.in_(list(dict.fromkeys(memory_ids)))
+            )
         return list(self.session.scalars(statement))
 
     def query_project_memories(
@@ -1708,6 +1862,7 @@ class MemoryIndexRepository:
         scope_conditions = [
             MemoryIndex.project_id == project_id,
             MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
         ]
         if app_id is not None:
             scope_conditions.append(MemoryIndex.app_id == app_id)
@@ -1821,6 +1976,290 @@ class MemoryIndexRepository:
             )
         )
 
+    def mark_scope_dirty(
+        self,
+        project_id: str,
+        app_id: str,
+        observed_at: datetime,
+    ) -> None:
+        self.session.execute(
+            update(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.consolidation_state == "ACTIVE",
+                MemoryIndex.last_observed_at.is_(None),
+            )
+            .values(last_observed_at=observed_at)
+            .execution_options(synchronize_session="fetch")
+        )
+        self.session.flush()
+
+    def list_scope_marker_backfill_candidates(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        retry_before: datetime,
+        limit: int = 200,
+    ) -> list[MemoryIndex]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("scope marker backfill limit must be between 1 and 1000")
+        return list(
+            self.session.scalars(
+                select(MemoryIndex)
+                .where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.app_id == app_id,
+                    MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.scope_markers_verified == 0,
+                    or_(
+                        MemoryIndex.scope_marker_backfill_attempted_at.is_(None),
+                        MemoryIndex.scope_marker_backfill_attempted_at
+                        <= retry_before,
+                    ),
+                )
+                .order_by(
+                    case(
+                        (
+                            MemoryIndex.scope_marker_backfill_attempted_at.is_(None),
+                            0,
+                        ),
+                        else_=1,
+                    ),
+                    MemoryIndex.scope_marker_backfill_attempted_at,
+                    MemoryIndex.created_at,
+                    MemoryIndex.mem0_memory_id,
+                )
+                .limit(limit)
+            )
+        )
+
+    def count_scope_marker_backfill_required(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+    ) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(MemoryIndex)
+                .where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.app_id == app_id,
+                    MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.scope_markers_verified == 0,
+                )
+            )
+            or 0
+        )
+
+    def mark_scope_markers_verified(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        memory_id: str,
+        verified_at: datetime | None = None,
+    ) -> bool:
+        result = self.session.execute(
+            update(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.mem0_memory_id == memory_id,
+                MemoryIndex.deleted_at.is_(None),
+            )
+            .values(
+                scope_markers_verified=1,
+                scope_marker_backfill_status="VERIFIED",
+                scope_marker_backfill_attempted_at=verified_at or _utc_now(),
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        self.session.flush()
+        return bool(result.rowcount)
+
+    def mark_scope_marker_backfill_outcome(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        memory_id: str,
+        status: str,
+        attempted_at: datetime,
+    ) -> bool:
+        if status not in {"CONFLICT", "MISSING"}:
+            raise ValueError("invalid scope marker backfill outcome")
+        result = self.session.execute(
+            update(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.mem0_memory_id == memory_id,
+                MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.scope_markers_verified == 0,
+            )
+            .values(
+                scope_marker_backfill_status=status,
+                scope_marker_backfill_attempted_at=attempted_at,
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        self.session.flush()
+        return bool(result.rowcount)
+
+    def scope_marker_backfill_counts(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+    ) -> dict[str, int]:
+        rows = self.session.execute(
+            select(MemoryIndex.scope_marker_backfill_status, func.count())
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.scope_markers_verified == 0,
+            )
+            .group_by(MemoryIndex.scope_marker_backfill_status)
+        )
+        return {status: int(count) for status, count in rows}
+
+    def list_dirty_anchors(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        after_last_observed_at: datetime | None = None,
+        after_memory_id: str | None = None,
+        limit: int = 100,
+    ) -> list[MemoryIndex]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("dirty anchor limit must be between 1 and 1000")
+        if (after_last_observed_at is None) != (after_memory_id is None):
+            raise ValueError("dirty anchor cursor is incomplete")
+
+        statement = select(MemoryIndex).where(
+            MemoryIndex.project_id == project_id,
+            MemoryIndex.app_id == app_id,
+            MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
+            MemoryIndex.pinned == 0,
+            MemoryIndex.scope_markers_verified == 1,
+            MemoryIndex.content_hash.is_not(None),
+            MemoryIndex.last_observed_at.is_not(None),
+            or_(
+                MemoryIndex.last_consolidation_scan_at.is_(None),
+                MemoryIndex.last_observed_at
+                > MemoryIndex.last_consolidation_scan_at,
+            ),
+        )
+        if after_last_observed_at is not None and after_memory_id is not None:
+            statement = statement.where(
+                or_(
+                    MemoryIndex.last_observed_at > after_last_observed_at,
+                    and_(
+                        MemoryIndex.last_observed_at == after_last_observed_at,
+                        MemoryIndex.mem0_memory_id > after_memory_id,
+                    ),
+                )
+            )
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    MemoryIndex.last_observed_at,
+                    MemoryIndex.mem0_memory_id,
+                ).limit(limit)
+            )
+        )
+
+    def mark_anchors_scanned(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        memory_ids: list[str],
+        scan_cutoff: datetime,
+    ) -> int:
+        if not memory_ids:
+            return 0
+        result = self.session.execute(
+            update(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.mem0_memory_id.in_(memory_ids),
+                MemoryIndex.last_observed_at.is_not(None),
+                MemoryIndex.last_observed_at <= scan_cutoff,
+            )
+            .values(last_consolidation_scan_at=scan_cutoff)
+            .execution_options(synchronize_session="fetch")
+        )
+        self.session.flush()
+        return int(result.rowcount or 0)
+
+    def count_dirty_anchors(self, *, project_id: str, app_id: str) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(MemoryIndex)
+                .where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.app_id == app_id,
+                    MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.consolidation_state == "ACTIVE",
+                    MemoryIndex.pinned == 0,
+                    MemoryIndex.scope_markers_verified == 1,
+                    MemoryIndex.content_hash.is_not(None),
+                    MemoryIndex.last_observed_at.is_not(None),
+                    or_(
+                        MemoryIndex.last_consolidation_scan_at.is_(None),
+                        MemoryIndex.last_observed_at
+                        > MemoryIndex.last_consolidation_scan_at,
+                    ),
+                )
+            )
+            or 0
+        )
+
+    def list_exact_group_peers(
+        self,
+        anchor: MemoryIndex,
+        *,
+        limit: int = 100,
+    ) -> list[MemoryIndex]:
+        if limit < 1 or limit > 100:
+            raise ValueError("exact peer limit must be between 1 and 100")
+        if not anchor.app_id or not anchor.content_hash:
+            return []
+
+        statement = select(MemoryIndex).where(
+            MemoryIndex.project_id == anchor.project_id,
+            MemoryIndex.app_id == anchor.app_id,
+            MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
+            MemoryIndex.pinned == 0,
+            MemoryIndex.scope_markers_verified == 1,
+            MemoryIndex.normalized_type == anchor.normalized_type,
+            MemoryIndex.content_hash == anchor.content_hash,
+        )
+        for column, value in (
+            (MemoryIndex.user_id, anchor.user_id),
+            (MemoryIndex.agent_id, anchor.agent_id),
+        ):
+            statement = statement.where(
+                column.is_(None) if value is None else column == value
+            )
+        return list(
+            self.session.scalars(
+                statement.order_by(MemoryIndex.mem0_memory_id).limit(limit)
+            )
+        )
+
     def mark_stale(
         self,
         project_id: str,
@@ -1907,6 +2346,14 @@ class MemoryIndexRepository:
         agent_id: str | None = None,
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        content_hash: str | None = None,
+        content_length: int | None = None,
+        normalized_type: str | None = None,
+        source: str | None = None,
+        pinned: bool | int | None = None,
+        expires_at: datetime | None = None,
+        scope_markers_verified: bool | int | None = True,
+        observed_at: datetime | None = None,
     ) -> MemoryIndex:
         projection_now = _utc_now()
         memory = self.session.scalar(
@@ -1915,9 +2362,13 @@ class MemoryIndexRepository:
                 MemoryIndex.mem0_memory_id == mem0_memory_id,
             )
         )
+        is_new = memory is None
         if memory is None:
             memory = MemoryIndex(project_id=project_id, mem0_memory_id=mem0_memory_id)
             self.session.add(memory)
+
+        previous_hash = memory.content_hash
+        previously_verified = memory.scope_markers_verified == 1
 
         memory.user_id = user_id
         memory.agent_id = agent_id
@@ -1925,6 +2376,24 @@ class MemoryIndexRepository:
         memory.run_id = run_id
         memory.category = category
         memory.metadata_projection_json = _json(metadata or {})
+        if observed_at is not None:
+            if memory.deleted_at is not None or previous_hash != content_hash:
+                memory.consolidation_state = "ACTIVE"
+                memory.shadowed_by_proposal_id = None
+            memory.content_hash = content_hash
+            memory.content_length = content_length
+            memory.normalized_type = normalized_type
+            memory.source = source
+            memory.pinned = int(bool(pinned))
+            memory.expires_at = expires_at
+            memory.scope_markers_verified = int(bool(scope_markers_verified))
+            if memory.scope_markers_verified == 1:
+                memory.scope_marker_backfill_status = "VERIFIED"
+                memory.scope_marker_backfill_attempted_at = observed_at
+            elif is_new or previously_verified:
+                memory.scope_marker_backfill_status = "PENDING"
+                memory.scope_marker_backfill_attempted_at = None
+            memory.last_observed_at = observed_at
         memory.deleted_at = None
         memory.updated_at = projection_now
         self.session.flush()
@@ -1941,6 +2410,14 @@ class MemoryIndexRepository:
         agent_id: str | None = None,
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        content_hash: str | None = None,
+        content_length: int | None = None,
+        normalized_type: str | None = None,
+        source: str | None = None,
+        pinned: bool | int | None = None,
+        expires_at: datetime | None = None,
+        scope_markers_verified: bool | int | None = True,
+        observed_at: datetime | None = None,
     ) -> MemoryClaimResult:
         projection_now = _utc_now()
         values = {
@@ -1953,8 +2430,44 @@ class MemoryIndexRepository:
             "deleted_at": None,
             "updated_at": projection_now,
         }
+        if observed_at is not None:
+            verified = int(bool(scope_markers_verified))
+            values.update(
+                {
+                    "content_hash": content_hash,
+                    "content_length": content_length,
+                    "normalized_type": normalized_type,
+                    "source": source,
+                    "pinned": int(bool(pinned)),
+                    "expires_at": expires_at,
+                    "scope_markers_verified": verified,
+                    "scope_marker_backfill_status": (
+                        "VERIFIED" if verified else "PENDING"
+                    ),
+                    "scope_marker_backfill_attempted_at": (
+                        observed_at if verified else None
+                    ),
+                    "last_observed_at": observed_at,
+                    "consolidation_state": "ACTIVE",
+                    "shadowed_by_proposal_id": None,
+                }
+            )
 
         def update_claimable() -> int:
+            update_values = dict(values)
+            if observed_at is not None:
+                same_hash = and_(
+                    MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.content_hash == content_hash,
+                )
+                update_values["consolidation_state"] = case(
+                    (same_hash, MemoryIndex.consolidation_state),
+                    else_="ACTIVE",
+                )
+                update_values["shadowed_by_proposal_id"] = case(
+                    (same_hash, MemoryIndex.shadowed_by_proposal_id),
+                    else_=None,
+                )
             result = self.session.execute(
                 update(MemoryIndex)
                 .where(
@@ -1965,7 +2478,7 @@ class MemoryIndexRepository:
                         MemoryIndex.deleted_at.is_not(None),
                     ),
                 )
-                .values(**values)
+                .values(**update_values)
                 .execution_options(synchronize_session="fetch")
             )
             return result.rowcount or 0
@@ -2094,6 +2607,7 @@ class EntityRepository:
                         MemoryIndex.project_id == project_id,
                         MemoryIndex.app_id == app_id,
                         MemoryIndex.deleted_at.is_(None),
+                        MemoryIndex.consolidation_state == "ACTIVE",
                     )
                     .order_by(MemoryIndex.id)
                     .limit(EXPLORER_RECORD_HORIZON + 1)
@@ -2189,6 +2703,7 @@ class EntityRepository:
                     MemoryIndex.project_id == project_id,
                     MemoryIndex.app_id == app_id,
                     MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.consolidation_state == "ACTIVE",
                     memory_id_column.in_(entity_ids),
                 )
                 .group_by(memory_id_column)
@@ -2315,6 +2830,7 @@ class EntityRepository:
                 MemoryIndex.project_id == project_id,
                 MemoryIndex.app_id == app_id,
                 MemoryIndex.deleted_at.is_(None),
+                MemoryIndex.consolidation_state == "ACTIVE",
                 identity_column == entity_id,
             )
             .order_by(
@@ -2420,28 +2936,620 @@ class JobRepository:
         event_id: str | None,
         job_type: str,
         payload: dict[str, Any],
+        run_after: datetime | None = None,
+        max_attempts: int = 3,
+        dedupe_key: str | None = None,
     ) -> Job:
+        if max_attempts < 1 or max_attempts > 100:
+            raise ValueError("max_attempts must be between 1 and 100")
         job = Job(
             project_id=project_id,
             event_id=event_id,
             job_type=job_type,
             payload_json=_json(payload),
+            run_after=run_after,
+            max_attempts=max_attempts,
+            dedupe_key=dedupe_key,
         )
         self.session.add(job)
         self.session.flush()
         return job
 
-    def claim_next(self) -> Job | None:
-        job = self.session.scalar(
-            select(Job)
-            .where(Job.status == JobStatus.PENDING)
-            .order_by(Job.created_at)
+    def _claim_candidate_statement(
+        self,
+        *,
+        job_types: tuple[str, ...],
+        now: datetime,
+        skip_locked: bool,
+    ):
+        eligible = or_(
+            and_(
+                Job.status == JobStatus.PENDING,
+                or_(Job.run_after.is_(None), Job.run_after <= now),
+            ),
+            and_(
+                Job.status == JobStatus.RUNNING,
+                Job.lease_expires_at.is_not(None),
+                Job.lease_expires_at <= now,
+            ),
         )
-        if job is None:
-            return None
+        statement = (
+            select(Job.id)
+            .where(eligible, Job.attempt_count < Job.max_attempts)
+            .order_by(
+                func.coalesce(Job.run_after, Job.created_at),
+                Job.created_at,
+                Job.id,
+            )
+            .limit(1)
+        )
+        if job_types:
+            statement = statement.where(Job.job_type.in_(job_types))
+        if skip_locked:
+            statement = statement.with_for_update(skip_locked=True)
+        return statement
 
-        job.status = JobStatus.RUNNING
-        job.locked_at = _utc_now()
-        job.attempt_count += 1
+    def claim_next(
+        self,
+        job_types: tuple[str, ...] = (),
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> Job | None:
+        if lease_seconds < 1 or lease_seconds > 86_400:
+            raise ValueError("lease_seconds must be between 1 and 86400")
+        now = now or _utc_now()
+        self.session.execute(
+            update(Job)
+            .where(
+                Job.status == JobStatus.RUNNING,
+                Job.lease_expires_at.is_not(None),
+                Job.lease_expires_at <= now,
+                Job.attempt_count >= Job.max_attempts,
+            )
+            .values(
+                status=JobStatus.FAILED,
+                lease_expires_at=None,
+                completed_at=now,
+                error_json=_json({"error_type": "AttemptsExhausted"}),
+                updated_at=now,
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        candidate = self._claim_candidate_statement(
+            job_types=job_types,
+            now=now,
+            skip_locked=self.session.get_bind().dialect.name == "postgresql",
+        )
+        claimed_id = self.session.scalar(
+            update(Job)
+            .where(Job.id == candidate.scalar_subquery())
+            .values(
+                status=JobStatus.RUNNING,
+                locked_at=now,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+                attempt_count=Job.attempt_count + 1,
+                completed_at=None,
+                updated_at=now,
+            )
+            .returning(Job.id)
+            .execution_options(synchronize_session="fetch")
+        )
+        if claimed_id is None:
+            return None
+        return self.session.scalar(
+            select(Job)
+            .where(Job.id == claimed_id)
+            .execution_options(populate_existing=True)
+        )
+
+    def payload(self, job: Job) -> dict[str, Any]:
+        try:
+            payload = json.loads(job.payload_json)
+        except (TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def mark_succeeded(
+        self,
+        job_id: str,
+        result: dict[str, object],
+    ) -> Job:
+        job = self.session.get(Job, job_id)
+        if job is None:
+            raise KeyError(job_id)
+        now = _utc_now()
+        job.status = JobStatus.SUCCEEDED
+        job.result_json = _json(result)
+        job.error_json = "{}"
+        job.lease_expires_at = None
+        job.completed_at = now
+        job.updated_at = now
         self.session.flush()
         return job
+
+    def mark_failed(
+        self,
+        job_id: str,
+        error: dict[str, object],
+        retry_at: datetime | None,
+    ) -> Job:
+        job = self.session.get(Job, job_id)
+        if job is None:
+            raise KeyError(job_id)
+        now = _utc_now()
+        should_retry = retry_at is not None and job.attempt_count < job.max_attempts
+        job.status = JobStatus.PENDING if should_retry else JobStatus.FAILED
+        job.error_json = _json(error)
+        job.run_after = retry_at if should_retry else job.run_after
+        job.locked_at = None
+        job.lease_expires_at = None
+        job.completed_at = None if should_retry else now
+        job.updated_at = now
+        self.session.flush()
+        return job
+
+    def consolidation_status(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        now = now or _utc_now()
+        jobs = self.session.scalars(
+            select(Job)
+            .where(
+                Job.project_id == project_id,
+                Job.job_type.in_(("consolidation.scan", "consolidation.finalize")),
+            )
+            .order_by(Job.created_at.desc())
+            .limit(5000)
+        )
+        matching = [
+            job
+            for job in jobs
+            if self.payload(job).get("app_id") == app_id
+        ]
+        succeeded = [
+            job
+            for job in matching
+            if job.status == JobStatus.SUCCEEDED and job.completed_at is not None
+        ]
+        pending = [job for job in matching if job.status == JobStatus.PENDING]
+        last_success = max(
+            (job.completed_at for job in succeeded if job.completed_at is not None),
+            default=None,
+        )
+        oldest_pending = min(
+            (job.created_at for job in pending),
+            default=None,
+        )
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        if oldest_pending is not None:
+            if oldest_pending.tzinfo is None:
+                oldest_pending = oldest_pending.replace(tzinfo=UTC)
+            else:
+                oldest_pending = oldest_pending.astimezone(UTC)
+        return {
+            "last_success_at": last_success,
+            "pending_count": len(pending),
+            "oldest_pending_age_seconds": (
+                max((now - oldest_pending).total_seconds(), 0.0)
+                if oldest_pending is not None
+                else None
+            ),
+        }
+
+
+class ConsolidationPolicyRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        policy: Mapping[str, object],
+    ) -> ConsolidationPolicy:
+        spec = ConsolidationPolicySpec.from_mapping(policy)
+        row = self.session.scalar(
+            select(ConsolidationPolicy).where(
+                ConsolidationPolicy.project_id == project_id,
+                ConsolidationPolicy.app_id == app_id,
+            )
+        )
+        if row is None:
+            row = ConsolidationPolicy(project_id=project_id, app_id=app_id)
+            self.session.add(row)
+        row.enabled = int(spec.enabled)
+        row.mode = spec.mode
+        row.version = spec.policy_version
+        row.policy_json = _json(spec.to_mapping())
+        row.updated_at = _utc_now()
+        self.session.flush()
+        return row
+
+    def get(self, project_id: str, app_id: str) -> ConsolidationPolicy | None:
+        return self.session.scalar(
+            select(ConsolidationPolicy).where(
+                ConsolidationPolicy.project_id == project_id,
+                ConsolidationPolicy.app_id == app_id,
+            )
+        )
+
+    def list_enabled(self) -> list[ConsolidationPolicy]:
+        return list(
+            self.session.scalars(
+                select(ConsolidationPolicy)
+                .where(ConsolidationPolicy.enabled == 1)
+                .order_by(
+                    ConsolidationPolicy.project_id,
+                    ConsolidationPolicy.app_id,
+                )
+            )
+        )
+
+    def spec(self, row: ConsolidationPolicy) -> ConsolidationPolicySpec:
+        try:
+            value = json.loads(row.policy_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("stored consolidation policy is invalid") from exc
+        if not isinstance(value, dict):
+            raise ValueError("stored consolidation policy is invalid")
+        return ConsolidationPolicySpec.from_mapping(value)
+
+
+class ConsolidationRunRepository:
+    NONTERMINAL = ("PENDING", "RUNNING")
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def active(self, project_id: str, app_id: str) -> ConsolidationRun | None:
+        return self.session.scalar(
+            select(ConsolidationRun).where(
+                ConsolidationRun.project_id == project_id,
+                ConsolidationRun.app_id == app_id,
+                ConsolidationRun.status.in_(self.NONTERMINAL),
+            )
+        )
+
+    def last_succeeded(
+        self, project_id: str, app_id: str
+    ) -> ConsolidationRun | None:
+        return self.session.scalar(
+            select(ConsolidationRun)
+            .where(
+                ConsolidationRun.project_id == project_id,
+                ConsolidationRun.app_id == app_id,
+                ConsolidationRun.status == "SUCCEEDED",
+            )
+            .order_by(ConsolidationRun.completed_at.desc())
+            .limit(1)
+        )
+
+    def last(self, project_id: str, app_id: str) -> ConsolidationRun | None:
+        return self.session.scalar(
+            select(ConsolidationRun)
+            .where(
+                ConsolidationRun.project_id == project_id,
+                ConsolidationRun.app_id == app_id,
+            )
+            .order_by(ConsolidationRun.created_at.desc(), ConsolidationRun.id.desc())
+            .limit(1)
+        )
+
+    def create(
+        self,
+        policy: ConsolidationPolicy,
+        *,
+        now: datetime,
+    ) -> ConsolidationRun:
+        run = ConsolidationRun(
+            project_id=policy.project_id,
+            app_id=policy.app_id,
+            policy_id=policy.id,
+            policy_version=policy.version,
+            mode=policy.mode,
+            status="PENDING",
+            created_at=now,
+            updated_at=now,
+        )
+        self.session.add(run)
+        self.session.flush()
+        return run
+
+    def get(
+        self,
+        run_id: str,
+        *,
+        project_id: str | None = None,
+        app_id: str | None = None,
+    ) -> ConsolidationRun:
+        statement = select(ConsolidationRun).where(
+            ConsolidationRun.id == run_id
+        )
+        if project_id is not None:
+            statement = statement.where(
+                ConsolidationRun.project_id == project_id
+            )
+        if app_id is not None:
+            statement = statement.where(ConsolidationRun.app_id == app_id)
+        run = self.session.scalar(statement)
+        if run is None:
+            raise KeyError(run_id)
+        return run
+
+    def mark_running(
+        self, run_id: str, *, scan_cutoff: datetime
+    ) -> ConsolidationRun:
+        run = self.get(run_id)
+        run.status = "RUNNING"
+        run.scan_cutoff = scan_cutoff
+        run.started_at = run.started_at or scan_cutoff
+        run.updated_at = scan_cutoff
+        self.session.flush()
+        return run
+
+    def mark_succeeded(
+        self,
+        run_id: str,
+        *,
+        counts: Mapping[str, object],
+        completed_at: datetime,
+    ) -> ConsolidationRun:
+        run = self.get(run_id)
+        run.status = "SUCCEEDED"
+        run.counts_json = _json(counts)
+        run.error_code = None
+        run.error_json = "{}"
+        run.completed_at = completed_at
+        run.updated_at = completed_at
+        self.session.flush()
+        return run
+
+    def mark_failed(
+        self,
+        run_id: str,
+        *,
+        error_code: str,
+        error: Mapping[str, object],
+        completed_at: datetime,
+    ) -> ConsolidationRun:
+        run = self.get(run_id)
+        run.status = "FAILED"
+        run.error_code = error_code
+        run.error_json = _json(dict(error))
+        run.completed_at = completed_at
+        run.updated_at = completed_at
+        self.session.flush()
+        return run
+
+
+class ConsolidationProposalRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        run: ConsolidationRun,
+        proposal_key: str,
+        kind: str,
+        source_ids: tuple[str, ...],
+        canonical_id: str | None,
+        score: float | None,
+        evidence: Mapping[str, object],
+        status: str,
+    ) -> ConsolidationProposal:
+        existing = self.session.scalar(
+            select(ConsolidationProposal).where(
+                ConsolidationProposal.run_id == run.id,
+                ConsolidationProposal.proposal_key == proposal_key,
+            )
+        )
+        if existing is not None:
+            return existing
+        proposal = ConsolidationProposal(
+            run_id=run.id,
+            project_id=run.project_id,
+            app_id=run.app_id,
+            proposal_key=proposal_key,
+            kind=kind,
+            status=status,
+            source_ids_json=_json(list(source_ids)),
+            canonical_memory_id=canonical_id,
+            score=score,
+            evidence_json=_json(dict(evidence)),
+        )
+        self.session.add(proposal)
+        self.session.flush()
+        return proposal
+
+    def get(self, proposal_id: str) -> ConsolidationProposal:
+        proposal = self.session.get(ConsolidationProposal, proposal_id)
+        if proposal is None:
+            raise KeyError(proposal_id)
+        return proposal
+
+    def source_ids(self, proposal: ConsolidationProposal) -> tuple[str, ...]:
+        try:
+            value = json.loads(proposal.source_ids_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("stored proposal source IDs are invalid") from exc
+        if (
+            not isinstance(value, list)
+            or not value
+            or any(not isinstance(item, str) or not item for item in value)
+        ):
+            raise ValueError("stored proposal source IDs are invalid")
+        return tuple(dict.fromkeys(value))
+
+    def expected_hashes(
+        self, proposal: ConsolidationProposal
+    ) -> dict[str, str]:
+        try:
+            value = json.loads(proposal.expected_hashes_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("stored proposal hashes are invalid") from exc
+        if not isinstance(value, dict) or any(
+            not isinstance(key, str) or not isinstance(item, str)
+            for key, item in value.items()
+        ):
+            raise ValueError("stored proposal hashes are invalid")
+        return value
+
+    def set_status(
+        self,
+        proposal: ConsolidationProposal,
+        status: str,
+    ) -> ConsolidationProposal:
+        proposal.status = status
+        proposal.updated_at = _utc_now()
+        self.session.flush()
+        return proposal
+
+    def list_for_run(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        run_id: str,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> list[ConsolidationProposal]:
+        if offset < 0 or limit < 1 or limit > 100:
+            raise ValueError("proposal page is invalid")
+        return list(
+            self.session.scalars(
+                select(ConsolidationProposal)
+                .where(
+                    ConsolidationProposal.project_id == project_id,
+                    ConsolidationProposal.app_id == app_id,
+                    ConsolidationProposal.run_id == run_id,
+                )
+                .order_by(
+                    ConsolidationProposal.created_at,
+                    ConsolidationProposal.id,
+                )
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+
+    def list_actionable_for_run(
+        self,
+        run_id: str,
+    ) -> list[ConsolidationProposal]:
+        return list(
+            self.session.scalars(
+                select(ConsolidationProposal)
+                .where(
+                    ConsolidationProposal.run_id == run_id,
+                    ConsolidationProposal.status == "PENDING",
+                )
+                .order_by(
+                    ConsolidationProposal.created_at,
+                    ConsolidationProposal.id,
+                )
+                .limit(1000)
+            )
+        )
+
+    def count_for_run(self, run_id: str) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(ConsolidationProposal)
+                .where(ConsolidationProposal.run_id == run_id)
+            )
+            or 0
+        )
+
+    def summary_for_run(self, run_id: str) -> dict[str, object]:
+        by_kind = {
+            kind: int(count)
+            for kind, count in self.session.execute(
+                select(ConsolidationProposal.kind, func.count())
+                .where(ConsolidationProposal.run_id == run_id)
+                .group_by(ConsolidationProposal.kind)
+            )
+        }
+        by_status = {
+            status: int(count)
+            for status, count in self.session.execute(
+                select(ConsolidationProposal.status, func.count())
+                .where(ConsolidationProposal.run_id == run_id)
+                .group_by(ConsolidationProposal.status)
+            )
+        }
+        return {
+            "by_kind": dict(sorted(by_kind.items())),
+            "by_status": dict(sorted(by_status.items())),
+            "total": sum(by_kind.values()),
+        }
+
+    def counts_for_scope(self, project_id: str, app_id: str) -> dict[str, int]:
+        rows = self.session.execute(
+            select(ConsolidationProposal.status, func.count())
+            .where(
+                ConsolidationProposal.project_id == project_id,
+                ConsolidationProposal.app_id == app_id,
+            )
+            .group_by(ConsolidationProposal.status)
+        )
+        return {status: int(count) for status, count in rows}
+
+
+class ConsolidationLineageRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get_source(
+        self,
+        *,
+        proposal_id: str,
+        source_memory_id: str,
+    ) -> ConsolidationLineage | None:
+        return self.session.scalar(
+            select(ConsolidationLineage).where(
+                ConsolidationLineage.proposal_id == proposal_id,
+                ConsolidationLineage.source_memory_id == source_memory_id,
+            )
+        )
+
+    def create(
+        self,
+        *,
+        proposal: ConsolidationProposal,
+        source_memory_id: str,
+        canonical_memory_id: str | None,
+        action: str,
+        source_content_hash: str | None,
+        export_job_id: str,
+        applied_at: datetime,
+    ) -> ConsolidationLineage:
+        existing = self.get_source(
+            proposal_id=proposal.id,
+            source_memory_id=source_memory_id,
+        )
+        if existing is not None:
+            return existing
+        lineage = ConsolidationLineage(
+            project_id=proposal.project_id,
+            app_id=proposal.app_id,
+            run_id=proposal.run_id,
+            proposal_id=proposal.id,
+            source_memory_id=source_memory_id,
+            canonical_memory_id=canonical_memory_id,
+            action=action,
+            source_content_hash=source_content_hash,
+            export_job_id=export_job_id,
+            metadata_json="{}",
+            applied_at=applied_at,
+        )
+        self.session.add(lineage)
+        self.session.flush()
+        return lineage

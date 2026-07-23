@@ -58,6 +58,13 @@ ensure neither value was persisted and every document remains within 65,536
 bytes. Fixture deletion runs before those trace assertions, so a trace
 regression does not strand either upstream memory.
 
+The live suite also adds two exact duplicates and one pinned duplicate through
+the sidecar, observes one pinned-safe proposal, shadows and rolls it back,
+shadows again, recreates the app against the same sidecar database, and then
+finalizes after the grace boundary. Acceptance requires canonical and pinned
+memories to remain, the redundant upstream ID to normalize to semantic 404,
+and lineage plus a delete event to survive the restart.
+
 Reconciliation coverage imports records bearing sidecar project/app markers and
 checks the `scanned`, `indexed`, `skipped_unscoped`, `skipped_other_scope`, and
 `stale_marked` counters. The default service verifies that
