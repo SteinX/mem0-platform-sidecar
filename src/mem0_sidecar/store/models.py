@@ -168,6 +168,13 @@ class MemoryIndex(Base):
             "last_observed_at",
             "last_consolidation_scan_at",
         ),
+        Index(
+            "ix_memories_index_scope_marker_backfill",
+            "project_id",
+            "app_id",
+            "scope_markers_verified",
+            "created_at",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -195,6 +202,9 @@ class MemoryIndex(Base):
     )
     last_consolidation_scan_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
+    )
+    scope_markers_verified: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
     )
     consolidation_state: Mapped[str] = mapped_column(
         String(32),
@@ -539,8 +549,13 @@ class ConsolidationProposal(Base):
     expected_hashes_json: Mapped[str] = mapped_column(
         Text, default="{}", server_default=text("'{}'"), nullable=False
     )
+    canonical_content_hash: Mapped[str | None] = mapped_column(String(64))
     export_job_id: Mapped[str | None] = mapped_column(
         ForeignKey("export_jobs.id")
+    )
+    shadow_attempt_id: Mapped[str | None] = mapped_column(String(36))
+    shadow_attempt_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
     )
     not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

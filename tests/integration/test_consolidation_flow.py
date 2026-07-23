@@ -51,6 +51,12 @@ class FlowMem0:
     async def search_memories(self, _payload):
         return {"results": list(self.memories.values())}
 
+    async def update_memory(self, memory_id: str, payload):
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            self.memories[memory_id]["metadata"] = metadata
+        return {"id": memory_id, "updated": True}
+
     async def delete_memory(self, memory_id: str):
         self.memories.pop(memory_id, None)
         return {"id": memory_id, "deleted": True}
@@ -131,3 +137,73 @@ async def test_exact_duplicate_checkpoint_shadow_search_and_finalize(db_session)
     assert db_session.query(ConsolidationLineage).one().source_memory_id == (
         "redundant"
     )
+
+
+@pytest.mark.asyncio
+async def test_scope_backfill_enables_legacy_exact_consolidation(db_session):
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    policy = ConsolidationPolicyRepository(db_session).upsert(
+        project_id="repo-a",
+        app_id="app-a",
+        policy={"enabled": True, "mode": "MANUAL"},
+    )
+    content_hash, content_length = memory_content_fingerprint({"memory": "same"})
+    assert content_hash is not None
+    for memory_id in ("canonical", "redundant"):
+        MemoryIndexRepository(db_session).upsert_memory(
+            project_id="repo-a",
+            mem0_memory_id=memory_id,
+            user_id="root",
+            app_id="app-a",
+            category="decision",
+            metadata={},
+            content_hash=content_hash,
+            content_length=content_length,
+            normalized_type="decision",
+            source="legacy",
+            pinned=False,
+            scope_markers_verified=False,
+            observed_at=NOW,
+        )
+    run = ConsolidationRunRepository(db_session).create(policy, now=NOW)
+    db_session.commit()
+    mem0 = FlowMem0()
+    for record in mem0.memories.values():
+        record["metadata"] = {}
+    service = ConsolidationService(
+        session=db_session,
+        mem0=mem0,
+        bridge_routing_ready=True,
+        hard_delete_enabled=True,
+        now=lambda: NOW,
+    )
+
+    backfilled = await service.backfill_scope_markers(
+        project_id="repo-a",
+        app_id="app-a",
+        limit=10,
+    )
+    await service.run_scan(run.id)
+    proposal = db_session.query(ConsolidationProposal).one()
+    await service.approve_proposal(
+        proposal.id,
+        expected_status="PENDING",
+        expected_source_hashes={
+            "canonical": content_hash,
+            "redundant": content_hash,
+        },
+    )
+    await service.shadow_approved(proposal.id)
+    applied = await service.finalize_shadowed(
+        proposal.id,
+        now=NOW + timedelta(days=8),
+    )
+
+    assert backfilled["backfilled"] == 2
+    assert backfilled["remaining"] == 0
+    assert applied["status"] == "APPLIED"
+    assert list(mem0.memories) == ["canonical"]

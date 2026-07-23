@@ -200,6 +200,9 @@ class ConsolidationWorker:
                 hard_delete_enabled=(
                     self.settings.consolidation_hard_delete_enabled
                 ),
+                shadow_lease_seconds=(
+                    self.settings.consolidation_job_lease_seconds
+                ),
             ).shadow_approved(proposal_id)
             proposal = ConsolidationProposalRepository(session).get(proposal_id)
             run = ConsolidationRunRepository(session).get(proposal.run_id)

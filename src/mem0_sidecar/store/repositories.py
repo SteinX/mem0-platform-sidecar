@@ -1996,6 +1996,70 @@ class MemoryIndexRepository:
         )
         self.session.flush()
 
+    def list_scope_marker_backfill_candidates(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        limit: int = 200,
+    ) -> list[MemoryIndex]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("scope marker backfill limit must be between 1 and 1000")
+        return list(
+            self.session.scalars(
+                select(MemoryIndex)
+                .where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.app_id == app_id,
+                    MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.scope_markers_verified == 0,
+                )
+                .order_by(MemoryIndex.created_at, MemoryIndex.mem0_memory_id)
+                .limit(limit)
+            )
+        )
+
+    def count_scope_marker_backfill_required(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+    ) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(MemoryIndex)
+                .where(
+                    MemoryIndex.project_id == project_id,
+                    MemoryIndex.app_id == app_id,
+                    MemoryIndex.deleted_at.is_(None),
+                    MemoryIndex.scope_markers_verified == 0,
+                )
+            )
+            or 0
+        )
+
+    def mark_scope_markers_verified(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        memory_id: str,
+    ) -> bool:
+        result = self.session.execute(
+            update(MemoryIndex)
+            .where(
+                MemoryIndex.project_id == project_id,
+                MemoryIndex.app_id == app_id,
+                MemoryIndex.mem0_memory_id == memory_id,
+                MemoryIndex.deleted_at.is_(None),
+            )
+            .values(scope_markers_verified=1)
+            .execution_options(synchronize_session="fetch")
+        )
+        self.session.flush()
+        return bool(result.rowcount)
+
     def list_dirty_anchors(
         self,
         *,
@@ -2016,6 +2080,7 @@ class MemoryIndexRepository:
             MemoryIndex.deleted_at.is_(None),
             MemoryIndex.consolidation_state == "ACTIVE",
             MemoryIndex.pinned == 0,
+            MemoryIndex.scope_markers_verified == 1,
             MemoryIndex.content_hash.is_not(None),
             MemoryIndex.last_observed_at.is_not(None),
             or_(
@@ -2079,6 +2144,7 @@ class MemoryIndexRepository:
                     MemoryIndex.deleted_at.is_(None),
                     MemoryIndex.consolidation_state == "ACTIVE",
                     MemoryIndex.pinned == 0,
+                    MemoryIndex.scope_markers_verified == 1,
                     MemoryIndex.content_hash.is_not(None),
                     MemoryIndex.last_observed_at.is_not(None),
                     or_(
@@ -2108,6 +2174,7 @@ class MemoryIndexRepository:
             MemoryIndex.deleted_at.is_(None),
             MemoryIndex.consolidation_state == "ACTIVE",
             MemoryIndex.pinned == 0,
+            MemoryIndex.scope_markers_verified == 1,
             MemoryIndex.normalized_type == anchor.normalized_type,
             MemoryIndex.content_hash == anchor.content_hash,
         )
@@ -2216,6 +2283,7 @@ class MemoryIndexRepository:
         source: str | None = None,
         pinned: bool | int | None = None,
         expires_at: datetime | None = None,
+        scope_markers_verified: bool | int | None = True,
         observed_at: datetime | None = None,
     ) -> MemoryIndex:
         projection_now = _utc_now()
@@ -2247,6 +2315,7 @@ class MemoryIndexRepository:
             memory.source = source
             memory.pinned = int(bool(pinned))
             memory.expires_at = expires_at
+            memory.scope_markers_verified = int(bool(scope_markers_verified))
             memory.last_observed_at = observed_at
         memory.deleted_at = None
         memory.updated_at = projection_now
@@ -2270,6 +2339,7 @@ class MemoryIndexRepository:
         source: str | None = None,
         pinned: bool | int | None = None,
         expires_at: datetime | None = None,
+        scope_markers_verified: bool | int | None = True,
         observed_at: datetime | None = None,
     ) -> MemoryClaimResult:
         projection_now = _utc_now()
@@ -2292,6 +2362,9 @@ class MemoryIndexRepository:
                     "source": source,
                     "pinned": int(bool(pinned)),
                     "expires_at": expires_at,
+                    "scope_markers_verified": int(
+                        bool(scope_markers_verified)
+                    ),
                     "last_observed_at": observed_at,
                     "consolidation_state": "ACTIVE",
                     "shadowed_by_proposal_id": None,

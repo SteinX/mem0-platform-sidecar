@@ -52,6 +52,14 @@ def upgrade() -> None:
         )
         batch_op.add_column(
             sa.Column(
+                "scope_markers_verified",
+                sa.Integer(),
+                nullable=False,
+                server_default=sa.text("0"),
+            )
+        )
+        batch_op.add_column(
+            sa.Column(
                 "consolidation_state",
                 sa.String(length=32),
                 nullable=False,
@@ -75,6 +83,11 @@ def upgrade() -> None:
                 "last_observed_at",
                 "last_consolidation_scan_at",
             ],
+            unique=False,
+        )
+        batch_op.create_index(
+            "ix_memories_index_scope_marker_backfill",
+            ["project_id", "app_id", "scope_markers_verified", "created_at"],
             unique=False,
         )
 
@@ -167,10 +180,15 @@ def upgrade() -> None:
         sa.Column(
             "expected_hashes_json", sa.Text(), nullable=False, server_default="{}"
         ),
+        sa.Column("canonical_content_hash", sa.String(length=64)),
         sa.Column(
             "export_job_id",
             sa.String(length=36),
             sa.ForeignKey("export_jobs.id"),
+        ),
+        sa.Column("shadow_attempt_id", sa.String(length=36)),
+        sa.Column(
+            "shadow_attempt_expires_at", sa.DateTime(timezone=True)
         ),
         sa.Column("not_before", sa.DateTime(timezone=True)),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -306,12 +324,14 @@ def downgrade() -> None:
         batch_op.drop_column("result_json")
 
     with op.batch_alter_table("memories_index") as batch_op:
+        batch_op.drop_index("ix_memories_index_scope_marker_backfill")
         batch_op.drop_index("ix_memories_index_consolidation_dirty")
         batch_op.drop_index("ix_memories_index_consolidation_exact")
         batch_op.drop_column("shadowed_by_proposal_id")
         batch_op.drop_column("consolidation_state")
         batch_op.drop_column("last_observed_at")
         batch_op.drop_column("last_consolidation_scan_at")
+        batch_op.drop_column("scope_markers_verified")
         batch_op.drop_column("expires_at")
         batch_op.drop_column("pinned")
         batch_op.drop_column("source")

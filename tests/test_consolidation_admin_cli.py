@@ -38,13 +38,13 @@ def factory_for(tmp_path):
     return factory
 
 
-def run_cli(factory, *args: str):
+def run_cli(factory, *args: str, mem0_client=None):
     stdout = io.StringIO()
     stderr = io.StringIO()
     code = main(
         list(args),
         session_factory=factory,
-        mem0_client=NoWriteMem0(),
+        mem0_client=mem0_client or NoWriteMem0(),
         settings=SidecarSettings(
             consolidation_bridge_routing_required=False,
         ),
@@ -227,3 +227,74 @@ def test_finalize_requires_explicit_hard_delete_confirmation(tmp_path) -> None:
     assert code == 2
     assert payload is None
     assert "--confirm-hard-delete" in stderr
+
+
+def test_scope_backfill_requires_confirmation_and_reports_remaining(tmp_path) -> None:
+    factory = factory_for(tmp_path)
+    with factory() as session:
+        MemoryIndexRepository(session).upsert_memory(
+            project_id=PROJECT_ID,
+            mem0_memory_id="legacy",
+            user_id="root",
+            app_id=APP_ID,
+            category="decision",
+            metadata={"type": "decision"},
+            content_hash="legacy-hash",
+            content_length=12,
+            normalized_type="decision",
+            source="legacy",
+            pinned=False,
+            scope_markers_verified=False,
+            observed_at=datetime(2026, 7, 23, tzinfo=UTC),
+        )
+        session.commit()
+
+    class BackfillMem0:
+        def __init__(self) -> None:
+            self.record = {
+                "id": "legacy",
+                "memory": "legacy",
+                "metadata": {"type": "decision"},
+            }
+
+        async def get_memory(self, _memory_id):
+            return self.record
+
+        async def update_memory(self, _memory_id, payload):
+            self.record["metadata"] = payload["metadata"]
+            return {"updated": True}
+
+    mem0 = BackfillMem0()
+    rejected = run_cli(
+        factory,
+        "consolidation",
+        "scope-backfill",
+        "--project-id",
+        PROJECT_ID,
+        "--app-id",
+        APP_ID,
+        "--confirm-app-id",
+        "wrong-app",
+        "--limit",
+        "10",
+        mem0_client=mem0,
+    )
+    accepted = run_cli(
+        factory,
+        "consolidation",
+        "scope-backfill",
+        "--project-id",
+        PROJECT_ID,
+        "--app-id",
+        APP_ID,
+        "--confirm-app-id",
+        APP_ID,
+        "--limit",
+        "10",
+        mem0_client=mem0,
+    )
+
+    assert rejected[0] == 1
+    assert accepted[0] == 0
+    assert accepted[1]["backfilled"] == 1
+    assert accepted[1]["remaining"] == 0

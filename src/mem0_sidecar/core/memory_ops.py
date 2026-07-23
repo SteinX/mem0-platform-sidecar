@@ -467,6 +467,9 @@ def _memory_projection_fields(
         record.get("expires_at", metadata.get("expiration_date")),
     )
     source = metadata.get("source", record.get("source"))
+    scope_markers_verified = isinstance(
+        metadata.get(SIDECAR_PROJECT_ID_METADATA_KEY), str
+    ) and isinstance(metadata.get(SIDECAR_APP_ID_METADATA_KEY), str)
     return {
         "content_hash": content_hash,
         "content_length": content_length,
@@ -474,6 +477,7 @@ def _memory_projection_fields(
         "source": source if isinstance(source, str) and source else None,
         "pinned": pinned,
         "expires_at": _parse_projection_datetime(expiration_value),
+        "scope_markers_verified": scope_markers_verified,
         "observed_at": _as_utc(observed_at),
     }
 

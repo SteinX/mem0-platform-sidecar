@@ -85,6 +85,7 @@ CONSOLIDATION_MEMORY_COLUMNS = {
     "expires_at",
     "last_observed_at",
     "last_consolidation_scan_at",
+    "scope_markers_verified",
     "consolidation_state",
     "shadowed_by_proposal_id",
 }
@@ -159,6 +160,7 @@ def test_consolidation_migration_upgrades_from_mutation_intents(tmp_path) -> Non
     assert {
         "ix_memories_index_consolidation_exact",
         "ix_memories_index_consolidation_dirty",
+        "ix_memories_index_scope_marker_backfill",
         "ix_consolidation_runs_scope_status_created",
         "ix_consolidation_proposals_scope_status",
         "ix_consolidation_lineage_scope_applied",

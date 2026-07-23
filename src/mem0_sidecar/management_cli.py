@@ -89,6 +89,12 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--app-id", required=True)
     run.add_argument("--dry-run", action="store_true", required=True)
 
+    scope_backfill = consolidation_resources.add_parser("scope-backfill")
+    scope_backfill.add_argument("--project-id", required=True)
+    scope_backfill.add_argument("--app-id", required=True)
+    scope_backfill.add_argument("--confirm-app-id", required=True)
+    scope_backfill.add_argument("--limit", type=int, default=200)
+
     proposals = consolidation_resources.add_parser("proposals")
     proposal_actions = proposals.add_subparsers(
         dest="consolidation_action", required=True
@@ -182,6 +188,14 @@ async def _execute(
                         settings.consolidation_hard_delete_enabled
                     ),
                 )
+                if arguments.consolidation_resource == "scope-backfill":
+                    if arguments.confirm_app_id != app_id:
+                        raise ValueError("app confirmation mismatch")
+                    return await service.backfill_scope_markers(
+                        project_id=project_id,
+                        app_id=app_id,
+                        limit=arguments.limit,
+                    )
                 if arguments.consolidation_resource == "policy":
                     if arguments.consolidation_action == "get":
                         row = policies.get(project_id, app_id)
