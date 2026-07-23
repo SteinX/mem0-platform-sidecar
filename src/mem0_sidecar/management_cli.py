@@ -177,11 +177,16 @@ async def _execute(
                 jobs = JobRepository(session)
                 project_id = arguments.project_id
                 app_id = arguments.app_id
+                current_bridge_ready = ServiceCapabilityRepository(
+                    session
+                ).bridge_routing_ready(project_id)
                 bridge_ready = (
-                    not settings.consolidation_bridge_routing_required
-                    or ServiceCapabilityRepository(
-                        session
-                    ).bridge_routing_ready(project_id)
+                    current_bridge_ready
+                    if arguments.consolidation_resource == "scope-backfill"
+                    else (
+                        not settings.consolidation_bridge_routing_required
+                        or current_bridge_ready
+                    )
                 )
                 service = ConsolidationService(
                     session=session,

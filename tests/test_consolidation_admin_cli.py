@@ -12,6 +12,7 @@ from mem0_sidecar.store.repositories import (
     ConsolidationRunRepository,
     MemoryIndexRepository,
     ProjectRepository,
+    ServiceCapabilityRepository,
 )
 
 PROJECT_ID = "repo-a"
@@ -280,6 +281,31 @@ def test_scope_backfill_requires_confirmation_and_reports_remaining(tmp_path) ->
         "10",
         mem0_client=mem0,
     )
+    missing_heartbeat = run_cli(
+        factory,
+        "consolidation",
+        "scope-backfill",
+        "--project-id",
+        PROJECT_ID,
+        "--app-id",
+        APP_ID,
+        "--confirm-app-id",
+        APP_ID,
+        "--confirm-writes-paused",
+        "--limit",
+        "10",
+        mem0_client=mem0,
+    )
+    with factory() as session:
+        ServiceCapabilityRepository(session).record_bridge_heartbeat(
+            project_id=PROJECT_ID,
+            instance_id="bridge-a",
+            bridge_version="0.1.1",
+            routes_reads=True,
+            routes_writes=True,
+            observed_at=datetime.now(UTC),
+        )
+        session.commit()
     accepted = run_cli(
         factory,
         "consolidation",
@@ -297,6 +323,7 @@ def test_scope_backfill_requires_confirmation_and_reports_remaining(tmp_path) ->
     )
 
     assert rejected[0] == 1
+    assert missing_heartbeat[0] == 1
     assert accepted[0] == 0
     assert accepted[1]["backfilled"] == 1
     assert accepted[1]["remaining"] == 0
