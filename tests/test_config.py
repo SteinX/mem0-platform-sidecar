@@ -16,6 +16,10 @@ def test_settings_defaults_use_local_development_values(monkeypatch) -> None:
     assert settings.consolidation_job_lease_seconds == 300
     assert settings.consolidation_hard_delete_enabled is False
     assert settings.consolidation_bridge_routing_required is True
+    assert settings.client_auth_enabled is False
+    assert settings.client_auth_path == "/auth/me"
+    assert settings.client_auth_timeout_seconds == 5.0
+    assert settings.client_auth_allow_bootstrap_admin is True
 
 
 def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
@@ -47,6 +51,12 @@ def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
     monkeypatch.setenv(
         "MEM0_SIDECAR_CONSOLIDATION_BRIDGE_ROUTING_REQUIRED", "false"
     )
+    monkeypatch.setenv("MEM0_SIDECAR_CLIENT_AUTH_ENABLED", "true")
+    monkeypatch.setenv("MEM0_SIDECAR_CLIENT_AUTH_PATH", "/auth/whoami")
+    monkeypatch.setenv("MEM0_SIDECAR_CLIENT_AUTH_TIMEOUT_SECONDS", "7.5")
+    monkeypatch.setenv(
+        "MEM0_SIDECAR_CLIENT_AUTH_ALLOW_BOOTSTRAP_ADMIN", "false"
+    )
 
     settings = SidecarSettings()
 
@@ -72,3 +82,7 @@ def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
     assert settings.consolidation_job_lease_seconds == 90
     assert settings.consolidation_hard_delete_enabled is True
     assert settings.consolidation_bridge_routing_required is False
+    assert settings.client_auth_enabled is True
+    assert settings.client_auth_path == "/auth/whoami"
+    assert settings.client_auth_timeout_seconds == 7.5
+    assert settings.client_auth_allow_bootstrap_admin is False

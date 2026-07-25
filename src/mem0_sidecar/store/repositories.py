@@ -1457,6 +1457,32 @@ class MutationIntentRepository:
             )
         )
 
+    def find_resumable_by_fingerprint(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        operation: str,
+        request_fingerprint: str,
+    ) -> MutationIntent | None:
+        candidates = self.session.scalars(
+            select(MutationIntent)
+            .where(
+                MutationIntent.project_id == project_id,
+                MutationIntent.app_id == app_id,
+                MutationIntent.operation == operation,
+                MutationIntent.status.in_(
+                    ("ACTIVE", "UNKNOWN", "PENDING", "FAILED", "PARTIAL")
+                ),
+            )
+            .order_by(MutationIntent.created_at.desc(), MutationIntent.id.desc())
+            .limit(self.RECOVERY_LIMIT)
+        )
+        for intent in candidates:
+            if self.payload(intent).get("request_fingerprint") == request_fingerprint:
+                return intent
+        return None
+
     def result(self, intent: MutationIntent) -> dict[str, Any]:
         try:
             result = json.loads(intent.result_json)
@@ -1486,6 +1512,53 @@ class MutationIntentRepository:
         self.session.flush()
         return targets
 
+    def add_target_batch(
+        self,
+        intent_id: str,
+        memory_ids: Iterable[str],
+    ) -> list[MutationIntentTarget]:
+        target_ids = list(dict.fromkeys(memory_ids))
+        if len(target_ids) > 200:
+            raise ValueError("mutation target batch exceeds 200 records")
+        if not target_ids:
+            return []
+        current_count = int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(MutationIntentTarget)
+                .where(MutationIntentTarget.intent_id == intent_id)
+            )
+            or 0
+        )
+        existing = set(
+            self.session.scalars(
+                select(MutationIntentTarget.memory_id).where(
+                    MutationIntentTarget.intent_id == intent_id,
+                    MutationIntentTarget.memory_id.in_(target_ids),
+                )
+            )
+        )
+        new_ids = [memory_id for memory_id in target_ids if memory_id not in existing]
+        if current_count + len(new_ids) > self.MAX_TARGETS:
+            raise ValueError("mutation intent exceeds 5000 memory targets")
+        maximum_ordinal = self.session.scalar(
+            select(func.max(MutationIntentTarget.ordinal)).where(
+                MutationIntentTarget.intent_id == intent_id
+            )
+        )
+        next_ordinal = 0 if maximum_ordinal is None else int(maximum_ordinal) + 1
+        targets = [
+            MutationIntentTarget(
+                intent_id=intent_id,
+                memory_id=memory_id,
+                ordinal=next_ordinal + ordinal,
+            )
+            for ordinal, memory_id in enumerate(new_ids)
+        ]
+        self.session.add_all(targets)
+        self.session.flush()
+        return targets
+
     def get(self, intent_id: str) -> MutationIntent:
         intent = self.session.get(MutationIntent, intent_id)
         if intent is None:
@@ -1498,6 +1571,19 @@ class MutationIntentRepository:
         except (TypeError, ValueError):
             return {}
         return payload if isinstance(payload, dict) else {}
+
+    def update_payload(
+        self,
+        intent_id: str,
+        payload: dict[str, Any],
+    ) -> MutationIntent:
+        intent = self.get(intent_id)
+        intent.payload_json = _trace_json(
+            self.sanitize_payload(intent.project_id, payload)
+        )
+        intent.updated_at = _utc_now()
+        self.session.flush()
+        return intent
 
     def list_recoverable(self, project_id: str, app_id: str) -> list[MutationIntent]:
         now = _utc_now()
@@ -1557,6 +1643,50 @@ class MutationIntentRepository:
             )
         )
 
+    def incomplete_targets(
+        self,
+        intent_id: str,
+        *,
+        limit: int = 200,
+    ) -> list[MutationIntentTarget]:
+        if limit < 1 or limit > 200:
+            raise ValueError("incomplete target limit must be between 1 and 200")
+        return list(
+            self.session.scalars(
+                select(MutationIntentTarget)
+                .where(
+                    MutationIntentTarget.intent_id == intent_id,
+                    MutationIntentTarget.status != "COMPLETED",
+                )
+                .order_by(
+                    MutationIntentTarget.ordinal,
+                    MutationIntentTarget.memory_id,
+                )
+                .limit(limit)
+            )
+        )
+
+    def get_target(self, target_id: str) -> MutationIntentTarget:
+        target = self.session.get(MutationIntentTarget, target_id)
+        if target is None:
+            raise KeyError(target_id)
+        return target
+
+    def count_targets(
+        self,
+        intent_id: str,
+        *,
+        status: str | None = None,
+    ) -> int:
+        statement = (
+            select(func.count())
+            .select_from(MutationIntentTarget)
+            .where(MutationIntentTarget.intent_id == intent_id)
+        )
+        if status is not None:
+            statement = statement.where(MutationIntentTarget.status == status)
+        return int(self.session.scalar(statement) or 0)
+
     def claim_recovery(self, intent: MutationIntent) -> bool:
         now = _utc_now()
         if intent.attempt_count >= self.MAX_ATTEMPTS:
@@ -1565,11 +1695,29 @@ class MutationIntentRepository:
                 error={"message": "Mutation recovery attempts exhausted"},
             )
             return False
-        intent.attempt_count += 1
-        intent.status = "ACTIVE"
-        intent.lease_expires_at = now + timedelta(seconds=self.LEASE_SECONDS)
-        intent.updated_at = now
+        expected_attempt_count = intent.attempt_count
+        expected_status = intent.status
         self.session.flush()
+        result = self.session.execute(
+            update(MutationIntent)
+            .where(
+                MutationIntent.id == intent.id,
+                MutationIntent.status == expected_status,
+                MutationIntent.attempt_count == expected_attempt_count,
+            )
+            .values(
+                attempt_count=expected_attempt_count + 1,
+                status="ACTIVE",
+                lease_expires_at=now + timedelta(seconds=self.LEASE_SECONDS),
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise MutationIntentFenceError(
+                "durable mutation recovery claim lost its fence"
+            )
+        self.session.expire(intent)
         return True
 
     def require_active_attempt(
@@ -1805,6 +1953,77 @@ class MemoryIndexRepository:
             statement = statement.where(MemoryIndex.run_id == run_id)
 
         return set(self.session.scalars(statement))
+
+    def count_bulk_delete_candidates(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        filters: Mapping[str, str],
+        created_at_lte: datetime | None = None,
+    ) -> int:
+        conditions = [
+            MemoryIndex.project_id == project_id,
+            MemoryIndex.app_id == app_id,
+            MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
+        ]
+        for field_name in ("user_id", "agent_id", "run_id"):
+            if value := filters.get(field_name):
+                conditions.append(getattr(MemoryIndex, field_name) == value)
+        if created_at_lte is not None:
+            conditions.append(MemoryIndex.created_at <= created_at_lte)
+        return int(
+            self.session.scalar(
+                select(func.count()).select_from(MemoryIndex).where(*conditions)
+            )
+            or 0
+        )
+
+    def list_bulk_delete_candidates(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        filters: Mapping[str, str],
+        created_at_lte: datetime | None = None,
+        after_created_at: datetime | None = None,
+        after_memory_id: str | None = None,
+        limit: int = 200,
+    ) -> list[MemoryIndex]:
+        if limit < 1 or limit > 200:
+            raise ValueError("bulk delete candidate limit must be between 1 and 200")
+        if (after_created_at is None) != (after_memory_id is None):
+            raise ValueError("bulk delete candidate cursor is incomplete")
+        conditions = [
+            MemoryIndex.project_id == project_id,
+            MemoryIndex.app_id == app_id,
+            MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
+        ]
+        for field_name in ("user_id", "agent_id", "run_id"):
+            if value := filters.get(field_name):
+                conditions.append(getattr(MemoryIndex, field_name) == value)
+        if created_at_lte is not None:
+            conditions.append(MemoryIndex.created_at <= created_at_lte)
+        if after_created_at is not None and after_memory_id is not None:
+            conditions.append(
+                or_(
+                    MemoryIndex.created_at > after_created_at,
+                    and_(
+                        MemoryIndex.created_at == after_created_at,
+                        MemoryIndex.mem0_memory_id > after_memory_id,
+                    ),
+                )
+            )
+        return list(
+            self.session.scalars(
+                select(MemoryIndex)
+                .where(*conditions)
+                .order_by(MemoryIndex.created_at, MemoryIndex.mem0_memory_id)
+                .limit(limit)
+            )
+        )
 
     def list_export_candidates(
         self,

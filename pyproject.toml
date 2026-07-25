@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mem0-platform-sidecar"
-version = "0.3.1"
+version = "0.3.2"
 description = "Control-plane sidecar for Mem0 OSS Platform compatibility"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,6 +41,7 @@ asyncio_mode = "auto"
 markers = [
   "e2e: tests that require a live Mem0 OSS-compatible REST service",
   "adoption_e2e: live tests that require the isolated unscoped-adoption gate",
+  "contract: protocol-shape tests for a declared compatibility profile",
 ]
 
 [tool.ruff]

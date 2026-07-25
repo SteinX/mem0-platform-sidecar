@@ -371,6 +371,14 @@ def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
     return dict(metadata)
 
 
+def _public_memory_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    public_metadata = dict(metadata)
+    public_metadata.pop(SIDECAR_PROJECT_ID_METADATA_KEY, None)
+    public_metadata.pop(SIDECAR_APP_ID_METADATA_KEY, None)
+    public_metadata.pop(SIDECAR_MUTATION_ID_METADATA_KEY, None)
+    return public_metadata
+
+
 def _append_categories(categories: list[str], value: Any) -> None:
     values = value if isinstance(value, (list, tuple)) else [value]
     for candidate in values:
@@ -673,6 +681,53 @@ def _filter_search_results(
     return filtered_response
 
 
+def _filter_compatible_results(
+    response: Any,
+    *,
+    memory_repo: MemoryIndexRepository,
+    scope: Scope,
+) -> Any:
+    if isinstance(response, list):
+        results = response
+        response_kind = "list"
+    elif isinstance(response, dict):
+        results = response.get("results")
+        if not isinstance(results, list):
+            return response
+        response_kind = "dict"
+    else:
+        return response
+
+    candidate_ids: list[str] = []
+    for item in results:
+        _append_memory_id(candidate_ids, _result_memory_id(item))
+    allowed_ids = memory_repo.list_scoped_memory_ids(
+        project_id=scope.project_id,
+        mem0_memory_ids=candidate_ids,
+        user_id=scope.user_id,
+        app_id=scope.app_id,
+        agent_id=scope.agent_id,
+        run_id=scope.run_id,
+    )
+    filtered_results = [
+        item
+        for item in results
+        if (memory_id := _result_memory_id(item)) is not None
+        and memory_id in allowed_ids
+    ]
+    if response_kind == "list":
+        return filtered_results
+    filtered_response = dict(response)
+    filtered_response["results"] = filtered_results
+    if "total" in filtered_response:
+        filtered_response["total"] = len(filtered_results)
+    return filtered_response
+
+
+def _trace_response(response: Any) -> dict[str, Any]:
+    return response if isinstance(response, dict) else {"results": response}
+
+
 def _trace_filter_value(value: object) -> object:
     if isinstance(value, tuple):
         return list(value)
@@ -970,6 +1025,51 @@ def _direct_write_app_scope(
         return "invalid", None
 
 
+def _direct_write_projection_matches(
+    memory: MemoryIndex,
+    record: dict[str, Any],
+    *,
+    source_app_id: str,
+) -> bool:
+    if memory.deleted_at is not None:
+        return False
+    try:
+        metadata = json.loads(memory.metadata_projection_json)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    categories = record["categories"]
+    projection_fields = _memory_projection_fields(
+        record,
+        observed_at=datetime.now(UTC),
+    )
+    expected_expiration = projection_fields["expires_at"]
+    expiration_matches = (
+        memory.expires_at is None and expected_expiration is None
+    ) or (
+        memory.expires_at is not None
+        and expected_expiration is not None
+        and _as_utc(memory.expires_at) == _as_utc(expected_expiration)
+    )
+    return (
+        memory.user_id == record["user_id"]
+        and memory.agent_id == record["agent_id"]
+        and memory.app_id == source_app_id
+        and memory.run_id == record["run_id"]
+        and memory.category == (categories[0] if categories else None)
+        and metadata == _public_memory_metadata(record["metadata"])
+        and memory.content_hash == projection_fields["content_hash"]
+        and memory.content_length == projection_fields["content_length"]
+        and memory.normalized_type == projection_fields["normalized_type"]
+        and memory.source == projection_fields["source"]
+        and bool(memory.pinned) == bool(projection_fields["pinned"])
+        and expiration_matches
+        and bool(memory.scope_markers_verified)
+        == bool(projection_fields["scope_markers_verified"])
+    )
+
+
 def _memory_delete_request(
     *,
     project_id: str,
@@ -997,6 +1097,32 @@ def _memory_delete_request(
         "run_id": memory.run_id,
     }
     return {key: value for key, value in request.items() if value}
+
+
+def _validated_bulk_delete_filters(filters: dict[str, Any]) -> dict[str, str]:
+    allowed_fields = {"user_id", "agent_id", "run_id"}
+    unknown_fields = sorted(set(filters) - allowed_fields)
+    if unknown_fields:
+        raise ValueError(
+            f"Unsupported bulk delete filters: {', '.join(unknown_fields)}"
+        )
+    validated = {
+        field_name: value
+        for field_name in allowed_fields
+        if (
+            value := validate_scope_id(
+                filters.get(field_name),
+                field_name=field_name,
+                required=False,
+            )
+        )
+        is not None
+    }
+    if not validated:
+        raise ValueError(
+            "At least one of user_id, agent_id, or run_id is required"
+        )
+    return validated
 
 
 class MemoryService:
@@ -1775,12 +1901,76 @@ class MemoryService:
                 ) from exc
             raise
 
+    async def list_memories(
+        self,
+        *,
+        project_id: str,
+        payload: dict[str, Any],
+        preserve_wire_shape: bool = False,
+    ) -> Any:
+        _require_clean_trace_session(self.session)
+        scope = normalize_scope(
+            project_id=project_id,
+            user_id=payload.get("user_id"),
+            app_id=payload.get("app_id"),
+            agent_id=payload.get("agent_id"),
+            run_id=payload.get("run_id"),
+        )
+        upstream_params = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"project_id", "app_id"}
+        }
+        event_request = {**upstream_params, "app_id": scope.app_id}
+        event_repo = EventRepository(self.session)
+        event = event_repo.create_event(
+            project_id=project_id,
+            app_id=scope.app_id,
+            user_id=scope.user_id,
+            agent_id=scope.agent_id,
+            run_id=scope.run_id,
+            operation="memory.list",
+            request=event_request,
+            subject_type="memory",
+            correlation_id=get_request_id(),
+        )
+        self.session.commit()
+        try:
+            if preserve_wire_shape and hasattr(self.mem0, "list_memories_raw"):
+                response = await self.mem0.list_memories_raw(upstream_params)
+            else:
+                response = await self.mem0.list_memories(upstream_params)
+            filter_response = (
+                _filter_compatible_results
+                if preserve_wire_shape
+                else _filter_search_results
+            )
+            filtered_response = filter_response(
+                response,
+                memory_repo=MemoryIndexRepository(self.session),
+                scope=scope,
+            )
+            event_repo.mark_succeeded(
+                event.id,
+                response=_trace_response(filtered_response),
+            )
+            self.session.commit()
+            return filtered_response
+        except Exception as exc:
+            _persist_failed_trace(
+                self.session,
+                event_id=event.id,
+                error=_error_payload(exc),
+            )
+            raise
+
     async def search_memories(
         self,
         *,
         project_id: str,
         payload: dict[str, Any],
-    ) -> dict[str, Any]:
+        preserve_wire_shape: bool = False,
+    ) -> Any:
         _require_clean_trace_session(self.session)
         scope = normalize_scope(
             project_id=project_id,
@@ -1815,13 +2005,24 @@ class MemoryService:
         )
         self.session.commit()
         try:
-            response = await self.mem0.search_memories(oss_payload)
-            filtered_response = _filter_search_results(
+            if preserve_wire_shape and hasattr(self.mem0, "search_memories_raw"):
+                response = await self.mem0.search_memories_raw(oss_payload)
+            else:
+                response = await self.mem0.search_memories(oss_payload)
+            filter_response = (
+                _filter_compatible_results
+                if preserve_wire_shape
+                else _filter_search_results
+            )
+            filtered_response = filter_response(
                 response,
                 memory_repo=MemoryIndexRepository(self.session),
                 scope=scope,
             )
-            event_repo.mark_succeeded(event.id, response=filtered_response)
+            event_repo.mark_succeeded(
+                event.id,
+                response=_trace_response(filtered_response),
+            )
             self.session.commit()
             return filtered_response
         except Exception as exc:
@@ -2148,6 +2349,7 @@ class MemoryService:
         memory_id: str,
         request_app_id: str | None = None,
         project_wide: bool = False,
+        trace_event: bool = False,
     ) -> dict[str, Any]:
         _require_clean_trace_session(self.session)
         memory, effective_app_id = _memory_for_request(
@@ -2162,19 +2364,73 @@ class MemoryService:
             raise KeyError(memory_id)
         projection_before = _snapshot_memory_projection(memory)
         _release_read_transaction(self.session)
+        event_id: str | None = None
+        if trace_event:
+            event = EventRepository(self.session).create_event(
+                project_id=project_id,
+                app_id=effective_app_id,
+                user_id=projection_before.user_id,
+                agent_id=projection_before.agent_id,
+                run_id=projection_before.run_id,
+                operation="memory.get",
+                request={
+                    key: value
+                    for key, value in {
+                        "memory_id": memory_id,
+                        "user_id": projection_before.user_id,
+                        "agent_id": projection_before.agent_id,
+                        "app_id": projection_before.app_id,
+                        "run_id": projection_before.run_id,
+                    }.items()
+                    if value
+                },
+                subject_type="memory",
+                subject_id=memory_id,
+                correlation_id=get_request_id(),
+            )
+            event_id = event.id
+            self.session.commit()
 
         try:
             response = await self.mem0.get_memory(memory_id)
         except Exception as exc:
             if _is_upstream_not_found(exc):
-                raise KeyError(memory_id) from exc
+                mapped_error = KeyError(memory_id)
+                if event_id is not None:
+                    _persist_failed_trace(
+                        self.session,
+                        event_id=event_id,
+                        error=_error_payload(mapped_error),
+                    )
+                raise mapped_error from exc
+            if event_id is not None:
+                _persist_failed_trace(
+                    self.session,
+                    event_id=event_id,
+                    error=_error_payload(exc),
+                )
             raise
-        validated_response = _validate_get_response(memory_id, response)
-        _require_unchanged_memory_projection(
-            self.session,
-            snapshot=projection_before,
-            app_id=effective_app_id,
-        )
+        try:
+            validated_response = _validate_get_response(memory_id, response)
+            _require_unchanged_memory_projection(
+                self.session,
+                snapshot=projection_before,
+                app_id=effective_app_id,
+            )
+        except Exception as exc:
+            if event_id is not None:
+                _persist_failed_trace(
+                    self.session,
+                    event_id=event_id,
+                    error=_error_payload(exc),
+                )
+            raise
+        if event_id is not None:
+            EventRepository(self.session).mark_succeeded(
+                event_id,
+                response=validated_response,
+            )
+            self.session.commit()
         return validated_response
 
     async def update_memory(
@@ -2185,6 +2441,7 @@ class MemoryService:
         request_app_id: str | None,
         project_wide: bool = False,
         payload: dict[str, Any],
+        return_upstream_response: bool = False,
     ) -> dict[str, Any]:
         patch = _validate_memory_patch(payload)
         memory, effective_app_id = _memory_for_request(
@@ -2236,6 +2493,7 @@ class MemoryService:
             request=patch,
             subject_type="memory",
             subject_id=memory_id,
+            correlation_id=get_request_id(),
         )
         intent = MutationIntentRepository(self.session).create(
             project_id=project_id,
@@ -2328,7 +2586,7 @@ class MemoryService:
             result = {"memory": normalized, "event": _event_payload(event)}
             intent_repo.complete(intent_id, result=result)
             self.session.commit()
-            return result
+            return update_response if return_upstream_response else result
         except BaseException as exc:
             if (
                 _is_upstream_not_found(exc)
@@ -2394,7 +2652,9 @@ class MemoryService:
         memory_id: str,
         request_app_id: str | None,
         project_wide: bool = False,
-    ) -> dict[str, Any]:
+        trace_event: bool = False,
+        preserve_wire_shape: bool = False,
+    ) -> Any:
         _require_clean_trace_session(self.session)
         memory, effective_app_id = _memory_for_request(
             self.session,
@@ -2408,23 +2668,77 @@ class MemoryService:
             raise KeyError(memory_id)
         projection_before = _snapshot_memory_projection(memory)
         _release_read_transaction(self.session)
+        event_id: str | None = None
+        if trace_event:
+            event = EventRepository(self.session).create_event(
+                project_id=project_id,
+                app_id=effective_app_id,
+                user_id=projection_before.user_id,
+                agent_id=projection_before.agent_id,
+                run_id=projection_before.run_id,
+                operation="memory.history",
+                request={
+                    key: value
+                    for key, value in {
+                        "memory_id": memory_id,
+                        "user_id": projection_before.user_id,
+                        "agent_id": projection_before.agent_id,
+                        "app_id": projection_before.app_id,
+                        "run_id": projection_before.run_id,
+                    }.items()
+                    if value
+                },
+                subject_type="memory",
+                subject_id=memory_id,
+                correlation_id=get_request_id(),
+            )
+            event_id = event.id
+            self.session.commit()
         try:
-            response = await self.mem0.get_memory_history(memory_id)
-        except ValueError as exc:
-            raise MemoryUpstreamProtocolError(
-                "Upstream memory history response could not be decoded"
-            ) from exc
+            try:
+                if preserve_wire_shape and hasattr(
+                    self.mem0,
+                    "get_memory_history_raw",
+                ):
+                    response = await self.mem0.get_memory_history_raw(memory_id)
+                else:
+                    response = await self.mem0.get_memory_history(memory_id)
+            except ValueError as exc:
+                raise MemoryUpstreamProtocolError(
+                    "Upstream memory history response could not be decoded"
+                ) from exc
+            except Exception as exc:
+                if _is_upstream_not_found(exc):
+                    raise KeyError(memory_id) from exc
+                raise
+            history_results = _history_results(response)
+            result = (
+                response
+                if preserve_wire_shape and isinstance(response, dict)
+                else history_results
+                if preserve_wire_shape
+                else {"results": history_results}
+            )
+            _require_unchanged_memory_projection(
+                self.session,
+                snapshot=projection_before,
+                app_id=effective_app_id,
+            )
         except Exception as exc:
-            if _is_upstream_not_found(exc):
-                raise KeyError(memory_id) from exc
+            if event_id is not None:
+                _persist_failed_trace(
+                    self.session,
+                    event_id=event_id,
+                    error=_error_payload(exc),
+                )
             raise
-        results = _history_results(response)
-        _require_unchanged_memory_projection(
-            self.session,
-            snapshot=projection_before,
-            app_id=effective_app_id,
-        )
-        return {"results": results}
+        if event_id is not None:
+            EventRepository(self.session).mark_succeeded(
+                event_id,
+                response=_trace_response(result),
+            )
+            self.session.commit()
+        return result
 
     async def mirror_direct_writes(
         self,
@@ -2510,6 +2824,9 @@ class MemoryService:
             accepted_records.append((normalized, source_app_id))
 
         indexed = 0
+        created = 0
+        updated = 0
+        unchanged = 0
         for offset in range(0, len(accepted_records), 200):
             ProjectRepository(self.session).lock_for_mutation(project_id)
             memory_repo = MemoryIndexRepository(self.session)
@@ -2524,7 +2841,21 @@ class MemoryService:
                 if existing is not None and _as_utc(existing.updated_at) > scan_cutoff:
                     accepted_ids.add(memory_id)
                     indexed += 1
+                    unchanged += 1
                     continue
+                if existing is None:
+                    created += 1
+                elif _direct_write_projection_matches(
+                    existing,
+                    normalized,
+                    source_app_id=source_app_id,
+                ):
+                    unchanged += 1
+                    accepted_ids.add(memory_id)
+                    indexed += 1
+                    continue
+                else:
+                    updated += 1
                 if existing is not None:
                     affected_projections.append(
                         _snapshot_memory_projection(existing)
@@ -2538,7 +2869,7 @@ class MemoryService:
                     app_id=source_app_id,
                     run_id=normalized["run_id"],
                     category=categories[0] if categories else None,
-                    metadata=normalized["metadata"],
+                    metadata=_public_memory_metadata(normalized["metadata"]),
                     **_memory_projection_fields(
                         normalized,
                         observed_at=scan_cutoff,
@@ -2616,6 +2947,9 @@ class MemoryService:
         return {
             "scanned": len(records),
             "indexed": indexed,
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
             "skipped_foreign": skipped_foreign,
             "skipped_invalid": skipped_invalid,
             "stale_marked": stale_marked,
@@ -2911,6 +3245,422 @@ class MemoryService:
                 ) from exc
             raise
 
+    def _snapshot_bulk_delete_targets(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        validated_filters: dict[str, str],
+        snapshot_cutoff: datetime,
+        intent_id: str,
+        attempt_token: int,
+    ) -> None:
+        intent_repo = MutationIntentRepository(self.session)
+        payload = intent_repo.payload(intent_repo.get(intent_id))
+        if payload.get("snapshot_complete"):
+            return
+
+        after_created_at: datetime | None = None
+        after_memory_id: str | None = None
+        while True:
+            candidates = MemoryIndexRepository(
+                self.session
+            ).list_bulk_delete_candidates(
+                project_id=project_id,
+                app_id=app_id,
+                filters=validated_filters,
+                created_at_lte=snapshot_cutoff,
+                after_created_at=after_created_at,
+                after_memory_id=after_memory_id,
+                limit=200,
+            )
+            if not candidates:
+                break
+            candidate_ids = [candidate.mem0_memory_id for candidate in candidates]
+            cursor = candidates[-1]
+            after_created_at = cursor.created_at
+            after_memory_id = cursor.mem0_memory_id
+            intent_repo = MutationIntentRepository(self.session)
+            intent_repo.require_active_attempt(intent_id, attempt_token)
+            intent_repo.add_target_batch(intent_id, candidate_ids)
+            intent_repo.renew_active_attempt(intent_id, attempt_token)
+            self.session.commit()
+
+        ProjectRepository(self.session).lock_for_mutation(project_id)
+        intent_repo = MutationIntentRepository(self.session)
+        intent_repo.require_active_attempt(intent_id, attempt_token)
+        payload = intent_repo.payload(intent_repo.get(intent_id))
+        payload["snapshot_complete"] = True
+        payload["target_count"] = intent_repo.count_targets(intent_id)
+        intent_repo.update_payload(intent_id, payload)
+        self.session.commit()
+
+    async def bulk_delete_memories(
+        self,
+        *,
+        project_id: str,
+        app_id: str,
+        filters: dict[str, Any],
+    ) -> dict[str, str]:
+        _require_clean_trace_session(self.session)
+        project_id = validate_scope_id(project_id, field_name="project_id")
+        app_id = validate_scope_id(app_id, field_name="app_id")
+        validated_filters = _validated_bulk_delete_filters(filters)
+        request_fingerprint = _canonical_fingerprint(
+            {
+                "project_id": project_id,
+                "app_id": app_id,
+                "filters": validated_filters,
+            }
+        )
+        ProjectRepository(self.session).lock_for_mutation(project_id)
+        intent_repo = MutationIntentRepository(self.session)
+        intent = intent_repo.find_resumable_by_fingerprint(
+            project_id=project_id,
+            app_id=app_id,
+            operation="memory.bulk_delete",
+            request_fingerprint=request_fingerprint,
+        )
+        resuming = intent is not None
+        existing_payload = intent_repo.payload(intent) if intent is not None else {}
+        snapshot_cutoff = _parse_projection_datetime(
+            existing_payload.get("snapshot_cutoff")
+        )
+        if snapshot_cutoff is None:
+            snapshot_cutoff = (
+                _as_utc(intent.created_at)
+                if intent is not None
+                else datetime.now(UTC)
+            )
+        if intent is None:
+            candidate_count = MemoryIndexRepository(
+                self.session
+            ).count_bulk_delete_candidates(
+                project_id=project_id,
+                app_id=app_id,
+                filters=validated_filters,
+                created_at_lte=snapshot_cutoff,
+            )
+            if candidate_count > MutationIntentRepository.MAX_TARGETS:
+                self.session.rollback()
+                raise ValueError("bulk delete exceeds 5000 memory targets")
+        if intent is not None and intent.status == "ACTIVE":
+            lease_expires_at = intent.lease_expires_at
+            if lease_expires_at is not None and _as_utc(
+                lease_expires_at
+            ) > datetime.now(UTC):
+                self.session.rollback()
+                raise MutationConflictError(
+                    f"Bulk delete {intent.id} is already in progress; retry later"
+                )
+
+        event_request = {"app_id": app_id, **validated_filters}
+        event = EventRepository(self.session).create_event(
+            project_id=project_id,
+            app_id=app_id,
+            user_id=validated_filters.get("user_id"),
+            agent_id=validated_filters.get("agent_id"),
+            run_id=validated_filters.get("run_id"),
+            operation="memory.bulk_delete",
+            request=event_request,
+            subject_type="memory",
+            correlation_id=get_request_id(),
+        )
+        if intent is None:
+            intent = intent_repo.create(
+                project_id=project_id,
+                app_id=app_id,
+                event_id=event.id,
+                operation="memory.bulk_delete",
+                payload={
+                    "request_fingerprint": request_fingerprint,
+                    "filters": validated_filters,
+                    "snapshot_cutoff": snapshot_cutoff.isoformat(),
+                    "snapshot_complete": False,
+                },
+            )
+        else:
+            intent.event_id = event.id
+            if not intent_repo.claim_recovery(intent):
+                error = {
+                    "message": "Bulk delete recovery attempts exhausted",
+                    "retry_required": True,
+                    "operation_id": intent.id,
+                }
+                EventRepository(self.session).mark_failed(event.id, error=error)
+                self.session.commit()
+                raise MutationConflictError(
+                    f"Bulk delete {intent.id} recovery attempts exhausted"
+                )
+        intent_id = intent.id
+        attempt_token = intent.attempt_count
+        intent_started_at = _as_utc(intent.created_at)
+        event_id = event.id
+        self.session.commit()
+
+        try:
+            self._snapshot_bulk_delete_targets(
+                project_id=project_id,
+                app_id=app_id,
+                validated_filters=validated_filters,
+                snapshot_cutoff=snapshot_cutoff,
+                intent_id=intent_id,
+                attempt_token=attempt_token,
+            )
+        except BaseException as exc:
+            self._record_intent_failure(
+                project_id,
+                intent_id,
+                attempt_token,
+                exc,
+                outcome_unknown=False,
+                mark_event_failed=isinstance(exc, Exception),
+            )
+            if isinstance(exc, MutationIntentFenceError):
+                raise MutationConflictError(
+                    "Durable bulk delete attempt was superseded"
+                ) from exc
+            raise
+
+        while True:
+            intent_repo = MutationIntentRepository(self.session)
+            targets = intent_repo.incomplete_targets(intent_id, limit=200)
+            if not targets:
+                break
+            target_descriptors = [
+                (target.id, target.memory_id) for target in targets
+            ]
+            self.session.rollback()
+            for target_id, memory_id in target_descriptors:
+                memory = MemoryIndexRepository(self.session).get_memory(
+                    project_id=project_id,
+                    mem0_memory_id=memory_id,
+                    app_id=app_id,
+                )
+                if memory is None:
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    intent_repo = MutationIntentRepository(self.session)
+                    intent_repo.require_active_attempt(intent_id, attempt_token)
+                    intent_repo.mark_target_succeeded(
+                        intent_repo.get_target(target_id)
+                    )
+                    intent_repo.renew_active_attempt(intent_id, attempt_token)
+                    self.session.commit()
+                    continue
+                projection_before = _snapshot_memory_projection(memory)
+                if _as_utc(memory.updated_at) > intent_started_at:
+                    error = {
+                        "message": "Memory projection changed during bulk delete",
+                        "memory_id": memory_id,
+                        "retry_required": True,
+                        "operation_id": intent_id,
+                    }
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    intent_repo = MutationIntentRepository(self.session)
+                    intent_repo.require_active_attempt(intent_id, attempt_token)
+                    intent_repo.mark_target_failed(
+                        intent_repo.get_target(target_id),
+                        error,
+                    )
+                    completed = intent_repo.count_targets(
+                        intent_id,
+                        status="COMPLETED",
+                    )
+                    EventRepository(self.session).mark_failed(event_id, error=error)
+                    intent_repo.fail(
+                        intent_id,
+                        status="PARTIAL" if completed else "FAILED",
+                        error=error,
+                    )
+                    self.session.commit()
+                    raise MutationConflictError(
+                        f"Bulk delete {intent_id} failed; retry required"
+                    )
+                self.session.rollback()
+
+                if resuming:
+                    try:
+                        await self.mem0.get_memory(memory_id)
+                    except Exception as exc:
+                        if not _is_upstream_not_found(exc):
+                            self._record_intent_failure(
+                                project_id,
+                                intent_id,
+                                attempt_token,
+                                exc,
+                                outcome_unknown=_is_ambiguous_upstream_failure(exc),
+                                mark_event_failed=True,
+                            )
+                            raise
+                        try:
+                            ProjectRepository(self.session).lock_for_mutation(
+                                project_id
+                            )
+                            intent_repo = MutationIntentRepository(self.session)
+                            intent_repo.require_active_attempt(
+                                intent_id,
+                                attempt_token,
+                            )
+                            current = MemoryIndexRepository(
+                                self.session
+                            ).get_memory(
+                                project_id=project_id,
+                                mem0_memory_id=memory_id,
+                                app_id=app_id,
+                            )
+                            if current is not None and not (
+                                _projection_matches_snapshot(
+                                    current,
+                                    projection_before,
+                                )
+                            ):
+                                raise MutationConflictError(
+                                    "Memory projection changed during bulk "
+                                    "delete recovery"
+                                ) from exc
+                            MemoryIndexRepository(self.session).delete_memory(
+                                project_id=project_id,
+                                mem0_memory_id=memory_id,
+                            )
+                            EntityRepository(
+                                self.session
+                            ).refresh_affected_memories(
+                                project_id,
+                                app_id,
+                                [projection_before],
+                            )
+                            intent_repo.mark_target_succeeded(
+                                intent_repo.get_target(target_id)
+                            )
+                            intent_repo.renew_active_attempt(
+                                intent_id,
+                                attempt_token,
+                            )
+                            self.session.commit()
+                            continue
+                        except BaseException as recovery_exc:
+                            self._record_intent_failure(
+                                project_id,
+                                intent_id,
+                                attempt_token,
+                                recovery_exc,
+                                outcome_unknown=True,
+                                mark_event_failed=isinstance(
+                                    recovery_exc,
+                                    Exception,
+                                ),
+                            )
+                            if isinstance(
+                                recovery_exc,
+                                MutationIntentFenceError,
+                            ):
+                                raise MutationConflictError(
+                                    "Durable bulk delete attempt was superseded"
+                                ) from recovery_exc
+                            raise
+
+                try:
+                    await self.mem0.delete_memory(memory_id)
+                except Exception as exc:
+                    error = {
+                        "message": "Bulk delete target failed; retry the operation",
+                        "memory_id": memory_id,
+                        "retry_required": True,
+                        "operation_id": intent_id,
+                        **_error_payload(exc),
+                    }
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    intent_repo = MutationIntentRepository(self.session)
+                    intent_repo.require_active_attempt(intent_id, attempt_token)
+                    target = intent_repo.get_target(target_id)
+                    completed = intent_repo.count_targets(
+                        intent_id,
+                        status="COMPLETED",
+                    )
+                    EventRepository(self.session).mark_failed(event_id, error=error)
+                    if _is_ambiguous_upstream_failure(exc):
+                        intent_repo.mark_unresolved(intent_id, error=error)
+                    else:
+                        intent_repo.mark_target_failed(target, error)
+                        intent_repo.fail(
+                            intent_id,
+                            status="PARTIAL" if completed else "FAILED",
+                            error=error,
+                        )
+                    self.session.commit()
+                    raise MutationConflictError(
+                        f"Bulk delete {intent_id} failed; retry required"
+                    ) from exc
+
+                try:
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    intent_repo = MutationIntentRepository(self.session)
+                    intent_repo.require_active_attempt(intent_id, attempt_token)
+                    current = MemoryIndexRepository(self.session).get_memory(
+                        project_id=project_id,
+                        mem0_memory_id=memory_id,
+                        app_id=app_id,
+                    )
+                    if current is None or not _projection_matches_snapshot(
+                        current,
+                        projection_before,
+                    ):
+                        raise MutationConflictError(
+                            "Memory projection changed during bulk delete"
+                        )
+                    MemoryIndexRepository(self.session).delete_memory(
+                        project_id=project_id,
+                        mem0_memory_id=memory_id,
+                    )
+                    EntityRepository(self.session).refresh_affected_memories(
+                        project_id,
+                        app_id,
+                        [projection_before],
+                    )
+                    intent_repo.mark_target_succeeded(
+                        intent_repo.get_target(target_id)
+                    )
+                    intent_repo.renew_active_attempt(intent_id, attempt_token)
+                    self.session.commit()
+                except BaseException as exc:
+                    self._record_intent_failure(
+                        project_id,
+                        intent_id,
+                        attempt_token,
+                        exc,
+                        outcome_unknown=True,
+                        mark_event_failed=isinstance(exc, Exception),
+                    )
+                    if isinstance(exc, MutationIntentFenceError):
+                        raise MutationConflictError(
+                            "Durable bulk delete attempt was superseded"
+                        ) from exc
+                    raise
+
+        try:
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            intent_repo = MutationIntentRepository(self.session)
+            intent_repo.require_active_attempt(intent_id, attempt_token)
+            result = {"message": "All relevant memories deleted"}
+            EventRepository(self.session).mark_succeeded(event_id, response=result)
+            intent_repo.complete(intent_id, result=result)
+            self.session.commit()
+            return result
+        except BaseException as exc:
+            self._record_intent_failure(
+                project_id,
+                intent_id,
+                attempt_token,
+                exc,
+                outcome_unknown=True,
+                mark_event_failed=isinstance(exc, Exception),
+            )
+            if isinstance(exc, MutationIntentFenceError):
+                raise MutationConflictError(
+                    "Durable bulk delete attempt was superseded"
+                ) from exc
+            raise
+
     async def delete_memory(
         self,
         *,
@@ -2958,6 +3708,7 @@ class MemoryService:
                 ),
                 subject_type="memory",
                 subject_id=memory_id,
+                correlation_id=get_request_id(),
             )
             event_repo.mark_failed(
                 event.id,
@@ -2985,6 +3736,7 @@ class MemoryService:
             ),
             subject_type="memory",
             subject_id=memory_id,
+            correlation_id=get_request_id(),
         )
         intent = MutationIntentRepository(self.session).create(
             project_id=project_id,

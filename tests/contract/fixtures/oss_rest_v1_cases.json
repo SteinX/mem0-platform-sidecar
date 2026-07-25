@@ -1,0 +1,133 @@
+[
+  {
+    "method": "POST",
+    "path_template": "/memories",
+    "case": "messages_add",
+    "request": {
+      "headers": {"X-Mem0-Project-ID": "default", "X-Mem0-App-ID": "default"},
+      "json": {
+        "messages": [{"role": "user", "content": "Prefers tea"}],
+        "user_id": "u1",
+        "project_id": "other-project",
+        "app_id": "other-app"
+      }
+    },
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["results"],
+    "expected_response": {"results": [{"id": "add-memory", "memory": "Prefers tea", "event": "ADD"}]},
+    "error_statuses": [400, 401, 403, 409, 422, 503],
+    "scope_precedence": ["header", "body", "filters", "metadata", "server_default"]
+  },
+  {
+    "method": "GET",
+    "path_template": "/memories",
+    "case": "scoped_list",
+    "request": {
+      "headers": {"X-Mem0-Project-ID": "default", "X-Mem0-App-ID": "default"},
+      "params": {"user_id": "u1", "project_id": "other-project", "app_id": "other-app"}
+    },
+    "expected_status": 200,
+    "response_type": "array",
+    "stable_keys": [],
+    "expected_response": [{"id": "contract-memory", "memory": "Prefers tea"}],
+    "error_statuses": [400, 401, 403, 422, 503],
+    "scope_precedence": ["header", "query", "server_default"]
+  },
+  {
+    "method": "POST",
+    "path_template": "/search",
+    "case": "filtered_search",
+    "request": {
+      "headers": {"X-Mem0-Project-ID": "default", "X-Mem0-App-ID": "default"},
+      "json": {
+        "query": "tea",
+        "user_id": "u1",
+        "project_id": "other-project",
+        "app_id": "other-app",
+        "filters": null
+      }
+    },
+    "expected_status": 200,
+    "response_type": "array",
+    "stable_keys": [],
+    "expected_response": [{"id": "contract-memory", "memory": "Prefers tea", "score": 0.91}],
+    "error_statuses": [400, 401, 403, 422, 503],
+    "scope_precedence": ["header", "body", "filters", "metadata", "server_default"]
+  },
+  {
+    "method": "GET",
+    "path_template": "/memories/{memory_id}",
+    "case": "get",
+    "request": {
+      "headers": {"X-Mem0-Project-ID": "default", "X-Mem0-App-ID": "default"},
+      "params": {"project_id": "other-project", "app_id": "other-app"}
+    },
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["id"],
+    "expected_response": {"id": "contract-memory", "memory": "Prefers tea", "user_id": "u1", "metadata": {}},
+    "error_statuses": [401, 403, 404, 422, 503],
+    "scope_precedence": ["header", "query", "projection", "server_default"]
+  },
+  {
+    "method": "PUT",
+    "path_template": "/memories/{memory_id}",
+    "case": "update",
+    "request": {
+      "headers": {"X-Mem0-Project-ID": "default", "X-Mem0-App-ID": "default"},
+      "json": {"text": "Prefers green tea", "project_id": "other-project", "app_id": "other-app"}
+    },
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["message"],
+    "expected_response": {"message": "Memory updated successfully"},
+    "error_statuses": [401, 403, 404, 409, 422, 503],
+    "scope_precedence": ["header", "body", "query", "projection", "server_default"]
+  },
+  {
+    "method": "GET",
+    "path_template": "/memories/{memory_id}/history",
+    "case": "history",
+    "request": {
+      "headers": {"X-Mem0-Project-ID": "default", "X-Mem0-App-ID": "default"},
+      "params": {"project_id": "other-project", "app_id": "other-app"}
+    },
+    "expected_status": 200,
+    "response_type": "array",
+    "stable_keys": [],
+    "expected_response": [{"id": "history-1", "memory_id": "contract-memory", "event": "ADD"}],
+    "error_statuses": [401, 403, 404, 422, 503],
+    "scope_precedence": ["header", "query", "projection", "server_default"]
+  },
+  {
+    "method": "DELETE",
+    "path_template": "/memories/{memory_id}",
+    "case": "delete",
+    "request": {
+      "headers": {"X-Mem0-Project-ID": "default", "X-Mem0-App-ID": "default"},
+      "params": {"project_id": "other-project", "app_id": "other-app"}
+    },
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["message"],
+    "expected_response": {"message": "Memory deleted successfully"},
+    "error_statuses": [401, 403, 404, 409, 422, 503],
+    "scope_precedence": ["header", "query", "projection", "server_default"]
+  },
+  {
+    "method": "DELETE",
+    "path_template": "/memories",
+    "case": "bulk_delete",
+    "request": {
+      "headers": {"X-Mem0-Project-ID": "default", "X-Mem0-App-ID": "default"},
+      "params": {"user_id": "u1", "project_id": "other-project", "app_id": "other-app"}
+    },
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["message"],
+    "expected_response": {"message": "All relevant memories deleted"},
+    "error_statuses": [400, 401, 403, 409, 422, 503],
+    "scope_precedence": ["header", "query", "server_default"]
+  }
+]

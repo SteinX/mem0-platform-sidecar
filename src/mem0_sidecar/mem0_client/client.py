@@ -93,7 +93,8 @@ class Mem0RestClient:
         *,
         payload: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+        preserve_response_shape: bool = False,
+    ) -> Any:
         url = self._url(path)
         started_at = time.perf_counter()
         async with httpx.AsyncClient(
@@ -192,6 +193,8 @@ class Mem0RestClient:
             )
             if isinstance(data, dict):
                 return data
+            if preserve_response_shape:
+                return data
             return {"results": data}
 
     def _log_extra(
@@ -250,13 +253,36 @@ class Mem0RestClient:
         normalized_response.setdefault("total", len(normalized))
         return normalized_response
 
+    async def search_memories_raw(self, payload: dict[str, Any]) -> Any:
+        return await self._request(
+            "POST",
+            self.search_path,
+            payload=payload,
+            preserve_response_shape=True,
+        )
+
     async def list_memories(self, params: dict[str, Any]) -> dict[str, Any]:
         return await self._request("GET", self.memories_path, params=params)
+
+    async def list_memories_raw(self, params: dict[str, Any]) -> Any:
+        return await self._request(
+            "GET",
+            self.memories_path,
+            params=params,
+            preserve_response_shape=True,
+        )
 
     async def get_memory_history(self, memory_id: str) -> dict[str, Any]:
         return await self._request(
             "GET",
             self._memory_item_path(memory_id, suffix="/history"),
+        )
+
+    async def get_memory_history_raw(self, memory_id: str) -> Any:
+        return await self._request(
+            "GET",
+            self._memory_item_path(memory_id, suffix="/history"),
+            preserve_response_shape=True,
         )
 
     async def get_memory(self, memory_id: str) -> dict[str, Any]:

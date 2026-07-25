@@ -40,7 +40,27 @@ class DirectWriteSyncWorker:
         while not stop.is_set():
             try:
                 result = await self.run_once()
-                LOGGER.info("direct_write_sync_completed", extra=result)
+                log_context = {
+                    "project_id": self.settings.default_project_id,
+                    "bypass_created": result["created"],
+                    "bypass_updated": result["updated"],
+                    "sync_scanned": result["scanned"],
+                    "sync_unchanged": result["unchanged"],
+                    "sync_skipped_foreign": result["skipped_foreign"],
+                    "sync_skipped_invalid": result["skipped_invalid"],
+                    "sync_stale_marked": result["stale_marked"],
+                    "sync_truncated": result["truncated"],
+                }
+                if result["created"] or result["updated"]:
+                    LOGGER.warning(
+                        "direct_write_bypass_detected",
+                        extra=log_context,
+                    )
+                else:
+                    LOGGER.info(
+                        "direct_write_sync_completed",
+                        extra=log_context,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
