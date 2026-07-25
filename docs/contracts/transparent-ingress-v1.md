@@ -25,7 +25,10 @@ members cannot supply project or app overrides through headers, body, query,
 filters, or sidecar metadata; their requests use the configured default project
 and that project's default app. This prevents a valid Core credential from
 becoming a cross-project sidecar credential. The ingress strips client-supplied
-scope headers and supplies only server-owned defaults.
+scope headers and supplies only server-owned defaults. The same boundary applies
+to the Platform-shaped `/v3/memories/*` and `/v1/memories/*` routes:
+`project_wide` and memory reconciliation require an `admin` or `system`
+principal.
 
 ## Authentication
 

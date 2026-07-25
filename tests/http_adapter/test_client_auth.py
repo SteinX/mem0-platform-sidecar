@@ -320,8 +320,6 @@ def test_platform_memory_routes_require_and_attach_client_principal(tmp_path) ->
         headers={"Authorization": "Bearer client-jwt"},
         json={
             "query": "tea",
-            "project_id": "default",
-            "app_id": "repo",
             "user_id": "u1",
         },
     )

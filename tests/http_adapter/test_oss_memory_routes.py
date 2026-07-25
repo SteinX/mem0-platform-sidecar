@@ -251,6 +251,36 @@ def test_oss_add_preserves_existing_project_default_app(tmp_path) -> None:
     assert project.default_app_id == "default-project"
 
 
+def test_oss_add_explicit_app_preserves_existing_project_default(tmp_path) -> None:
+    mem0 = OssRouteMem0Client()
+    app = _app(tmp_path, mem0)
+    with app.state.session_factory() as session:
+        project = session.get(Project, "default-project")
+        assert project is not None
+        project.default_app_id = "mem0"
+        session.commit()
+
+    response = TestClient(app).post(
+        "/memories",
+        json={
+            "messages": [{"role": "user", "content": "canary"}],
+            "user_id": "canary-user",
+            "app_id": "ingress-canary",
+            "infer": False,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert (
+        mem0.add_payloads[0]["metadata"]["_mem0_sidecar_app_id"]
+        == "ingress-canary"
+    )
+    with app.state.session_factory() as session:
+        project = session.get(Project, "default-project")
+        assert project is not None
+        assert project.default_app_id == "mem0"
+
+
 def test_oss_search_uses_filter_scope_and_top_level_entity_precedence(
     tmp_path,
 ) -> None:

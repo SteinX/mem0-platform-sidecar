@@ -1544,6 +1544,10 @@ class MemoryService:
         normalized = _normalize_memory_record(record, projection=projection)
         observed_at = datetime.now(UTC)
         categories = normalized["categories"]
+        projection_fields = _memory_projection_fields(
+            normalized,
+            observed_at=observed_at,
+        )
         affected_projections = (
             [_snapshot_memory_projection(projection)]
             if projection is not None
@@ -1557,8 +1561,8 @@ class MemoryService:
             app_id=app_id,
             run_id=normalized["run_id"],
             category=categories[0] if categories else None,
-            metadata=normalized["metadata"],
-            **_memory_projection_fields(normalized, observed_at=observed_at),
+            metadata=_public_memory_metadata(normalized["metadata"]),
+            **projection_fields,
         )
         affected_projections.append(_snapshot_memory_projection(indexed))
         target = intent_repo.targets(intent_id)[0]
@@ -2565,8 +2569,11 @@ class MemoryService:
                 raise MutationConflictError(
                     "Memory projection changed during upstream update"
                 )
-            metadata = normalized["metadata"]
             categories = normalized["categories"]
+            projection_fields = _memory_projection_fields(
+                normalized,
+                observed_at=observed_at,
+            )
             indexed = memory_repo.upsert_memory(
                 project_id=project_id,
                 mem0_memory_id=memory_id,
@@ -2575,11 +2582,8 @@ class MemoryService:
                 app_id=effective_app_id,
                 run_id=normalized["run_id"],
                 category=categories[0] if categories else None,
-                metadata=metadata,
-                **_memory_projection_fields(
-                    normalized,
-                    observed_at=observed_at,
-                ),
+                metadata=_public_memory_metadata(normalized["metadata"]),
+                **projection_fields,
             )
             EntityRepository(self.session).refresh_affected_memories(
                 project_id,
@@ -3118,7 +3122,7 @@ class MemoryService:
                             app_id=app_id,
                             run_id=normalized["run_id"],
                             category=categories[0] if categories else None,
-                            metadata=metadata,
+                            metadata=_public_memory_metadata(metadata),
                             **_memory_projection_fields(
                                 normalized,
                                 observed_at=scan_cutoff,
@@ -3137,7 +3141,7 @@ class MemoryService:
                             app_id=app_id,
                             run_id=normalized["run_id"],
                             category=categories[0] if categories else None,
-                            metadata=metadata,
+                            metadata=_public_memory_metadata(metadata),
                             **_memory_projection_fields(
                                 normalized,
                                 observed_at=scan_cutoff,
