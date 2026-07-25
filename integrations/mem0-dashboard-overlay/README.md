@@ -35,6 +35,7 @@ Configure the dashboard runtime, not the browser build, with:
 
 ```bash
 SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
+SIDECAR_INTERNAL_API_KEY=replace-with-operator-api-key
 SIDECAR_PROJECT_ID=default
 # Optional: pin Memory, Request Trace, and Entity Explorers to one app.
 SIDECAR_APP_ID=default
@@ -43,6 +44,10 @@ SIDECAR_APP_ID=default
 # Mirror this only when the Mem0 OSS server itself is intentionally auth-disabled.
 AUTH_DISABLED=false
 ```
+
+`SIDECAR_INTERNAL_API_KEY` is a server-only operator credential used by the
+same-origin proxy when sidecar inbound authentication is enabled. Never prefix
+it with `NEXT_PUBLIC_` or expose it to browser code.
 
 `SIDECAR_PROJECT_ID` is authoritative for every forwarded request. If it is
 unset, the overlay falls back to `MEM0_SIDECAR_DEFAULT_PROJECT_ID`, then

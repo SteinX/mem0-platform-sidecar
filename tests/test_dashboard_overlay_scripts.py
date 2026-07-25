@@ -1797,6 +1797,35 @@ def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
     assert 'result.status === "unavailable"' in route_content
 
 
+def test_apply_dashboard_overlay_forwards_server_only_sidecar_api_key(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    write_dashboard_package(dashboard)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(OVERLAY / "scripts" / "apply-dashboard-overlay"),
+            str(dashboard),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    route_content = (dashboard / "src/app/api/sidecar/[...path]/route.ts").read_text()
+    proxy_content = (dashboard / "src/utils/sidecar-proxy.ts").read_text()
+
+    assert "operatorApiKey: process.env.SIDECAR_INTERNAL_API_KEY" in route_content
+    assert "operatorApiKey?: string;" in proxy_content
+    assert 'headers.set("X-API-Key", operatorApiKey);' in proxy_content
+    assert 'request.headers.get("X-API-Key")' not in proxy_content
+    assert "NEXT_PUBLIC_SIDECAR_INTERNAL_API_KEY" not in route_content
+    assert "NEXT_PUBLIC_SIDECAR_INTERNAL_API_KEY" not in proxy_content
+
+
 def test_apply_dashboard_overlay_serializes_rotating_refresh_tokens(tmp_path):
     dashboard = tmp_path / "dashboard"
     write_dashboard_package(dashboard)
