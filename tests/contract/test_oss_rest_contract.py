@@ -49,3 +49,26 @@ def test_every_declared_oss_rest_v1_route_has_a_sidecar_handler(tmp_path) -> Non
     }
 
     assert missing == set()
+
+
+@pytest.mark.contract
+def test_every_oss_rest_v1_case_declares_wire_compatibility() -> None:
+    required_fields = {
+        "method",
+        "path_template",
+        "case",
+        "request",
+        "expected_status",
+        "response_type",
+        "stable_keys",
+        "error_statuses",
+        "scope_precedence",
+    }
+
+    for case in _load_cases():
+        assert set(case) == required_fields
+        assert case["expected_status"] == 200
+        assert case["response_type"] in {"array", "object"}
+        assert isinstance(case["stable_keys"], list)
+        assert 401 in case["error_statuses"]
+        assert case["scope_precedence"][-1] == "server_default"

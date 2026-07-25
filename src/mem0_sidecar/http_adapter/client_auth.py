@@ -13,10 +13,17 @@ class ClientPrincipal:
 
 
 class ClientAuthenticationRejected(RuntimeError):
-    def __init__(self, *, status_code: int, detail: str) -> None:
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        detail: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        self.headers = dict(headers or {})
 
 
 class ClientAuthenticationUnavailable(ClientAuthenticationRejected):
@@ -56,6 +63,17 @@ def _redacted_detail(
     ):
         detail = detail.replace(credential, "[redacted]")
     return detail
+
+
+def _safe_auth_challenge(value: str | None) -> dict[str, str]:
+    if (
+        value is None
+        or not value
+        or len(value) > 512
+        or any(ord(character) < 32 for character in value)
+    ):
+        return {}
+    return {"WWW-Authenticate": value}
 
 
 class ClientAuthVerifier:
@@ -144,6 +162,9 @@ class ClientAuthVerifier:
                     detail,
                     authorization=authorization,
                     x_api_key=x_api_key,
+                ),
+                headers=_safe_auth_challenge(
+                    response.headers.get("WWW-Authenticate")
                 ),
             )
         if response.status_code != 200:

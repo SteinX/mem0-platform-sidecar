@@ -292,6 +292,27 @@ async def test_mem0_client_normalizes_non_dict_history_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mem0_client_raw_compatibility_methods_preserve_arrays() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search":
+            return httpx.Response(200, json=[{"id": "search-1"}])
+        if request.url.path.endswith("/history"):
+            return httpx.Response(200, json=[{"id": "event-1"}])
+        return httpx.Response(200, json=[{"id": "mem-1"}])
+
+    client = Mem0RestClient(
+        base_url="http://mem0.local",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert await client.list_memories_raw({}) == [{"id": "mem-1"}]
+    assert await client.search_memories_raw({"query": "tea"}) == [
+        {"id": "search-1"}
+    ]
+    assert await client.get_memory_history_raw("mem-1") == [{"id": "event-1"}]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("operation", "expected_path"),
     [

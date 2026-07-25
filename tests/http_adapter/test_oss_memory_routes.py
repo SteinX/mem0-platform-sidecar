@@ -1,5 +1,6 @@
 from typing import Any
 
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -9,8 +10,8 @@ from mem0_sidecar.http_adapter.client_auth import (
     ClientAuthenticationRejected,
     ClientPrincipal,
 )
-from mem0_sidecar.mem0_client.client import Mem0UpstreamError
-from mem0_sidecar.store.models import Event
+from mem0_sidecar.mem0_client.client import Mem0RestClient, Mem0UpstreamError
+from mem0_sidecar.store.models import Event, Project
 from mem0_sidecar.store.repositories import MemoryIndexRepository
 
 
@@ -53,12 +54,23 @@ class OssRouteMem0Client:
             ]
         }
 
+    async def search_memories_raw(
+        self,
+        payload: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        self.search_payloads.append(payload)
+        return [{"id": "mem-oss-1", "memory": "Prefers tea", "score": 0.91}]
+
     async def list_memories(self, params: dict[str, Any]) -> dict[str, Any]:
         self.list_params.append(params)
         return {
             "results": [{"id": "mem-oss-1", "memory": "Prefers tea"}],
             "total": 1,
         }
+
+    async def list_memories_raw(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        self.list_params.append(params)
+        return [{"id": "mem-oss-1", "memory": "Prefers tea"}]
 
     async def get_memory_history(self, memory_id: str) -> dict[str, Any]:
         self.history_ids.append(memory_id)
@@ -71,6 +83,19 @@ class OssRouteMem0Client:
                 }
             ]
         }
+
+    async def get_memory_history_raw(
+        self,
+        memory_id: str,
+    ) -> list[dict[str, Any]]:
+        self.history_ids.append(memory_id)
+        return [
+            {
+                "id": "history-1",
+                "memory_id": memory_id,
+                "event": "ADD",
+            }
+        ]
 
     async def update_memory(
         self,
@@ -122,6 +147,18 @@ class FailingBulkDeleteMem0Client(OssRouteMem0Client):
             response_text="retry",
             outcome_unknown=False,
             message="retry",
+        )
+
+
+class RejectingSearchMem0Client(OssRouteMem0Client):
+    async def search_memories_raw(self, payload: dict[str, Any]) -> Any:
+        raise Mem0UpstreamError(
+            method="POST",
+            path="/search",
+            status_code=422,
+            response_text='{"detail":[{"loc":["body","top_k"],"msg":"too large"}]}',
+            outcome_unknown=False,
+            message="upstream rejected search",
         )
 
 
@@ -225,12 +262,9 @@ def test_oss_search_uses_filter_scope_and_top_level_entity_precedence(
     )
 
     assert response.status_code == 200, response.text
-    assert response.json() == {
-        "results": [
-            {"id": "mem-oss-1", "memory": "Prefers tea", "score": 0.91}
-        ],
-        "total": 1,
-    }
+    assert response.json() == [
+        {"id": "mem-oss-1", "memory": "Prefers tea", "score": 0.91}
+    ]
     assert mem0.search_payloads == [
         {
             "query": "tea",
@@ -281,10 +315,7 @@ def test_oss_list_returns_scoped_core_shape_and_creates_trace(tmp_path) -> None:
     )
 
     assert response.status_code == 200, response.text
-    assert response.json() == {
-        "results": [{"id": "mem-oss-1", "memory": "Prefers tea"}],
-        "total": 1,
-    }
+    assert response.json() == [{"id": "mem-oss-1", "memory": "Prefers tea"}]
     assert mem0.list_params == [
         {
             "user_id": "u1",
@@ -364,15 +395,13 @@ def test_oss_history_returns_core_shape_and_creates_trace(tmp_path) -> None:
     )
 
     assert response.status_code == 200, response.text
-    assert response.json() == {
-        "results": [
-            {
-                "id": "history-1",
-                "memory_id": "mem-oss-1",
-                "event": "ADD",
-            }
-        ]
-    }
+    assert response.json() == [
+        {
+            "id": "history-1",
+            "memory_id": "mem-oss-1",
+            "event": "ADD",
+        }
+    ]
     assert mem0.history_ids == ["mem-oss-1"]
 
     with app.state.session_factory() as session:
@@ -522,6 +551,102 @@ def test_oss_bulk_delete_rejects_non_admin_before_upstream_call(tmp_path) -> Non
     assert mem0.deleted_ids == []
 
 
+def test_oss_member_cannot_override_default_project_or_app_scope(tmp_path) -> None:
+    mem0 = OssRouteMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            default_project_id="default-project",
+            client_auth_enabled=True,
+        ),
+        mem0_client=mem0,
+        client_auth_verifier=MemberVerifier(),
+    )
+
+    response = TestClient(app).post(
+        "/memories",
+        headers={
+            "X-API-Key": "member-key",
+            "X-Mem0-Project-ID": "other-project",
+        },
+        json={
+            "messages": [{"role": "user", "content": "Prefers tea"}],
+            "user_id": "u1",
+            "app_id": "other-app",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": "Project and app scope overrides require an admin principal"
+    }
+    assert mem0.add_payloads == []
+    with app.state.session_factory() as session:
+        assert session.get(Project, "other-project") is None
+
+
+def test_oss_scoped_reads_match_pinned_core_v2_0_12_wire_shapes(
+    tmp_path,
+) -> None:
+    golden = {
+        "list": [{"id": "mem-oss-1", "memory": "Prefers tea"}],
+        "search": [
+            {"id": "mem-oss-1", "memory": "Prefers tea", "score": 0.91}
+        ],
+        "history": [
+            {
+                "id": "history-1",
+                "memory_id": "mem-oss-1",
+                "event": "ADD",
+            }
+        ],
+    }
+
+    async def core_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search":
+            return httpx.Response(200, json=golden["search"])
+        if request.url.path.endswith("/history"):
+            return httpx.Response(200, json=golden["history"])
+        return httpx.Response(200, json=golden["list"])
+
+    app = _app(
+        tmp_path,
+        Mem0RestClient(
+            base_url="http://mem0.local",
+            transport=httpx.MockTransport(core_handler),
+        ),
+    )
+    with app.state.session_factory() as session:
+        MemoryIndexRepository(session).upsert_memory(
+            project_id="default-project",
+            mem0_memory_id="mem-oss-1",
+            user_id="u1",
+            app_id="app-a",
+            category=None,
+            metadata={},
+        )
+        session.commit()
+    client = TestClient(app)
+
+    listed = client.get(
+        "/memories",
+        params={"user_id": "u1", "app_id": "app-a"},
+    )
+    searched = client.post(
+        "/search",
+        json={"query": "tea", "user_id": "u1", "app_id": "app-a"},
+    )
+    history = client.get(
+        "/memories/mem-oss-1/history",
+        params={"app_id": "app-a"},
+    )
+
+    assert listed.status_code == searched.status_code == history.status_code == 200
+    assert listed.json() == golden["list"]
+    assert searched.json() == golden["search"]
+    assert history.json() == golden["history"]
+
+
 def test_oss_routes_use_declared_error_envelopes(tmp_path) -> None:
     mem0 = FailingBulkDeleteMem0Client()
     app = _app(tmp_path, mem0)
@@ -539,7 +664,10 @@ def test_oss_routes_use_declared_error_envelopes(tmp_path) -> None:
 
     missing = client.get(
         "/memories/missing",
-        headers={"X-Mem0-App-ID": "app-a"},
+        headers={
+            "X-Mem0-App-ID": "app-a",
+            "X-Request-ID": "oss-missing-1",
+        },
     )
     invalid = client.post(
         "/memories",
@@ -557,6 +685,50 @@ def test_oss_routes_use_declared_error_envelopes(tmp_path) -> None:
     assert conflict.status_code == 409
     assert set(conflict.json()) == {"detail"}
     assert "retry required" in conflict.json()["detail"]
+    with app.state.session_factory() as session:
+        missing_event = session.scalar(
+            select(Event).where(
+                Event.operation == "memory.get",
+                Event.correlation_id == "oss-missing-1",
+            )
+        )
+        assert missing_event is not None
+        assert missing_event.status == "FAILED"
+
+
+def test_oss_validation_and_upstream_errors_match_core_statuses(tmp_path) -> None:
+    app = _app(tmp_path, OssRouteMem0Client())
+    client = TestClient(app)
+
+    missing_entity = client.post(
+        "/memories",
+        json={"messages": [{"role": "user", "content": "Prefers tea"}]},
+    )
+    empty_query = client.post(
+        "/search",
+        json={"query": "", "user_id": "u1"},
+    )
+    null_filters = client.post(
+        "/search",
+        json={"query": "tea", "user_id": "u1", "filters": None},
+    )
+
+    assert missing_entity.status_code == 400
+    assert empty_query.status_code == 400
+    assert null_filters.status_code == 200
+
+    rejecting_path = tmp_path / "rejecting"
+    rejecting_path.mkdir()
+    rejecting_app = _app(rejecting_path, RejectingSearchMem0Client())
+    upstream_rejection = TestClient(rejecting_app).post(
+        "/search",
+        json={"query": "tea", "user_id": "u1", "top_k": 100_000},
+    )
+
+    assert upstream_rejection.status_code == 422
+    assert upstream_rejection.json() == {
+        "detail": [{"loc": ["body", "top_k"], "msg": "too large"}]
+    }
 
 
 def test_oss_routes_preserve_auth_rejection_envelope(tmp_path) -> None:

@@ -1695,11 +1695,29 @@ class MutationIntentRepository:
                 error={"message": "Mutation recovery attempts exhausted"},
             )
             return False
-        intent.attempt_count += 1
-        intent.status = "ACTIVE"
-        intent.lease_expires_at = now + timedelta(seconds=self.LEASE_SECONDS)
-        intent.updated_at = now
+        expected_attempt_count = intent.attempt_count
+        expected_status = intent.status
         self.session.flush()
+        result = self.session.execute(
+            update(MutationIntent)
+            .where(
+                MutationIntent.id == intent.id,
+                MutationIntent.status == expected_status,
+                MutationIntent.attempt_count == expected_attempt_count,
+            )
+            .values(
+                attempt_count=expected_attempt_count + 1,
+                status="ACTIVE",
+                lease_expires_at=now + timedelta(seconds=self.LEASE_SECONDS),
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise MutationIntentFenceError(
+                "durable mutation recovery claim lost its fence"
+            )
+        self.session.expire(intent)
         return True
 
     def require_active_attempt(
@@ -1942,6 +1960,7 @@ class MemoryIndexRepository:
         project_id: str,
         app_id: str,
         filters: Mapping[str, str],
+        created_at_lte: datetime | None = None,
     ) -> int:
         conditions = [
             MemoryIndex.project_id == project_id,
@@ -1952,6 +1971,8 @@ class MemoryIndexRepository:
         for field_name in ("user_id", "agent_id", "run_id"):
             if value := filters.get(field_name):
                 conditions.append(getattr(MemoryIndex, field_name) == value)
+        if created_at_lte is not None:
+            conditions.append(MemoryIndex.created_at <= created_at_lte)
         return int(
             self.session.scalar(
                 select(func.count()).select_from(MemoryIndex).where(*conditions)
@@ -1965,6 +1986,7 @@ class MemoryIndexRepository:
         project_id: str,
         app_id: str,
         filters: Mapping[str, str],
+        created_at_lte: datetime | None = None,
         after_created_at: datetime | None = None,
         after_memory_id: str | None = None,
         limit: int = 200,
@@ -1982,6 +2004,8 @@ class MemoryIndexRepository:
         for field_name in ("user_id", "agent_id", "run_id"):
             if value := filters.get(field_name):
                 conditions.append(getattr(MemoryIndex, field_name) == value)
+        if created_at_lte is not None:
+            conditions.append(MemoryIndex.created_at <= created_at_lte)
         if after_created_at is not None and after_memory_id is not None:
             conditions.append(
                 or_(

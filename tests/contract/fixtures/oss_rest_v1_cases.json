@@ -2,41 +2,89 @@
   {
     "method": "POST",
     "path_template": "/memories",
-    "case": "messages_add"
+    "case": "messages_add",
+    "request": {"body_required": ["messages"], "entity_any_of": ["user_id", "agent_id", "run_id"]},
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["results"],
+    "error_statuses": [400, 401, 403, 409, 422, 503],
+    "scope_precedence": ["header", "body", "filters", "metadata", "server_default"]
   },
   {
     "method": "GET",
     "path_template": "/memories",
-    "case": "scoped_list"
+    "case": "scoped_list",
+    "request": {"query_optional": ["user_id", "agent_id", "run_id", "top_k", "show_expired"]},
+    "expected_status": 200,
+    "response_type": "array",
+    "stable_keys": [],
+    "error_statuses": [400, 401, 403, 422, 503],
+    "scope_precedence": ["header", "query", "server_default"]
   },
   {
     "method": "POST",
     "path_template": "/search",
-    "case": "filtered_search"
+    "case": "filtered_search",
+    "request": {"body_required": ["query"], "nullable": ["filters"]},
+    "expected_status": 200,
+    "response_type": "array",
+    "stable_keys": [],
+    "error_statuses": [400, 401, 403, 422, 503],
+    "scope_precedence": ["header", "body", "filters", "metadata", "server_default"]
   },
   {
     "method": "GET",
     "path_template": "/memories/{memory_id}",
-    "case": "get"
+    "case": "get",
+    "request": {"path_required": ["memory_id"]},
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["id"],
+    "error_statuses": [401, 403, 404, 422, 503],
+    "scope_precedence": ["header", "query", "projection", "server_default"]
   },
   {
     "method": "PUT",
     "path_template": "/memories/{memory_id}",
-    "case": "update"
+    "case": "update",
+    "request": {"path_required": ["memory_id"], "body_optional": ["text", "metadata", "expiration_date"]},
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["message"],
+    "error_statuses": [401, 403, 404, 409, 422, 503],
+    "scope_precedence": ["header", "body", "query", "projection", "server_default"]
   },
   {
     "method": "GET",
     "path_template": "/memories/{memory_id}/history",
-    "case": "history"
+    "case": "history",
+    "request": {"path_required": ["memory_id"]},
+    "expected_status": 200,
+    "response_type": "array",
+    "stable_keys": [],
+    "error_statuses": [401, 403, 404, 422, 503],
+    "scope_precedence": ["header", "query", "projection", "server_default"]
   },
   {
     "method": "DELETE",
     "path_template": "/memories/{memory_id}",
-    "case": "delete"
+    "case": "delete",
+    "request": {"path_required": ["memory_id"]},
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["message"],
+    "error_statuses": [401, 403, 404, 409, 422, 503],
+    "scope_precedence": ["header", "query", "projection", "server_default"]
   },
   {
     "method": "DELETE",
     "path_template": "/memories",
-    "case": "bulk_delete"
+    "case": "bulk_delete",
+    "request": {"entity_any_of": ["user_id", "agent_id", "run_id"], "admin_only": true},
+    "expected_status": 200,
+    "response_type": "object",
+    "stable_keys": ["message"],
+    "error_statuses": [400, 401, 403, 409, 422, 503],
+    "scope_precedence": ["header", "query", "server_default"]
   }
 ]

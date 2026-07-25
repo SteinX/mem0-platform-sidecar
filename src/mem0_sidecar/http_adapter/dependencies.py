@@ -42,6 +42,7 @@ async def require_client_principal(
         raise HTTPException(
             status_code=exc.status_code,
             detail=exc.detail,
+            headers=exc.headers,
         ) from exc
     request.state.client_principal = principal
     return principal

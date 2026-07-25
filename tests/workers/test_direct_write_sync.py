@@ -1,11 +1,21 @@
 import asyncio
+import hashlib
+from datetime import UTC, datetime
 
 import pytest
 
 from mem0_sidecar.config import SidecarSettings
+from mem0_sidecar.core.memory_ops import (
+    SIDECAR_APP_ID_METADATA_KEY,
+    SIDECAR_MUTATION_ID_METADATA_KEY,
+    SIDECAR_PROJECT_ID_METADATA_KEY,
+)
 from mem0_sidecar.store.database import create_session_factory
 from mem0_sidecar.store.models import MemoryIndex
-from mem0_sidecar.store.repositories import ProjectRepository
+from mem0_sidecar.store.repositories import (
+    MemoryIndexRepository,
+    ProjectRepository,
+)
 from mem0_sidecar.workers.direct_write_sync import DirectWriteSyncWorker
 
 
@@ -246,3 +256,68 @@ async def test_direct_write_sync_worker_logs_unchanged_scan_as_info(
     assert records[-1].bypass_created == 0
     assert records[-1].bypass_updated == 0
     assert records[-1].sync_unchanged == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_write_sync_ignores_sidecar_internal_metadata(
+    db_session,
+) -> None:
+    db_session_factory = create_session_factory(db_session.get_bind())
+    with db_session_factory() as session:
+        ProjectRepository(session).upsert_default_project(
+            project_id="repo-a",
+            name="repo-a",
+            mem0_base_url="http://mem0.invalid",
+            default_app_id="app-a",
+        )
+        MemoryIndexRepository(session).upsert_memory(
+            project_id="repo-a",
+            mem0_memory_id="sidecar-memory",
+            user_id="u1",
+            app_id="app-a",
+            category="preference",
+            metadata={"type": "preference"},
+            content_hash=hashlib.sha256(b"Prefers tea").hexdigest(),
+            content_length=len("Prefers tea"),
+            normalized_type="preference",
+            scope_markers_verified=True,
+            observed_at=datetime.now(UTC),
+        )
+        session.commit()
+
+    class _SidecarRecordClient:
+        async def list_memories(self, params):
+            return {
+                "results": [
+                    {
+                        "id": "sidecar-memory",
+                        "memory": "Prefers tea",
+                        "user_id": "u1",
+                        "metadata": {
+                            "type": "preference",
+                            SIDECAR_PROJECT_ID_METADATA_KEY: "repo-a",
+                            SIDECAR_APP_ID_METADATA_KEY: "app-a",
+                            SIDECAR_MUTATION_ID_METADATA_KEY: "intent-1",
+                        },
+                    }
+                ],
+                "total": 1,
+            }
+
+    worker = DirectWriteSyncWorker(
+        settings=SidecarSettings(
+            database_url="sqlite://",
+            mem0_base_url="http://mem0.invalid",
+            default_project_id="repo-a",
+            direct_write_sync_enabled=True,
+            direct_write_sync_default_app_id="app-a",
+        ),
+        session_factory=db_session_factory,
+        mem0_client=_SidecarRecordClient(),
+    )
+
+    result = await worker.run_once()
+
+    assert result["created"] == 0
+    assert result["updated"] == 0
+    assert result["unchanged"] == 1

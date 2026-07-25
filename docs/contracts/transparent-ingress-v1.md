@@ -8,7 +8,7 @@ discover a sidecar-specific URL.
 ## Scope and identity
 
 Every request resolves a project and app before reaching `MemoryService`.
-Resolution order is:
+For trusted `admin` and internal `system` principals, resolution order is:
 
 1. `X-Mem0-Project-ID` and `X-Mem0-App-ID` headers;
 2. top-level `project_id` and `app_id`;
@@ -20,8 +20,12 @@ The three standard Mem0 entity identifiers remain `user_id`, `agent_id`, and
 `run_id`. At least one is required by `POST /memories`. An unscoped
 `GET /memories` is admin-only.
 
-The optional project/app headers are deployment controls. Generic clients do
-not need them when the ingress supplies a fixed default project and app.
+The optional project/app selectors are operator controls. Ordinary authenticated
+members cannot supply project or app overrides through headers, body, query,
+filters, or sidecar metadata; their requests use the configured default project
+and that project's default app. This prevents a valid Core credential from
+becoming a cross-project sidecar credential. The ingress strips client-supplied
+scope headers and supplies only server-owned defaults.
 
 ## Authentication
 
@@ -81,11 +85,15 @@ Query parameters:
 - `top_k`: integer from 0 through the configured Core list limit;
 - `show_expired`: boolean, default false.
 
-Success is `200` with:
+Pinned Core `v2.0.12-steinx.1` returns a top-level array for a scoped list, so
+success is `200` with:
 
 ```json
-{"results": [{"id": "memory-id", "memory": "Prefers tea"}]}
+[{"id": "memory-id", "memory": "Prefers tea"}]
 ```
+
+If a future Core response is an object, the sidecar preserves that object and
+its stable keys instead of synthesizing a different envelope.
 
 When no entity identifier is supplied, a non-admin principal receives `403`.
 
@@ -105,11 +113,12 @@ Request JSON:
 ```
 
 Top-level `user_id`, `agent_id`, and `run_id` remain accepted for compatibility
-and override the same keys inside `filters`, matching Core. Success is `200`
-with Core's search result shape:
+and override the same keys inside `filters`, matching Core. `filters: null` is
+accepted as an empty filter object. Pinned Core returns a top-level array for a
+scoped search, so success is `200` with:
 
 ```json
-{"results": [{"id": "memory-id", "memory": "Prefers tea", "score": 0.91}]}
+[{"id": "memory-id", "memory": "Prefers tea", "score": 0.91}]
 ```
 
 ### `GET /memories/{memory_id}`
@@ -131,8 +140,9 @@ its projection before responding.
 
 ### `GET /memories/{memory_id}/history`
 
-Success is `200` with the Core history result. The route uses the same opaque
-and single-decode memory-ID rules as Platform REST.
+Success is `200` with the unmodified Core history result. Pinned Core returns a
+top-level array. The route uses the same opaque and single-decode memory-ID
+rules as Platform REST.
 
 ### `DELETE /memories/{memory_id}`
 
@@ -177,10 +187,11 @@ The compatibility profile uses:
 
 ## Observability
 
-Each accepted memory operation creates one sidecar Event and preserves or
-generates `X-Request-ID`. The sidecar Event is the canonical public request
-record. Core request logs describe internal data-plane calls after cutover.
-Direct-write reconciliation never synthesizes a client Event.
+Each accepted memory operation, including a projected-memory `404`, creates one
+sidecar Event and preserves or generates `X-Request-ID`. The sidecar Event is
+the canonical public request record. Core request logs describe internal
+data-plane calls after cutover. Direct-write reconciliation never synthesizes a
+client Event.
 
 ## Explicit exclusions
 

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.config import SidecarSettings
@@ -25,6 +25,42 @@ class CompatibleScope:
 
 def _non_empty_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def enforce_compatible_scope_boundary(
+    request: Request,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Prevent ordinary Core principals from selecting sidecar tenant scope."""
+
+    principal = request.state.client_principal
+    if principal.role in {"admin", "system"}:
+        return
+
+    body = payload or {}
+    filters = body.get("filters")
+    if not isinstance(filters, dict):
+        filters = {}
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    selectors = (
+        request.headers.get("X-Mem0-Project-ID"),
+        request.headers.get("X-Mem0-App-ID"),
+        body.get("project_id"),
+        body.get("app_id"),
+        request.query_params.get("project_id"),
+        request.query_params.get("app_id"),
+        filters.get("project_id"),
+        filters.get("app_id"),
+        metadata.get(_SIDECAR_PROJECT_ID_METADATA_KEY),
+        metadata.get(_SIDECAR_APP_ID_METADATA_KEY),
+    )
+    if any(_non_empty_string(selector) is not None for selector in selectors):
+        raise HTTPException(
+            status_code=403,
+            detail="Project and app scope overrides require an admin principal",
+        )
 
 
 def resolve_compatible_scope(

@@ -18,11 +18,12 @@ def _response_transport(
     status_code: int,
     payload: dict[str, Any],
     observed: list[httpx.Request] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
         if observed is not None:
             observed.append(request)
-        return httpx.Response(status_code, json=payload)
+        return httpx.Response(status_code, json=payload, headers=headers)
 
     return httpx.MockTransport(handler)
 
@@ -220,6 +221,28 @@ async def test_auth_rejection_preserves_status_without_leaking_secrets(
 
 
 @pytest.mark.asyncio
+async def test_auth_rejection_preserves_safe_www_authenticate_challenge() -> None:
+    verifier = ClientAuthVerifier(
+        enabled=True,
+        base_url="http://mem0.local",
+        admin_api_key=None,
+        transport=_response_transport(
+            401,
+            {"detail": "Authentication required."},
+            headers={"WWW-Authenticate": "Bearer"},
+        ),
+    )
+
+    with pytest.raises(ClientAuthenticationRejected) as captured:
+        await verifier.verify(
+            authorization=None,
+            x_api_key=None,
+        )
+
+    assert captured.value.headers == {"WWW-Authenticate": "Bearer"}
+
+
+@pytest.mark.asyncio
 async def test_auth_transport_failure_becomes_generic_unavailable() -> None:
     def timeout(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("secret-token timed out", request=request)
@@ -317,6 +340,7 @@ class _RejectingVerifier:
         raise ClientAuthenticationRejected(
             status_code=401,
             detail="Authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
 
@@ -342,6 +366,7 @@ def test_platform_auth_rejection_uses_fastapi_detail_envelope(tmp_path) -> None:
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Authentication required."}
+    assert response.headers["WWW-Authenticate"] == "Bearer"
 
 
 def test_health_does_not_invoke_client_auth(tmp_path) -> None:

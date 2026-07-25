@@ -1,3 +1,4 @@
+import json
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -24,10 +25,14 @@ from mem0_sidecar.http_adapter.oss_response_adapter import (
     as_oss_search_response,
 )
 from mem0_sidecar.http_adapter.project_scope import (
+    enforce_compatible_scope_boundary,
     ensure_project,
     resolve_compatible_memory_scope,
     resolve_compatible_scope,
 )
+from mem0_sidecar.mem0_client.client import Mem0UpstreamError
+from mem0_sidecar.observability import get_request_id
+from mem0_sidecar.store.repositories import EventRepository, MemoryIndexRepository
 
 oss_memory_router = APIRouter(
     route_class=_SingleDecodeMemoryRoute,
@@ -35,6 +40,57 @@ oss_memory_router = APIRouter(
 )
 SessionDependency = Annotated[Session, Depends(get_session)]
 Mem0Dependency = Annotated[Any, Depends(get_mem0_client)]
+
+
+class _CompatibleBadRequest(ValueError):
+    pass
+
+
+def _raise_compatible_upstream_error(exc: Mem0UpstreamError) -> None:
+    if exc.status_code not in {400, 404, 422}:
+        raise exc
+    detail: Any = "Upstream request rejected"
+    if exc.response_text:
+        try:
+            document = json.loads(exc.response_text)
+        except (TypeError, ValueError):
+            document = None
+        if isinstance(document, dict) and isinstance(
+            document.get("detail"),
+            (str, list, dict),
+        ):
+            detail = document["detail"]
+    raise HTTPException(status_code=exc.status_code, detail=detail) from exc
+
+
+def _trace_missing_compatible_memory(
+    session: Session,
+    *,
+    project_id: str,
+    app_id: str,
+    memory_id: str,
+    operation: str,
+) -> None:
+    memory = MemoryIndexRepository(session).get_memory(
+        project_id=project_id,
+        mem0_memory_id=memory_id,
+        app_id=app_id,
+    )
+    if memory is not None:
+        return
+    event_repo = EventRepository(session)
+    event = event_repo.create_event(
+        project_id=project_id,
+        app_id=app_id,
+        operation=operation,
+        request={"app_id": app_id, "memory_id": memory_id},
+        subject_type="memory",
+        subject_id=memory_id,
+        correlation_id=get_request_id(),
+    )
+    event_repo.mark_failed(event.id, error={"message": "Memory not found"})
+    session.commit()
+    raise HTTPException(status_code=404, detail="Memory not found")
 
 
 def _validate_add_payload(payload: dict[str, Any]) -> None:
@@ -58,7 +114,9 @@ def _validate_add_payload(payload: dict[str, Any]) -> None:
         for field_name in ("user_id", "agent_id", "run_id")
     ]
     if not any(entity_ids):
-        raise ValueError("At least one of user_id, agent_id, or run_id is required")
+        raise _CompatibleBadRequest(
+            "At least one of user_id, agent_id, or run_id is required"
+        )
 
 
 def _search_service_payload(
@@ -68,8 +126,10 @@ def _search_service_payload(
 ) -> dict[str, Any]:
     query = payload.get("query")
     if not isinstance(query, str) or not query.strip():
-        raise ValueError("query must be a non-empty string")
+        raise _CompatibleBadRequest("query must be a non-empty string")
     filters = payload.get("filters", {})
+    if filters is None:
+        filters = {}
     if not isinstance(filters, dict):
         raise ValueError("filters must be an object")
 
@@ -136,6 +196,7 @@ async def oss_add_memory(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     try:
+        enforce_compatible_scope_boundary(request, payload)
         _validate_add_payload(payload)
         scope = resolve_compatible_scope(request, session, payload)
         ensure_project(
@@ -159,6 +220,12 @@ async def oss_add_memory(
     except MutationConflictError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except _CompatibleBadRequest as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Mem0UpstreamError as exc:
+        session.rollback()
+        _raise_compatible_upstream_error(exc)
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -172,8 +239,9 @@ async def oss_list_memories(
     request: Request,
     session: SessionDependency,
     mem0: Mem0Dependency,
-) -> dict[str, Any]:
+) -> Any:
     try:
+        enforce_compatible_scope_boundary(request)
         scope = resolve_compatible_scope(request, session)
         service_payload = _list_service_payload(request, app_id=scope.app_id)
         has_entity_scope = any(
@@ -190,10 +258,14 @@ async def oss_list_memories(
         return await MemoryService(session=session, mem0=mem0).list_memories(
             project_id=scope.project_id,
             payload=service_payload,
+            preserve_wire_shape=True,
         )
     except HTTPException:
         session.rollback()
         raise
+    except Mem0UpstreamError as exc:
+        session.rollback()
+        _raise_compatible_upstream_error(exc)
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -209,6 +281,7 @@ async def oss_bulk_delete_memories(
     mem0: Mem0Dependency,
 ) -> dict[str, str]:
     try:
+        enforce_compatible_scope_boundary(request)
         principal = request.state.client_principal
         if principal.role not in {"admin", "system"}:
             raise HTTPException(
@@ -236,6 +309,9 @@ async def oss_bulk_delete_memories(
     except MutationConflictError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Mem0UpstreamError as exc:
+        session.rollback()
+        _raise_compatible_upstream_error(exc)
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -250,16 +326,24 @@ async def oss_search_memories(
     request: Request,
     session: SessionDependency,
     mem0: Mem0Dependency,
-) -> dict[str, Any]:
+) -> Any:
     try:
+        enforce_compatible_scope_boundary(request, payload)
         scope = resolve_compatible_scope(request, session, payload)
         service_payload = _search_service_payload(payload, app_id=scope.app_id)
         session.rollback()
         result = await MemoryService(session=session, mem0=mem0).search_memories(
             project_id=scope.project_id,
             payload=service_payload,
+            preserve_wire_shape=True,
         )
         return as_oss_search_response(result)
+    except _CompatibleBadRequest as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Mem0UpstreamError as exc:
+        session.rollback()
+        _raise_compatible_upstream_error(exc)
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -277,10 +361,18 @@ async def oss_get_memory(
 ) -> dict[str, Any]:
     memory_id = _decode_memory_id(memory_id)
     try:
+        enforce_compatible_scope_boundary(request)
         scope = resolve_compatible_memory_scope(
             request,
             session,
             memory_id=memory_id,
+        )
+        _trace_missing_compatible_memory(
+            session,
+            project_id=scope.project_id,
+            app_id=scope.app_id,
+            memory_id=memory_id,
+            operation="memory.get",
         )
         session.rollback()
         return await MemoryService(session=session, mem0=mem0).get_memory(
@@ -292,6 +384,9 @@ async def oss_get_memory(
     except KeyError as exc:
         session.rollback()
         raise HTTPException(status_code=404, detail="Memory not found") from exc
+    except Mem0UpstreamError as exc:
+        session.rollback()
+        _raise_compatible_upstream_error(exc)
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -306,13 +401,21 @@ async def oss_get_memory_history(
     request: Request,
     session: SessionDependency,
     mem0: Mem0Dependency,
-) -> dict[str, Any]:
+) -> Any:
     memory_id = _decode_memory_id(memory_id)
     try:
+        enforce_compatible_scope_boundary(request)
         scope = resolve_compatible_memory_scope(
             request,
             session,
             memory_id=memory_id,
+        )
+        _trace_missing_compatible_memory(
+            session,
+            project_id=scope.project_id,
+            app_id=scope.app_id,
+            memory_id=memory_id,
+            operation="memory.history",
         )
         session.rollback()
         return await MemoryService(
@@ -323,10 +426,14 @@ async def oss_get_memory_history(
             memory_id=memory_id,
             request_app_id=scope.app_id,
             trace_event=True,
+            preserve_wire_shape=True,
         )
     except KeyError as exc:
         session.rollback()
         raise HTTPException(status_code=404, detail="Memory not found") from exc
+    except Mem0UpstreamError as exc:
+        session.rollback()
+        _raise_compatible_upstream_error(exc)
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -345,11 +452,19 @@ async def oss_update_memory(
 ) -> dict[str, Any]:
     memory_id = _decode_memory_id(memory_id)
     try:
+        enforce_compatible_scope_boundary(request, payload)
         scope = resolve_compatible_memory_scope(
             request,
             session,
             memory_id=memory_id,
             payload=payload,
+        )
+        _trace_missing_compatible_memory(
+            session,
+            project_id=scope.project_id,
+            app_id=scope.app_id,
+            memory_id=memory_id,
+            operation="memory.update",
         )
         patch = dict(payload)
         patch.pop("project_id", None)
@@ -368,6 +483,9 @@ async def oss_update_memory(
     except KeyError as exc:
         session.rollback()
         raise HTTPException(status_code=404, detail="Memory not found") from exc
+    except Mem0UpstreamError as exc:
+        session.rollback()
+        _raise_compatible_upstream_error(exc)
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -385,6 +503,7 @@ async def oss_delete_memory(
 ) -> dict[str, Any]:
     memory_id = _decode_memory_id(memory_id)
     try:
+        enforce_compatible_scope_boundary(request)
         scope = resolve_compatible_memory_scope(
             request,
             session,
@@ -403,6 +522,9 @@ async def oss_delete_memory(
     except KeyError as exc:
         session.rollback()
         raise HTTPException(status_code=404, detail="Memory not found") from exc
+    except Mem0UpstreamError as exc:
+        session.rollback()
+        _raise_compatible_upstream_error(exc)
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
