@@ -218,12 +218,9 @@ def ensure_project(
         field_name="app_id",
         required=False,
     )
-    existing_project = session.get(Project, validated_project_id)
-    ProjectRepository(session).upsert_default_project(
+    ProjectRepository(session).ensure_project(
         project_id=validated_project_id,
         name=validated_project_id,
         mem0_base_url=settings.mem0_base_url,
-        default_app_id=(
-            validated_app_id if existing_project is None else None
-        ),
+        default_app_id=validated_app_id,
     )

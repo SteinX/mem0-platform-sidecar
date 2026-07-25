@@ -10,6 +10,8 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from sqlalchemy import and_, case, delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -821,6 +823,58 @@ class ProjectRepository:
                 project.default_agent_id = default_agent_id
             if default_app_id is not None:
                 project.default_app_id = default_app_id
+        self.session.flush()
+        return project
+
+    def ensure_project(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        mem0_base_url: str,
+        default_app_id: str | None = None,
+    ) -> Project:
+        project = self.session.get(Project, project_id)
+        if project is not None:
+            if project.name != name:
+                project.name = name
+            if project.mem0_base_url != mem0_base_url:
+                project.mem0_base_url = mem0_base_url
+            self.session.flush()
+            return project
+
+        values = {
+            "id": project_id,
+            "name": name,
+            "default_app_id": default_app_id or project_id,
+            "mem0_base_url": mem0_base_url,
+        }
+        dialect_name = self.session.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            statement = postgresql_insert(Project).values(**values)
+        elif dialect_name == "sqlite":
+            statement = sqlite_insert(Project).values(**values)
+        else:
+            raise RuntimeError(
+                "atomic project bootstrap requires SQLite or PostgreSQL"
+            )
+        self.session.execute(
+            statement.on_conflict_do_nothing(
+                index_elements=[Project.id],
+            )
+        )
+        self.session.flush()
+        project = self.session.get(
+            Project,
+            project_id,
+            populate_existing=True,
+        )
+        if project is None:
+            raise RuntimeError("project bootstrap did not return a project")
+        if project.name != name:
+            project.name = name
+        if project.mem0_base_url != mem0_base_url:
+            project.mem0_base_url = mem0_base_url
         self.session.flush()
         return project
 

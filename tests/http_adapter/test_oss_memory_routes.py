@@ -231,6 +231,26 @@ def test_oss_add_returns_core_shape_and_creates_trace(tmp_path) -> None:
         assert event.correlation_id == "oss-add-1"
 
 
+def test_oss_add_preserves_existing_project_default_app(tmp_path) -> None:
+    mem0 = OssRouteMem0Client()
+    app = _app(tmp_path, mem0)
+
+    response = TestClient(app).post(
+        "/memories",
+        headers={"X-Mem0-App-ID": "app-explicit"},
+        json={
+            "messages": [{"role": "user", "content": "Prefers tea"}],
+            "user_id": "u1",
+        },
+    )
+
+    assert response.status_code == 200
+    with app.state.session_factory() as session:
+        project = session.get(Project, "default-project")
+    assert project is not None
+    assert project.default_app_id == "default-project"
+
+
 def test_oss_add_explicit_app_preserves_existing_project_default(tmp_path) -> None:
     mem0 = OssRouteMem0Client()
     app = _app(tmp_path, mem0)
