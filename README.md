@@ -3,6 +3,15 @@
 Control-plane sidecar for making self-hosted Mem0 OSS easier to use from
 Platform-shaped agent integrations.
 
+## Release 0.3.2
+
+This release adds the server-side foundation for transparent Mem0 ingress:
+Core-backed client authentication, durable OSS-compatible memory routes,
+atomic bulk-delete recovery, and direct-write bypass telemetry. Scoped
+list/search/history responses preserve the pinned Core wire shape, ordinary
+principals cannot select arbitrary sidecar project/app scopes, and missing
+compatibility reads are recorded as failed canonical Events.
+
 The sidecar is not a fork of Mem0. Mem0 OSS remains the memory data plane and
 continues to own memory storage, embeddings, and vector search. This service
 sits in front of Mem0 OSS and adds the control-plane pieces that agent plugins
