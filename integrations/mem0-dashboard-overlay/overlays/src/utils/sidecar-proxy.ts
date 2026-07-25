@@ -5,6 +5,7 @@ type SidecarProxyOptions = {
   baseUrl: string | null;
   configuredProjectId: string;
   configuredAppId?: string;
+  operatorApiKey?: string;
   validateDashboardSession: () => Promise<boolean>;
   fetchUpstream?: typeof fetch;
 };
@@ -386,6 +387,7 @@ export async function proxySidecarRequest(
     baseUrl,
     configuredProjectId,
     configuredAppId,
+    operatorApiKey,
     validateDashboardSession,
   } = options;
   const scopedAppId = configuredAppId === "*" ? undefined : configuredAppId;
@@ -457,6 +459,9 @@ export async function proxySidecarRequest(
 
   const headers = new Headers();
   headers.set("Content-Type", "application/json");
+  if (operatorApiKey) {
+    headers.set("X-API-Key", operatorApiKey);
+  }
   const requestId = request.headers.get("X-Request-ID");
   if (requestId) {
     headers.set("X-Request-ID", requestId);

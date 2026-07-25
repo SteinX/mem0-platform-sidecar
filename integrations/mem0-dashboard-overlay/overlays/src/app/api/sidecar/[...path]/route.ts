@@ -103,6 +103,7 @@ async function proxy(
       baseUrl: getSidecarBaseUrl(),
       configuredProjectId: getConfiguredProjectId(),
       configuredAppId: getConfiguredAppId(),
+      operatorApiKey: process.env.SIDECAR_INTERNAL_API_KEY,
       validateDashboardSession: () =>
         validateDashboardSession((pending) => {
           pendingRefreshCookie = pending;

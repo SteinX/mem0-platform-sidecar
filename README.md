@@ -209,10 +209,15 @@ Configure the dashboard runtime with:
 
 ```bash
 SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765
+SIDECAR_INTERNAL_API_KEY=replace-with-operator-api-key
 SIDECAR_PROJECT_ID=default
 # Only mirror this when the Mem0 OSS server itself runs auth-disabled for local dev.
 AUTH_DISABLED=false
 ```
+
+Keep `SIDECAR_INTERNAL_API_KEY` server-only. The dashboard proxy sends it to an
+authenticated sidecar as `X-API-Key`; it is never included in browser runtime
+configuration.
 
 Set `SIDECAR_PROJECT_ID` in the dashboard runtime to the sidecar project that
 should own dashboard category and export actions. If it is not set, the overlay
