@@ -1826,6 +1826,74 @@ def test_apply_dashboard_overlay_forwards_server_only_sidecar_api_key(tmp_path):
     assert "NEXT_PUBLIC_SIDECAR_INTERNAL_API_KEY" not in proxy_content
 
 
+def test_dashboard_sidecar_proxy_drops_browser_credentials_at_runtime(tmp_path):
+    if not shutil.which("bun"):
+        pytest.skip("bun is required for the dashboard proxy runtime test")
+
+    proxy_path = (
+        OVERLAY / "overlays/src/utils/sidecar-proxy.ts"
+    ).resolve()
+    harness = tmp_path / "sidecar-proxy-auth.ts"
+    harness.write_text(
+        f"""
+import {{proxySidecarRequest}} from {json.dumps(proxy_path.as_uri())};
+
+let observed: Headers | undefined;
+const request = new Request(
+  "http://dashboard.local/api/sidecar/v1/memories/query",
+  {{
+    method: "POST",
+    headers: {{
+      "Authorization": "Bearer browser-token",
+      "Content-Type": "application/json",
+      "X-API-Key": "browser-key",
+      "X-Request-ID": "dashboard-request-1",
+    }},
+    body: JSON.stringify({{page: 1, page_size: 20}}),
+  }},
+);
+
+const response = await proxySidecarRequest(
+  request,
+  "/v1/memories/query",
+  {{
+    baseUrl: "http://sidecar.internal",
+    configuredProjectId: "default",
+    configuredAppId: "default",
+    operatorApiKey: "operator-key",
+    validateDashboardSession: async () => true,
+    fetchUpstream: async (_url, init) => {{
+      observed = new Headers(init?.headers);
+      return Response.json({{results: []}});
+    }},
+  }},
+);
+
+if (response.status !== 200) throw new Error(`unexpected status: ${{response.status}}`);
+if (!observed) throw new Error("upstream headers were not observed");
+if (observed.get("X-API-Key") !== "operator-key") {{
+  throw new Error(`operator key missing: ${{observed.get("X-API-Key")}}`);
+}}
+if (observed.has("Authorization")) {{
+  throw new Error("browser authorization header reached sidecar");
+}}
+if (observed.get("X-Request-ID") !== "dashboard-request-1") {{
+  throw new Error("request ID was not preserved");
+}}
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bun", str(harness)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_apply_dashboard_overlay_serializes_rotating_refresh_tokens(tmp_path):
     dashboard = tmp_path / "dashboard"
     write_dashboard_package(dashboard)
