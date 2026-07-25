@@ -1834,7 +1834,26 @@ async def test_update_memory_patches_whitelist_and_refreshes_projection(
     )
     assert projection is not None
     assert projection.category == "decision"
-    assert json.loads(projection.metadata_projection_json)["type"] == "decision"
+    assert json.loads(projection.metadata_projection_json) == {
+        "type": "decision"
+    }
+    assert projection.scope_markers_verified == 1
+
+    mem0.list_response = {
+        "results": [mem0.records["mem-1"]],
+        "total": 1,
+    }
+    mirror_result = await MemoryService(
+        session=db_session,
+        mem0=mem0,
+    ).mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="app-a",
+        scan_limit=100,
+    )
+
+    assert mirror_result["updated"] == 0
+    assert mirror_result["unchanged"] == 1
 
 
 @pytest.mark.asyncio
@@ -2000,14 +2019,16 @@ async def test_reconcile_imports_only_matching_scope_and_marks_absent_stale(
         "stale_marked": 1,
     }
     assert mem0.list_calls == [{"top_k": 5000, "show_expired": True}]
-    assert (
-        MemoryIndexRepository(db_session).get_memory(
-            project_id="repo-a",
-            mem0_memory_id="matching",
-            app_id="app-a",
-        )
-        is not None
+    matching = MemoryIndexRepository(db_session).get_memory(
+        project_id="repo-a",
+        mem0_memory_id="matching",
+        app_id="app-a",
     )
+    assert matching is not None
+    assert json.loads(matching.metadata_projection_json) == {
+        "type": "decision"
+    }
+    assert matching.scope_markers_verified == 1
     stale = MemoryIndexRepository(db_session).get_memory(
         project_id="repo-a",
         mem0_memory_id="old-a",
@@ -2022,6 +2043,24 @@ async def test_reconcile_imports_only_matching_scope_and_marks_absent_stale(
         )
         is not None
     )
+
+    mem0.list_response = {
+        "results": [
+            {"id": "matching", "memory": "match", "metadata": matching_metadata}
+        ],
+        "total": 1,
+    }
+    mirror_result = await MemoryService(
+        session=db_session,
+        mem0=mem0,
+    ).mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="app-a",
+        scan_limit=100,
+    )
+
+    assert mirror_result["updated"] == 0
+    assert mirror_result["unchanged"] == 1
 
 
 @pytest.mark.asyncio
