@@ -663,7 +663,11 @@ async def test_memory_service_search_filters_upstream_results_by_indexed_scope(
             "query": "hello",
             "user_id": "root",
             "app_id": "app-a",
-            "filters": {"topic": "scope-test"},
+            "filters": {
+                "topic": "scope-test",
+                "project_id": "repo-a",
+                "app_id": "app-a",
+            },
         },
     )
 

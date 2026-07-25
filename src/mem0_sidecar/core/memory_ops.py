@@ -323,8 +323,15 @@ def _oss_search_payload(payload: dict[str, Any], *, scope: Scope) -> dict[str, A
     oss_payload = dict(payload)
     oss_payload.pop("project_id", None)
     oss_payload.pop("app_id", None)
+    filters = (
+        dict(payload["filters"])
+        if isinstance(payload.get("filters"), dict)
+        else {}
+    )
+    filters.pop("project_id", None)
+    filters.pop("app_id", None)
     oss_payload["filters"] = _filters_with_sidecar_scope(
-        payload.get("filters") if isinstance(payload.get("filters"), dict) else None,
+        filters,
         scope=scope,
     )
     return oss_payload
