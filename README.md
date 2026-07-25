@@ -3,14 +3,15 @@
 Control-plane sidecar for making self-hosted Mem0 OSS easier to use from
 Platform-shaped agent integrations.
 
-## Release 0.3.2
+## Release 0.3.3
 
-This release adds the server-side foundation for transparent Mem0 ingress:
-Core-backed client authentication, durable OSS-compatible memory routes,
-atomic bulk-delete recovery, and direct-write bypass telemetry. Scoped
-list/search/history responses preserve the pinned Core wire shape, ordinary
-principals cannot select arbitrary sidecar project/app scopes, and missing
-compatibility reads are recorded as failed canonical Events.
+This hotfix completes the transparent Mem0 ingress security and projection
+contract introduced in 0.3.2. Ordinary principals now use server-owned default
+project/app scope across both OSS-compatible and Platform-shaped memory routes,
+project-wide access and reconciliation require an admin or system principal,
+and memory projections retain public metadata while separately recording
+verified internal scope markers. The runtime and package versions are also
+kept in lockstep by a regression test.
 
 The sidecar is not a fork of Mem0. Mem0 OSS remains the memory data plane and
 continues to own memory storage, embeddings, and vector search. This service
@@ -101,6 +102,11 @@ Mem0 OSS request:
 
 - `_mem0_sidecar_project_id`
 - `_mem0_sidecar_app_id`
+
+Explicit project/app selectors and `project_wide` are trusted operator controls.
+Only `admin` and internal `system` principals may use them. Ordinary
+authenticated members always use `MEM0_SIDECAR_DEFAULT_PROJECT_ID` and that
+project's default app. Memory reconciliation is likewise admin/system-only.
 
 Search requests include the same scope metadata as upstream filters, and the
 returned results are checked against the sidecar memory index.
