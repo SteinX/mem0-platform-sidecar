@@ -1,6 +1,7 @@
 from typing import Any
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -583,6 +584,60 @@ def test_oss_member_cannot_override_default_project_or_app_scope(tmp_path) -> No
     assert mem0.add_payloads == []
     with app.state.session_factory() as session:
         assert session.get(Project, "other-project") is None
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "payload"),
+    [
+        ("GET", "/memories/other-app-memory", None),
+        ("GET", "/memories/other-app-memory/history", None),
+        ("PUT", "/memories/other-app-memory", {"text": "changed"}),
+        ("DELETE", "/memories/other-app-memory", None),
+    ],
+)
+def test_oss_member_cannot_infer_another_app_from_memory_id(
+    tmp_path,
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None,
+) -> None:
+    mem0 = OssRouteMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            default_project_id="default-project",
+            client_auth_enabled=True,
+        ),
+        mem0_client=mem0,
+        client_auth_verifier=MemberVerifier(),
+    )
+    with app.state.session_factory() as session:
+        MemoryIndexRepository(session).upsert_memory(
+            project_id="default-project",
+            mem0_memory_id="other-app-memory",
+            user_id="u1",
+            app_id="other-app",
+            category=None,
+            metadata={},
+        )
+        session.commit()
+
+    response = TestClient(app).request(
+        method,
+        path,
+        headers={
+            "X-API-Key": "member-key",
+            "X-Request-ID": "member-cross-app-1",
+        },
+        json=payload,
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Memory not found"}
+    assert mem0.get_memory_ids == []
+    assert mem0.history_ids == []
+    assert mem0.update_calls == []
+    assert mem0.deleted_ids == []
 
 
 def test_oss_scoped_reads_match_pinned_core_v2_0_12_wire_shapes(

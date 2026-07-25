@@ -127,6 +127,9 @@ def resolve_compatible_memory_scope(
     scope = resolve_compatible_scope(request, session, payload)
     if scope.app_is_explicit:
         return scope
+    principal = request.state.client_principal
+    if principal.role not in {"admin", "system"}:
+        return scope
     memory = MemoryIndexRepository(session).get_memory(
         project_id=scope.project_id,
         mem0_memory_id=memory_id,
