@@ -18,7 +18,11 @@ from mem0_sidecar.core.memory_ops import (
     validate_idempotency_key,
 )
 from mem0_sidecar.core.scope import validate_scope_id
-from mem0_sidecar.http_adapter.dependencies import get_mem0_client, get_session
+from mem0_sidecar.http_adapter.dependencies import (
+    get_mem0_client,
+    get_session,
+    require_client_principal,
+)
 from mem0_sidecar.http_adapter.project_scope import (
     ensure_project,
     normalized_payload_for_project,
@@ -55,7 +59,10 @@ class _SingleDecodeMemoryRoute(APIRoute):
         return super().matches(scope)
 
 
-memory_router = APIRouter(route_class=_SingleDecodeMemoryRoute)
+memory_router = APIRouter(
+    route_class=_SingleDecodeMemoryRoute,
+    dependencies=[Depends(require_client_principal)],
+)
 SessionDependency = Annotated[Session, Depends(get_session)]
 Mem0Dependency = Annotated[Any, Depends(get_mem0_client)]
 

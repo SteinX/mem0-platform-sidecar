@@ -9,6 +9,7 @@ from mem0_sidecar.config import SidecarSettings, load_settings
 from mem0_sidecar.core.memory_ops import MutationConflictError
 from mem0_sidecar.http_adapter.capability_routes import capability_router
 from mem0_sidecar.http_adapter.category_routes import category_router
+from mem0_sidecar.http_adapter.client_auth import ClientAuthVerifier
 from mem0_sidecar.http_adapter.consolidation_routes import consolidation_router
 from mem0_sidecar.http_adapter.entity_routes import entity_router
 from mem0_sidecar.http_adapter.event_routes import event_router
@@ -28,6 +29,7 @@ def create_app(
     *,
     session_factory=None,
     mem0_client=None,
+    client_auth_verifier=None,
 ) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(settings)
@@ -58,6 +60,17 @@ def create_app(
             ca_bundle=settings.mem0_ca_bundle,
             memories_path=settings.mem0_memories_path,
             search_path=settings.mem0_search_path,
+        )
+    if client_auth_verifier is None:
+        client_auth_verifier = ClientAuthVerifier(
+            enabled=settings.client_auth_enabled,
+            base_url=settings.mem0_base_url,
+            admin_api_key=settings.mem0_api_key,
+            auth_path=settings.client_auth_path,
+            timeout_seconds=settings.client_auth_timeout_seconds,
+            allow_bootstrap_admin=settings.client_auth_allow_bootstrap_admin,
+            verify_tls=settings.mem0_verify_tls,
+            ca_bundle=settings.mem0_ca_bundle,
         )
 
     @asynccontextmanager
@@ -119,6 +132,7 @@ def create_app(
     app.state.settings = settings
     app.state.session_factory = session_factory
     app.state.mem0_client = mem0_client
+    app.state.client_auth_verifier = client_auth_verifier
     app.add_middleware(
         RequestLoggingMiddleware,
         request_id_header=settings.request_id_header,
