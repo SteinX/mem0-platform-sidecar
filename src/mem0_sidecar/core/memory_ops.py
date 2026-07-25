@@ -3115,7 +3115,7 @@ class MemoryService:
                             app_id=app_id,
                             run_id=normalized["run_id"],
                             category=categories[0] if categories else None,
-                            metadata=metadata,
+                            metadata=_public_memory_metadata(metadata),
                             **_memory_projection_fields(
                                 normalized,
                                 observed_at=scan_cutoff,
@@ -3134,7 +3134,7 @@ class MemoryService:
                             app_id=app_id,
                             run_id=normalized["run_id"],
                             category=categories[0] if categories else None,
-                            metadata=metadata,
+                            metadata=_public_memory_metadata(metadata),
                             **_memory_projection_fields(
                                 normalized,
                                 observed_at=scan_cutoff,
