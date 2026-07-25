@@ -834,14 +834,19 @@ class ProjectRepository:
         mem0_base_url: str,
         default_app_id: str | None = None,
     ) -> Project:
+        project = self.session.get(Project, project_id)
+        if project is not None:
+            if project.name != name:
+                project.name = name
+            if project.mem0_base_url != mem0_base_url:
+                project.mem0_base_url = mem0_base_url
+            self.session.flush()
+            return project
+
         values = {
             "id": project_id,
             "name": name,
             "default_app_id": default_app_id or project_id,
-            "mem0_base_url": mem0_base_url,
-        }
-        conflict_updates = {
-            "name": name,
             "mem0_base_url": mem0_base_url,
         }
         dialect_name = self.session.get_bind().dialect.name
@@ -854,9 +859,8 @@ class ProjectRepository:
                 "atomic project bootstrap requires SQLite or PostgreSQL"
             )
         self.session.execute(
-            statement.on_conflict_do_update(
+            statement.on_conflict_do_nothing(
                 index_elements=[Project.id],
-                set_=conflict_updates,
             )
         )
         self.session.flush()
@@ -867,6 +871,11 @@ class ProjectRepository:
         )
         if project is None:
             raise RuntimeError("project bootstrap did not return a project")
+        if project.name != name:
+            project.name = name
+        if project.mem0_base_url != mem0_base_url:
+            project.mem0_base_url = mem0_base_url
+        self.session.flush()
         return project
 
     def lock_for_mutation(self, project_id: str) -> Project:

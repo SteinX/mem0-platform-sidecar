@@ -16,6 +16,9 @@ from sqlalchemy import (
     insert,
     select,
 )
+from sqlalchemy import (
+    event as sqlalchemy_event,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -136,6 +139,51 @@ def test_project_ensure_concurrent_bootstrap_has_no_insert_collision(tmp_path) -
         project = verification.get(Project, "alpha")
         assert project is not None
         assert project.default_app_id in {"app-a", "app-b"}
+
+
+def test_project_ensure_existing_unchanged_is_read_only(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'projects-read.sqlite3'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        ProjectRepository(session).ensure_project(
+            project_id="alpha",
+            name="Alpha",
+            mem0_base_url="http://mem0:8000",
+            default_app_id="app-first",
+        )
+        session.commit()
+
+    statements: list[str] = []
+
+    def capture_statement(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        statements.append(statement)
+
+    sqlalchemy_event.listen(engine, "before_cursor_execute", capture_statement)
+    try:
+        with Session(engine) as session:
+            ProjectRepository(session).ensure_project(
+                project_id="alpha",
+                name="Alpha",
+                mem0_base_url="http://mem0:8000",
+                default_app_id="app-second",
+            )
+            session.commit()
+    finally:
+        sqlalchemy_event.remove(engine, "before_cursor_execute", capture_statement)
+
+    writes = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+    ]
+    assert writes == []
 
 
 def test_project_mutation_lock_is_postgresql_row_lock(db_session, monkeypatch) -> None:
