@@ -15,6 +15,7 @@ from mem0_sidecar.http_adapter.entity_routes import entity_router
 from mem0_sidecar.http_adapter.event_routes import event_router
 from mem0_sidecar.http_adapter.export_routes import export_router
 from mem0_sidecar.http_adapter.memory_routes import memory_router
+from mem0_sidecar.http_adapter.oss_memory_routes import oss_memory_router
 from mem0_sidecar.mem0_client.client import Mem0RestClient
 from mem0_sidecar.observability import RequestLoggingMiddleware, configure_logging
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
@@ -138,6 +139,7 @@ def create_app(
         request_id_header=settings.request_id_header,
     )
     app.include_router(memory_router)
+    app.include_router(oss_memory_router)
     app.include_router(capability_router)
     app.include_router(event_router)
     app.include_router(entity_router)

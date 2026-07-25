@@ -1,0 +1,42 @@
+[
+  {
+    "method": "POST",
+    "path_template": "/memories",
+    "case": "messages_add"
+  },
+  {
+    "method": "GET",
+    "path_template": "/memories",
+    "case": "scoped_list"
+  },
+  {
+    "method": "POST",
+    "path_template": "/search",
+    "case": "filtered_search"
+  },
+  {
+    "method": "GET",
+    "path_template": "/memories/{memory_id}",
+    "case": "get"
+  },
+  {
+    "method": "PUT",
+    "path_template": "/memories/{memory_id}",
+    "case": "update"
+  },
+  {
+    "method": "GET",
+    "path_template": "/memories/{memory_id}/history",
+    "case": "history"
+  },
+  {
+    "method": "DELETE",
+    "path_template": "/memories/{memory_id}",
+    "case": "delete"
+  },
+  {
+    "method": "DELETE",
+    "path_template": "/memories",
+    "case": "bulk_delete"
+  }
+]

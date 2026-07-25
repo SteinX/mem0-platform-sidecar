@@ -41,6 +41,7 @@ asyncio_mode = "auto"
 markers = [
   "e2e: tests that require a live Mem0 OSS-compatible REST service",
   "adoption_e2e: live tests that require the isolated unscoped-adoption gate",
+  "contract: protocol-shape tests for a declared compatibility profile",
 ]
 
 [tool.ruff]

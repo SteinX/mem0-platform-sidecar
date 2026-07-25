@@ -43,6 +43,7 @@ from mem0_sidecar.store.repositories import (
     ExportJobRepository,
     JobRepository,
     MemoryIndexRepository,
+    MutationIntentRepository,
     ProjectRepository,
 )
 
@@ -625,6 +626,46 @@ def test_entity_memory_ids_reject_unbounded_mutation_targets(
         match="mutation intent exceeds 5000 memory targets",
     ):
         repository.list_entity_memory_ids("alpha", "app-a", "user", "alice")
+
+
+def test_mutation_intent_target_batches_are_bounded_to_200(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="alpha",
+        name="alpha",
+        mem0_base_url="http://mem0:8000",
+        default_app_id="app-a",
+    )
+    event = EventRepository(db_session).create_event(
+        project_id="alpha",
+        app_id="app-a",
+        operation="memory.bulk_delete",
+        request={"app_id": "app-a", "user_id": "alice"},
+        user_id="alice",
+    )
+    repository = MutationIntentRepository(db_session)
+    intent = repository.create(
+        project_id="alpha",
+        app_id="app-a",
+        event_id=event.id,
+        operation="memory.bulk_delete",
+        payload={"request_fingerprint": "fingerprint"},
+    )
+
+    first_batch = repository.add_target_batch(
+        intent.id,
+        [f"memory-{index}" for index in range(200)],
+    )
+
+    assert len(first_batch) == 200
+    assert repository.count_targets(intent.id) == 200
+    with pytest.raises(
+        ValueError,
+        match="mutation target batch exceeds 200 records",
+    ):
+        repository.add_target_batch(
+            intent.id,
+            [f"later-{index}" for index in range(201)],
+        )
 
 
 def test_entity_rebuild_locks_project_before_snapshot_and_delete(
