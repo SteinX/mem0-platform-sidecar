@@ -77,6 +77,67 @@ def test_category_model_enforces_unique_name_per_project(db_session):
         db_session.flush()
 
 
+def test_project_ensure_preserves_first_default_across_sessions(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'projects.sqlite3'}")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as first, Session(engine) as second:
+        ProjectRepository(first).ensure_project(
+            project_id="alpha",
+            name="Alpha",
+            mem0_base_url="http://mem0-a:8000",
+            default_app_id="app-first",
+        )
+        first.commit()
+        ProjectRepository(second).ensure_project(
+            project_id="alpha",
+            name="Alpha Updated",
+            mem0_base_url="http://mem0-b:8000",
+            default_app_id="app-second",
+        )
+        second.commit()
+
+    with Session(engine) as verification:
+        project = verification.get(Project, "alpha")
+        assert project is not None
+        assert project.default_app_id == "app-first"
+        assert project.name == "Alpha Updated"
+        assert project.mem0_base_url == "http://mem0-b:8000"
+
+
+def test_project_ensure_concurrent_bootstrap_has_no_insert_collision(tmp_path) -> None:
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'projects-concurrent.sqlite3'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    Base.metadata.create_all(engine)
+    barrier = Barrier(2)
+
+    def bootstrap(app_id: str) -> None:
+        with Session(engine) as session:
+            barrier.wait()
+            ProjectRepository(session).ensure_project(
+                project_id="alpha",
+                name="Alpha",
+                mem0_base_url="http://mem0:8000",
+                default_app_id=app_id,
+            )
+            session.commit()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(bootstrap, "app-a"),
+            executor.submit(bootstrap, "app-b"),
+        ]
+        for future in futures:
+            future.result(timeout=30)
+
+    with Session(engine) as verification:
+        project = verification.get(Project, "alpha")
+        assert project is not None
+        assert project.default_app_id in {"app-a", "app-b"}
+
+
 def test_project_mutation_lock_is_postgresql_row_lock(db_session, monkeypatch) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="alpha",

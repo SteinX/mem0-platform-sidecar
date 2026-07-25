@@ -218,14 +218,9 @@ def ensure_project(
         field_name="app_id",
         required=False,
     )
-    bootstrap_app_id = (
-        validated_app_id
-        if session.get(Project, validated_project_id) is None
-        else None
-    )
-    ProjectRepository(session).upsert_default_project(
+    ProjectRepository(session).ensure_project(
         project_id=validated_project_id,
         name=validated_project_id,
         mem0_base_url=settings.mem0_base_url,
-        default_app_id=bootstrap_app_id,
+        default_app_id=validated_app_id,
     )
