@@ -528,6 +528,42 @@ def test_route_scoped_add_preserves_query_app_id_and_bootstraps_default_app_id(
     assert project_a.default_app_id == "app-x"
 
 
+def test_route_scoped_add_preserves_existing_default_app_id(tmp_path) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-default",
+        ),
+        mem0_client=mem0,
+    )
+    with app.state.session_factory() as session:
+        ProjectRepository(session).upsert_default_project(
+            project_id="repo-a",
+            name="Repo A",
+            mem0_base_url="http://mem0.local",
+            default_app_id="app-default",
+        )
+        session.commit()
+
+    response = TestClient(app).post(
+        "/v3/memories/add/",
+        json={
+            "project_id": "repo-a",
+            "app_id": "app-explicit",
+            "text": "hello",
+            "user_id": "root",
+        },
+    )
+
+    assert response.status_code == 200
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+    assert project is not None
+    assert project.default_app_id == "app-default"
+
+
 @pytest.mark.parametrize(
     "invalid_app_id",
     [
