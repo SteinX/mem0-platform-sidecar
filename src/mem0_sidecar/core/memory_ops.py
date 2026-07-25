@@ -970,6 +970,51 @@ def _direct_write_app_scope(
         return "invalid", None
 
 
+def _direct_write_projection_matches(
+    memory: MemoryIndex,
+    record: dict[str, Any],
+    *,
+    source_app_id: str,
+) -> bool:
+    if memory.deleted_at is not None:
+        return False
+    try:
+        metadata = json.loads(memory.metadata_projection_json)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    categories = record["categories"]
+    projection_fields = _memory_projection_fields(
+        record,
+        observed_at=datetime.now(UTC),
+    )
+    expected_expiration = projection_fields["expires_at"]
+    expiration_matches = (
+        memory.expires_at is None and expected_expiration is None
+    ) or (
+        memory.expires_at is not None
+        and expected_expiration is not None
+        and _as_utc(memory.expires_at) == _as_utc(expected_expiration)
+    )
+    return (
+        memory.user_id == record["user_id"]
+        and memory.agent_id == record["agent_id"]
+        and memory.app_id == source_app_id
+        and memory.run_id == record["run_id"]
+        and memory.category == (categories[0] if categories else None)
+        and metadata == record["metadata"]
+        and memory.content_hash == projection_fields["content_hash"]
+        and memory.content_length == projection_fields["content_length"]
+        and memory.normalized_type == projection_fields["normalized_type"]
+        and memory.source == projection_fields["source"]
+        and bool(memory.pinned) == bool(projection_fields["pinned"])
+        and expiration_matches
+        and bool(memory.scope_markers_verified)
+        == bool(projection_fields["scope_markers_verified"])
+    )
+
+
 def _memory_delete_request(
     *,
     project_id: str,
@@ -2686,6 +2731,9 @@ class MemoryService:
             accepted_records.append((normalized, source_app_id))
 
         indexed = 0
+        created = 0
+        updated = 0
+        unchanged = 0
         for offset in range(0, len(accepted_records), 200):
             ProjectRepository(self.session).lock_for_mutation(project_id)
             memory_repo = MemoryIndexRepository(self.session)
@@ -2700,7 +2748,18 @@ class MemoryService:
                 if existing is not None and _as_utc(existing.updated_at) > scan_cutoff:
                     accepted_ids.add(memory_id)
                     indexed += 1
+                    unchanged += 1
                     continue
+                if existing is None:
+                    created += 1
+                elif _direct_write_projection_matches(
+                    existing,
+                    normalized,
+                    source_app_id=source_app_id,
+                ):
+                    unchanged += 1
+                else:
+                    updated += 1
                 if existing is not None:
                     affected_projections.append(
                         _snapshot_memory_projection(existing)
@@ -2792,6 +2851,9 @@ class MemoryService:
         return {
             "scanned": len(records),
             "indexed": indexed,
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
             "skipped_foreign": skipped_foreign,
             "skipped_invalid": skipped_invalid,
             "stale_marked": stale_marked,

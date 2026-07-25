@@ -28,6 +28,7 @@ from mem0_sidecar.store.models import (
     Base,
     Category,
     Entity,
+    Event,
     EventStatus,
     MemoryIndex,
     MutationIntent,
@@ -2077,6 +2078,9 @@ async def test_direct_write_mirror_preserves_source_app_identity_and_repairs_sco
     assert result == {
         "scanned": 8,
         "indexed": 6,
+        "created": 5,
+        "updated": 1,
+        "unchanged": 0,
         "skipped_foreign": 1,
         "skipped_invalid": 1,
         "stale_marked": 0,
@@ -2106,6 +2110,65 @@ async def test_direct_write_mirror_preserves_source_app_identity_and_repairs_sco
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_write_mirror_classifies_bypasses_without_events(
+    db_session,
+) -> None:
+    _create_project(db_session)
+    records = [
+        {
+            "id": "stable",
+            "memory": "stable",
+            "app_id": "app-a",
+            "metadata": {"type": "decision"},
+        },
+        {
+            "id": "changed",
+            "memory": "before",
+            "app_id": "app-a",
+            "metadata": {"type": "decision"},
+        },
+    ]
+    mem0 = ExplorerMem0Client()
+    mem0.list_response = {"results": records, "total": 2}
+    service = MemoryService(session=db_session, mem0=mem0)
+    await service.mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="app-a",
+        scan_limit=100,
+    )
+
+    records[1] = {**records[1], "memory": "after"}
+    records.append(
+        {
+            "id": "created",
+            "memory": "new",
+            "app_id": "app-a",
+            "metadata": {"type": "decision"},
+        }
+    )
+    mem0.list_response = {"results": records, "total": 3}
+
+    result = await service.mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="app-a",
+        scan_limit=100,
+    )
+
+    assert result == {
+        "scanned": 3,
+        "indexed": 3,
+        "created": 1,
+        "updated": 1,
+        "unchanged": 1,
+        "skipped_foreign": 0,
+        "skipped_invalid": 0,
+        "stale_marked": 0,
+        "truncated": False,
+    }
+    assert db_session.query(Event).count() == 0
 
 
 @pytest.mark.asyncio
@@ -2156,7 +2219,7 @@ async def test_direct_write_mirror_does_not_redirty_unchanged_projection(
         app_id="app-a",
     ) == 0
 
-    await service.mirror_direct_writes(
+    unchanged_result = await service.mirror_direct_writes(
         project_id="repo-a",
         default_app_id="default-app",
         scan_limit=100,
@@ -2174,9 +2237,12 @@ async def test_direct_write_mirror_does_not_redirty_unchanged_projection(
         project_id="repo-a",
         app_id="app-a",
     ) == 0
+    assert unchanged_result["created"] == 0
+    assert unchanged_result["updated"] == 0
+    assert unchanged_result["unchanged"] == 1
 
     record["memory"] = "The deployment uses the next stable release tag."
-    await service.mirror_direct_writes(
+    changed_result = await service.mirror_direct_writes(
         project_id="repo-a",
         default_app_id="default-app",
         scan_limit=100,
@@ -2194,6 +2260,9 @@ async def test_direct_write_mirror_does_not_redirty_unchanged_projection(
         project_id="repo-a",
         app_id="app-a",
     ) == 1
+    assert changed_result["created"] == 0
+    assert changed_result["updated"] == 1
+    assert changed_result["unchanged"] == 0
 
 
 @pytest.mark.asyncio
@@ -2234,6 +2303,9 @@ async def test_direct_write_mirror_blank_app_fallback_hydrates_and_rejects_false
     assert mirrored == {
         "scanned": 4,
         "indexed": 2,
+        "created": 2,
+        "updated": 0,
+        "unchanged": 0,
         "skipped_foreign": 0,
         "skipped_invalid": 2,
         "stale_marked": 0,

@@ -301,6 +301,8 @@ def test_cli_runs_one_direct_write_sync_pass(tmp_path) -> None:
     assert code == 0
     assert error == ""
     assert result["indexed"] == 1
+    assert result["indexed_deprecated"] is True
+    assert result["created"] == 1
     with factory() as session:
         projection = session.query(MemoryIndex).filter_by(
             project_id=PROJECT_ID,

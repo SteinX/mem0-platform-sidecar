@@ -60,6 +60,9 @@ async def test_direct_write_sync_worker_runs_one_bounded_mirror(
     result = await worker.run_once()
 
     assert result["indexed"] == 1
+    assert result["created"] == 1
+    assert result["updated"] == 0
+    assert result["unchanged"] == 0
     assert client.calls == [{"top_k": 321, "show_expired": True}]
     with db_session_factory() as session:
         projection = session.query(MemoryIndex).filter_by(
@@ -142,3 +145,104 @@ async def test_direct_write_sync_worker_logs_only_failure_type(
     assert record.error_type == "RuntimeError"
     assert "raw upstream response secret" not in caplog.text
     assert record.exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_direct_write_sync_worker_warns_when_bypass_is_detected(
+    db_session,
+    caplog,
+) -> None:
+    db_session_factory = create_session_factory(db_session.get_bind())
+    with db_session_factory() as session:
+        ProjectRepository(session).upsert_default_project(
+            project_id="repo-a",
+            name="repo-a",
+            mem0_base_url="http://mem0.invalid",
+            default_app_id="default-app",
+        )
+        session.commit()
+    stop = asyncio.Event()
+
+    class _OnePassListClient(_ListClient):
+        async def list_memories(self, params):
+            result = await super().list_memories(params)
+            stop.set()
+            return result
+
+    worker = DirectWriteSyncWorker(
+        settings=SidecarSettings(
+            database_url="sqlite://",
+            mem0_base_url="http://mem0.invalid",
+            default_project_id="repo-a",
+            direct_write_sync_enabled=True,
+            direct_write_sync_default_app_id="default-app",
+            direct_write_sync_interval_seconds=1,
+        ),
+        session_factory=db_session_factory,
+        mem0_client=_OnePassListClient(),
+    )
+
+    with caplog.at_level("WARNING", logger="mem0_sidecar.direct_write_sync"):
+        await worker.run_forever(stop)
+
+    record = caplog.records[-1]
+    assert record.message == "direct_write_bypass_detected"
+    assert record.project_id == "repo-a"
+    assert record.bypass_created == 1
+    assert record.bypass_updated == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_write_sync_worker_logs_unchanged_scan_as_info(
+    db_session,
+    caplog,
+) -> None:
+    db_session_factory = create_session_factory(db_session.get_bind())
+    with db_session_factory() as session:
+        ProjectRepository(session).upsert_default_project(
+            project_id="repo-a",
+            name="repo-a",
+            mem0_base_url="http://mem0.invalid",
+            default_app_id="default-app",
+        )
+        session.commit()
+    settings = SidecarSettings(
+        database_url="sqlite://",
+        mem0_base_url="http://mem0.invalid",
+        default_project_id="repo-a",
+        direct_write_sync_enabled=True,
+        direct_write_sync_default_app_id="default-app",
+        direct_write_sync_interval_seconds=1,
+    )
+    worker = DirectWriteSyncWorker(
+        settings=settings,
+        session_factory=db_session_factory,
+        mem0_client=_ListClient(),
+    )
+    await worker.run_once()
+
+    stop = asyncio.Event()
+
+    class _OnePassListClient(_ListClient):
+        async def list_memories(self, params):
+            result = await super().list_memories(params)
+            stop.set()
+            return result
+
+    worker = DirectWriteSyncWorker(
+        settings=settings,
+        session_factory=db_session_factory,
+        mem0_client=_OnePassListClient(),
+    )
+    with caplog.at_level("INFO", logger="mem0_sidecar.direct_write_sync"):
+        await worker.run_forever(stop)
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "mem0_sidecar.direct_write_sync"
+    ]
+    assert records[-1].message == "direct_write_sync_completed"
+    assert records[-1].bypass_created == 0
+    assert records[-1].bypass_updated == 0
+    assert records[-1].sync_unchanged == 1

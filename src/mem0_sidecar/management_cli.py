@@ -162,7 +162,7 @@ async def _execute(
     with session_factory() as session:
         try:
             if arguments.resource == "direct-write-sync":
-                return await MemoryService(
+                result = await MemoryService(
                     session=session,
                     mem0=mem0_client,
                 ).mirror_direct_writes(
@@ -171,6 +171,7 @@ async def _execute(
                     scan_limit=arguments.scan_limit,
                     legacy_cap=arguments.legacy_cap,
                 )
+                return {**result, "indexed_deprecated": True}
             if arguments.resource == "consolidation":
                 policies = ConsolidationPolicyRepository(session)
                 proposals = ConsolidationProposalRepository(session)
