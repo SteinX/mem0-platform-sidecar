@@ -387,7 +387,10 @@ def _assert_recovered(factory, client, operation: str) -> None:
                 select(MemoryIndex).where(MemoryIndex.mem0_memory_id == "memory-one")
             )
             assert memory is not None
-            assert json.loads(memory.metadata_projection_json)["version"] == "new"
+            assert json.loads(memory.metadata_projection_json) == {
+                "version": "new"
+            }
+            assert memory.scope_markers_verified == 1
         elif operation == "delete":
             memory = session.scalar(
                 select(MemoryIndex).where(MemoryIndex.mem0_memory_id == "memory-one")

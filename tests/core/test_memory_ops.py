@@ -1830,7 +1830,26 @@ async def test_update_memory_patches_whitelist_and_refreshes_projection(
     )
     assert projection is not None
     assert projection.category == "decision"
-    assert json.loads(projection.metadata_projection_json)["type"] == "decision"
+    assert json.loads(projection.metadata_projection_json) == {
+        "type": "decision"
+    }
+    assert projection.scope_markers_verified == 1
+
+    mem0.list_response = {
+        "results": [mem0.records["mem-1"]],
+        "total": 1,
+    }
+    mirror_result = await MemoryService(
+        session=db_session,
+        mem0=mem0,
+    ).mirror_direct_writes(
+        project_id="repo-a",
+        default_app_id="app-a",
+        scan_limit=100,
+    )
+
+    assert mirror_result["updated"] == 0
+    assert mirror_result["unchanged"] == 1
 
 
 @pytest.mark.asyncio

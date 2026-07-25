@@ -24,6 +24,7 @@ from mem0_sidecar.http_adapter.dependencies import (
     require_client_principal,
 )
 from mem0_sidecar.http_adapter.project_scope import (
+    enforce_compatible_scope_boundary,
     ensure_project,
     normalized_payload_for_project,
     resolve_app_id,
@@ -119,6 +120,22 @@ def _resolve_memory_app_scope(
     )
 
 
+def _enforce_platform_scope_boundary(
+    request: Request,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    enforce_compatible_scope_boundary(request, payload)
+    principal = request.state.client_principal
+    if principal.role in {"admin", "system"}:
+        return
+    body_selects_project_wide = payload is not None and "project_wide" in payload
+    if body_selects_project_wide or "project_wide" in request.query_params:
+        raise HTTPException(
+            status_code=403,
+            detail="Project-wide memory access requires an admin principal",
+        )
+
+
 def _decode_memory_id(memory_id: str) -> str:
     try:
         decoded = unquote(memory_id, encoding="utf-8", errors="strict")
@@ -146,6 +163,7 @@ async def add_memory(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     try:
+        _enforce_platform_scope_boundary(request, payload)
         idempotency_key = validate_idempotency_key(
             request.headers.get("Idempotency-Key")
         )
@@ -197,6 +215,7 @@ async def search_memories(
     session: SessionDependency,
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
+    _enforce_platform_scope_boundary(request, payload)
     project_id = resolve_project_id(request, payload)
     service = MemoryService(session=session, mem0=mem0)
     return await service.search_memories(
@@ -213,6 +232,7 @@ async def query_memories(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     try:
+        _enforce_platform_scope_boundary(request, payload)
         project_id = resolve_project_id(request, payload)
         app_id, project_wide = _resolve_memory_app_scope(
             request,
@@ -271,6 +291,7 @@ async def get_memory(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     memory_id = _decode_memory_id(memory_id)
+    _enforce_platform_scope_boundary(request)
     project_id = resolve_project_id(request)
     try:
         request_app_id, project_wide = _resolve_memory_app_scope(
@@ -309,8 +330,9 @@ async def update_memory(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     memory_id = _decode_memory_id(memory_id)
-    project_id = resolve_project_id(request, payload)
     try:
+        _enforce_platform_scope_boundary(request, payload)
+        project_id = resolve_project_id(request, payload)
         request_app_id, project_wide = _resolve_memory_app_scope(
             request,
             session,
@@ -353,6 +375,7 @@ async def get_memory_history(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     memory_id = _decode_memory_id(memory_id)
+    _enforce_platform_scope_boundary(request)
     project_id = resolve_project_id(request)
     try:
         request_app_id, project_wide = _resolve_memory_app_scope(
@@ -393,6 +416,12 @@ async def reconcile_memories(
     mem0: Mem0Dependency,
 ) -> dict[str, int]:
     try:
+        principal = request.state.client_principal
+        if principal.role not in {"admin", "system"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Memory reconciliation requires an admin principal",
+            )
         project_id = validate_scope_id(
             resolve_project_id(request, payload),
             field_name="project_id",
@@ -452,6 +481,7 @@ async def delete_memory(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     memory_id = _decode_memory_id(memory_id)
+    _enforce_platform_scope_boundary(request)
     project_id = resolve_project_id(request)
     try:
         request_app_id, project_wide = _resolve_memory_app_scope(
