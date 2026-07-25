@@ -1383,6 +1383,47 @@ def test_platform_member_cannot_override_project_or_app_scope(tmp_path) -> None:
     assert mem0.add_payloads == []
 
 
+def test_platform_member_uses_server_owned_default_app_for_add_and_search(
+    tmp_path,
+) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+            client_auth_enabled=True,
+        ),
+        mem0_client=mem0,
+        client_auth_verifier=StaticMemberVerifier(),
+    )
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        assert project is not None
+        project.default_app_id = "app-x"
+        session.commit()
+    client = TestClient(app)
+
+    added = client.post(
+        "/v3/memories/add/",
+        headers={"X-API-Key": "member-key"},
+        json={"text": "hello", "user_id": "root"},
+    )
+    searched = client.post(
+        "/v3/memories/search/",
+        headers={"X-API-Key": "member-key"},
+        json={"query": "hello", "user_id": "root"},
+    )
+
+    assert added.status_code == 200
+    assert searched.status_code == 200
+    assert mem0.add_payloads[0]["metadata"][SIDECAR_APP_ID_METADATA_KEY] == "app-x"
+    assert (
+        mem0.search_payloads[0]["filters"][SIDECAR_APP_ID_METADATA_KEY]
+        == "app-x"
+    )
+
+
 def test_platform_member_cannot_use_project_wide_memory_access(tmp_path) -> None:
     mem0 = ExplorerRouteMem0Client()
     app = create_app(
@@ -1407,6 +1448,28 @@ def test_platform_member_cannot_use_project_wide_memory_access(tmp_path) -> None
         "detail": "Project-wide memory access requires an admin principal"
     }
     assert mem0.get_memory_ids == []
+
+
+def test_platform_member_can_send_project_wide_false(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+            client_auth_enabled=True,
+        ),
+        mem0_client=ExplorerRouteMem0Client(),
+        client_auth_verifier=StaticMemberVerifier(),
+    )
+
+    response = TestClient(app).post(
+        "/v1/memories/query",
+        headers={"X-API-Key": "member-key"},
+        json={"project_wide": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"] == []
 
 
 def test_platform_member_cannot_reconcile_memories(tmp_path) -> None:
