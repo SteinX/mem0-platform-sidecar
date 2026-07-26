@@ -222,6 +222,14 @@ def test_query_events_rejects_non_object_json(tmp_path, payload) -> None:
         ("channel", {"transport": "mcp"}),
         (
             "channel",
+            {"transport": [], "credential_kind": "core_api_key"},
+        ),
+        (
+            "channel",
+            {"transport": "mcp", "credential_kind": {}},
+        ),
+        (
+            "channel",
             {
                 "transport": "mcp",
                 "credential_kind": "legacy_static",

@@ -167,16 +167,20 @@ def _parse_event_query(payload: dict[str, Any]) -> EventQuery:
             raise ValueError(
                 "channel requires transport and credential_kind"
             )
+        raw_transport = raw_channel.get("transport")
+        if not isinstance(raw_transport, str):
+            raise ValueError("channel transport must be a string")
+        raw_credential_kind = raw_channel.get("credential_kind")
+        if not isinstance(raw_credential_kind, str):
+            raise ValueError("channel credential_kind must be a string")
         raw_credential_id = raw_channel.get("credential_id")
         if raw_credential_id is not None and not isinstance(
             raw_credential_id, str
         ):
             raise ValueError("channel credential_id must be a string")
         channel = EventChannelFilter(
-            transport=parse_transport(raw_channel.get("transport")),
-            credential_kind=parse_credential_kind(
-                raw_channel.get("credential_kind")
-            ),
+            transport=parse_transport(raw_transport),
+            credential_kind=parse_credential_kind(raw_credential_kind),
             credential_id=raw_credential_id,
         )
 
