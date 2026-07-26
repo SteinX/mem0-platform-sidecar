@@ -217,7 +217,7 @@ export default function ApiKeysPage() {
   ];
 
   return (
-    <div className="w-[min(100%,calc(100vw-13rem))] min-w-0 max-w-full space-y-5 overflow-x-hidden">
+    <div className="w-full min-w-0 max-w-full space-y-5">
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 space-y-1">
           <h1 className="font-fustat text-xl font-semibold">
