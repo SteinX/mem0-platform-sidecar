@@ -28,6 +28,10 @@ from mem0_sidecar.core.explorer_filters import (
     MEMORY_FILTER_FIELDS,
     parse_explorer_query,
 )
+from mem0_sidecar.request_attribution import (
+    RequestAttribution,
+    bind_request_attribution,
+)
 from mem0_sidecar.store.models import (
     Base,
     Category,
@@ -42,6 +46,7 @@ from mem0_sidecar.store.models import (
 from mem0_sidecar.store.repositories import (
     CategoryRepository,
     EntityRepository,
+    EventChannelFilter,
     EventRepository,
     ExportJobRepository,
     JobRepository,
@@ -49,6 +54,129 @@ from mem0_sidecar.store.repositories import (
     MutationIntentRepository,
     ProjectRepository,
 )
+
+
+def test_event_repository_snapshots_request_attribution_columns(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    attribution = RequestAttribution(
+        transport="mcp",
+        credential_kind="core_api_key",
+        credential_id="e0544e3c-d217-40d9-bc9a-c1f64077542a",
+        credential_label="codex-devbox",
+        credential_prefix="m0sk_client_",
+    )
+
+    with bind_request_attribution(attribution):
+        event = EventRepository(db_session).create_event(
+            project_id="repo-a",
+            app_id="app-a",
+            operation="memory.search",
+            request={"app_id": "app-a", "query": "tea"},
+        )
+
+    assert event.request_transport == "mcp"
+    assert event.credential_kind == "core_api_key"
+    assert event.credential_id == "e0544e3c-d217-40d9-bc9a-c1f64077542a"
+    assert event.credential_label == "codex-devbox"
+    assert event.credential_prefix == "m0sk_client_"
+    assert "codex-devbox" not in event.request_json
+
+
+def test_event_query_filters_exact_client_id_and_returns_safe_channel_facets(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    repository = EventRepository(db_session)
+    core = RequestAttribution(
+        transport="mcp",
+        credential_kind="core_api_key",
+        credential_id="e0544e3c-d217-40d9-bc9a-c1f64077542a",
+        credential_label="codex-devbox",
+        credential_prefix="m0sk_client_",
+    )
+    legacy = RequestAttribution(
+        transport="mcp",
+        credential_kind="legacy_static",
+        credential_label="Legacy shared MCP key",
+    )
+    with bind_request_attribution(core):
+        core_event = repository.create_event(
+            project_id="repo-a",
+            app_id="app-a",
+            operation="memory.search",
+            request={"app_id": "app-a"},
+        )
+    with bind_request_attribution(legacy):
+        repository.create_event(
+            project_id="repo-a",
+            app_id="app-a",
+            operation="memory.search",
+            request={"app_id": "app-a"},
+        )
+    db_session.add(
+        Event(
+            id="historical-event",
+            project_id="repo-a",
+            app_id="app-a",
+            operation="memory.search",
+            status=EventStatus.SUCCEEDED,
+            request_json='{"app_id":"app-a"}',
+        )
+    )
+    db_session.flush()
+
+    page = repository.query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            channel=EventChannelFilter(
+                transport="mcp",
+                credential_kind="core_api_key",
+                credential_id="e0544e3c-d217-40d9-bc9a-c1f64077542a",
+            ),
+            page=1,
+            page_size=20,
+        ),
+    )
+
+    assert [event.id for event in page.items] == [core_event.id]
+    assert page.total == 1
+    assert page.channels == [
+        {
+            "transport": "mcp",
+            "credential_kind": "core_api_key",
+            "credential_id": "e0544e3c-d217-40d9-bc9a-c1f64077542a",
+            "label": "codex-devbox",
+            "key_prefix": "m0sk_client_",
+            "count": 1,
+        },
+        {
+            "transport": "mcp",
+            "credential_kind": "legacy_static",
+            "credential_id": None,
+            "label": "Legacy shared MCP key",
+            "key_prefix": None,
+            "count": 1,
+        },
+        {
+            "transport": "unknown",
+            "credential_kind": "unknown",
+            "credential_id": None,
+            "label": "Unknown (pre-attribution)",
+            "key_prefix": None,
+            "count": 1,
+        },
+    ]
 
 
 def test_category_model_enforces_unique_name_per_project(db_session):
@@ -2334,13 +2462,21 @@ def test_event_model_matches_request_trace_migration() -> None:
             "agent_id",
             "created_at",
         ),
-        "ix_events_project_app_run_created": (
-            "project_id",
-            "app_id",
-            "run_id",
-            "created_at",
-        ),
-        "ix_events_project_operation_created": (
+            "ix_events_project_app_run_created": (
+                "project_id",
+                "app_id",
+                "run_id",
+                "created_at",
+            ),
+            "ix_events_project_app_channel_created": (
+                "project_id",
+                "app_id",
+                "request_transport",
+                "credential_kind",
+                "credential_id",
+                "created_at",
+            ),
+            "ix_events_project_operation_created": (
             "project_id",
             "operation",
             "created_at",

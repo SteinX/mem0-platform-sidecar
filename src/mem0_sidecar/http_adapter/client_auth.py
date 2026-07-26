@@ -1,15 +1,19 @@
 import secrets
 from dataclasses import dataclass
-from typing import Literal
 
 import httpx
 
+from mem0_sidecar.request_attribution import (
+    AttributionRejected,
+    RequestAttribution,
+)
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class ClientPrincipal:
     subject_id: str | None
     role: str
-    credential_kind: Literal["bearer", "api_key", "disabled"]
+    attribution: RequestAttribution
 
 
 class ClientAuthenticationRejected(RuntimeError):
@@ -32,17 +36,6 @@ class ClientAuthenticationUnavailable(ClientAuthenticationRejected):
             status_code=503,
             detail="Authentication service is unavailable.",
         )
-
-
-def _credential_kind(
-    authorization: str | None,
-    x_api_key: str | None,
-) -> Literal["bearer", "api_key", "disabled"]:
-    if authorization is not None:
-        return "bearer"
-    if x_api_key is not None:
-        return "api_key"
-    return "disabled"
 
 
 def _redacted_detail(
@@ -105,12 +98,16 @@ class ClientAuthVerifier:
         *,
         authorization: str | None,
         x_api_key: str | None,
+        caller_context: str | None = None,
     ) -> ClientPrincipal:
         if not self.enabled:
             return ClientPrincipal(
                 subject_id=None,
                 role="system",
-                credential_kind="disabled",
+                attribution=RequestAttribution(
+                    transport="rest",
+                    credential_kind="disabled",
+                ),
             )
 
         if (
@@ -120,10 +117,26 @@ class ClientAuthVerifier:
             and self.admin_api_key is not None
             and secrets.compare_digest(x_api_key, self.admin_api_key)
         ):
+            if caller_context is None:
+                attribution = RequestAttribution(
+                    transport="rest",
+                    credential_kind="operator_static",
+                    credential_label="Legacy admin API key",
+                )
+            else:
+                try:
+                    attribution = RequestAttribution.from_internal_header(
+                        caller_context
+                    )
+                except AttributionRejected as exc:
+                    raise ClientAuthenticationRejected(
+                        status_code=400,
+                        detail="Invalid caller attribution.",
+                    ) from exc
             return ClientPrincipal(
                 subject_id=None,
                 role="admin",
-                credential_kind="api_key",
+                attribution=attribution,
             )
 
         headers: dict[str, str] = {}
@@ -180,11 +193,18 @@ class ClientAuthVerifier:
         role = response_body.get("role")
         if not isinstance(subject_id, str) or not subject_id:
             raise ClientAuthenticationUnavailable()
-        if not isinstance(role, str) or not role:
+        if not isinstance(role, str) or not 1 <= len(role) <= 64:
             raise ClientAuthenticationUnavailable()
+        descriptor = response_body.get("credential")
+        if not isinstance(descriptor, dict):
+            raise ClientAuthenticationUnavailable()
+        try:
+            attribution = RequestAttribution.from_core_descriptor(descriptor)
+        except AttributionRejected as exc:
+            raise ClientAuthenticationUnavailable() from exc
 
         return ClientPrincipal(
             subject_id=subject_id,
             role=role,
-            credential_kind=_credential_kind(authorization, x_api_key),
+            attribution=attribution,
         )

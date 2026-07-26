@@ -3,6 +3,7 @@ import ipaddress
 import json
 import re
 import secrets
+import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -27,6 +28,14 @@ from mem0_sidecar.core.trace_payloads import (
     sanitize_trace_payload,
     trace_key_is_secret,
     trace_result_summary,
+)
+from mem0_sidecar.request_attribution import (
+    RequestAttribution,
+    current_request_attribution,
+)
+from mem0_sidecar.request_attribution_codec import (
+    CredentialKind,
+    RequestTransport,
 )
 from mem0_sidecar.store.models import (
     Category,
@@ -60,6 +69,7 @@ _EVENT_QUERY_MAX_ATTEMPTS = 2
 _EVENT_QUERY_UNSTABLE_ERROR = (
     "event query snapshot changed; retry with narrower filters"
 )
+_EVENT_CHANNEL_FACET_LIMIT = 100
 _REDACTED_URL = "[REDACTED_URL]"
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = "),.;"
@@ -418,6 +428,38 @@ class MemoryClaimResult:
 
 
 @dataclass(frozen=True)
+class EventChannelFilter:
+    transport: RequestTransport
+    credential_kind: CredentialKind
+    credential_id: str | None = None
+
+    def __post_init__(self) -> None:
+        valid_transport = {
+            "core_api_key": {"mcp", "rest"},
+            "legacy_static": {"mcp"},
+            "operator_static": {"rest"},
+            "session": {"rest"},
+            "disabled": {"mcp", "rest"},
+            "unknown": {"system", "unknown"},
+        }[self.credential_kind]
+        if self.transport not in valid_transport:
+            raise ValueError(
+                "channel transport and credential_kind are incompatible"
+            )
+        if self.credential_kind == "core_api_key":
+            if self.credential_id is None:
+                raise ValueError("core_api_key channel requires credential_id")
+            try:
+                uuid.UUID(self.credential_id)
+            except ValueError as exc:
+                raise ValueError("channel credential_id must be a UUID") from exc
+        elif self.credential_id is not None:
+            raise ValueError(
+                "channel credential_id is only valid for core_api_key"
+            )
+
+
+@dataclass(frozen=True)
 class EventQuery:
     operation: str | None = None
     statuses: tuple[EventStatus, ...] = ()
@@ -425,6 +467,7 @@ class EventQuery:
     from_at: datetime | None = None
     to_at: datetime | None = None
     entity_filters: Mapping[str, str] = field(default_factory=dict)
+    channel: EventChannelFilter | None = None
     page: int = 1
     page_size: int = 50
 
@@ -434,6 +477,7 @@ class EventPage:
     items: list[Event]
     total: int
     buckets: list[dict[str, object]]
+    channels: list[dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -443,6 +487,11 @@ class _EventCandidate:
     user_id: str | None
     agent_id: str | None
     run_id: str | None
+    request_transport: str | None
+    credential_kind: str | None
+    credential_id: str | None
+    credential_label: str | None
+    credential_prefix: str | None
     request_json: str
     created_at: datetime
     operation: str
@@ -701,6 +750,11 @@ def _event_matches_candidate(event: object, candidate: _EventCandidate) -> bool:
         and event.user_id == candidate.user_id
         and event.agent_id == candidate.agent_id
         and event.run_id == candidate.run_id
+        and event.request_transport == candidate.request_transport
+        and event.credential_kind == candidate.credential_kind
+        and event.credential_id == candidate.credential_id
+        and event.credential_label == candidate.credential_label
+        and event.credential_prefix == candidate.credential_prefix
         and event.request_json == candidate.request_json
         and _as_utc(event.created_at) == _as_utc(candidate.created_at)
         and event.operation == candidate.operation
@@ -786,6 +840,53 @@ def _event_timeline_buckets(
             "count": counts[timestamp],
         }
         for timestamp in sorted(counts)
+    ]
+
+
+def _candidate_attribution(
+    candidate: _EventCandidate,
+) -> RequestAttribution:
+    return RequestAttribution.from_stored(
+        transport=candidate.request_transport,
+        credential_kind=candidate.credential_kind,
+        credential_id=candidate.credential_id,
+        credential_label=candidate.credential_label,
+        credential_prefix=candidate.credential_prefix,
+    )
+
+
+def _matches_event_channel(
+    candidate: _EventCandidate,
+    expected: EventChannelFilter | None,
+) -> bool:
+    if expected is None:
+        return True
+    actual = _candidate_attribution(candidate)
+    return (
+        actual.transport == expected.transport
+        and actual.credential_kind == expected.credential_kind
+        and actual.credential_id == expected.credential_id
+    )
+
+
+def _event_channel_facets(
+    candidates: list[_EventCandidate],
+) -> list[dict[str, object]]:
+    grouped: dict[RequestAttribution, int] = {}
+    for candidate in candidates:
+        attribution = _candidate_attribution(candidate)
+        grouped[attribution] = grouped.get(attribution, 0) + 1
+    ordered = sorted(
+        grouped.items(),
+        key=lambda item: (
+            -item[1],
+            item[0].to_channel_dict()["label"].lower(),
+            item[0].credential_id or "",
+        ),
+    )[:_EVENT_CHANNEL_FACET_LIMIT]
+    return [
+        {**attribution.to_channel_dict(), "count": count}
+        for attribution, count in ordered
     ]
 
 
@@ -1162,6 +1263,7 @@ class EventRepository:
         canonical_run_id = _raw_canonical_event_entity_id(
             raw_request, run_id, field_name="run_id"
         )
+        attribution = current_request_attribution()
         event = Event(
             project_id=project_id,
             app_id=canonical_app_id,
@@ -1179,6 +1281,11 @@ class EventRepository:
                 correlation_id,
                 internal_hosts=internal_hosts,
             ),
+            request_transport=attribution.transport,
+            credential_kind=attribution.credential_kind,
+            credential_id=attribution.credential_id,
+            credential_label=attribution.credential_label,
+            credential_prefix=attribution.credential_prefix,
             started_at=started_at,
         )
         self.session.add(event)
@@ -1358,6 +1465,11 @@ class EventRepository:
                     Event.user_id,
                     Event.agent_id,
                     Event.run_id,
+                    Event.request_transport,
+                    Event.credential_kind,
+                    Event.credential_id,
+                    Event.credential_label,
+                    Event.credential_prefix,
                     Event.request_json,
                     Event.created_at,
                     Event.operation,
@@ -1379,7 +1491,7 @@ class EventRepository:
         if len(rows) > EVENT_SCAN_LIMIT:
             raise ValueError("entity filter scan exceeds 5000 records")
         candidates = [_EventCandidate(*row) for row in rows]
-        matches = [
+        scope_matches = [
             candidate
             for candidate in candidates
             if _matches_event_scope(
@@ -1391,6 +1503,12 @@ class EventRepository:
                 candidate.agent_id,
                 candidate.run_id,
             )
+        ]
+        channels = _event_channel_facets(scope_matches)
+        matches = [
+            candidate
+            for candidate in scope_matches
+            if _matches_event_channel(candidate, query.channel)
         ]
         offset = (query.page - 1) * query.page_size
         page_candidates = matches[offset : offset + query.page_size]
@@ -1430,6 +1548,7 @@ class EventRepository:
                 [candidate.created_at for candidate in matches],
                 query,
             ),
+            channels=channels,
         )
 
 

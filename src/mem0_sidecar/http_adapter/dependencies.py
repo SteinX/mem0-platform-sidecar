@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, Request
@@ -10,6 +10,10 @@ from mem0_sidecar.http_adapter.client_auth import (
     ClientPrincipal,
 )
 from mem0_sidecar.mem0_client.client import Mem0RestClient
+from mem0_sidecar.request_attribution import (
+    CALLER_CONTEXT_HEADER,
+    bind_request_attribution,
+)
 
 
 def get_session(request: Request) -> Iterator[Session]:
@@ -32,11 +36,12 @@ ClientAuthDependency = Annotated[Any, Depends(get_client_auth_verifier)]
 async def require_client_principal(
     request: Request,
     verifier: ClientAuthDependency,
-) -> ClientPrincipal:
+) -> AsyncIterator[ClientPrincipal]:
     try:
         principal = await verifier.verify(
             authorization=request.headers.get("Authorization"),
             x_api_key=request.headers.get("X-API-Key"),
+            caller_context=request.headers.get(CALLER_CONTEXT_HEADER),
         )
     except ClientAuthenticationRejected as exc:
         raise HTTPException(
@@ -45,4 +50,5 @@ async def require_client_principal(
             headers=exc.headers,
         ) from exc
     request.state.client_principal = principal
-    return principal
+    with bind_request_attribution(principal.attribution):
+        yield principal
