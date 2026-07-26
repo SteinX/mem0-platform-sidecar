@@ -14,7 +14,9 @@ from scripts.run_live_e2e_compose import (
     compose_down_command,
     compose_run_command,
     compose_up_command,
+    resolve_mcp_context,
     resolve_upstream_context,
+    verify_source_revisions,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,9 +35,7 @@ REAL_BROWSER_SMOKE = (
     / "scripts"
     / "run-browser-destructive-e2e.cjs"
 )
-REAL_BROWSER_CONTRACT = (
-    ROOT / "tests" / "e2e" / "test-browser-destructive-contract.cjs"
-)
+REAL_BROWSER_CONTRACT = ROOT / "tests" / "e2e" / "test-browser-destructive-contract.cjs"
 
 
 def _compose_service(content: str, service_name: str) -> str:
@@ -64,9 +64,9 @@ def test_live_runner_retains_postgres_mocked_ui_and_real_browser_gates() -> None
         "node",
         "/app/run-browser-smoke.cjs",
     ]
-    assert compose_runner.browser_destructive_smoke_command(
-        "sidecar-e2e-test"
-    )[-2:] == [
+    assert compose_runner.browser_destructive_smoke_command("sidecar-e2e-test")[
+        -2:
+    ] == [
         "node",
         "/app/run-browser-destructive-e2e.cjs",
     ]
@@ -127,8 +127,7 @@ def test_browser_smoke_requires_response_detail_and_zero_browser_errors() -> Non
     browser_smoke = MOCKED_BROWSER_SMOKE.read_text()
 
     assert (
-        'await waitText("browser-smoke-detail-query-from-response");'
-        in browser_smoke
+        'await waitText("browser-smoke-detail-query-from-response");' in browser_smoke
     )
     assert "request drawer loaded response-derived detail content" in browser_smoke
     for zero_error_gate in (
@@ -187,6 +186,8 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
         "MEM0_E2E_SIDECAR_URL",
         "MEM0_E2E_SIDECAR_API_KEY",
         "MEM0_E2E_MEM0_URL",
+        "proveSidecarRejectsMissingCredentials",
+        "Sidecar default authentication did not fail closed",
         "seedFixtureThroughSidecar",
         "sidecarHeaders",
         "openMemoryDetails",
@@ -205,6 +206,9 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
         "api-key-new",
         "Copy client key",
         "Client key copied",
+        "Browser.grantPermissions",
+        'permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"]',
+        'evaluate("navigator.clipboard.readText()")',
         "client-keys-created-copied-desktop.png",
         'padEnd(\n      255,\n      "x",',
         "clickBySelector",
@@ -233,6 +237,7 @@ def test_real_browser_auth_check_uses_an_auth_enabled_dashboard() -> None:
     browser_runner = _compose_service(content, "browser-smoke")
 
     assert "DASHBOARD_URL: http://dashboard:3000" in mem0
+    assert 'AUTH_DISABLED: "false"' in mem0
     assert 'AUTH_DISABLED: "false"' in auth_dashboard
     assert "dashboard-auth-check:" in browser
     assert "condition: service_healthy" in browser
@@ -253,15 +258,9 @@ def test_e2e_sidecar_uses_a_private_operator_key() -> None:
     auth_dashboard = _compose_service(content, "dashboard-auth-check")
 
     assert "ADMIN_API_KEY: e2e-sidecar-operator-key-00000001" in mem0
-    assert (
-        "MEM0_SIDECAR_MEM0_API_KEY: e2e-sidecar-operator-key-00000001"
-        in sidecar
-    )
+    assert "MEM0_SIDECAR_MEM0_API_KEY: e2e-sidecar-operator-key-00000001" in sidecar
     for service in (dashboard, auth_dashboard):
-        assert (
-            "SIDECAR_INTERNAL_API_KEY: e2e-sidecar-operator-key-00000001"
-            in service
-        )
+        assert "SIDECAR_INTERNAL_API_KEY: e2e-sidecar-operator-key-00000001" in service
 
 
 def test_real_browser_capture_waits_for_stable_animations_and_compact_fit() -> None:
@@ -282,11 +281,9 @@ def test_real_browser_capture_waits_for_stable_animations_and_compact_fit() -> N
     assert "window.visualViewport?.width" in source
     narrow_metrics = source.index("await setViewport(cdp, {\n      width: 960")
     assert "mobile: false" in source[narrow_metrics : narrow_metrics + 160]
-    first_desktop_metrics = source.index(
-        "await setViewport(cdp, {\n      width: 1440"
-    )
+    first_desktop_metrics = source.index("await setViewport(cdp, {\n      width: 1440")
     assert first_desktop_metrics < source.index(
-        "stage = \"prove unauthenticated Client Keys redirect\""
+        'stage = "prove unauthenticated Client Keys redirect"'
     )
     assert source.index(
         'await waitForVisualStability(cdp, "compact Client Keys list")'
@@ -307,8 +304,8 @@ def test_real_browser_delete_finds_action_inside_radix_sheet_dialog() -> None:
     confirm_source = source[confirm_start:confirm_end]
 
     assert "!item.closest('[role=\"dialog\"]')" not in confirm_source
-    assert "item.innerText.includes(\"Memory details\")" in confirm_source
-    assert "drawer.querySelectorAll(\"button\")" in confirm_source
+    assert 'item.innerText.includes("Memory details")' in confirm_source
+    assert 'drawer.querySelectorAll("button")' in confirm_source
 
 
 def test_real_browser_direct_mem0_absence_contract_is_executable() -> None:
@@ -392,10 +389,7 @@ def test_export_browser_evidence_rejects_non_png_payload(
         lambda command, **kwargs: subprocess.CompletedProcess(
             command,
             0,
-            stdout=(
-                f"{compose_runner.BROWSER_EVIDENCE_PREFIX}"
-                f"{json.dumps(payload)}"
-            ),
+            stdout=(f"{compose_runner.BROWSER_EVIDENCE_PREFIX}{json.dumps(payload)}"),
             stderr="",
         ),
     )
@@ -420,9 +414,7 @@ def test_prepare_dashboard_context_applies_overlay_and_retains_auth_shell(
     (dashboard / "pnpm-workspace.yaml").write_text("packages:\n  - '.'\n")
     root_app = dashboard / "src" / "app" / "(root)"
     root_app.mkdir(parents=True)
-    (root_app / "clientLayout.tsx").write_text(
-        "AuthLoadingState\nTooltipProvider\n"
-    )
+    (root_app / "clientLayout.tsx").write_text("AuthLoadingState\nTooltipProvider\n")
     (root_app / "dashboard-client-layout.tsx").write_text(
         "AuthProvider\n<ClientLayout>{children}</ClientLayout>\n"
     )
@@ -483,6 +475,57 @@ def test_resolve_upstream_context_prefers_explicit_env_override(monkeypatch) -> 
     assert str(resolve_upstream_context()) == "/tmp/explicit-upstream"
 
 
+def test_resolve_mcp_context_prefers_explicit_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("MEM0_E2E_MCP_CONTEXT", "/tmp/explicit-mcp")
+
+    assert str(resolve_mcp_context()) == "/tmp/explicit-mcp"
+
+
+def test_exact_source_revision_gate_binds_all_three_clean_sources(
+    monkeypatch,
+) -> None:
+    contexts = {
+        "sidecar": Path("/tmp/sidecar"),
+        "core": Path("/tmp/core"),
+        "mcp": Path("/tmp/mcp"),
+    }
+    revisions = {
+        contexts["sidecar"]: "a" * 40,
+        contexts["core"]: "b" * 40,
+        contexts["mcp"]: "c" * 40,
+    }
+    monkeypatch.setattr(
+        compose_runner,
+        "_git_revision",
+        lambda context: revisions[context],
+    )
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: compose_runner.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="",
+            stderr="",
+        ),
+    )
+    monkeypatch.setenv("MEM0_E2E_EXPECTED_SIDECAR_SHA", "a" * 40)
+    monkeypatch.setenv("MEM0_E2E_EXPECTED_CORE_SHA", "b" * 40)
+    monkeypatch.setenv("MEM0_E2E_EXPECTED_MCP_SHA", "c" * 40)
+
+    observed = verify_source_revisions(
+        sidecar_context=contexts["sidecar"],
+        core_context=contexts["core"],
+        mcp_context=contexts["mcp"],
+    )
+
+    assert observed == {
+        "sidecar": "a" * 40,
+        "core": "b" * 40,
+        "mcp": "c" * 40,
+    }
+
+
 def test_compose_command_uses_e2e_file_and_isolated_project() -> None:
     command = compose_command("sidecar-e2e-test")
 
@@ -495,7 +538,7 @@ def test_compose_up_command_starts_local_stack_detached() -> None:
     command = compose_up_command("sidecar-e2e-test")
 
     assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
-    assert command[-9:] == [
+    assert command[-10:] == [
         "up",
         "-d",
         "--build",
@@ -503,6 +546,7 @@ def test_compose_up_command_starts_local_stack_detached() -> None:
         "postgres",
         "mem0",
         "sidecar",
+        "mcp",
         "dashboard",
         "browser",
     ]
@@ -557,9 +601,7 @@ def test_compose_cleanup_check_lists_remaining_project_resources() -> None:
 
 
 def test_compose_cleanup_checks_project_containers_networks_volumes_and_images():
-    commands = compose_runner.compose_cleanup_resource_commands(
-        "sidecar-e2e-test"
-    )
+    commands = compose_runner.compose_cleanup_resource_commands("sidecar-e2e-test")
 
     assert commands == {
         "containers": [
@@ -642,6 +684,29 @@ def test_e2e_compose_runs_real_sidecar_with_ephemeral_database_and_health() -> N
     assert re.search(r"(?m)^  sidecar-data:\s*$", content)
 
 
+def test_e2e_compose_runs_hybrid_mcp_for_multi_token_revocation_gate() -> None:
+    content = COMPOSE_FILE.read_text()
+    mcp = _compose_service(content, "mcp")
+    runner = _compose_service(content, "e2e-runner")
+
+    for contract in (
+        "context: ${MEM0_E2E_MCP_CONTEXT:?set MEM0_E2E_MCP_CONTEXT}",
+        "MEM0_OSS_MCP_AUTH_MODE: hybrid",
+        "MEM0_OSS_MCP_CLIENT_AUTH_URL: http://mem0:8000/auth/me",
+        "MEM0_OSS_MCP_TOKEN: e2e-legacy-shared-mcp-key-00000001",
+        'MEM0_SIDECAR_REQUIRED: "true"',
+        "MEM0_SIDECAR_API_KEY: e2e-sidecar-operator-key-00000001",
+        "http://127.0.0.1:8080/health",
+    ):
+        assert contract in mcp
+    for contract in (
+        "MEM0_E2E_MCP_URL: http://mcp:8080/mcp",
+        "MEM0_E2E_SIDECAR_URL: http://sidecar:8765",
+        "MEM0_E2E_MCP_LEGACY_TOKEN: e2e-legacy-shared-mcp-key-00000001",
+    ):
+        assert contract in runner
+
+
 def test_dashboard_uses_healthy_sidecar_with_exact_project_and_app() -> None:
     content = COMPOSE_FILE.read_text()
     dashboard = _compose_service(content, "dashboard")
@@ -681,11 +746,13 @@ def test_sidecar_container_volume_image_and_logs_are_in_cleanup_contract() -> No
     assert '"sidecar"' in runner_source
     assert "-v" in compose_down_command("sidecar-e2e-test")
     assert "local" in compose_down_command("sidecar-e2e-test")
-    assert "label=com.docker.compose.project=sidecar-e2e-test" in (
-        resource_commands["containers"]
+    assert (
+        "label=com.docker.compose.project=sidecar-e2e-test"
+        in (resource_commands["containers"])
     )
-    assert "label=com.docker.compose.project=sidecar-e2e-test" in (
-        resource_commands["volumes"]
+    assert (
+        "label=com.docker.compose.project=sidecar-e2e-test"
+        in (resource_commands["volumes"])
     )
     assert "reference=sidecar-e2e-test-*" in resource_commands["images"]
 
@@ -759,9 +826,7 @@ def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
     assert hasattr(compose_runner, "mocked_browser_smoke_command")
     assert hasattr(compose_runner, "browser_destructive_smoke_command")
     mocked_command = compose_runner.mocked_browser_smoke_command("unique-compose")
-    real_command = compose_runner.browser_destructive_smoke_command(
-        "unique-compose"
-    )
+    real_command = compose_runner.browser_destructive_smoke_command("unique-compose")
     assert mocked_command in commands
     assert real_command in commands
     assert commands.index(real_command) < commands.index(evidence_export)
@@ -899,9 +964,7 @@ def test_compose_main_cleanup_does_not_mask_primary_failure(
         compose_runner.main()
 
     assert exc_info.value is primary
-    assert f"{cleanup_failure.rstrip('s')} cleanup failed" in (
-        capsys.readouterr().err
-    )
+    assert f"{cleanup_failure.rstrip('s')} cleanup failed" in (capsys.readouterr().err)
 
 
 def test_e2e_docs_cover_explorer_reconcile_and_cleanup_contracts() -> None:

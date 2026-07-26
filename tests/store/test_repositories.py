@@ -1,4 +1,5 @@
 import json
+import uuid
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
@@ -3908,6 +3909,71 @@ def test_event_query_sql_narrows_exact_channel_before_scan_limit(
         "legacy_static": 5001,
         "core_api_key": 1,
     }
+
+
+def test_event_channel_facet_grouping_is_bounded_in_sql(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 7, 13, tzinfo=UTC)
+    db_session.add_all(
+        [
+            Event(
+                id=f"channel-{index:03d}",
+                project_id="repo-a",
+                app_id="app-a",
+                operation="memory.search",
+                status=EventStatus.SUCCEEDED,
+                request_transport="mcp",
+                credential_kind="core_api_key",
+                credential_id=str(uuid.UUID(int=index + 1)),
+                credential_label=f"client-{index:03d}",
+                credential_prefix="m0sk_client_",
+                request_json='{"app_id":"app-a"}',
+                created_at=created_at,
+            )
+            for index in range(130)
+        ]
+    )
+    db_session.flush()
+    grouped_queries: list[tuple[str, object]] = []
+
+    def capture_grouped_query(
+        _connection,
+        _cursor,
+        statement,
+        parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        if "GROUP BY events.request_transport" in statement:
+            grouped_queries.append((statement, parameters))
+
+    sqlalchemy_event.listen(
+        db_session.bind,
+        "before_cursor_execute",
+        capture_grouped_query,
+    )
+    try:
+        page = EventRepository(db_session).query_project_events(
+            "repo-a",
+            "app-a",
+            repositories.EventQuery(page=1, page_size=20),
+        )
+    finally:
+        sqlalchemy_event.remove(
+            db_session.bind,
+            "before_cursor_execute",
+            capture_grouped_query,
+        )
+
+    assert len(page.channels) == repositories._EVENT_CHANNEL_FACET_LIMIT
+    assert len(grouped_queries) == 1
+    statement, parameters = grouped_queries[0]
+    assert " LIMIT " in statement
+    assert repositories._EVENT_CHANNEL_FACET_LIMIT in parameters
 
 
 def test_event_query_bounds_legacy_scope_facet_fallback(db_session) -> None:

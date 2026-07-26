@@ -62,12 +62,76 @@ def resolve_upstream_context() -> Path:
     return (main_checkout_root.parent / "upstream").resolve()
 
 
-def build_runner_env(*, project_id: str) -> dict[str, str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key != "MEM0_E2E_API_KEY"
+def resolve_mcp_context() -> Path:
+    override = os.environ.get("MEM0_E2E_MCP_CONTEXT")
+    if override:
+        return Path(override).expanduser().resolve()
+    return (ROOT.parents[1] / "mem0-oss-mcp").resolve()
+
+
+def _git_revision(context: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=context,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def verify_source_revisions(
+    *,
+    sidecar_context: Path,
+    core_context: Path,
+    mcp_context: Path,
+) -> dict[str, str]:
+    sources = {
+        "sidecar": (
+            sidecar_context,
+            "MEM0_E2E_EXPECTED_SIDECAR_SHA",
+        ),
+        "core": (
+            core_context,
+            "MEM0_E2E_EXPECTED_CORE_SHA",
+        ),
+        "mcp": (
+            mcp_context,
+            "MEM0_E2E_EXPECTED_MCP_SHA",
+        ),
     }
+    revisions: dict[str, str] = {}
+    for name, (context, expected_variable) in sources.items():
+        revision = _git_revision(context)
+        revisions[name] = revision
+        expected = os.environ.get(expected_variable)
+        if expected is None:
+            continue
+        if revision != expected:
+            raise RuntimeError(
+                f"{name} source revision {revision} did not match "
+                f"{expected_variable}={expected}"
+            )
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=context,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if status.stdout.strip():
+            raise RuntimeError(
+                f"{name} source has uncommitted changes; exact-SHA E2E refused"
+            )
+    print(
+        "MEM0_E2E_SOURCE_REVISIONS=" + json.dumps(revisions, sort_keys=True),
+        flush=True,
+    )
+    return revisions
+
+
+def build_runner_env(*, project_id: str) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if key != "MEM0_E2E_API_KEY"}
     env["MEM0_E2E_BASE_URL"] = INTERNAL_MEM0_BASE_URL
     env["MEM0_E2E_PROJECT_ID"] = project_id
     env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(resolve_upstream_context())
@@ -85,6 +149,7 @@ def compose_up_command(project_name: str) -> list[str]:
         "postgres",
         "mem0",
         "sidecar",
+        "mcp",
         "dashboard",
         "browser",
     ]
@@ -205,17 +270,14 @@ def export_browser_evidence(
     if evidence_line is None:
         raise RuntimeError("Browser evidence export returned no evidence payload")
     try:
-        encoded_files = json.loads(
-            evidence_line.removeprefix(BROWSER_EVIDENCE_PREFIX)
-        )
+        encoded_files = json.loads(evidence_line.removeprefix(BROWSER_EVIDENCE_PREFIX))
     except json.JSONDecodeError as exc:
         raise RuntimeError("Browser evidence export returned invalid JSON") from exc
     if not isinstance(encoded_files, dict):
         raise RuntimeError("Browser evidence export returned a non-object payload")
     if set(encoded_files) != set(BROWSER_EVIDENCE_FILENAMES):
         raise RuntimeError(
-            "Browser evidence export returned the wrong files: "
-            f"{sorted(encoded_files)}"
+            f"Browser evidence export returned the wrong files: {sorted(encoded_files)}"
         )
 
     target.mkdir(parents=True, exist_ok=True)
@@ -408,6 +470,7 @@ def dump_diagnostics(base_compose: list[str], *, env: dict[str, str]) -> None:
             "--tail=240",
             "mem0",
             "sidecar",
+            "mcp",
             "postgres",
             "openai-stub",
             "e2e-runner",
@@ -434,6 +497,12 @@ def main() -> int:
     )
     timeout_seconds = int(os.environ.get("MEM0_E2E_STARTUP_TIMEOUT", "180"))
     upstream_context = resolve_upstream_context()
+    mcp_context = resolve_mcp_context()
+    verify_source_revisions(
+        sidecar_context=ROOT,
+        core_context=upstream_context,
+        mcp_context=mcp_context,
+    )
     dashboard_temp = tempfile.TemporaryDirectory(prefix="mem0-dashboard-smoke-")
     try:
         dashboard_context = prepare_dashboard_context(
@@ -445,6 +514,7 @@ def main() -> int:
         raise
     compose_env = os.environ.copy()
     compose_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(upstream_context)
+    compose_env["MEM0_E2E_MCP_CONTEXT"] = str(mcp_context)
     compose_env["MEM0_E2E_DASHBOARD_CONTEXT"] = str(dashboard_context)
     compose_env["MEM0_E2E_PROJECT_ID"] = project_id
     evidence_target = Path(
@@ -456,6 +526,7 @@ def main() -> int:
     runner_env = build_runner_env(project_id=project_id)
     runner_env["MEM0_E2E_DASHBOARD_CONTEXT"] = str(dashboard_context)
     runner_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(upstream_context)
+    runner_env["MEM0_E2E_MCP_CONTEXT"] = str(mcp_context)
     base_compose = compose_command(project_name)
 
     try:

@@ -46,8 +46,9 @@ services:
     environment:
       APP_DB_NAME: mem0_app
       ADMIN_API_KEY: e2e-sidecar-operator-key-00000001
-      AUTH_DISABLED: "true"
+      AUTH_DISABLED: "false"
       DASHBOARD_URL: http://dashboard:3000
+      HISTORY_DB_PATH: /tmp/mem0-history.db
       JWT_SECRET: e2e-jwt-secret
       MEM0_TELEMETRY: "false"
       MEM0_OSS_LIST_FETCH_LIMIT: "5000"
@@ -102,6 +103,40 @@ services:
       timeout: 3s
       retries: 60
 
+  mcp:
+    build:
+      context: ${MEM0_E2E_MCP_CONTEXT:?set MEM0_E2E_MCP_CONTEXT}
+      dockerfile: Dockerfile
+    depends_on:
+      mem0:
+        condition: service_healthy
+      sidecar:
+        condition: service_healthy
+    environment:
+      MEM0_OSS_BASE_URL: http://mem0:8000
+      MEM0_OSS_API_KEY: e2e-sidecar-operator-key-00000001
+      MEM0_OSS_MCP_AUTH_MODE: hybrid
+      MEM0_OSS_MCP_CLIENT_AUTH_URL: http://mem0:8000/auth/me
+      MEM0_OSS_MCP_HOST: 0.0.0.0
+      MEM0_OSS_MCP_PORT: "8080"
+      MEM0_OSS_MCP_TOKEN: e2e-legacy-shared-mcp-key-00000001
+      MEM0_OSS_DEFAULT_APP_ID: ${MEM0_E2E_APP_ID:-sidecar-e2e-app}
+      MEM0_SIDECAR_API_KEY: e2e-sidecar-operator-key-00000001
+      MEM0_SIDECAR_BASE_URL: http://sidecar:8765
+      MEM0_SIDECAR_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
+      MEM0_SIDECAR_REQUIRED: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
   e2e-runner:
     build:
       context: ..
@@ -111,7 +146,11 @@ services:
         condition: service_healthy
     environment:
       MEM0_E2E_BASE_URL: http://mem0:8000
+      MEM0_E2E_API_KEY: e2e-sidecar-operator-key-00000001
+      MEM0_E2E_MCP_LEGACY_TOKEN: e2e-legacy-shared-mcp-key-00000001
+      MEM0_E2E_MCP_URL: http://mcp:8080/mcp
       MEM0_E2E_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
+      MEM0_E2E_SIDECAR_URL: http://sidecar:8765
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
     command:
@@ -135,6 +174,7 @@ services:
         condition: service_healthy
     environment:
       MEM0_E2E_BASE_URL: http://mem0:8000
+      MEM0_E2E_API_KEY: e2e-sidecar-operator-key-00000001
       MEM0_E2E_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
       MEM0_E2E_ADOPTION_ENABLED: "true"
       MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED: "true"
@@ -160,7 +200,7 @@ services:
       sidecar:
         condition: service_healthy
     environment:
-      AUTH_DISABLED: "true"
+      AUTH_DISABLED: "false"
       NEXT_PUBLIC_API_URL: http://mem0:8000
       NEXT_PUBLIC_INSTANCE_NAME: Browser Smoke
       SIDECAR_INTERNAL_API_URL: http://sidecar:8765

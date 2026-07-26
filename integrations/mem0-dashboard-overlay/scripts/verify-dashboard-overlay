@@ -1190,6 +1190,13 @@ def verify_proxy_contract(dashboard_dir: Path) -> str | None:
             return f"sidecar proxy missing category item {method} support"
     if 'const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);' not in proxy_content:
         return "sidecar proxy METHODS_WITH_BODY must include PATCH"
+    if 'redirect: "manual"' not in proxy_content:
+        return "sidecar proxy must disable authenticated upstream redirects"
+    if (
+        "response.status >= 300 && response.status < 400"
+        not in proxy_content
+    ):
+        return "sidecar proxy must reject upstream redirect responses"
     for method in ("PATCH", "DELETE"):
         if (
             re.search(
@@ -1457,6 +1464,14 @@ def verify_api_keys_page(dashboard_dir: Path) -> str | None:
             "Client Keys desktop labels must truncate with a full-value affordance",
         ),
         (
+            "Legacy client key (${key.key_prefix}...)",
+            "Client Keys page must safely label historical empty descriptors",
+        ),
+        (
+            "displayKeyLabel(key)",
+            "Client Keys page must normalize historical labels consistently",
+        ),
+        (
             "mountedRef.current = true",
             "Client Keys page must restore its mounted guard after Strict Mode remount",
         ),
@@ -1493,7 +1508,7 @@ def verify_api_keys_page(dashboard_dir: Path) -> str | None:
             "Client Keys page must bound intrinsic width inside the dashboard scroll area",
         ),
         (
-            'aria-label={`Revoke ${key.label}`}',
+            'aria-label={`Revoke ${displayKeyLabel(key)}`}',
             "Client Keys compact revoke action must have an accessible name",
         ),
         (

@@ -77,7 +77,6 @@ def test_internal_header_parses_only_the_constant_legacy_descriptor() -> None:
         {**_core_payload(), "transport": "rest"},
         {**_core_payload(), "credential_kind": "operator_static"},
         {**_core_payload(), "credential_id": "not-a-uuid"},
-        {**_core_payload(), "label": ""},
         {**_core_payload(), "label": "x" * 256},
         {**_core_payload(), "key_prefix": "x" * 13},
         {**_core_payload(), "token": "must-not-be-accepted"},
@@ -96,6 +95,23 @@ def test_internal_header_rejects_malformed_or_expanded_context(
 ) -> None:
     with pytest.raises(AttributionRejected):
         RequestAttribution.from_internal_header(_header(payload))
+
+
+def test_legacy_empty_core_key_label_gets_a_stable_safe_fallback() -> None:
+    internal = RequestAttribution.from_internal_header(_header(_core_payload("  ")))
+    direct = RequestAttribution.from_core_descriptor(
+        {
+            "kind": "core_api_key",
+            "id": "e0544e3c-d217-40d9-bc9a-c1f64077542a",
+            "label": "",
+            "key_prefix": "m0sk_client_",
+        }
+    )
+
+    expected = "Legacy client key (m0sk_client_...)"
+    assert internal.credential_label == expected
+    assert direct.credential_label == expected
+    assert direct.to_channel_dict()["label"] == expected
 
 
 def test_internal_header_rejects_oversized_and_invalid_base64() -> None:

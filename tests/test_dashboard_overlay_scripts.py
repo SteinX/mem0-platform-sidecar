@@ -993,6 +993,11 @@ def test_request_trace_verifier_rejects_missing_runtime_wiring(tmp_path):
             "Client Keys desktop labels must truncate with a full-value affordance",
         ),
         (
+            "Legacy client key (${key.key_prefix}...)",
+            "Legacy client key",
+            "Client Keys page must safely label historical empty descriptors",
+        ),
+        (
             "w-[min(100%,calc(100vw-13rem))]",
             "w-full",
             (
@@ -1822,7 +1827,7 @@ def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "sidecar proxy request harness: 44 contracts passed" in result.stdout
+    assert "sidecar proxy request harness: 45 contracts passed" in result.stdout
 
 
 def test_sidecar_proxy_harness_rejects_stale_applied_target(tmp_path):
@@ -2024,6 +2029,8 @@ def test_apply_dashboard_overlay_forwards_server_only_sidecar_api_key(tmp_path):
     assert "operatorApiKey: process.env.SIDECAR_INTERNAL_API_KEY" in route_content
     assert "operatorApiKey?: string;" in proxy_content
     assert 'headers.set("X-API-Key", operatorApiKey);' in proxy_content
+    assert 'redirect: "manual"' in proxy_content
+    assert "response.status >= 300 && response.status < 400" in proxy_content
     assert 'request.headers.get("X-API-Key")' not in proxy_content
     assert "NEXT_PUBLIC_SIDECAR_INTERNAL_API_KEY" not in route_content
     assert "NEXT_PUBLIC_SIDECAR_INTERNAL_API_KEY" not in proxy_content

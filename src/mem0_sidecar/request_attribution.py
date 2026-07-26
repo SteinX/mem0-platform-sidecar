@@ -49,16 +49,27 @@ class RequestAttribution:
         no_key_fields = self.credential_id is None and self.credential_prefix is None
         match self.credential_kind:
             case "core_api_key":
+                normalized_label = (self.credential_label or "").strip()
                 if (
                     self.transport not in {"mcp", "rest"}
                     or self.credential_id is None
                     or not _valid_uuid(self.credential_id)
                     or self.credential_label is None
-                    or not 1 <= len(self.credential_label) <= 255
                     or self.credential_prefix is None
                     or not 1 <= len(self.credential_prefix) <= 12
                 ):
                     raise AttributionRejected()
+                if not normalized_label:
+                    normalized_label = (
+                        f"Legacy client key ({self.credential_prefix}...)"
+                    )
+                if len(normalized_label) > 255:
+                    raise AttributionRejected()
+                object.__setattr__(
+                    self,
+                    "credential_label",
+                    normalized_label,
+                )
             case "legacy_static":
                 if (
                     self.transport != "mcp"

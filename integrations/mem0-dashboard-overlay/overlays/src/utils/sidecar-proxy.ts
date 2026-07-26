@@ -470,6 +470,7 @@ export async function proxySidecarRequest(
   const init: RequestInit = {
     method: request.method,
     headers,
+    redirect: "manual",
   };
 
   if (METHODS_WITH_BODY.has(request.method)) {
@@ -510,6 +511,9 @@ export async function proxySidecarRequest(
   try {
     response = await (options.fetchUpstream ?? fetch)(url, init);
   } catch {
+    return jsonError("Sidecar upstream request failed", 502);
+  }
+  if (response.status >= 300 && response.status < 400) {
     return jsonError("Sidecar upstream request failed", 502);
   }
 

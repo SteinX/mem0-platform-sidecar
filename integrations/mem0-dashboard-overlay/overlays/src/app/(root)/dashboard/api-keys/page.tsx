@@ -35,6 +35,11 @@ type ApiKeyColumn = {
   readonly render?: (value: ApiKey[keyof ApiKey], row: ApiKey) => ReactNode;
 };
 
+function displayKeyLabel(key: Pick<ApiKey, "label" | "key_prefix">): string {
+  const label = key.label.trim();
+  return label || `Legacy client key (${key.key_prefix}...)`;
+}
+
 export default function ApiKeysPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [newLabel, setNewLabel] = useState("");
@@ -158,8 +163,8 @@ export default function ApiKeysPage() {
       key: "label",
       label: "Client",
       width: 30,
-      render: (value) => {
-        const label = typeof value === "string" ? value : "";
+      render: (_value, row) => {
+        const label = displayKeyLabel(row);
         return (
           <span className="block truncate" title={label}>
             {label}
@@ -200,7 +205,7 @@ export default function ApiKeysPage() {
           type="button"
           variant="ghost"
           size="icon"
-          aria-label={`Revoke ${row.label}`}
+          aria-label={`Revoke ${displayKeyLabel(row)}`}
           onClick={() => setKeyToRevoke(row)}
           disabled={isRevoking}
           className="size-7"
@@ -387,8 +392,11 @@ export default function ApiKeysPage() {
               >
                 <div className="flex min-w-0 items-start justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="truncate font-medium" title={key.label}>
-                      {key.label}
+                    <p
+                      className="truncate font-medium"
+                      title={displayKeyLabel(key)}
+                    >
+                      {displayKeyLabel(key)}
                     </p>
                     <code className="break-all font-mono text-xs text-onSurface-default-secondary">
                       {key.key_prefix}...
@@ -398,7 +406,7 @@ export default function ApiKeysPage() {
                     type="button"
                     variant="ghost"
                     size="icon"
-                    aria-label={`Revoke ${key.label}`}
+                    aria-label={`Revoke ${displayKeyLabel(key)}`}
                     onClick={() => setKeyToRevoke(key)}
                     disabled={isRevoking}
                     className="size-8 shrink-0"
@@ -426,7 +434,7 @@ export default function ApiKeysPage() {
         onConfirm={handleRevoke}
         title="Revoke client key"
         description="REST and MCP clients using this key will immediately stop working. This cannot be undone."
-        itemName={keyToRevoke?.label ?? ""}
+        itemName={keyToRevoke === null ? "" : displayKeyLabel(keyToRevoke)}
         confirmButtonText="Revoke"
         isPending={isRevoking}
         pendingButtonText="Revoking..."

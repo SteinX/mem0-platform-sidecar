@@ -1,4 +1,6 @@
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -24,6 +26,32 @@ from mem0_sidecar.store.models import Base
 from mem0_sidecar.store.repositories import ProjectRepository
 from mem0_sidecar.workers.consolidation import ConsolidationRuntime
 from mem0_sidecar.workers.direct_write_sync import DirectWriteSyncWorker
+
+logger = logging.getLogger(__name__)
+
+
+async def _run_supervised_loop(
+    *,
+    name: str,
+    loop: Callable[[asyncio.Event], Awaitable[None]],
+    stop: asyncio.Event,
+    retry_seconds: float,
+) -> None:
+    while not stop.is_set():
+        try:
+            await loop(stop)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("%s failed; restarting", name)
+        else:
+            if stop.is_set():
+                return
+            logger.error("%s exited unexpectedly; restarting", name)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=retry_seconds)
+        except TimeoutError:
+            pass
 
 
 def create_app(
@@ -102,11 +130,21 @@ def create_app(
                 mem0_client=mem0_client,
             )
             scheduler_task = asyncio.create_task(
-                runtime.scheduler_loop(consolidation_stop),
+                _run_supervised_loop(
+                    name="consolidation scheduler",
+                    loop=runtime.scheduler_loop,
+                    stop=consolidation_stop,
+                    retry_seconds=settings.worker_poll_interval_seconds,
+                ),
                 name="mem0-consolidation-scheduler",
             )
             worker_task = asyncio.create_task(
-                runtime.worker_loop(consolidation_stop),
+                _run_supervised_loop(
+                    name="consolidation worker",
+                    loop=runtime.worker_loop,
+                    stop=consolidation_stop,
+                    retry_seconds=settings.worker_poll_interval_seconds,
+                ),
                 name="mem0-consolidation-worker",
             )
             consolidation_tasks.extend((scheduler_task, worker_task))

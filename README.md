@@ -123,6 +123,7 @@ python -m pip install -e ".[dev]"
 Run the service against a local Mem0 OSS REST endpoint:
 
 ```bash
+python -m alembic upgrade head
 MEM0_SIDECAR_MEM0_BASE_URL=http://127.0.0.1:8000 \
 uvicorn mem0_sidecar.http_adapter.app:create_app \
   --factory \
@@ -141,6 +142,7 @@ Add and search:
 
 ```bash
 curl -sS http://127.0.0.1:8765/v3/memories/add/ \
+  -H 'X-API-Key: replace-with-client-key' \
   -H 'Content-Type: application/json' \
   -H 'X-Request-ID: readme-demo-add' \
   -d '{
@@ -151,6 +153,7 @@ curl -sS http://127.0.0.1:8765/v3/memories/add/ \
   }'
 
 curl -sS http://127.0.0.1:8765/v3/memories/search/ \
+  -H 'X-API-Key: replace-with-client-key' \
   -H 'Content-Type: application/json' \
   -H 'X-Request-ID: readme-demo-search' \
   -d '{
@@ -189,12 +192,12 @@ On Linux, `host.docker.internal` may require an explicit compose
 
 ## Dashboard Overlay
 
-The sidecar includes an optional Mem0 OSS dashboard overlay that unlocks the
-self-hosted Categories and Export pages. Phase 1 is intentionally narrow:
-Categories and Export are self-hosted, while the rest of the Cloud-only
-dashboard remains unchanged and unimplemented in the overlay. The overlay source
-lives under `integrations/mem0-dashboard-overlay/` and is applied to an
-upstream `server/dashboard` checkout.
+The sidecar includes an optional Mem0 OSS dashboard overlay for Memories,
+Requests, Entities, Client Keys, Categories, and Export. These pages share the
+same authenticated server-side proxy, project/app scope, navigation, and
+session handling. The overlay source lives under
+`integrations/mem0-dashboard-overlay/` and is applied to an upstream
+`server/dashboard` checkout.
 
 ```bash
 python integrations/mem0-dashboard-overlay/scripts/apply-dashboard-overlay \
@@ -231,8 +234,8 @@ runtime so the overlay follows that auth-disabled mode. Do not use auth-disabled
 dashboard proxying for production deployments.
 
 The proxy also enforces the configured dashboard project on every forwarded
-Categories and Export request. Caller-supplied `project_id` values in paths,
-query strings, or export request bodies are rewritten to `SIDECAR_PROJECT_ID`.
+overlay request. Caller-supplied `project_id` values in paths, query strings,
+or request bodies are rewritten to `SIDECAR_PROJECT_ID`.
 
 If verification fails or an upstream dashboard upgrade goes sideways, back out
 the overlay in the dashboard checkout before trying again:

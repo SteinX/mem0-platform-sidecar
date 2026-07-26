@@ -37,6 +37,26 @@ function sidecarHeaders(headers = {}) {
   return { ...headers, "X-API-Key": sidecarApiKey };
 }
 
+async function proveSidecarRejectsMissingCredentials() {
+  const path = `${sidecarBase}/v1/projects/${encodeURIComponent(projectId)}/capabilities`;
+  const health = await fetchWithTimeout(`${sidecarBase}/healthz`, {
+    timeout: 5000,
+  });
+  if (!health.ok) throw new Error(await responseDiagnostic(health));
+  for (const headers of [{}, { "X-API-Key": "wrong-client-key" }]) {
+    const response = await fetchWithTimeout(path, {
+      headers,
+      timeout: 5000,
+    });
+    if (response.status !== 401) {
+      throw new Error(
+        `Sidecar default authentication did not fail closed: ` +
+          (await responseDiagnostic(response)),
+      );
+    }
+  }
+}
+
 function errorMessage(error) {
   return error && error.stack ? error.stack : String(error);
 }
@@ -146,6 +166,27 @@ async function openTarget() {
   });
   if (!response.ok) throw new Error(await responseDiagnostic(response));
   return response.json();
+}
+
+async function grantDashboardClipboardPermissions() {
+  const response = await fetchWithTimeout(`${cdpBase}/json/version`, {
+    timeout: 5000,
+  });
+  if (!response.ok) throw new Error(await responseDiagnostic(response));
+  const version = await response.json();
+  if (typeof version.webSocketDebuggerUrl !== "string") {
+    throw new Error("Chromium browser target omitted its debugger URL");
+  }
+  const browser = new CdpSession(version.webSocketDebuggerUrl);
+  await browser.open();
+  try {
+    await browser.send("Browser.grantPermissions", {
+      origin: new URL(dashboardBase).origin,
+      permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"],
+    });
+  } finally {
+    browser.close();
+  }
 }
 
 async function captureBrowserEvidence(cdp, filename) {
@@ -504,6 +545,7 @@ async function assertClientKeysFitViewport(cdp) {
 
 async function listCoreClientKeys() {
   const response = await fetchWithTimeout(`${mem0Base}/api-keys`, {
+    headers: sidecarHeaders(),
     timeout: 10000,
   });
   if (!response.ok) throw new Error(await responseDiagnostic(response));
@@ -614,6 +656,10 @@ async function createClientKeyThroughDashboard(cdp, label) {
       )`,
     "successful client-key copy state",
   );
+  const clipboardText = await evaluate("navigator.clipboard.readText()");
+  if (clipboardText !== secret) {
+    throw new Error("Clipboard did not contain the one-time client key");
+  }
   const evidenceRedacted = await evaluate(`(() => {
     const input = document.querySelector("#api-key-new");
     if (!(input instanceof HTMLInputElement)) return false;
@@ -809,7 +855,11 @@ async function cleanupClientKey(label) {
     }
     const response = await fetchWithTimeout(
       `${mem0Base}/api-keys/${encodeURIComponent(key.id)}`,
-      { method: "DELETE", timeout: 10000 },
+      {
+        method: "DELETE",
+        headers: sidecarHeaders(),
+        timeout: 10000,
+      },
     );
     if (![200, 204, 404].includes(response.status)) {
       failures.push(await responseDiagnostic(response));
@@ -1049,7 +1099,10 @@ async function assertMem0Absent(memoryId) {
   const url = `${mem0Base}/memories/${encodeURIComponent(memoryId)}`;
   const deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
-    const response = await fetchWithTimeout(url, { timeout: 5000 });
+    const response = await fetchWithTimeout(url, {
+      headers: sidecarHeaders(),
+      timeout: 5000,
+    });
     const classification = await classifyDirectMem0Get(response);
     if (classification === "absent") return;
     await sleep(200);
@@ -1064,7 +1117,7 @@ async function cleanupFixture(memoryId) {
     [
       "Mem0 cleanup DELETE",
       `${mem0Base}/memories/${encodeURIComponent(memoryId)}`,
-      {},
+      sidecarHeaders(),
     ],
   ]) {
     try {
@@ -1106,11 +1159,14 @@ async function main() {
   let stage = "seed fixture through direct sidecar";
   let primaryError;
   try {
+    stage = "prove deployed sidecar authentication fails closed";
+    await proveSidecarRejectsMissingCredentials();
     stage = "create real Core dashboard session";
     const refreshToken = await dashboardRefreshToken();
     fixture = await seedFixtureThroughSidecar();
     stage = "connect to Chromium";
     await waitForBrowser();
+    await grantDashboardClipboardPermissions();
     const target = await openTarget();
     cdp = new CdpSession(target.webSocketDebuggerUrl);
     await cdp.open();

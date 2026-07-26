@@ -21,6 +21,7 @@ See [E2E Testing](e2e.md).
 ## Run HTTP Routes
 
 ```bash
+python -m alembic upgrade head
 uvicorn mem0_sidecar.http_adapter.app:create_app --factory --host 127.0.0.1 --port 8765
 curl http://127.0.0.1:8765/healthz
 curl http://127.0.0.1:8765/readyz
@@ -78,6 +79,17 @@ block the migration or be blocked until the migration completes, leading to
 request latency or timeouts. Keep the maintenance window even though the
 migration enforces the lock.
 
+When rolling back from a release that introduced
+`0009_request_channel_attribution`, keep the new image or checkout available
+long enough to run its migration code:
+
+1. Stop sidecar HTTP writers, MCP bridge traffic, and background workers.
+2. Back up the sidecar database and verify that the backup is readable.
+3. With the new release's code, run
+   `python -m alembic downgrade 0008_memory_consolidation`.
+4. Start the previous image, then verify `/readyz` and a real read/write
+   roundtrip before restoring client traffic.
+
 ## Dashboard Overlay
 
 Apply the overlay to an upstream dashboard checkout, then verify it before you
@@ -95,8 +107,8 @@ The dashboard runtime, not the sidecar service, reads
 at the sidecar service URL, for example
 `SIDECAR_INTERNAL_API_URL=http://mem0-platform-sidecar:8765`.
 
-Phase 1 only self-hosts Categories and Export. Other Cloud-only dashboard
-pages and features remain unchanged and are not implemented by this overlay.
+The overlay self-hosts Memories, Requests, Entities, Client Keys, Categories,
+and Export through one authenticated proxy and consistent project/app scope.
 
 If verification fails or an upstream upgrade breaks the dashboard checkout,
 back out the overlay before retrying:

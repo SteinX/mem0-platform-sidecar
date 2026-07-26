@@ -1501,7 +1501,6 @@ class EventRepository:
         canonical_facet_conditions: Sequence[ColumnElement[bool]],
         legacy_facet_conditions: Sequence[ColumnElement[bool]],
     ) -> EventPage | None:
-        grouped_channels: dict[RequestAttribution, int] = {}
         channel_columns = (
             Event.request_transport,
             Event.credential_kind,
@@ -1509,13 +1508,61 @@ class EventRepository:
             Event.credential_label,
             Event.credential_prefix,
         )
+        legacy_facet_rows = list(
+            self.session.execute(
+                select(
+                    Event.id,
+                    Event.app_id,
+                    Event.user_id,
+                    Event.agent_id,
+                    Event.run_id,
+                    Event.request_json,
+                )
+                .where(*legacy_facet_conditions)
+                .limit(EVENT_SCAN_LIMIT + 1)
+            )
+        )
+        if len(legacy_facet_rows) > EVENT_SCAN_LIMIT:
+            raise ValueError(
+                "legacy event scope facet scan exceeds 5000 records"
+            )
+        matching_legacy_event_ids: list[str] = []
+        for (
+            event_id,
+            canonical_app_id,
+            canonical_user_id,
+            canonical_agent_id,
+            canonical_run_id,
+            request_json,
+        ) in legacy_facet_rows:
+            if not _matches_event_scope(
+                request_json,
+                app_id,
+                entity_filters,
+                canonical_app_id,
+                canonical_user_id,
+                canonical_agent_id,
+                canonical_run_id,
+            ):
+                continue
+            matching_legacy_event_ids.append(event_id)
+
+        facet_scope = and_(*canonical_facet_conditions)
+        if matching_legacy_event_ids:
+            facet_scope = or_(
+                facet_scope,
+                Event.id.in_(matching_legacy_event_ids),
+            )
+        grouped_channels: dict[RequestAttribution, int] = {}
         canonical_channel_rows = self.session.execute(
             select(
                 *channel_columns,
                 func.count(Event.id),
             )
-            .where(*canonical_facet_conditions)
+            .where(facet_scope)
             .group_by(*channel_columns)
+            .order_by(func.count(Event.id).desc(), *channel_columns)
+            .limit(_EVENT_CHANNEL_FACET_LIMIT)
         )
         for (
             transport,
@@ -1532,62 +1579,7 @@ class EventRepository:
                 credential_label=credential_label,
                 credential_prefix=credential_prefix,
             )
-            grouped_channels[attribution] = (
-                grouped_channels.get(attribution, 0) + count
-            )
-
-        legacy_facet_rows = list(
-            self.session.execute(
-                select(
-                    Event.app_id,
-                    Event.user_id,
-                    Event.agent_id,
-                    Event.run_id,
-                    Event.request_transport,
-                    Event.credential_kind,
-                    Event.credential_id,
-                    Event.credential_label,
-                    Event.credential_prefix,
-                    Event.request_json,
-                )
-                .where(*legacy_facet_conditions)
-                .limit(EVENT_SCAN_LIMIT + 1)
-            )
-        )
-        if len(legacy_facet_rows) > EVENT_SCAN_LIMIT:
-            raise ValueError(
-                "legacy event scope facet scan exceeds 5000 records"
-            )
-        for (
-            canonical_app_id,
-            canonical_user_id,
-            canonical_agent_id,
-            canonical_run_id,
-            transport,
-            credential_kind,
-            credential_id,
-            credential_label,
-            credential_prefix,
-            request_json,
-        ) in legacy_facet_rows:
-            if not _matches_event_scope(
-                request_json,
-                app_id,
-                entity_filters,
-                canonical_app_id,
-                canonical_user_id,
-                canonical_agent_id,
-                canonical_run_id,
-            ):
-                continue
-            attribution = RequestAttribution.from_stored(
-                transport=transport,
-                credential_kind=credential_kind,
-                credential_id=credential_id,
-                credential_label=credential_label,
-                credential_prefix=credential_prefix,
-            )
-            grouped_channels[attribution] = grouped_channels.get(attribution, 0) + 1
+            grouped_channels[attribution] = count
         channels = _event_channel_facet_payload(grouped_channels)
         rows = list(
             self.session.execute(
