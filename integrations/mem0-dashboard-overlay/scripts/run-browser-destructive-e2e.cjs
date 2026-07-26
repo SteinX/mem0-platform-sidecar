@@ -653,17 +653,17 @@ async function createClientKeyThroughDashboard(cdp, label) {
     throw new Error("Copy client key action was not available");
   }
   const clipboardCaptureInstalled = await evaluate(`(() => {
-    const clipboard = navigator.clipboard;
-    if (!clipboard || typeof clipboard.writeText !== "function") return false;
-    const nativeWriteText = clipboard.writeText.bind(clipboard);
-    globalThis.__mem0E2EClipboardWrites = [];
-    Object.defineProperty(clipboard, "writeText", {
-      configurable: true,
-      value: async (value) => {
-        await nativeWriteText(value);
-        globalThis.__mem0E2EClipboardWrites.push(String(value));
-      },
-    });
+    if (typeof document.execCommand !== "function") return false;
+    const nativeExecCommand = document.execCommand.bind(document);
+    globalThis.__mem0E2ECopyPayloads = [];
+    document.execCommand = (command, ...args) => {
+      if (String(command).toLowerCase() === "copy") {
+        globalThis.__mem0E2ECopyPayloads.push(
+          globalThis.getSelection()?.toString() || "",
+        );
+      }
+      return nativeExecCommand(command, ...args);
+    };
     return true;
   })()`);
   if (!clipboardCaptureInstalled) {
@@ -679,10 +679,10 @@ async function createClientKeyThroughDashboard(cdp, label) {
     "successful client-key copy state",
   );
   const clipboardText = await evaluate(
-    "globalThis.__mem0E2EClipboardWrites.at(-1)",
+    "globalThis.__mem0E2ECopyPayloads.at(-1)",
   );
   if (clipboardText !== secret) {
-    throw new Error("Clipboard write did not receive the one-time client key");
+    throw new Error("Browser copy payload was not the one-time client key");
   }
   const evidenceRedacted = await evaluate(`(() => {
     const input = document.querySelector("#api-key-new");
