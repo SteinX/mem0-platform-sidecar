@@ -52,3 +52,16 @@ async def require_client_principal(
     request.state.client_principal = principal
     with bind_request_attribution(principal.attribution):
         yield principal
+
+
+async def require_operator_principal(
+    request: Request,
+    verifier: ClientAuthDependency,
+) -> AsyncIterator[ClientPrincipal]:
+    async for principal in require_client_principal(request, verifier):
+        if principal.role not in {"admin", "system"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Operator access is required.",
+            )
+        yield principal

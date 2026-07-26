@@ -13,7 +13,7 @@ from mem0_sidecar.http_adapter.capability_routes import capability_router
 from mem0_sidecar.http_adapter.category_routes import category_router
 from mem0_sidecar.http_adapter.client_auth import ClientAuthVerifier
 from mem0_sidecar.http_adapter.consolidation_routes import consolidation_router
-from mem0_sidecar.http_adapter.dependencies import require_client_principal
+from mem0_sidecar.http_adapter.dependencies import require_operator_principal
 from mem0_sidecar.http_adapter.entity_routes import entity_router
 from mem0_sidecar.http_adapter.event_routes import event_router
 from mem0_sidecar.http_adapter.export_routes import export_router
@@ -179,7 +179,7 @@ def create_app(
     )
     app.include_router(memory_router)
     app.include_router(oss_memory_router)
-    protected = [Depends(require_client_principal)]
+    protected = [Depends(require_operator_principal)]
     app.include_router(capability_router, dependencies=protected)
     app.include_router(event_router, dependencies=protected)
     app.include_router(entity_router, dependencies=protected)

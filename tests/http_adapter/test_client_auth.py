@@ -594,6 +594,26 @@ def test_control_plane_routes_require_client_authentication(tmp_path) -> None:
     assert response.json() == {"detail": "Authentication required."}
 
 
+def test_control_plane_routes_reject_member_principal(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            client_auth_enabled=True,
+        ),
+        mem0_client=_SearchMem0Client(),
+        client_auth_verifier=_RecordingVerifier(),
+    )
+
+    response = TestClient(app).post(
+        "/v1/events/query",
+        headers={"Authorization": "Bearer member-jwt"},
+        json={"project_id": "default", "app_id": "repo"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Operator access is required."}
+
+
 def test_health_does_not_invoke_client_auth(tmp_path) -> None:
     app = create_app(
         settings=SidecarSettings(
