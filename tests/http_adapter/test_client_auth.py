@@ -481,6 +481,28 @@ class _RecordingVerifier:
         )
 
 
+class _AdminClientKeyVerifier:
+    async def verify(
+        self,
+        *,
+        authorization: str | None,
+        x_api_key: str | None,
+        caller_context: str | None = None,
+    ) -> ClientPrincipal:
+        del authorization, x_api_key, caller_context
+        return ClientPrincipal(
+            subject_id="admin-user",
+            role="admin",
+            attribution=RequestAttribution(
+                transport="rest",
+                credential_kind="core_api_key",
+                credential_id="e0544e3c-d217-40d9-bc9a-c1f64077542a",
+                credential_label="automation",
+                credential_prefix="m0sk_client_",
+            ),
+        )
+
+
 def test_platform_memory_routes_require_and_attach_client_principal(tmp_path) -> None:
     verifier = _RecordingVerifier()
     app = create_app(
@@ -607,6 +629,26 @@ def test_control_plane_routes_reject_member_principal(tmp_path) -> None:
     response = TestClient(app).post(
         "/v1/events/query",
         headers={"Authorization": "Bearer member-jwt"},
+        json={"project_id": "default", "app_id": "repo"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Operator access is required."}
+
+
+def test_control_plane_routes_reject_admin_owned_client_key(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            client_auth_enabled=True,
+        ),
+        mem0_client=_SearchMem0Client(),
+        client_auth_verifier=_AdminClientKeyVerifier(),
+    )
+
+    response = TestClient(app).post(
+        "/v1/events/query",
+        headers={"Authorization": "Bearer named-client-key"},
         json={"project_id": "default", "app_id": "repo"},
     )
 

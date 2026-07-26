@@ -31,6 +31,13 @@ def get_client_auth_verifier(request: Request) -> ClientAuthVerifier:
 
 
 ClientAuthDependency = Annotated[Any, Depends(get_client_auth_verifier)]
+_OPERATOR_CREDENTIAL_KINDS = frozenset(
+    {
+        "disabled",
+        "operator_static",
+        "session",
+    }
+)
 
 
 async def require_client_principal(
@@ -59,7 +66,11 @@ async def require_operator_principal(
     verifier: ClientAuthDependency,
 ) -> AsyncIterator[ClientPrincipal]:
     async for principal in require_client_principal(request, verifier):
-        if principal.role not in {"admin", "system"}:
+        if (
+            principal.role not in {"admin", "system"}
+            or principal.attribution.credential_kind
+            not in _OPERATOR_CREDENTIAL_KINDS
+        ):
             raise HTTPException(
                 status_code=403,
                 detail="Operator access is required.",
