@@ -408,6 +408,44 @@ def test_export_browser_evidence_rejects_non_png_payload(
         )
 
 
+def test_export_e2e_test_reports_copies_from_daemon_namespace(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    reports = {
+        filename: f"<testsuite name='{filename}'/>".encode()
+        for filename in compose_runner.E2E_TEST_REPORT_FILENAMES
+    }
+    payload = {
+        filename: base64.b64encode(content).decode("ascii")
+        for filename, content in reports.items()
+    }
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                f"{compose_runner.E2E_TEST_REPORT_PREFIX}"
+                f"{json.dumps(payload)}"
+            ),
+            stderr="",
+        ),
+    )
+
+    compose_runner.export_e2e_test_reports(
+        "sidecar-e2e-test",
+        target=tmp_path,
+        env={},
+    )
+
+    assert {
+        filename: (tmp_path / filename).read_bytes()
+        for filename in compose_runner.E2E_TEST_REPORT_FILENAMES
+    } == reports
+
+
 def test_prepare_dashboard_context_applies_overlay_and_retains_auth_shell(
     tmp_path,
 ) -> None:
@@ -875,6 +913,11 @@ def _pin_compose_main_sources(monkeypatch) -> None:
         "write_e2e_evidence_manifest",
         lambda **_kwargs: None,
     )
+    monkeypatch.setattr(
+        compose_runner,
+        "export_e2e_test_reports",
+        lambda *args, **kwargs: None,
+    )
 
 
 def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
@@ -901,10 +944,16 @@ def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
         lambda upstream, target: target,
     )
     evidence_export = ["export-browser-evidence"]
+    report_export = ["export-test-reports"]
     monkeypatch.setattr(
         compose_runner,
         "export_browser_evidence",
         lambda *args, **kwargs: commands.append(evidence_export),
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "export_e2e_test_reports",
+        lambda *args, **kwargs: commands.append(report_export),
     )
 
     def fake_subprocess_run(command, **kwargs):
@@ -932,6 +981,7 @@ def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
     real_command = compose_runner.browser_destructive_smoke_command("unique-compose")
     assert mocked_command in commands
     assert real_command in commands
+    assert commands.index(report_export) < commands.index(real_command)
     assert commands.index(real_command) < commands.index(evidence_export)
     assert commands.index(evidence_export) < commands.index(mocked_command)
 

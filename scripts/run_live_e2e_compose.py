@@ -35,6 +35,7 @@ E2E_TEST_REPORT_FILENAMES = (
     "live-tests.xml",
     "adoption-test.xml",
 )
+E2E_TEST_REPORT_PREFIX = "MEM0_E2E_TEST_REPORTS_JSON="
 E2E_COMPLETED_GATES = (
     "postgres_migration_smoke",
     "live_service_tests",
@@ -228,15 +229,20 @@ def browser_destructive_smoke_command(project_name: str) -> list[str]:
     ]
 
 
-def browser_evidence_export_command(project_name: str) -> list[str]:
-    filenames = json.dumps(BROWSER_EVIDENCE_FILENAMES)
+def browser_evidence_export_command(
+    project_name: str,
+    *,
+    filenames: tuple[str, ...] = BROWSER_EVIDENCE_FILENAMES,
+    prefix: str = BROWSER_EVIDENCE_PREFIX,
+) -> list[str]:
+    encoded_filenames = json.dumps(filenames)
     source = (
         'const fs=require("node:fs");'
-        f"const names={filenames};"
+        f"const names={encoded_filenames};"
         "const payload=Object.fromEntries(names.map((name)=>["
         'name,fs.readFileSync(`/evidence/${name}`).toString("base64")'
         "]));"
-        f'process.stdout.write("{BROWSER_EVIDENCE_PREFIX}"+JSON.stringify(payload));'
+        f'process.stdout.write("{prefix}"+JSON.stringify(payload));'
     )
     return [
         *compose_command(project_name),
@@ -302,6 +308,63 @@ def export_browser_evidence(
             ) from exc
         if not data.startswith(PNG_SIGNATURE):
             raise RuntimeError(f"Browser evidence {filename} was not a valid PNG")
+        destination = target / filename
+        destination.write_bytes(data)
+        destination.chmod(0o600)
+
+
+def export_e2e_test_reports(
+    project_name: str,
+    *,
+    target: Path,
+    env: dict[str, str],
+) -> None:
+    result = subprocess.run(
+        browser_evidence_export_command(
+            project_name,
+            filenames=E2E_TEST_REPORT_FILENAMES,
+            prefix=E2E_TEST_REPORT_PREFIX,
+        ),
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            "Could not export E2E test reports from the Compose daemon: "
+            f"{diagnostic or result.returncode}"
+        )
+    report_line = next(
+        (
+            line
+            for line in reversed(result.stdout.splitlines())
+            if line.startswith(E2E_TEST_REPORT_PREFIX)
+        ),
+        None,
+    )
+    if report_line is None:
+        raise RuntimeError("E2E test report export returned no payload")
+    try:
+        encoded_files = json.loads(report_line.removeprefix(E2E_TEST_REPORT_PREFIX))
+        reports = {
+            filename: base64.b64decode(encoded_files[filename], validate=True)
+            for filename in E2E_TEST_REPORT_FILENAMES
+        }
+    except (
+        binascii.Error,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise RuntimeError("E2E test report export returned invalid data") from exc
+    if set(encoded_files) != set(E2E_TEST_REPORT_FILENAMES):
+        raise RuntimeError("E2E test report export returned the wrong files")
+    target.mkdir(parents=True, exist_ok=True)
+    for filename, data in reports.items():
         destination = target / filename
         destination.write_bytes(data)
         destination.chmod(0o600)
@@ -608,6 +671,11 @@ def main() -> int:
                 project_name,
                 service_name="e2e-adoption-runner",
             ),
+            env=runner_env,
+        )
+        export_e2e_test_reports(
+            project_name,
+            target=evidence_target,
             env=runner_env,
         )
         print("\n=== real destructive browser acceptance gate ===")
