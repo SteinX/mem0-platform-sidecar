@@ -154,7 +154,19 @@ export default function ApiKeysPage() {
   };
 
   const columns: ApiKeyColumn[] = [
-    { key: "label", label: "Client", width: 30 },
+    {
+      key: "label",
+      label: "Client",
+      width: 30,
+      render: (value) => {
+        const label = typeof value === "string" ? value : "";
+        return (
+          <span className="block truncate" title={label}>
+            {label}
+          </span>
+        );
+      },
+    },
     {
       key: "key_prefix",
       label: "Key prefix",
@@ -200,7 +212,7 @@ export default function ApiKeysPage() {
   ];
 
   return (
-    <div className="w-full min-w-0 max-w-full space-y-5 overflow-x-hidden">
+    <div className="w-[min(100%,calc(100vw-13rem))] min-w-0 max-w-full space-y-5 overflow-x-hidden">
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 space-y-1">
           <h1 className="font-fustat text-xl font-semibold">
@@ -228,13 +240,17 @@ export default function ApiKeysPage() {
                   <Label htmlFor="api-key-label">Client label</Label>
                   <Input
                     id="api-key-label"
+                    aria-describedby="api-key-label-description"
                     value={newLabel}
                     onChange={(event) => setNewLabel(event.target.value)}
                     placeholder="OpenCode laptop"
                     autoComplete="off"
                     maxLength={255}
                   />
-                  <p className="text-xs text-onSurface-default-secondary">
+                  <p
+                    id="api-key-label-description"
+                    className="text-xs text-onSurface-default-secondary"
+                  >
                     Use a distinct label for each machine, agent, or integration
                     so Requests can attribute its activity.
                   </p>
@@ -265,13 +281,25 @@ export default function ApiKeysPage() {
                     />
                     <CopyToClipboard
                       text={newKey}
-                      onCopy={() => setCopied(true)}
+                      onCopy={(_text, succeeded) => {
+                        setCopied(succeeded);
+                        if (!succeeded) {
+                          toast({
+                            title: "Failed to copy client key",
+                            description:
+                              "Copy the one-time key from the field manually.",
+                            variant: "destructive",
+                          });
+                        }
+                      }}
                     >
                       <Button
                         type="button"
                         variant="outline"
                         size="icon"
-                        aria-label="Copy client key"
+                        aria-label={
+                          copied ? "Client key copied" : "Copy client key"
+                        }
                       >
                         {copied ? (
                           <Check className="size-4" />
@@ -281,6 +309,9 @@ export default function ApiKeysPage() {
                       </Button>
                     </CopyToClipboard>
                   </div>
+                  <span role="status" aria-live="polite" className="sr-only">
+                    {copied ? "Client key copied" : ""}
+                  </span>
                   <p className="text-xs text-onSurface-danger-primary">
                     Save this key now. It is shown only once.
                   </p>
@@ -397,6 +428,8 @@ export default function ApiKeysPage() {
         description="REST and MCP clients using this key will immediately stop working. This cannot be undone."
         itemName={keyToRevoke?.label ?? ""}
         confirmButtonText="Revoke"
+        isPending={isRevoking}
+        pendingButtonText="Revoking..."
       />
     </div>
   );

@@ -265,7 +265,7 @@ images with the requested `image_tag` and a short commit SHA tag; set
 
 The dashboard image is built from `mem0ai/mem0` at `mem0_ref` after applying
 and verifying the dashboard overlay in this repository. The default manual
-`mem0_ref` is `main`.
+`mem0_ref` is the reviewed stable baseline `v2.0.12`.
 
 ## Add To An Existing Mem0 OSS Compose Stack
 
@@ -281,16 +281,20 @@ services:
     environment:
       MEM0_SIDECAR_DATABASE_URL: sqlite:////data/mem0_sidecar.sqlite3
       MEM0_SIDECAR_MEM0_BASE_URL: http://mem0:8000
-      MEM0_SIDECAR_MEM0_API_KEY: ${MEM0_SIDECAR_MEM0_API_KEY:-}
+      MEM0_SIDECAR_MEM0_API_KEY: ${MEM0_SIDECAR_MEM0_API_KEY:?Set a private operator key}
       MEM0_SIDECAR_MEM0_API_KEY_HEADER_NAME: ${MEM0_SIDECAR_MEM0_API_KEY_HEADER_NAME:-X-API-Key}
       MEM0_SIDECAR_MEM0_API_KEY_PREFIX: ${MEM0_SIDECAR_MEM0_API_KEY_PREFIX:-}
       MEM0_SIDECAR_MEM0_EXTRA_HEADERS: ${MEM0_SIDECAR_MEM0_EXTRA_HEADERS:-{}}
+      MEM0_SIDECAR_CLIENT_AUTH_ENABLED: "true"
+      MEM0_SIDECAR_CLIENT_AUTH_PATH: /auth/me
+      MEM0_SIDECAR_CLIENT_AUTH_TIMEOUT_SECONDS: "5"
+      MEM0_SIDECAR_CLIENT_AUTH_ALLOW_BOOTSTRAP_ADMIN: "true"
       MEM0_SIDECAR_LOG_FORMAT: json
       MEM0_SIDECAR_REQUEST_ID_HEADER: X-Request-ID
     volumes:
       - mem0-sidecar-data:/data
     ports:
-      - "8765:8765"
+      - "127.0.0.1:8765:8765"
     depends_on:
       - mem0
 
@@ -301,7 +305,10 @@ volumes:
 If Mem0 OSS is behind a gateway, set the sidecar base URL to the gateway URL
 and configure the auth/header variables below. The sidecar forwards only to the
 configured REST base URL and does not make assumptions about where Mem0 OSS is
-deployed.
+deployed. Keep the sidecar on a private application network; the loopback port
+above is for operator diagnostics only. Non-health routes fail closed by
+default and validate the incoming bearer or API key through Mem0 Core
+`/auth/me`.
 
 ## Configuration
 
@@ -322,6 +329,10 @@ prefix. `.env.example` is the deployment starting point.
 | `MEM0_SIDECAR_MEM0_CONNECT_TIMEOUT_SECONDS` | unset | Upstream connect timeout. `.env.example` sets `30` for Docker. |
 | `MEM0_SIDECAR_MEM0_VERIFY_TLS` | `true` | Verify TLS certificates for HTTPS upstreams. |
 | `MEM0_SIDECAR_MEM0_CA_BUNDLE` | unset | Optional CA bundle path for private CAs. |
+| `MEM0_SIDECAR_CLIENT_AUTH_ENABLED` | `true` | Require a valid Core session, Core API key, or permitted bootstrap operator credential on every non-health route. Disable only in isolated development. |
+| `MEM0_SIDECAR_CLIENT_AUTH_PATH` | `/auth/me` | Core path used to validate incoming credentials without following redirects. |
+| `MEM0_SIDECAR_CLIENT_AUTH_TIMEOUT_SECONDS` | `5` | Timeout for Core caller validation. |
+| `MEM0_SIDECAR_CLIENT_AUTH_ALLOW_BOOTSTRAP_ADMIN` | `true` | Permit the configured private upstream operator key for dashboard, MCP, and maintenance calls. |
 | `MEM0_SIDECAR_DEFAULT_PROJECT_ID` | `default` | Fallback project when neither `project_id` nor `app_id` is provided. |
 | `MEM0_SIDECAR_DIRECT_WRITE_SYNC_ENABLED` | `false` | Periodically mirror direct Mem0 OSS writes into the sidecar index. Prefer routing writers through the sidecar and enable this as a compatibility safety net. |
 | `MEM0_SIDECAR_DIRECT_WRITE_SYNC_INTERVAL_SECONDS` | `60` | Delay between bounded mirror passes. |

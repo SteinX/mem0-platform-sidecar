@@ -37,6 +37,7 @@
     "src/components/self-hosted/explorer/filter-builder.tsx",
     "src/components/self-hosted/explorer/entity-badges.tsx",
     "src/components/self-hosted/explorer/explorer-component-state.ts",
+    "src/components/ui/delete-confirmation-modal.tsx",
     "src/types/sidecar.ts"
   ]
 }

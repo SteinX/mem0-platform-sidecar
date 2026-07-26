@@ -1,3 +1,4 @@
+import json
 import secrets
 from dataclasses import dataclass
 
@@ -7,6 +8,8 @@ from mem0_sidecar.request_attribution import (
     AttributionRejected,
     RequestAttribution,
 )
+
+_MAX_CORE_AUTH_RESPONSE_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +70,24 @@ def _safe_auth_challenge(value: str | None) -> dict[str, str]:
     ):
         return {}
     return {"WWW-Authenticate": value}
+
+
+async def _read_bounded_auth_body(response: httpx.Response) -> bytes:
+    raw_content_length = response.headers.get("Content-Length")
+    if raw_content_length is not None:
+        try:
+            content_length = int(raw_content_length)
+        except ValueError as exc:
+            raise ClientAuthenticationUnavailable() from exc
+        if content_length < 0 or content_length > _MAX_CORE_AUTH_RESPONSE_BYTES:
+            raise ClientAuthenticationUnavailable()
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk)
+        if len(body) > _MAX_CORE_AUTH_RESPONSE_BYTES:
+            raise ClientAuthenticationUnavailable()
+    return bytes(body)
 
 
 class ClientAuthVerifier:
@@ -152,17 +173,21 @@ class ClientAuthVerifier:
                 verify=self.ca_bundle or self.verify_tls,
                 follow_redirects=False,
             ) as client:
-                response = await client.get(
+                async with client.stream(
+                    "GET",
                     f"{self.base_url}{self.auth_path}",
                     headers=headers,
-                )
+                ) as response:
+                    status_code = response.status_code
+                    challenge = response.headers.get("WWW-Authenticate")
+                    response_body_bytes = await _read_bounded_auth_body(response)
         except httpx.RequestError as exc:
             raise ClientAuthenticationUnavailable() from exc
 
-        if response.status_code in {401, 403}:
+        if status_code in {401, 403}:
             try:
-                response_body = response.json()
-            except ValueError:
+                response_body = json.loads(response_body_bytes)
+            except (UnicodeError, ValueError):
                 response_body = {}
             detail = (
                 response_body.get("detail")
@@ -170,22 +195,20 @@ class ClientAuthVerifier:
                 else None
             )
             raise ClientAuthenticationRejected(
-                status_code=response.status_code,
+                status_code=status_code,
                 detail=_redacted_detail(
                     detail,
                     authorization=authorization,
                     x_api_key=x_api_key,
                 ),
-                headers=_safe_auth_challenge(
-                    response.headers.get("WWW-Authenticate")
-                ),
+                headers=_safe_auth_challenge(challenge),
             )
-        if response.status_code != 200:
+        if status_code != 200:
             raise ClientAuthenticationUnavailable()
 
         try:
-            response_body = response.json()
-        except ValueError as exc:
+            response_body = json.loads(response_body_bytes)
+        except (UnicodeError, ValueError) as exc:
             raise ClientAuthenticationUnavailable() from exc
         if not isinstance(response_body, dict):
             raise ClientAuthenticationUnavailable()

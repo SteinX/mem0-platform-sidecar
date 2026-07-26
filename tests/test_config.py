@@ -4,6 +4,7 @@ from mem0_sidecar.config import SidecarSettings, load_settings
 def test_settings_defaults_use_local_development_values(monkeypatch) -> None:
     monkeypatch.delenv("MEM0_SIDECAR_DATABASE_URL", raising=False)
     monkeypatch.delenv("MEM0_SIDECAR_MEM0_BASE_URL", raising=False)
+    monkeypatch.delenv("MEM0_SIDECAR_CLIENT_AUTH_ENABLED", raising=False)
 
     settings = load_settings()
 
@@ -16,7 +17,7 @@ def test_settings_defaults_use_local_development_values(monkeypatch) -> None:
     assert settings.consolidation_job_lease_seconds == 300
     assert settings.consolidation_hard_delete_enabled is False
     assert settings.consolidation_bridge_routing_required is True
-    assert settings.client_auth_enabled is False
+    assert settings.client_auth_enabled is True
     assert settings.client_auth_path == "/auth/me"
     assert settings.client_auth_timeout_seconds == 5.0
     assert settings.client_auth_allow_bootstrap_admin is True

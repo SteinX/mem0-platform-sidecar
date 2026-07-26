@@ -34,7 +34,7 @@ class SidecarSettings(BaseSettings):
     consolidation_job_lease_seconds: int = Field(default=300, ge=30, le=3600)
     consolidation_hard_delete_enabled: bool = Field(default=False)
     consolidation_bridge_routing_required: bool = Field(default=True)
-    client_auth_enabled: bool = Field(default=False)
+    client_auth_enabled: bool = Field(default=True)
     client_auth_path: str = Field(default="/auth/me")
     client_auth_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     client_auth_allow_bootstrap_admin: bool = Field(default=True)

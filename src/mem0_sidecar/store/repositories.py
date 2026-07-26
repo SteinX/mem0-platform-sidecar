@@ -1455,7 +1455,25 @@ class EventRepository:
             conditions.append(Event.created_at >= _as_utc(query.from_at))
         if query.to_at is not None:
             conditions.append(Event.created_at <= _as_utc(query.to_at))
-        facet_conditions = list(conditions)
+        canonical_facet_conditions = [
+            *conditions,
+            Event.app_id == app_id,
+        ]
+        legacy_scope_conditions: list[ColumnElement[bool]] = [
+            Event.app_id.is_(None)
+        ]
+        for field_name, expected in validated_entity_filters.items():
+            if field_name == "app_id":
+                continue
+            column = entity_columns.get(field_name)
+            if column is None:
+                continue
+            canonical_facet_conditions.append(column == expected)
+            legacy_scope_conditions.append(column.is_(None))
+        legacy_facet_conditions = [
+            *conditions,
+            or_(*legacy_scope_conditions),
+        ]
         conditions.extend(_event_channel_sql_conditions(query.channel))
 
         for _attempt in range(_EVENT_QUERY_MAX_ATTEMPTS):
@@ -1465,7 +1483,8 @@ class EventRepository:
                 query=query,
                 entity_filters=validated_entity_filters,
                 conditions=conditions,
-                facet_conditions=facet_conditions,
+                canonical_facet_conditions=canonical_facet_conditions,
+                legacy_facet_conditions=legacy_facet_conditions,
             )
             if page is not None:
                 return page
@@ -1479,25 +1498,66 @@ class EventRepository:
         query: EventQuery,
         entity_filters: Mapping[str, str],
         conditions: Sequence[ColumnElement[bool]],
-        facet_conditions: Sequence[ColumnElement[bool]],
+        canonical_facet_conditions: Sequence[ColumnElement[bool]],
+        legacy_facet_conditions: Sequence[ColumnElement[bool]],
     ) -> EventPage | None:
         grouped_channels: dict[RequestAttribution, int] = {}
-        facet_rows = self.session.execute(
-            select(
-                Event.app_id,
-                Event.user_id,
-                Event.agent_id,
-                Event.run_id,
-                Event.request_transport,
-                Event.credential_kind,
-                Event.credential_id,
-                Event.credential_label,
-                Event.credential_prefix,
-                Event.request_json,
-            )
-            .where(*facet_conditions)
-            .execution_options(yield_per=1000)
+        channel_columns = (
+            Event.request_transport,
+            Event.credential_kind,
+            Event.credential_id,
+            Event.credential_label,
+            Event.credential_prefix,
         )
+        canonical_channel_rows = self.session.execute(
+            select(
+                *channel_columns,
+                func.count(Event.id),
+            )
+            .where(*canonical_facet_conditions)
+            .group_by(*channel_columns)
+        )
+        for (
+            transport,
+            credential_kind,
+            credential_id,
+            credential_label,
+            credential_prefix,
+            count,
+        ) in canonical_channel_rows:
+            attribution = RequestAttribution.from_stored(
+                transport=transport,
+                credential_kind=credential_kind,
+                credential_id=credential_id,
+                credential_label=credential_label,
+                credential_prefix=credential_prefix,
+            )
+            grouped_channels[attribution] = (
+                grouped_channels.get(attribution, 0) + count
+            )
+
+        legacy_facet_rows = list(
+            self.session.execute(
+                select(
+                    Event.app_id,
+                    Event.user_id,
+                    Event.agent_id,
+                    Event.run_id,
+                    Event.request_transport,
+                    Event.credential_kind,
+                    Event.credential_id,
+                    Event.credential_label,
+                    Event.credential_prefix,
+                    Event.request_json,
+                )
+                .where(*legacy_facet_conditions)
+                .limit(EVENT_SCAN_LIMIT + 1)
+            )
+        )
+        if len(legacy_facet_rows) > EVENT_SCAN_LIMIT:
+            raise ValueError(
+                "legacy event scope facet scan exceeds 5000 records"
+            )
         for (
             canonical_app_id,
             canonical_user_id,
@@ -1509,7 +1569,7 @@ class EventRepository:
             credential_label,
             credential_prefix,
             request_json,
-        ) in facet_rows:
+        ) in legacy_facet_rows:
             if not _matches_event_scope(
                 request_json,
                 app_id,

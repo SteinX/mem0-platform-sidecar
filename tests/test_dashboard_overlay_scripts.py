@@ -221,6 +221,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/components/self-hosted/explorer/filter-builder.tsx",
         "src/components/self-hosted/explorer/entity-badges.tsx",
         "src/components/self-hosted/explorer/explorer-component-state.ts",
+        "src/components/ui/delete-confirmation-modal.tsx",
         "src/app/(root)/dashboard/components/main-nav.tsx",
     ]:
         target = dashboard / relative
@@ -239,6 +240,7 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
     assert "src/utils/sidecar-project.ts" in manifest["files"]
     assert "src/utils/sidecar-proxy.ts" in manifest["files"]
     assert "src/utils/category-editor-state.ts" in manifest["files"]
+    assert "src/components/ui/delete-confirmation-modal.tsx" in manifest["files"]
 
 
 def test_dashboard_overlay_readme_documents_memory_explorer_operations():
@@ -981,6 +983,24 @@ def test_request_trace_verifier_rejects_missing_runtime_wiring(tmp_path):
             "Client Keys labels must match the Core descriptor length bound",
         ),
         (
+            'aria-describedby="api-key-label-description"',
+            'aria-label="Client label"',
+            "Client Keys label input must describe how attribution uses the label",
+        ),
+        (
+            'className="block truncate" title={label}',
+            'className="block" title={label}',
+            "Client Keys desktop labels must truncate with a full-value affordance",
+        ),
+        (
+            "w-[min(100%,calc(100vw-13rem))]",
+            "w-full",
+            (
+                "Client Keys page must bound intrinsic width inside the "
+                "dashboard scroll area"
+            ),
+        ),
+        (
             "if (creatingRef.current ||",
             "if (missingCreatingRef.current ||",
             "Client Keys creation must reject concurrent submissions",
@@ -1009,6 +1029,21 @@ def test_request_trace_verifier_rejects_missing_runtime_wiring(tmp_path):
             'isCreating ? "Creating..." : "Create"',
             '"Create"',
             "Client Keys page must lock the create interaction while pending",
+        ),
+        (
+            "onCopy={(_text, succeeded)",
+            "onCopy={()",
+            "Client Keys copy state must use the actual clipboard result",
+        ),
+        (
+            'copied ? "Client key copied" : "Copy client key"',
+            '"Copy client key"',
+            "Client Keys copy action must expose its success state",
+        ),
+        (
+            "isPending={isRevoking}",
+            "isPending={false}",
+            "Client Keys revoke dialog must expose its pending state",
         ),
     ],
 )
@@ -1046,6 +1081,77 @@ def test_client_keys_verifier_rejects_browser_secret_persistence(
         "Client Keys page must not persist or log the one-time secret"
         in result.stderr
     )
+
+
+def test_browser_evidence_redacts_one_time_client_key():
+    script = (
+        OVERLAY / "scripts" / "run-browser-destructive-e2e.cjs"
+    ).read_text()
+
+    assert 'input.value = "[redacted one-time client key]"' in script
+    assert 'input.setAttribute("data-evidence-redacted", "true")' in script
+    assert (
+        "One-time client key could not be redacted for evidence"
+        in script
+    )
+
+
+@pytest.mark.parametrize(
+    ("required", "replacement", "error"),
+    [
+        (
+            "showCloseIcon={!isPending}",
+            "showCloseIcon={true}",
+            "Pending destructive actions must hide the close control",
+        ),
+        (
+            "aria-busy={isPending}",
+            "aria-busy={false}",
+            "Pending destructive actions must expose busy state",
+        ),
+        (
+            "if (!isPending && confirmationText === itemName)",
+            "if (confirmationText === itemName)",
+            "Destructive confirmation must reject duplicate pending submissions",
+        ),
+        (
+            'className="break-all font-bold"',
+            'className="font-bold"',
+            "Destructive confirmation names must wrap without overflowing",
+        ),
+        (
+            "text-onSurface-default-secondary",
+            "text-[#565553]",
+            "Destructive confirmation must use semantic text colors",
+        ),
+        (
+            "<Label htmlFor={confirmationInputId}",
+            "<Label>",
+            "Destructive confirmation input must have an accessible label",
+        ),
+        (
+            "aria-describedby={confirmationDescriptionId}",
+            'aria-label="Confirmation"',
+            "Destructive confirmation input must describe the required value",
+        ),
+    ],
+)
+def test_delete_confirmation_verifier_rejects_missing_pending_contract(
+    tmp_path,
+    required,
+    replacement,
+    error,
+):
+    dashboard = applied_overlay(tmp_path)
+    modal = dashboard / "src/components/ui/delete-confirmation-modal.tsx"
+    content = modal.read_text()
+    assert required in content
+    modal.write_text(content.replace(required, replacement, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert error in result.stderr
 
 
 @pytest.mark.parametrize(

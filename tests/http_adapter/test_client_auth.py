@@ -416,6 +416,28 @@ async def test_auth_transport_failure_becomes_generic_unavailable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_oversized_auth_response_fails_closed() -> None:
+    def oversized(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"x" * (64 * 1024 + 1),
+        )
+
+    verifier = ClientAuthVerifier(
+        enabled=True,
+        base_url="http://mem0.local",
+        admin_api_key=None,
+        transport=httpx.MockTransport(oversized),
+    )
+
+    with pytest.raises(ClientAuthenticationUnavailable):
+        await verifier.verify(
+            authorization="Bearer client-jwt",
+            x_api_key=None,
+        )
+
+
+@pytest.mark.asyncio
 async def test_invalid_auth_me_success_payload_fails_closed() -> None:
     verifier = ClientAuthVerifier(
         enabled=True,
@@ -554,6 +576,22 @@ def test_platform_auth_rejection_uses_fastapi_detail_envelope(tmp_path) -> None:
     assert response.status_code == 401
     assert response.json() == {"detail": "Authentication required."}
     assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_control_plane_routes_require_client_authentication(tmp_path) -> None:
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            client_auth_enabled=True,
+        ),
+        mem0_client=_SearchMem0Client(),
+        client_auth_verifier=_RejectingVerifier(),
+    )
+
+    response = TestClient(app).get("/v1/projects/default/categories")
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Authentication required."}
 
 
 def test_health_does_not_invoke_client_auth(tmp_path) -> None:

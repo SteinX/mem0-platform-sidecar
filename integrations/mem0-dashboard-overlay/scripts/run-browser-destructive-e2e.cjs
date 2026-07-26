@@ -15,6 +15,7 @@ const authDashboardBase = (
 const sidecarBase = (
   process.env.MEM0_E2E_SIDECAR_URL || "http://sidecar:8765"
 ).replace(/\/$/, "");
+const sidecarApiKey = process.env.MEM0_E2E_SIDECAR_API_KEY;
 const mem0Base = (process.env.MEM0_E2E_MEM0_URL || "http://mem0:8000").replace(
   /\/$/,
   "",
@@ -23,9 +24,17 @@ const projectId = process.env.MEM0_E2E_PROJECT_ID || "sidecar-e2e";
 const appId = process.env.MEM0_E2E_APP_ID || "sidecar-e2e-app";
 const browserEvidenceDir =
   process.env.MEM0_E2E_BROWSER_EVIDENCE_DIR || "/evidence";
+const cdpCommandTimeoutMs = 15000;
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function sidecarHeaders(headers = {}) {
+  if (!sidecarApiKey) {
+    throw new Error("MEM0_E2E_SIDECAR_API_KEY is required");
+  }
+  return { ...headers, "X-API-Key": sidecarApiKey };
 }
 
 function errorMessage(error) {
@@ -93,16 +102,21 @@ class CdpSession {
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
+      clearTimeout(pending.timeout);
       if (message.error) pending.reject(new Error(message.error.message));
       else pending.resolve(message.result || {});
     });
   }
 
-  send(method, params = {}) {
+  send(method, params = {}, timeoutMs = cdpCommandTimeoutMs) {
     const id = this.nextId;
     this.nextId += 1;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timeout });
       this.socket.send(JSON.stringify({ id, method, params }));
     });
   }
@@ -114,6 +128,13 @@ class CdpSession {
   }
 
   close() {
+    for (const [id, pending] of this.pending.entries()) {
+      clearTimeout(pending.timeout);
+      pending.reject(
+        new Error(`CDP session closed with command ${id} pending`),
+      );
+    }
+    this.pending.clear();
     this.socket.close();
   }
 }
@@ -237,10 +258,10 @@ async function seedFixtureThroughSidecar() {
   const marker = `real-browser-destructive-${token}`;
   const response = await fetchWithTimeout(`${sidecarBase}/v3/memories/add/`, {
     method: "POST",
-    headers: {
+    headers: sidecarHeaders({
       "Content-Type": "application/json",
       "X-Request-ID": `browser-seed-${token}`,
-    },
+    }),
     body: JSON.stringify({
       project_id: projectId,
       app_id: appId,
@@ -298,7 +319,38 @@ function createBrowserDriver(cdp) {
     );
   };
 
-  return { evaluate, waitFor };
+  const clickBySelector = async (selector) => {
+    const point = await evaluate(`(() => {
+      const target = document.querySelector(${JSON.stringify(selector)});
+      const rect = target?.getBoundingClientRect();
+      return rect && rect.width > 0 && rect.height > 0
+        ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+        : null;
+    })()`);
+    if (!point) return false;
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: point.x,
+      y: point.y,
+    });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: point.x,
+      y: point.y,
+      button: "left",
+      clickCount: 1,
+    });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: point.x,
+      y: point.y,
+      button: "left",
+      clickCount: 1,
+    });
+    return true;
+  };
+
+  return { clickBySelector, evaluate, waitFor };
 }
 
 async function waitForVisualStability(cdp, label) {
@@ -479,7 +531,7 @@ async function waitForCoreClientKey(label, expectedPresent) {
 }
 
 async function createClientKeyThroughDashboard(cdp, label) {
-  const { evaluate, waitFor } = createBrowserDriver(cdp);
+  const { clickBySelector, evaluate, waitFor } = createBrowserDriver(cdp);
   await cdp.send("Page.navigate", {
     url: `${dashboardBase}/dashboard/api-keys`,
   });
@@ -553,6 +605,27 @@ async function createClientKeyThroughDashboard(cdp, label) {
   if (!copyActionAvailable) {
     throw new Error("Copy client key action was not available");
   }
+  const copied = await clickBySelector('[aria-label="Copy client key"]');
+  if (!copied) throw new Error("Copy client key action could not be invoked");
+  await waitFor(
+    `document.querySelector('[aria-label="Client key copied"]') !== null &&
+      [...document.querySelectorAll('[role="status"]')].some(
+        (item) => item.textContent.trim() === "Client key copied",
+      )`,
+    "successful client-key copy state",
+  );
+  const evidenceRedacted = await evaluate(`(() => {
+    const input = document.querySelector("#api-key-new");
+    if (!(input instanceof HTMLInputElement)) return false;
+    input.value = "[redacted one-time client key]";
+    input.setAttribute("data-evidence-redacted", "true");
+    return input.value === "[redacted one-time client key]";
+  })()`);
+  if (!evidenceRedacted) {
+    throw new Error("One-time client key could not be redacted for evidence");
+  }
+  await waitForVisualStability(cdp, "copied one-time client key");
+  await captureBrowserEvidence(cdp, "client-keys-created-copied-desktop.png");
   const descriptor = await waitForCoreClientKey(label, true);
   const matchingKeys = (await listCoreClientKeys()).filter(
     (key) => key?.label === label,
@@ -665,6 +738,12 @@ async function revokeClientKeyThroughDashboard(cdp, label) {
     })()`,
     "enabled client-key revoke action",
   );
+  await cdp.send("Network.emulateNetworkConditions", {
+    offline: false,
+    latency: 1200,
+    downloadThroughput: -1,
+    uploadThroughput: -1,
+  });
   const confirmed = await evaluate(`(() => {
     const dialog = document.querySelector('[role="dialog"]');
     const button = dialog &&
@@ -678,11 +757,45 @@ async function revokeClientKeyThroughDashboard(cdp, label) {
   })()`);
   if (!confirmed)
     throw new Error(`Client-key revoke was not enabled for ${label}`);
-  await waitForCoreClientKey(label, false);
-  await waitFor(
-    `!document.querySelector(${JSON.stringify(revokeSelector)})`,
-    `revoked client key ${label} to disappear`,
-  );
+  try {
+    await waitFor(
+      `(() => {
+        const dialog = document.querySelector('[role="dialog"]');
+        const revoke = dialog &&
+          [...dialog.querySelectorAll("button")].find(
+            (item) => item.innerText.trim() === "Revoking...",
+          );
+        const cancel = dialog &&
+          [...dialog.querySelectorAll("button")].find(
+            (item) => item.innerText.trim() === "Cancel",
+          );
+        const input = dialog?.querySelector(
+          'input[placeholder="Enter name to confirm"]',
+        );
+        return Boolean(
+          revoke?.disabled &&
+          revoke.getAttribute("aria-busy") === "true" &&
+          cancel?.disabled &&
+          input?.disabled,
+        );
+      })()`,
+      "locked client-key revoke pending state",
+    );
+    await waitForVisualStability(cdp, "Client Keys revoke pending");
+    await captureBrowserEvidence(cdp, "client-keys-revoke-pending-desktop.png");
+    await waitForCoreClientKey(label, false);
+    await waitFor(
+      `!document.querySelector(${JSON.stringify(revokeSelector)})`,
+      `revoked client key ${label} to disappear`,
+    );
+  } finally {
+    await cdp.send("Network.emulateNetworkConditions", {
+      offline: false,
+      latency: 0,
+      downloadThroughput: -1,
+      uploadThroughput: -1,
+    });
+  }
 }
 
 async function cleanupClientKey(label) {
@@ -884,11 +997,11 @@ function scopedSidecarUrl(memoryId) {
   return `${sidecarBase}/v1/memories/${encodeURIComponent(memoryId)}?${query}`;
 }
 
-async function waitForDirectAbsence(label, url) {
+async function waitForDirectAbsence(label, url, headers = {}) {
   const deadline = Date.now() + 30000;
   let lastDiagnostic = "not checked";
   while (Date.now() < deadline) {
-    const response = await fetchWithTimeout(url, { timeout: 5000 });
+    const response = await fetchWithTimeout(url, { headers, timeout: 5000 });
     if (response.status === 404) return;
     lastDiagnostic = await responseDiagnostic(response);
     if (response.status >= 500) throw new Error(`${label}: ${lastDiagnostic}`);
@@ -898,7 +1011,11 @@ async function waitForDirectAbsence(label, url) {
 }
 
 async function assertSidecarAbsent(memoryId) {
-  await waitForDirectAbsence("direct sidecar GET", scopedSidecarUrl(memoryId));
+  await waitForDirectAbsence(
+    "direct sidecar GET",
+    scopedSidecarUrl(memoryId),
+    sidecarHeaders(),
+  );
 }
 
 async function classifyDirectMem0Get(response) {
@@ -942,15 +1059,17 @@ async function assertMem0Absent(memoryId) {
 
 async function cleanupFixture(memoryId) {
   const failures = [];
-  for (const [label, url] of [
-    ["sidecar cleanup DELETE", scopedSidecarUrl(memoryId)],
+  for (const [label, url, headers] of [
+    ["sidecar cleanup DELETE", scopedSidecarUrl(memoryId), sidecarHeaders()],
     [
       "Mem0 cleanup DELETE",
       `${mem0Base}/memories/${encodeURIComponent(memoryId)}`,
+      {},
     ],
   ]) {
     try {
       const response = await fetchWithTimeout(url, {
+        headers,
         method: "DELETE",
         timeout: 30000,
       });
@@ -979,7 +1098,11 @@ async function cleanupFixture(memoryId) {
 async function main() {
   let fixture;
   let cdp;
-  const clientKeyLabel = `browser-client-${Date.now()}-${crypto.randomUUID()}`;
+  const clientKeyLabel =
+    `browserclient${Date.now()}${crypto.randomUUID().replaceAll("-", "")}`.padEnd(
+      255,
+      "x",
+    );
   let stage = "seed fixture through direct sidecar";
   let primaryError;
   try {

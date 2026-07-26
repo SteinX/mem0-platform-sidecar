@@ -185,8 +185,10 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
         "MEM0_E2E_DASHBOARD_URL",
         "MEM0_E2E_AUTH_DASHBOARD_URL",
         "MEM0_E2E_SIDECAR_URL",
+        "MEM0_E2E_SIDECAR_API_KEY",
         "MEM0_E2E_MEM0_URL",
         "seedFixtureThroughSidecar",
+        "sidecarHeaders",
         "openMemoryDetails",
         "confirmExactMemoryId",
         "waitForMemoryToDisappear",
@@ -202,7 +204,16 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
         "/dashboard/api-keys",
         "api-key-new",
         "Copy client key",
+        "Client key copied",
+        "client-keys-created-copied-desktop.png",
+        'padEnd(\n      255,\n      "x",',
+        "clickBySelector",
+        '"Input.dispatchMouseEvent"',
+        "CDP ${method} timed out after ${timeoutMs}ms",
         "Revoke client key",
+        "Revoking...",
+        "client-keys-revoke-pending-desktop.png",
+        "Network.emulateNetworkConditions",
         'cdp.on("Network.requestWillBeSent"',
         'cdp.on("Network.responseReceived"',
         'method === "DELETE"',
@@ -230,7 +241,27 @@ def test_real_browser_auth_check_uses_an_auth_enabled_dashboard() -> None:
         in browser_runner
     )
     assert "MEM0_E2E_BROWSER_EVIDENCE_DIR: /evidence" in browser_runner
+    assert "MEM0_E2E_SIDECAR_API_KEY:" in browser_runner
     assert "MEM0_E2E_EVIDENCE_DIR" in browser_runner
+
+
+def test_e2e_sidecar_uses_a_private_operator_key() -> None:
+    content = COMPOSE_FILE.read_text()
+    mem0 = _compose_service(content, "mem0")
+    sidecar = _compose_service(content, "sidecar")
+    dashboard = _compose_service(content, "dashboard")
+    auth_dashboard = _compose_service(content, "dashboard-auth-check")
+
+    assert "ADMIN_API_KEY: e2e-sidecar-operator-key-00000001" in mem0
+    assert (
+        "MEM0_SIDECAR_MEM0_API_KEY: e2e-sidecar-operator-key-00000001"
+        in sidecar
+    )
+    for service in (dashboard, auth_dashboard):
+        assert (
+            "SIDECAR_INTERNAL_API_KEY: e2e-sidecar-operator-key-00000001"
+            in service
+        )
 
 
 def test_real_browser_capture_waits_for_stable_animations_and_compact_fit() -> None:
@@ -261,6 +292,11 @@ def test_real_browser_capture_waits_for_stable_animations_and_compact_fit() -> N
         'await waitForVisualStability(cdp, "compact Client Keys list")'
     ) < source.index(
         'await captureBrowserEvidence(cdp, "client-keys-list-compact.png")'
+    )
+    assert source.index(
+        'await waitForVisualStability(cdp, "Client Keys revoke pending")'
+    ) < source.index(
+        'await captureBrowserEvidence(cdp, "client-keys-revoke-pending-desktop.png")'
     )
 
 

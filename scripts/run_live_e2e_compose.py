@@ -23,8 +23,10 @@ MEM0_READY_CHECK = (
 BROWSER_EVIDENCE_FILENAMES = (
     "client-keys-unauthenticated-desktop.png",
     "client-keys-create-dialog-desktop.png",
+    "client-keys-created-copied-desktop.png",
     "client-keys-list-desktop.png",
     "client-keys-list-compact.png",
+    "client-keys-revoke-pending-desktop.png",
 )
 BROWSER_EVIDENCE_PREFIX = "MEM0_E2E_EVIDENCE_JSON="
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"

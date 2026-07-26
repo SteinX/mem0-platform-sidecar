@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
@@ -11,6 +11,7 @@ from mem0_sidecar.http_adapter.capability_routes import capability_router
 from mem0_sidecar.http_adapter.category_routes import category_router
 from mem0_sidecar.http_adapter.client_auth import ClientAuthVerifier
 from mem0_sidecar.http_adapter.consolidation_routes import consolidation_router
+from mem0_sidecar.http_adapter.dependencies import require_client_principal
 from mem0_sidecar.http_adapter.entity_routes import entity_router
 from mem0_sidecar.http_adapter.event_routes import event_router
 from mem0_sidecar.http_adapter.export_routes import export_router
@@ -140,12 +141,13 @@ def create_app(
     )
     app.include_router(memory_router)
     app.include_router(oss_memory_router)
-    app.include_router(capability_router)
-    app.include_router(event_router)
-    app.include_router(entity_router)
-    app.include_router(category_router)
-    app.include_router(consolidation_router)
-    app.include_router(export_router)
+    protected = [Depends(require_client_principal)]
+    app.include_router(capability_router, dependencies=protected)
+    app.include_router(event_router, dependencies=protected)
+    app.include_router(entity_router, dependencies=protected)
+    app.include_router(category_router, dependencies=protected)
+    app.include_router(consolidation_router, dependencies=protected)
+    app.include_router(export_router, dependencies=protected)
 
     @app.exception_handler(MutationConflictError)
     async def mutation_conflict_handler(

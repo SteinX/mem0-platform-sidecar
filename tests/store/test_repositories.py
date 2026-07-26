@@ -3790,6 +3790,7 @@ def test_event_query_applies_sql_narrowing_before_bounded_scope_scan(
             Event(
                 id=f"list-{index:04d}",
                 project_id="repo-a",
+                app_id="app-a",
                 operation="memory.list",
                 status=EventStatus.SUCCEEDED,
                 request_json='{"app_id":"app-a"}',
@@ -3907,6 +3908,43 @@ def test_event_query_sql_narrows_exact_channel_before_scan_limit(
         "legacy_static": 5001,
         "core_api_key": 1,
     }
+
+
+def test_event_query_bounds_legacy_scope_facet_fallback(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 7, 13, tzinfo=UTC)
+    db_session.add_all(
+        [
+            Event(
+                id=f"legacy-null-scope-{index:04d}",
+                project_id="repo-a",
+                operation="memory.search",
+                status=EventStatus.SUCCEEDED,
+                request_json='{"app_id":"app-a"}',
+                response_json="{}",
+                error_json="{}",
+                created_at=created_at,
+                result_count=0,
+                has_results=0,
+            )
+            for index in range(5001)
+        ]
+    )
+    db_session.flush()
+
+    with pytest.raises(
+        ValueError,
+        match="^legacy event scope facet scan exceeds 5000 records$",
+    ):
+        EventRepository(db_session).query_project_events(
+            "repo-a",
+            "app-a",
+            repositories.EventQuery(page=1, page_size=20),
+        )
 
 
 def test_event_query_sql_narrows_canonical_app_before_scope_scan(db_session) -> None:
