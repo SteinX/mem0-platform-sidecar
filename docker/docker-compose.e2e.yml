@@ -253,6 +253,7 @@ services:
       - --remote-debugging-address=0.0.0.0
       - --remote-debugging-port=9222
       - --remote-allow-origins=*
+      - --unsafely-treat-insecure-origin-as-secure=http://dashboard:3000
       - --user-data-dir=/tmp/browser-smoke-profile
       - about:blank
     depends_on:

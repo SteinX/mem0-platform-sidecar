@@ -242,6 +242,10 @@ def test_real_browser_auth_check_uses_an_auth_enabled_dashboard() -> None:
     assert 'AUTH_DISABLED: "false"' in mem0
     assert 'AUTH_DISABLED: "false"' in auth_dashboard
     assert "dashboard-auth-check:" in browser
+    assert (
+        "--unsafely-treat-insecure-origin-as-secure=http://dashboard:3000"
+        in browser
+    )
     assert "condition: service_healthy" in browser
     assert (
         "MEM0_E2E_AUTH_DASHBOARD_URL: http://dashboard-auth-check:3000"
