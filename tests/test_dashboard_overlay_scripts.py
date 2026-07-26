@@ -435,6 +435,7 @@ def test_dashboard_overlay_includes_memory_explorer_page_and_drawer_contracts():
         "Source unavailable",
         "AlertDialog",
         "DeleteConfirmationModal",
+        "isPending={isDeleting}",
         "Copy ID",
         "overflow-x-hidden",
         "sm:max-w-2xl",

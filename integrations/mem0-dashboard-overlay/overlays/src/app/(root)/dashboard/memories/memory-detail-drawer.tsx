@@ -649,7 +649,9 @@ export function MemoryDetailDrawer({
         title="Delete memory"
         description="This memory will be permanently removed. This cannot be undone."
         itemName={activeMemoryId ?? ""}
-        confirmButtonText={isDeleting ? "Deleting..." : "Delete"}
+        confirmButtonText="Delete"
+        isPending={isDeleting}
+        pendingButtonText="Deleting..."
       />
     </>
   );
