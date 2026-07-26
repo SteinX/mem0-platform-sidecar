@@ -953,6 +953,102 @@ def test_request_trace_verifier_rejects_missing_runtime_wiring(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("required", "replacement", "error"),
+    [
+        (
+            "API_KEY_ENDPOINTS.BY_ID(target.id)",
+            "API_KEY_ENDPOINTS.MISSING_BY_ID(target.id)",
+            "Client Keys page must revoke keys by exact Core key ID",
+        ),
+        (
+            "useApiQuery<ApiKey[]>",
+            "useApiQuery<ApiKeyCreateResponse[]>",
+            "Client Keys list must use the secret-free key descriptor",
+        ),
+        (
+            'setNewKey("")',
+            'setNewKey("retained")',
+            "Client Keys page must clear the one-time secret on dialog close",
+        ),
+        (
+            "MEM0_OSS_MCP_TOKEN",
+            "MISSING_MCP_TOKEN_VARIABLE",
+            "Client Keys page must explain the compatible MCP token variable",
+        ),
+        (
+            "maxLength={255}",
+            "maxLength={256}",
+            "Client Keys labels must match the Core descriptor length bound",
+        ),
+        (
+            "if (creatingRef.current ||",
+            "if (missingCreatingRef.current ||",
+            "Client Keys creation must reject concurrent submissions",
+        ),
+        (
+            "if (keyToRevoke === null || revokingRef.current)",
+            "if (keyToRevoke === null || missingRevokingRef.current)",
+            "Client Keys revocation must reject concurrent submissions",
+        ),
+        (
+            "mountedRef.current = true",
+            "missingMountedRef.current = true",
+            "Client Keys page must restore its mounted guard after Strict Mode remount",
+        ),
+        (
+            "mountedRef.current = false",
+            "missingMountedRef.current = false",
+            "Client Keys page must guard async completion after unmount",
+        ),
+        (
+            "API_KEY_ENDPOINTS.BY_ID(response.data.id)",
+            "API_KEY_ENDPOINTS.BY_ID(missingResponse.data.id)",
+            "Client Keys page must revoke a key whose one-time secret cannot be shown",
+        ),
+        (
+            'isCreating ? "Creating..." : "Create"',
+            '"Create"',
+            "Client Keys page must lock the create interaction while pending",
+        ),
+    ],
+)
+def test_client_keys_verifier_rejects_missing_secret_safety_contracts(
+    tmp_path,
+    required,
+    replacement,
+    error,
+):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/api-keys/page.tsx"
+    content = page.read_text()
+    assert required in content
+    page.write_text(content.replace(required, replacement, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert error in result.stderr
+
+
+@pytest.mark.parametrize("forbidden", ["localStorage", "sessionStorage", "console.log"])
+def test_client_keys_verifier_rejects_browser_secret_persistence(
+    tmp_path,
+    forbidden,
+):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/api-keys/page.tsx"
+    page.write_text(page.read_text() + f"\n// {forbidden}\n")
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert (
+        "Client Keys page must not persist or log the one-time secret"
+        in result.stderr
+    )
+
+
+@pytest.mark.parametrize(
     ("relative", "before", "after", "error"),
     [
         (

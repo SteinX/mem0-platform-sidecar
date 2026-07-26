@@ -1074,6 +1074,13 @@ async def test_shadow_exact_duplicate_excludes_canonical_and_rolls_back(db_sessi
         agent_id=None,
         run_id=None,
     ) == {"duplicate-a", "duplicate-b"}
+    assert [
+        memory.mem0_memory_id
+        for memory in repository.list_dirty_anchors(
+            project_id="repo-a",
+            app_id="app-a",
+        )
+    ] == ["duplicate-b"]
     assert mem0.delete_calls == []
 
 

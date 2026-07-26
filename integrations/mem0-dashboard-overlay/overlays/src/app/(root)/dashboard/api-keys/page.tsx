@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { format } from "date-fns";
 import { Check, Copy, KeyRound, Plus, Trash2 } from "lucide-react";
 import { CopyToClipboard } from "react-copy-to-clipboard";
@@ -41,6 +41,18 @@ export default function ApiKeysPage() {
   const [newKey, setNewKey] = useState("");
   const [copied, setCopied] = useState(false);
   const [keyToRevoke, setKeyToRevoke] = useState<ApiKey | null>(null);
+  const [isCreating, setIsCreating] = useState(false);
+  const [isRevoking, setIsRevoking] = useState(false);
+  const mountedRef = useRef(true);
+  const creatingRef = useRef(false);
+  const revokingRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const {
     data: keys = [],
@@ -56,14 +68,28 @@ export default function ApiKeysPage() {
 
   const handleCreate = async () => {
     const label = newLabel.trim();
-    if (label === "") {
+    if (creatingRef.current || label === "" || label.length > 255) {
       return;
     }
+    creatingRef.current = true;
+    setIsCreating(true);
     try {
       const response = await api.post<ApiKeyCreateResponse>(
         API_KEY_ENDPOINTS.BASE,
         { label },
       );
+      if (!mountedRef.current) {
+        try {
+          await api.delete(API_KEY_ENDPOINTS.BY_ID(response.data.id));
+        } catch {
+          toast({
+            title: "Client key cleanup failed",
+            description: `Manually revoke key ${response.data.id}.`,
+            variant: "destructive",
+          });
+        }
+        return;
+      }
       setNewKey(response.data.key);
       setNewLabel(label);
       void refetch();
@@ -76,18 +102,28 @@ export default function ApiKeysPage() {
         description: getErrorMessage(error),
         variant: "destructive",
       });
+    } finally {
+      creatingRef.current = false;
+      if (mountedRef.current) {
+        setIsCreating(false);
+      }
     }
   };
 
   const handleRevoke = async () => {
-    if (keyToRevoke === null) {
+    if (keyToRevoke === null || revokingRef.current) {
       return;
     }
+    const target = keyToRevoke;
+    revokingRef.current = true;
+    setIsRevoking(true);
     try {
-      await api.delete(API_KEY_ENDPOINTS.BY_ID(keyToRevoke.id));
+      await api.delete(API_KEY_ENDPOINTS.BY_ID(target.id));
       toast({ title: "Client key revoked", variant: "success" });
-      setKeyToRevoke(null);
-      void refetch();
+      if (mountedRef.current) {
+        setKeyToRevoke(null);
+        void refetch();
+      }
     } catch (error) {
       if (!(error instanceof Error)) {
         throw error;
@@ -97,10 +133,18 @@ export default function ApiKeysPage() {
         description: getErrorMessage(error),
         variant: "destructive",
       });
+    } finally {
+      revokingRef.current = false;
+      if (mountedRef.current) {
+        setIsRevoking(false);
+      }
     }
   };
 
   const handleDialogClose = (open: boolean) => {
+    if (!open && creatingRef.current) {
+      return;
+    }
     if (!open) {
       setNewKey("");
       setNewLabel("");
@@ -146,6 +190,7 @@ export default function ApiKeysPage() {
           size="icon"
           aria-label={`Revoke ${row.label}`}
           onClick={() => setKeyToRevoke(row)}
+          disabled={isRevoking}
           className="size-7"
         >
           <Trash2 className="size-3.5 text-onSurface-danger-primary" />
@@ -155,7 +200,7 @@ export default function ApiKeysPage() {
   ];
 
   return (
-    <div className="min-w-0 space-y-5">
+    <div className="w-full min-w-0 max-w-full space-y-5 overflow-x-hidden">
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 space-y-1">
           <h1 className="font-fustat text-xl font-semibold">
@@ -168,7 +213,7 @@ export default function ApiKeysPage() {
         </div>
         <Dialog open={createOpen} onOpenChange={handleDialogClose}>
           <DialogTrigger asChild>
-            <Button size="sm">
+            <Button size="sm" className="w-full max-w-full sm:w-auto">
               <Plus className="mr-1 size-4" />
               Create client key
             </Button>
@@ -187,6 +232,7 @@ export default function ApiKeysPage() {
                     onChange={(event) => setNewLabel(event.target.value)}
                     placeholder="OpenCode laptop"
                     autoComplete="off"
+                    maxLength={255}
                   />
                   <p className="text-xs text-onSurface-default-secondary">
                     Use a distinct label for each machine, agent, or integration
@@ -196,10 +242,14 @@ export default function ApiKeysPage() {
                 <Button
                   type="button"
                   onClick={() => void handleCreate()}
-                  disabled={newLabel.trim() === ""}
+                  disabled={
+                    isCreating ||
+                    newLabel.trim() === "" ||
+                    newLabel.trim().length > 255
+                  }
                   className="w-full"
                 >
-                  Create
+                  {isCreating ? "Creating..." : "Create"}
                 </Button>
               </div>
             ) : (
@@ -247,6 +297,10 @@ export default function ApiKeysPage() {
                     </code>
                     .
                   </p>
+                  <p>
+                    Set <code className="font-mono">MEM0_OSS_MCP_TOKEN</code> to
+                    this value in the client&apos;s private environment file.
+                  </p>
                 </div>
                 <Button
                   type="button"
@@ -267,7 +321,7 @@ export default function ApiKeysPage() {
       >
         <KeyRound className="mt-0.5 size-4 shrink-0" />
         <div className="min-w-0 space-y-1">
-          <h2 id="client-key-usage" className="font-semibold">
+          <h2 id="client-key-usage" className="break-words font-semibold">
             Migration-safe authentication
           </h2>
           <p className="break-words text-sm text-onSurface-default-secondary">
@@ -287,18 +341,18 @@ export default function ApiKeysPage() {
         />
       ) : (
         <>
-          <Card className="hidden overflow-hidden border-memBorder-primary md:block">
+          <Card className="hidden overflow-hidden border-memBorder-primary lg:block">
             <DataTable
               data={keys}
               columns={columns}
               getRowKey={(row) => row.id}
             />
           </Card>
-          <div className="space-y-2 md:hidden">
+          <div className="space-y-2 lg:hidden">
             {keys.map((key) => (
               <Card
                 key={key.id}
-                className="min-w-0 space-y-3 border-memBorder-primary p-4"
+                className="w-full min-w-0 max-w-full space-y-3 overflow-hidden border-memBorder-primary p-4"
               >
                 <div className="flex min-w-0 items-start justify-between gap-3">
                   <div className="min-w-0">
@@ -315,6 +369,7 @@ export default function ApiKeysPage() {
                     size="icon"
                     aria-label={`Revoke ${key.label}`}
                     onClick={() => setKeyToRevoke(key)}
+                    disabled={isRevoking}
                     className="size-8 shrink-0"
                   >
                     <Trash2 className="size-4 text-onSurface-danger-primary" />
@@ -332,7 +387,11 @@ export default function ApiKeysPage() {
 
       <DeleteConfirmationModal
         isOpen={keyToRevoke !== null}
-        onClose={() => setKeyToRevoke(null)}
+        onClose={() => {
+          if (!revokingRef.current) {
+            setKeyToRevoke(null);
+          }
+        }}
         onConfirm={handleRevoke}
         title="Revoke client key"
         description="REST and MCP clients using this key will immediately stop working. This cannot be undone."

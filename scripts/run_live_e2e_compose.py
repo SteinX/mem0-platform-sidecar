@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import os
 import shutil
 import subprocess
@@ -17,6 +20,14 @@ MEM0_READY_CHECK = (
     "import urllib.request; "
     "urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=2)"
 )
+BROWSER_EVIDENCE_FILENAMES = (
+    "client-keys-unauthenticated-desktop.png",
+    "client-keys-create-dialog-desktop.png",
+    "client-keys-list-desktop.png",
+    "client-keys-list-compact.png",
+)
+BROWSER_EVIDENCE_PREFIX = "MEM0_E2E_EVIDENCE_JSON="
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def compose_command(project_name: str) -> list[str]:
@@ -138,6 +149,88 @@ def browser_destructive_smoke_command(project_name: str) -> list[str]:
     ]
 
 
+def browser_evidence_export_command(project_name: str) -> list[str]:
+    filenames = json.dumps(BROWSER_EVIDENCE_FILENAMES)
+    source = (
+        'const fs=require("node:fs");'
+        f"const names={filenames};"
+        "const payload=Object.fromEntries(names.map((name)=>["
+        'name,fs.readFileSync(`/evidence/${name}`).toString("base64")'
+        "]));"
+        f'process.stdout.write("{BROWSER_EVIDENCE_PREFIX}"+JSON.stringify(payload));'
+    )
+    return [
+        *compose_command(project_name),
+        "run",
+        "--rm",
+        "--no-deps",
+        "browser-smoke",
+        "node",
+        "-e",
+        source,
+    ]
+
+
+def export_browser_evidence(
+    project_name: str,
+    *,
+    target: Path,
+    env: dict[str, str],
+) -> None:
+    result = subprocess.run(
+        browser_evidence_export_command(project_name),
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            "Could not export browser evidence from the Compose daemon: "
+            f"{diagnostic or result.returncode}"
+        )
+
+    evidence_line = next(
+        (
+            line
+            for line in reversed(result.stdout.splitlines())
+            if line.startswith(BROWSER_EVIDENCE_PREFIX)
+        ),
+        None,
+    )
+    if evidence_line is None:
+        raise RuntimeError("Browser evidence export returned no evidence payload")
+    try:
+        encoded_files = json.loads(
+            evidence_line.removeprefix(BROWSER_EVIDENCE_PREFIX)
+        )
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Browser evidence export returned invalid JSON") from exc
+    if not isinstance(encoded_files, dict):
+        raise RuntimeError("Browser evidence export returned a non-object payload")
+    if set(encoded_files) != set(BROWSER_EVIDENCE_FILENAMES):
+        raise RuntimeError(
+            "Browser evidence export returned the wrong files: "
+            f"{sorted(encoded_files)}"
+        )
+
+    target.mkdir(parents=True, exist_ok=True)
+    for filename in BROWSER_EVIDENCE_FILENAMES:
+        try:
+            data = base64.b64decode(encoded_files[filename], validate=True)
+        except (binascii.Error, ValueError, TypeError) as exc:
+            raise RuntimeError(
+                f"Browser evidence {filename} was not valid base64"
+            ) from exc
+        if not data.startswith(PNG_SIGNATURE):
+            raise RuntimeError(f"Browser evidence {filename} was not a valid PNG")
+        destination = target / filename
+        destination.write_bytes(data)
+        destination.chmod(0o600)
+
+
 def prepare_dashboard_context(upstream_context: Path, target: Path) -> Path:
     source = upstream_context / "server" / "dashboard"
     if not (source / "package.json").is_file():
@@ -160,14 +253,6 @@ def prepare_dashboard_context(upstream_context: Path, target: Path) -> Path:
         / "apply-dashboard-overlay"
     )
     subprocess.run([str(apply_script), str(target)], cwd=ROOT, check=True)
-    shutil.copy2(
-        ROOT / "tests" / "e2e" / "dashboard_client_layout.browser-smoke.tsx",
-        target / "src" / "app" / "(root)" / "clientLayout.tsx",
-    )
-    shutil.copy2(
-        ROOT / "tests" / "e2e" / "dashboard_root_layout.browser-smoke.tsx",
-        target / "src" / "app" / "(root)" / "dashboard-client-layout.tsx",
-    )
     shutil.copy2(
         ROOT
         / "integrations"
@@ -360,6 +445,12 @@ def main() -> int:
     compose_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(upstream_context)
     compose_env["MEM0_E2E_DASHBOARD_CONTEXT"] = str(dashboard_context)
     compose_env["MEM0_E2E_PROJECT_ID"] = project_id
+    evidence_target = Path(
+        os.environ.get(
+            "MEM0_E2E_EVIDENCE_DIR",
+            "/tmp/mem0-sidecar-e2e-evidence",
+        )
+    ).expanduser()
     runner_env = build_runner_env(project_id=project_id)
     runner_env["MEM0_E2E_DASHBOARD_CONTEXT"] = str(dashboard_context)
     runner_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(upstream_context)
@@ -390,6 +481,11 @@ def main() -> int:
         )
         print("\n=== real destructive browser acceptance gate ===")
         run(browser_destructive_smoke_command(project_name), env=compose_env)
+        export_browser_evidence(
+            project_name,
+            target=evidence_target,
+            env=compose_env,
+        )
         print("\n=== mocked UI behavior smoke (not deployed-proxy acceptance) ===")
         run(mocked_browser_smoke_command(project_name), env=compose_env)
     except Exception:

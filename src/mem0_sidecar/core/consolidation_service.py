@@ -571,6 +571,7 @@ class ConsolidationService:
             ):
                 source.consolidation_state = "ACTIVE"
                 source.shadowed_by_proposal_id = None
+                source.last_consolidation_scan_at = None
                 restored += 1
         proposal.not_before = None
         proposals.set_status(proposal, "ROLLED_BACK")

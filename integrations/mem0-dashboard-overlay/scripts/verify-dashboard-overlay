@@ -1412,6 +1412,12 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
 
 def verify_api_keys_page(dashboard_dir: Path) -> str | None:
     content = (dashboard_dir / API_KEYS_PAGE).read_text()
+    create_body = extract_named_arrow_function_body(content, "handleCreate")
+    revoke_body = extract_named_arrow_function_body(content, "handleRevoke")
+    if create_body is None:
+        return "Client Keys page must define its create interaction"
+    if revoke_body is None:
+        return "Client Keys page must define its revoke interaction"
     for contract, error in (
         (
             "API &amp; MCP Client Keys",
@@ -1420,6 +1426,42 @@ def verify_api_keys_page(dashboard_dir: Path) -> str | None:
         (
             "API_KEY_ENDPOINTS.BASE",
             "Client Keys page must use Core API key management",
+        ),
+        (
+            "API_KEY_ENDPOINTS.BY_ID(target.id)",
+            "Client Keys page must revoke keys by exact Core key ID",
+        ),
+        (
+            "useApiQuery<ApiKey[]>",
+            "Client Keys list must use the secret-free key descriptor",
+        ),
+        (
+            'setNewKey("")',
+            "Client Keys page must clear the one-time secret on dialog close",
+        ),
+        (
+            "MEM0_OSS_MCP_TOKEN",
+            "Client Keys page must explain the compatible MCP token variable",
+        ),
+        (
+            "maxLength={255}",
+            "Client Keys labels must match the Core descriptor length bound",
+        ),
+        (
+            "mountedRef.current = true",
+            "Client Keys page must restore its mounted guard after Strict Mode remount",
+        ),
+        (
+            "mountedRef.current = false",
+            "Client Keys page must guard async completion after unmount",
+        ),
+        (
+            "API_KEY_ENDPOINTS.BY_ID(response.data.id)",
+            "Client Keys page must revoke a key whose one-time secret cannot be shown",
+        ),
+        (
+            'isCreating ? "Creating..." : "Create"',
+            "Client Keys page must lock the create interaction while pending",
         ),
         (
             "Authorization: Bearer &lt;key&gt;",
@@ -1434,16 +1476,25 @@ def verify_api_keys_page(dashboard_dir: Path) -> str | None:
             "Client Keys page must explain legacy static-token compatibility",
         ),
         (
-            'className="space-y-2 md:hidden"',
-            "Client Keys page must provide a mobile key list",
+            'className="space-y-2 lg:hidden"',
+            "Client Keys page must provide a compact key list",
         ),
         (
             'aria-label={`Revoke ${key.label}`}',
-            "Client Keys mobile revoke action must have an accessible name",
+            "Client Keys compact revoke action must have an accessible name",
         ),
     ):
         if contract not in content:
             return error
+    if "if (creatingRef.current ||" not in create_body:
+        return "Client Keys creation must reject concurrent submissions"
+    if "if (keyToRevoke === null || revokingRef.current)" not in revoke_body:
+        return "Client Keys revocation must reject concurrent submissions"
+    for forbidden in ("localStorage", "sessionStorage", "console.log"):
+        if forbidden in content:
+            return (
+                "Client Keys page must not persist or log the one-time secret"
+            )
     if "UpgradeBanner" in content:
         return "Client Keys page must not discourage supported multi-key usage"
     return None

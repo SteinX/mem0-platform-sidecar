@@ -4,7 +4,7 @@ import json
 import re
 import secrets
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -15,6 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from mem0_sidecar.core.consolidation_policy import ConsolidationPolicySpec
 from mem0_sidecar.core.explorer_filters import (
@@ -869,13 +870,9 @@ def _matches_event_channel(
     )
 
 
-def _event_channel_facets(
-    candidates: list[_EventCandidate],
+def _event_channel_facet_payload(
+    grouped: Mapping[RequestAttribution, int],
 ) -> list[dict[str, object]]:
-    grouped: dict[RequestAttribution, int] = {}
-    for candidate in candidates:
-        attribution = _candidate_attribution(candidate)
-        grouped[attribution] = grouped.get(attribution, 0) + 1
     ordered = sorted(
         grouped.items(),
         key=lambda item: (
@@ -887,6 +884,29 @@ def _event_channel_facets(
     return [
         {**attribution.to_channel_dict(), "count": count}
         for attribution, count in ordered
+    ]
+
+
+def _event_channel_sql_conditions(
+    channel: EventChannelFilter | None,
+) -> list[ColumnElement[bool]]:
+    if channel is None:
+        return []
+    if channel.transport == "unknown" and channel.credential_kind == "unknown":
+        return [
+            Event.request_transport.is_(None),
+            Event.credential_kind.is_(None),
+            Event.credential_id.is_(None),
+        ]
+    credential_id_condition = (
+        Event.credential_id == channel.credential_id
+        if channel.credential_id is not None
+        else Event.credential_id.is_(None)
+    )
+    return [
+        Event.request_transport == channel.transport,
+        Event.credential_kind == channel.credential_kind,
+        credential_id_condition,
     ]
 
 
@@ -1402,7 +1422,7 @@ class EventRepository:
         query: EventQuery,
     ) -> EventPage:
         app_id = validate_scope_id(app_id, field_name="app_id")
-        conditions = [
+        conditions: list[ColumnElement[bool]] = [
             Event.project_id == project_id,
             or_(Event.app_id == app_id, Event.app_id.is_(None)),
         ]
@@ -1435,6 +1455,8 @@ class EventRepository:
             conditions.append(Event.created_at >= _as_utc(query.from_at))
         if query.to_at is not None:
             conditions.append(Event.created_at <= _as_utc(query.to_at))
+        facet_conditions = list(conditions)
+        conditions.extend(_event_channel_sql_conditions(query.channel))
 
         for _attempt in range(_EVENT_QUERY_MAX_ATTEMPTS):
             page = self._query_project_events_snapshot(
@@ -1443,6 +1465,7 @@ class EventRepository:
                 query=query,
                 entity_filters=validated_entity_filters,
                 conditions=conditions,
+                facet_conditions=facet_conditions,
             )
             if page is not None:
                 return page
@@ -1455,8 +1478,57 @@ class EventRepository:
         app_id: str,
         query: EventQuery,
         entity_filters: Mapping[str, str],
-        conditions: list[object],
+        conditions: Sequence[ColumnElement[bool]],
+        facet_conditions: Sequence[ColumnElement[bool]],
     ) -> EventPage | None:
+        grouped_channels: dict[RequestAttribution, int] = {}
+        facet_rows = self.session.execute(
+            select(
+                Event.app_id,
+                Event.user_id,
+                Event.agent_id,
+                Event.run_id,
+                Event.request_transport,
+                Event.credential_kind,
+                Event.credential_id,
+                Event.credential_label,
+                Event.credential_prefix,
+                Event.request_json,
+            )
+            .where(*facet_conditions)
+            .execution_options(yield_per=1000)
+        )
+        for (
+            canonical_app_id,
+            canonical_user_id,
+            canonical_agent_id,
+            canonical_run_id,
+            transport,
+            credential_kind,
+            credential_id,
+            credential_label,
+            credential_prefix,
+            request_json,
+        ) in facet_rows:
+            if not _matches_event_scope(
+                request_json,
+                app_id,
+                entity_filters,
+                canonical_app_id,
+                canonical_user_id,
+                canonical_agent_id,
+                canonical_run_id,
+            ):
+                continue
+            attribution = RequestAttribution.from_stored(
+                transport=transport,
+                credential_kind=credential_kind,
+                credential_id=credential_id,
+                credential_label=credential_label,
+                credential_prefix=credential_prefix,
+            )
+            grouped_channels[attribution] = grouped_channels.get(attribution, 0) + 1
+        channels = _event_channel_facet_payload(grouped_channels)
         rows = list(
             self.session.execute(
                 select(
@@ -1504,7 +1576,6 @@ class EventRepository:
                 candidate.run_id,
             )
         ]
-        channels = _event_channel_facets(scope_matches)
         matches = [
             candidate
             for candidate in scope_matches

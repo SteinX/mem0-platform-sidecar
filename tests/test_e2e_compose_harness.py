@@ -1,3 +1,5 @@
+import base64
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -68,6 +70,7 @@ def test_live_runner_retains_postgres_mocked_ui_and_real_browser_gates() -> None
         "node",
         "/app/run-browser-destructive-e2e.cjs",
     ]
+    assert hasattr(compose_runner, "export_browser_evidence")
 
 
 def test_postgres_smoke_retains_phase2_exact_roundtrip_and_head_parity() -> None:
@@ -180,6 +183,7 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
     for contract in (
         "MEM0_E2E_BROWSER_CDP",
         "MEM0_E2E_DASHBOARD_URL",
+        "MEM0_E2E_AUTH_DASHBOARD_URL",
         "MEM0_E2E_SIDECAR_URL",
         "MEM0_E2E_MEM0_URL",
         "seedFixtureThroughSidecar",
@@ -194,6 +198,7 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
         "revokeClientKeyThroughDashboard",
         "waitForCoreClientKey",
         "cleanupClientKey",
+        "proveUnauthenticatedClientKeysRedirect",
         "/dashboard/api-keys",
         "api-key-new",
         "Copy client key",
@@ -207,6 +212,56 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
         "finally",
     ):
         assert contract in source
+
+
+def test_real_browser_auth_check_uses_an_auth_enabled_dashboard() -> None:
+    content = COMPOSE_FILE.read_text()
+    mem0 = _compose_service(content, "mem0")
+    auth_dashboard = _compose_service(content, "dashboard-auth-check")
+    browser = _compose_service(content, "browser")
+    browser_runner = _compose_service(content, "browser-smoke")
+
+    assert "DASHBOARD_URL: http://dashboard:3000" in mem0
+    assert 'AUTH_DISABLED: "false"' in auth_dashboard
+    assert "dashboard-auth-check:" in browser
+    assert "condition: service_healthy" in browser
+    assert (
+        "MEM0_E2E_AUTH_DASHBOARD_URL: http://dashboard-auth-check:3000"
+        in browser_runner
+    )
+    assert "MEM0_E2E_BROWSER_EVIDENCE_DIR: /evidence" in browser_runner
+    assert "MEM0_E2E_EVIDENCE_DIR" in browser_runner
+
+
+def test_real_browser_capture_waits_for_stable_animations_and_compact_fit() -> None:
+    source = REAL_BROWSER_SMOKE.read_text()
+
+    assert "waitForVisualStability" in source
+    assert "document.getAnimations().every" in source
+    assert 'document.querySelectorAll("nextjs-portal")' in source
+    assert 'style.setProperty("display", "none", "important")' in source
+    assert "async function setViewport" in source
+    assert '"Browser.getWindowForTarget"' in source
+    assert '"Browser.setWindowBounds"' in source
+    assert '"Emulation.setVisibleSize"' in source
+    assert '"Emulation.setPageScaleFactor"' in source
+    assert "screenWidth: width" in source
+    assert "assertClientKeysFitViewport" in source
+    assert "document.documentElement.scrollWidth <= viewportWidth" in source
+    assert "window.visualViewport?.width" in source
+    narrow_metrics = source.index("await setViewport(cdp, {\n      width: 960")
+    assert "mobile: false" in source[narrow_metrics : narrow_metrics + 160]
+    first_desktop_metrics = source.index(
+        "await setViewport(cdp, {\n      width: 1440"
+    )
+    assert first_desktop_metrics < source.index(
+        "stage = \"prove unauthenticated Client Keys redirect\""
+    )
+    assert source.index(
+        'await waitForVisualStability(cdp, "compact Client Keys list")'
+    ) < source.index(
+        'await captureBrowserEvidence(cdp, "client-keys-list-compact.png")'
+    )
 
 
 def test_real_browser_delete_finds_action_inside_radix_sheet_dialog() -> None:
@@ -240,7 +295,84 @@ def test_browser_runner_image_contains_mocked_and_real_scripts() -> None:
     assert "run-browser-destructive-e2e.cjs" in dockerfile
 
 
-def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
+def test_browser_evidence_export_command_reads_exact_expected_files() -> None:
+    command = compose_runner.browser_evidence_export_command("sidecar-e2e-test")
+
+    assert command[-3:-1] == ["node", "-e"]
+    source = command[-1]
+    assert "/evidence/" in source
+    assert compose_runner.BROWSER_EVIDENCE_PREFIX in source
+    for filename in compose_runner.BROWSER_EVIDENCE_FILENAMES:
+        assert filename in source
+
+
+def test_export_browser_evidence_copies_valid_pngs_from_daemon(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    png = compose_runner.PNG_SIGNATURE + b"browser-evidence"
+    payload = {
+        filename: base64.b64encode(png).decode("ascii")
+        for filename in compose_runner.BROWSER_EVIDENCE_FILENAMES
+    }
+    stdout = (
+        "compose diagnostic\n"
+        f"{compose_runner.BROWSER_EVIDENCE_PREFIX}{json.dumps(payload)}"
+    )
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=stdout,
+            stderr="",
+        ),
+    )
+
+    compose_runner.export_browser_evidence(
+        "sidecar-e2e-test",
+        target=tmp_path,
+        env={},
+    )
+
+    for filename in compose_runner.BROWSER_EVIDENCE_FILENAMES:
+        destination = tmp_path / filename
+        assert destination.read_bytes() == png
+        assert destination.stat().st_mode & 0o777 == 0o600
+
+
+def test_export_browser_evidence_rejects_non_png_payload(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    payload = {
+        filename: base64.b64encode(b"not-a-png").decode("ascii")
+        for filename in compose_runner.BROWSER_EVIDENCE_FILENAMES
+    }
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                f"{compose_runner.BROWSER_EVIDENCE_PREFIX}"
+                f"{json.dumps(payload)}"
+            ),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="not a valid PNG"):
+        compose_runner.export_browser_evidence(
+            "sidecar-e2e-test",
+            target=tmp_path,
+            env={},
+        )
+
+
+def test_prepare_dashboard_context_applies_overlay_and_retains_auth_shell(
     tmp_path,
 ) -> None:
     dashboard = tmp_path / "upstream" / "server" / "dashboard"
@@ -250,6 +382,14 @@ def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
     )
     (dashboard / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
     (dashboard / "pnpm-workspace.yaml").write_text("packages:\n  - '.'\n")
+    root_app = dashboard / "src" / "app" / "(root)"
+    root_app.mkdir(parents=True)
+    (root_app / "clientLayout.tsx").write_text(
+        "AuthLoadingState\nTooltipProvider\n"
+    )
+    (root_app / "dashboard-client-layout.tsx").write_text(
+        "AuthProvider\n<ClientLayout>{children}</ClientLayout>\n"
+    )
 
     prepared = compose_runner.prepare_dashboard_context(
         tmp_path / "upstream",
@@ -262,12 +402,12 @@ def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
     client_layout = (
         prepared / "src" / "app" / "(root)" / "clientLayout.tsx"
     ).read_text()
-    assert "AuthLoadingState" not in client_layout
+    assert "AuthLoadingState" in client_layout
     assert "TooltipProvider" in client_layout
     dashboard_client_layout = (
         prepared / "src" / "app" / "(root)" / "dashboard-client-layout.tsx"
     ).read_text()
-    assert "AuthProvider" not in dashboard_client_layout
+    assert "AuthProvider" in dashboard_client_layout
     assert "<ClientLayout>{children}</ClientLayout>" in dashboard_client_layout
     assert (prepared / "Dockerfile.e2e").is_file()
     assert hasattr(compose_runner, "mocked_browser_smoke_command")
@@ -554,6 +694,12 @@ def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
         "prepare_dashboard_context",
         lambda upstream, target: target,
     )
+    evidence_export = ["export-browser-evidence"]
+    monkeypatch.setattr(
+        compose_runner,
+        "export_browser_evidence",
+        lambda *args, **kwargs: commands.append(evidence_export),
+    )
 
     def fake_subprocess_run(command, **kwargs):
         commands.append(command)
@@ -582,7 +728,8 @@ def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
     )
     assert mocked_command in commands
     assert real_command in commands
-    assert commands.index(real_command) < commands.index(mocked_command)
+    assert commands.index(real_command) < commands.index(evidence_export)
+    assert commands.index(evidence_export) < commands.index(mocked_command)
 
 
 def test_compose_main_reports_cleanup_failure_without_primary(monkeypatch) -> None:
@@ -599,6 +746,11 @@ def test_compose_main_reports_cleanup_failure_without_primary(monkeypatch) -> No
         compose_runner,
         "prepare_dashboard_context",
         lambda upstream, target: target,
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "export_browser_evidence",
+        lambda *args, **kwargs: None,
     )
 
     def fail_down(command, **kwargs):
@@ -631,6 +783,11 @@ def test_compose_main_reports_resource_cleanup_failure_without_primary(
         compose_runner,
         "prepare_dashboard_context",
         lambda upstream, target: target,
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "export_browser_evidence",
+        lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         compose_runner.subprocess,

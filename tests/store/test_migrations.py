@@ -106,7 +106,7 @@ def test_request_channel_migration_preserves_historical_rows_as_unknown(
 ) -> None:
     database_url = f"sqlite:///{tmp_path / 'request-channel.sqlite3'}"
     config = _alembic_config(database_url)
-    command.upgrade(config, "head")
+    command.upgrade(config, "0008_memory_consolidation")
     engine = sa.create_engine(database_url, future=True)
     with engine.begin() as connection:
         connection.execute(
@@ -137,7 +137,7 @@ def test_request_channel_migration_preserves_historical_rows_as_unknown(
             )
         )
 
-    command.upgrade(config, "0008_memory_consolidation")
+    command.upgrade(config, "0009_request_channel_attribution")
 
     inspector = sa.inspect(engine)
     columns = {

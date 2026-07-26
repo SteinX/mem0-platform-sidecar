@@ -29,8 +29,9 @@ async function main() {
     source.includes("if (require.main === module)"),
     "real browser script must be import-safe for executable helper contracts",
   );
-  const { classifyDirectMem0Get, setDashboardSessionPrerequisite } =
-    require(scriptPath);
+  const { classifyDirectMem0Get, setDashboardSessionPrerequisite } = require(
+    scriptPath,
+  );
   check(
     typeof classifyDirectMem0Get === "function",
     "classifyDirectMem0Get must be exported",
@@ -41,13 +42,19 @@ async function main() {
   );
 
   const cookieCalls = [];
-  await setDashboardSessionPrerequisite({
-    async send(method, params) {
-      cookieCalls.push({ method, params });
-      return { success: true };
+  await setDashboardSessionPrerequisite(
+    {
+      async send(method, params) {
+        cookieCalls.push({ method, params });
+        return { success: true };
+      },
     },
-  });
-  check(cookieCalls.length === 1, "dashboard session must set exactly one cookie");
+    "real-refresh-token",
+  );
+  check(
+    cookieCalls.length === 1,
+    "dashboard session must set exactly one cookie",
+  );
   check(
     cookieCalls[0].method === "Network.setCookie",
     "dashboard session must use the CDP cookie API",
@@ -60,12 +67,27 @@ async function main() {
   );
   await rejects(
     () =>
-      setDashboardSessionPrerequisite({
-        async send() {
-          return { success: false };
+      setDashboardSessionPrerequisite(
+        {
+          async send() {
+            return { success: false };
+          },
         },
-      }),
+        "real-refresh-token",
+      ),
     "rejected dashboard session cookie",
+  );
+  await rejects(
+    () =>
+      setDashboardSessionPrerequisite(
+        {
+          async send() {
+            return { success: true };
+          },
+        },
+        "",
+      ),
+    "missing dashboard refresh token",
   );
 
   check(
@@ -109,11 +131,14 @@ async function main() {
     "HTTP 200 non-JSON body",
   );
   await rejects(
-    () => classifyDirectMem0Get(new Response("upstream failed", { status: 503 })),
+    () =>
+      classifyDirectMem0Get(new Response("upstream failed", { status: 503 })),
     "HTTP 5xx",
   );
 
-  console.log("browser destructive helper: direct Mem0 absence contract passed");
+  console.log(
+    "browser destructive helper: direct Mem0 absence contract passed",
+  );
 }
 
 main().catch((error) => {

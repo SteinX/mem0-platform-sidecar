@@ -3839,6 +3839,76 @@ def test_event_query_applies_sql_narrowing_before_bounded_scope_scan(
         )
 
 
+def test_event_query_sql_narrows_exact_channel_before_scan_limit(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 7, 13, tzinfo=UTC)
+    db_session.add_all(
+        [
+            Event(
+                id=f"legacy-{index:04d}",
+                project_id="repo-a",
+                app_id="app-a",
+                operation="memory.search",
+                status=EventStatus.SUCCEEDED,
+                request_transport="mcp",
+                credential_kind="legacy_static",
+                credential_label="Legacy shared MCP key",
+                request_json='{"app_id":"app-a"}',
+                created_at=created_at,
+            )
+            for index in range(5001)
+        ]
+    )
+    client_id = "e0544e3c-d217-40d9-bc9a-c1f64077542a"
+    db_session.add(
+        Event(
+            id="matching-client",
+            project_id="repo-a",
+            app_id="app-a",
+            operation="memory.search",
+            status=EventStatus.SUCCEEDED,
+            request_transport="mcp",
+            credential_kind="core_api_key",
+            credential_id=client_id,
+            credential_label="codex-devbox",
+            credential_prefix="m0sk_client_",
+            request_json='{"app_id":"app-a"}',
+            created_at=created_at,
+        )
+    )
+    db_session.flush()
+
+    page = EventRepository(db_session).query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            channel=EventChannelFilter(
+                transport="mcp",
+                credential_kind="core_api_key",
+                credential_id=client_id,
+            ),
+            page=1,
+            page_size=20,
+        ),
+    )
+
+    assert [event.id for event in page.items] == ["matching-client"]
+    assert page.total == 1
+    assert {
+        channel["credential_kind"]: channel["count"]
+        for channel in page.channels
+    } == {
+        "legacy_static": 5001,
+        "core_api_key": 1,
+    }
+
+
 def test_event_query_sql_narrows_canonical_app_before_scope_scan(db_session) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",

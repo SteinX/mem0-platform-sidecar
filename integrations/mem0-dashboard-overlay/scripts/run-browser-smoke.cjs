@@ -279,6 +279,13 @@ function installBrowserMocks() {
     updated_at: "2026-07-13T11:00:00Z",
   };
   const requestDetailId = "trace-add/detail";
+  const requestChannel = {
+    transport: "mcp",
+    credential_kind: "core_api_key",
+    credential_id: "browser-smoke-client-key",
+    label: "OpenCode smoke",
+    key_prefix: "m0sk_smoke",
+  };
   const trace = (operation) => {
     const display = operation || "OTHER";
     return {
@@ -291,6 +298,7 @@ function installBrowserMocks() {
         display === "OTHER" ? "memory.list" : `memory.${display.toLowerCase()}`,
       display_operation: display,
       status: "SUCCEEDED",
+      channel: requestChannel,
       entities: [
         { type: "user", id: "Alice-01" },
         { type: "app", id: "smoke-app" },
@@ -396,6 +404,10 @@ function installBrowserMocks() {
         page_size: 20,
         has_more: false,
         timeline: [{ timestamp: "2026-07-13T12:00:00Z", count: 1 }],
+        channels:
+          state.mode === "empty"
+            ? []
+            : [{ ...requestChannel, count: 1 }],
       });
     }
     if (/\/v1\/memories\/[^/]+\/history/.test(url)) {
@@ -693,6 +705,7 @@ async function main() {
     await setMode("normal");
     await clickButton("Retry");
     await waitText("Request timeline");
+    await waitText("OpenCode smoke");
     check(true, "request list recovered from error state");
 
     await clickButton("SEARCH");

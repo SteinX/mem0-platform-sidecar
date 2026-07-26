@@ -3,9 +3,14 @@
 
 // Real destructive browser acceptance: no browser response interception or mocks.
 
+const fs = require("node:fs");
+
 const cdpBase = process.env.MEM0_E2E_BROWSER_CDP || "http://browser:9222";
 const dashboardBase = (
   process.env.MEM0_E2E_DASHBOARD_URL || "http://dashboard:3000"
+).replace(/\/$/, "");
+const authDashboardBase = (
+  process.env.MEM0_E2E_AUTH_DASHBOARD_URL || "http://dashboard-auth-check:3000"
 ).replace(/\/$/, "");
 const sidecarBase = (
   process.env.MEM0_E2E_SIDECAR_URL || "http://sidecar:8765"
@@ -16,6 +21,8 @@ const mem0Base = (process.env.MEM0_E2E_MEM0_URL || "http://mem0:8000").replace(
 );
 const projectId = process.env.MEM0_E2E_PROJECT_ID || "sidecar-e2e";
 const appId = process.env.MEM0_E2E_APP_ID || "sidecar-e2e-app";
+const browserEvidenceDir =
+  process.env.MEM0_E2E_BROWSER_EVIDENCE_DIR || "/evidence";
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -120,16 +127,108 @@ async function openTarget() {
   return response.json();
 }
 
-async function setDashboardSessionPrerequisite(cdp) {
+async function captureBrowserEvidence(cdp, filename) {
+  await cdp.send("Runtime.evaluate", {
+    expression: `document.querySelectorAll("nextjs-portal").forEach(
+      (portal) => portal.style.setProperty("display", "none", "important"),
+    )`,
+  });
+  const screenshot = await cdp.send("Page.captureScreenshot", {
+    format: "png",
+    fromSurface: true,
+    captureBeyondViewport: false,
+  });
+  const data = Buffer.from(screenshot.data || "", "base64");
+  const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (
+    data.length < pngSignature.length ||
+    !data.subarray(0, 8).equals(pngSignature)
+  ) {
+    throw new Error(`Browser evidence ${filename} was not a valid PNG`);
+  }
+  fs.mkdirSync(browserEvidenceDir, { recursive: true });
+  fs.writeFileSync(`${browserEvidenceDir}/${filename}`, data, { mode: 0o600 });
+}
+
+async function dashboardRefreshToken() {
+  const credentials = {
+    name: "Browser E2E",
+    email: "browser-e2e@example.com",
+    password: "browser-e2e-password",
+  };
+  const setup = await fetchWithTimeout(`${mem0Base}/auth/setup-status`, {
+    timeout: 10000,
+  });
+  if (!setup.ok) throw new Error(await responseDiagnostic(setup));
+  const setupState = await setup.json();
+  const path = setupState?.needsSetup ? "/auth/register" : "/auth/login";
+  const payload = setupState?.needsSetup
+    ? credentials
+    : { email: credentials.email, password: credentials.password };
+  const response = await fetchWithTimeout(`${mem0Base}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    timeout: 10000,
+  });
+  if (!response.ok) throw new Error(await responseDiagnostic(response));
+  const session = await response.json();
+  if (
+    typeof session?.refresh_token !== "string" ||
+    session.refresh_token.length === 0
+  ) {
+    throw new Error("Core dashboard session omitted its refresh token");
+  }
+  return session.refresh_token;
+}
+
+async function setDashboardSessionPrerequisite(cdp, refreshToken) {
+  if (typeof refreshToken !== "string" || refreshToken.length === 0) {
+    throw new Error("A real dashboard refresh token is required");
+  }
   const cookie = await cdp.send("Network.setCookie", {
     name: "mem0_refresh_token",
-    value: "real-browser-destructive-session",
+    value: refreshToken,
     url: dashboardBase,
     httpOnly: true,
     sameSite: "Lax",
   });
   if (cookie.success === false) {
     throw new Error("Real browser dashboard session cookie was rejected");
+  }
+}
+
+async function proveUnauthenticatedClientKeysRedirect(cdp) {
+  await cdp.send("Network.deleteCookies", {
+    name: "mem0_refresh_token",
+    url: authDashboardBase,
+  });
+  await cdp.send("Page.navigate", {
+    url: `${authDashboardBase}/dashboard/api-keys`,
+  });
+  const { evaluate, waitFor } = createBrowserDriver(cdp);
+  await waitFor(
+    `location.origin === ${JSON.stringify(authDashboardBase)} &&
+      location.pathname === "/login"`,
+    "unauthenticated Client Keys redirect",
+  );
+  await waitFor(
+    `document.readyState === "complete" &&
+      document.body?.innerText?.includes("Sign in to Mem0") === true`,
+    "unauthenticated login page",
+  );
+  const result = await evaluate(`({
+    path: location.pathname,
+    body: document.body?.innerText || ""
+  })`);
+  if (
+    result?.path !== "/login" ||
+    !result?.body?.includes("Sign in to Mem0") ||
+    result?.body?.includes("API & MCP Client Keys")
+  ) {
+    throw new Error(
+      `Unauthenticated Client Keys route was exposed: ${JSON.stringify(result)}`,
+    );
   }
 }
 
@@ -202,6 +301,155 @@ function createBrowserDriver(cdp) {
   return { evaluate, waitFor };
 }
 
+async function waitForVisualStability(cdp, label) {
+  const { waitFor } = createBrowserDriver(cdp);
+  await waitFor(
+    `document.readyState === "complete" &&
+      document.getAnimations().every(
+        (animation) => animation.playState !== "running",
+      )`,
+    `${label} visual stability`,
+  );
+  await cdp.send("Runtime.evaluate", {
+    expression:
+      "new Promise((resolve) => requestAnimationFrame(() => " +
+      "requestAnimationFrame(resolve)))",
+    awaitPromise: true,
+  });
+}
+
+async function setViewport(cdp, { width, height, mobile }) {
+  const { windowId } = await cdp.send("Browser.getWindowForTarget");
+  await cdp.send("Browser.setWindowBounds", {
+    windowId,
+    bounds: {
+      width,
+      height,
+      windowState: "normal",
+    },
+  });
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width,
+    height,
+    deviceScaleFactor: 1,
+    mobile,
+    scale: 1,
+    screenWidth: width,
+    screenHeight: height,
+    positionX: 0,
+    positionY: 0,
+    dontSetVisibleSize: false,
+    screenOrientation: {
+      type: "portraitPrimary",
+      angle: 0,
+    },
+  });
+  await cdp.send("Emulation.setVisibleSize", { width, height });
+  await cdp.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
+}
+
+async function assertClientKeysFitViewport(cdp) {
+  const { evaluate } = createBrowserDriver(cdp);
+  const metricsExpression = `(() => {
+      const heading = [...document.querySelectorAll("h1")].find(
+        (item) => item.innerText.trim() === "API & MCP Client Keys",
+      );
+      const button = [...document.querySelectorAll("button")].find(
+        (item) => item.innerText.trim() === "Create client key",
+      );
+      const revokeButtons = [
+        ...document.querySelectorAll('button[aria-label^="Revoke "]'),
+      ].filter((item) => item.getClientRects().length > 0);
+      if (!heading || !button || revokeButtons.length === 0) {
+        return { fits: false, missing: true };
+      }
+      const viewportWidth = document.documentElement.clientWidth;
+      const innerWidth = window.innerWidth;
+      const visualViewportWidth = window.visualViewport?.width ?? null;
+      const screenWidth = window.screen.width;
+      const headingRect = heading.getBoundingClientRect();
+      const buttonRect = button.getBoundingClientRect();
+      const revokeRects = revokeButtons.map((item) =>
+        item.getBoundingClientRect(),
+      );
+      const fits =
+        document.documentElement.scrollWidth <= viewportWidth &&
+        innerWidth <= viewportWidth + 1 &&
+        (visualViewportWidth === null ||
+          visualViewportWidth <= viewportWidth + 1) &&
+        screenWidth <= viewportWidth + 1 &&
+        headingRect.left >= 0 &&
+        headingRect.right <= viewportWidth + 1 &&
+        buttonRect.left >= 0 &&
+        buttonRect.right <= viewportWidth + 1 &&
+        buttonRect.width > 0 &&
+        revokeRects.every(
+          (rect) =>
+            rect.left >= 0 &&
+            rect.right <= viewportWidth + 1 &&
+            rect.width > 0,
+        );
+      const overflowing = [...document.querySelectorAll("*")]
+        .map((element) => {
+          const rect = element.getBoundingClientRect();
+          return {
+            tag: element.tagName,
+            className:
+              typeof element.className === "string"
+                ? element.className.slice(0, 160)
+                : "",
+            left: Math.round(rect.left),
+            right: Math.round(rect.right),
+            width: Math.round(rect.width),
+          };
+        })
+        .filter(
+          (item) =>
+            item.width > 0 &&
+            (item.left < -1 || item.right > viewportWidth + 1),
+        )
+        .slice(0, 8);
+      return {
+        fits,
+        viewportWidth,
+        innerWidth,
+        visualViewportWidth,
+        screenWidth,
+        documentWidth: document.documentElement.scrollWidth,
+        headingLeft: headingRect.left,
+        headingRight: headingRect.right,
+        buttonLeft: buttonRect.left,
+        buttonRight: buttonRect.right,
+        revokeButtons: revokeRects.map((rect) => ({
+          left: rect.left,
+          right: rect.right,
+          width: rect.width,
+        })),
+        overflowing,
+      };
+    })()`;
+  const deadline = Date.now() + 10000;
+  let metrics;
+  while (Date.now() < deadline) {
+    metrics = await evaluate(metricsExpression);
+    if (metrics?.fits) {
+      await cdp.send("Runtime.evaluate", {
+        expression:
+          "new Promise((resolve) => requestAnimationFrame(() => " +
+          "requestAnimationFrame(resolve)))",
+        awaitPromise: true,
+      });
+      const stableMetrics = await evaluate(metricsExpression);
+      if (stableMetrics?.fits) return stableMetrics;
+    }
+    await sleep(100);
+  }
+  throw new Error(
+    `Client Keys content did not fit the compact viewport: ` +
+      JSON.stringify(metrics),
+  );
+}
+
 async function listCoreClientKeys() {
   const response = await fetchWithTimeout(`${mem0Base}/api-keys`, {
     timeout: 10000,
@@ -252,6 +500,8 @@ async function createClientKeyThroughDashboard(cdp, label) {
     `Boolean(document.querySelector("#api-key-label"))`,
     "client-key label input",
   );
+  await waitForVisualStability(cdp, "client-key create dialog");
+  await captureBrowserEvidence(cdp, "client-keys-create-dialog-desktop.png");
   const entered = await evaluate(`(() => {
     const input = document.querySelector("#api-key-label");
     if (!(input instanceof HTMLInputElement)) return false;
@@ -281,8 +531,9 @@ async function createClientKeyThroughDashboard(cdp, label) {
     const button = dialog &&
       [...dialog.querySelectorAll("button")].find(
         (item) => item.innerText.trim() === "Create",
-      );
+    );
     if (!button || button.disabled) return false;
+    button.click();
     button.click();
     return true;
   })()`);
@@ -303,6 +554,14 @@ async function createClientKeyThroughDashboard(cdp, label) {
     throw new Error("Copy client key action was not available");
   }
   const descriptor = await waitForCoreClientKey(label, true);
+  const matchingKeys = (await listCoreClientKeys()).filter(
+    (key) => key?.label === label,
+  );
+  if (matchingKeys.length !== 1) {
+    throw new Error(
+      `Concurrent create produced ${matchingKeys.length} keys for ${label}`,
+    );
+  }
   if (
     typeof descriptor?.id !== "string" ||
     typeof descriptor?.key_prefix !== "string"
@@ -411,8 +670,9 @@ async function revokeClientKeyThroughDashboard(cdp, label) {
     const button = dialog &&
       [...dialog.querySelectorAll("button")].find(
         (item) => item.innerText.trim() === "Revoke",
-      );
+    );
     if (!button || button.disabled) return false;
+    button.click();
     button.click();
     return true;
   })()`);
@@ -723,6 +983,8 @@ async function main() {
   let stage = "seed fixture through direct sidecar";
   let primaryError;
   try {
+    stage = "create real Core dashboard session";
+    const refreshToken = await dashboardRefreshToken();
     fixture = await seedFixtureThroughSidecar();
     stage = "connect to Chromium";
     await waitForBrowser();
@@ -740,12 +1002,23 @@ async function main() {
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
     await cdp.send("Network.enable");
-    stage = "install dashboard session prerequisite";
-    await setDashboardSessionPrerequisite(cdp);
-    await cdp.send("Emulation.setDeviceMetricsOverride", {
+    await setViewport(cdp, {
       width: 1440,
       height: 900,
-      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    stage = "prove unauthenticated Client Keys redirect";
+    await proveUnauthenticatedClientKeysRedirect(cdp);
+    await waitForVisualStability(cdp, "unauthenticated login page");
+    await captureBrowserEvidence(
+      cdp,
+      "client-keys-unauthenticated-desktop.png",
+    );
+    stage = "install dashboard session prerequisite";
+    await setDashboardSessionPrerequisite(cdp, refreshToken);
+    await setViewport(cdp, {
+      width: 1440,
+      height: 900,
       mobile: false,
     });
 
@@ -760,6 +1033,35 @@ async function main() {
       clientKeyLabel,
       clientKey.descriptor,
       clientKey.secret,
+    );
+    await waitForVisualStability(cdp, "desktop Client Keys list");
+    await captureBrowserEvidence(cdp, "client-keys-list-desktop.png");
+    await setViewport(cdp, {
+      width: 960,
+      height: 1024,
+      mobile: false,
+    });
+    await cdp.send("Page.navigate", {
+      url: `${dashboardBase}/dashboard/api-keys`,
+    });
+    await createBrowserDriver(cdp).waitFor(
+      `document.body?.innerText?.includes(${JSON.stringify(clientKeyLabel)}) === true`,
+      "compact Client Keys list",
+    );
+    await waitForVisualStability(cdp, "compact Client Keys list");
+    await assertClientKeysFitViewport(cdp);
+    await captureBrowserEvidence(cdp, "client-keys-list-compact.png");
+    await setViewport(cdp, {
+      width: 1440,
+      height: 900,
+      mobile: false,
+    });
+    await cdp.send("Page.navigate", {
+      url: `${dashboardBase}/dashboard/api-keys`,
+    });
+    await createBrowserDriver(cdp).waitFor(
+      `document.body?.innerText?.includes(${JSON.stringify(clientKeyLabel)}) === true`,
+      "restored desktop Client Keys list",
     );
     stage = "revoke client key through live dashboard";
     await revokeClientKeyThroughDashboard(cdp, clientKeyLabel);
