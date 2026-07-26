@@ -3,7 +3,12 @@ import type {
   ExplorerFilter,
   ExplorerMatch,
 } from "@/types/dashboard-explorer";
-import type { SidecarTraceQuery } from "@/types/sidecar";
+import type {
+  SidecarCredentialKind,
+  SidecarRequestTransport,
+  SidecarTraceChannelFilter,
+  SidecarTraceQuery,
+} from "@/types/sidecar";
 
 export type RequestTraceQueryState = {
   match: ExplorerMatch;
@@ -11,6 +16,7 @@ export type RequestTraceQueryState = {
   date_range: ExplorerDateRange;
   operation: SidecarTraceQuery["operation"];
   has_results: boolean | null;
+  channel: SidecarTraceChannelFilter | null;
   page: number;
   page_size: number;
 };
@@ -33,7 +39,6 @@ const ENTITY_FIELDS = new Set<ExplorerFilter["field"]>([
   "app_id",
   "run_id",
 ]);
-
 export function normalizeRequestTraceQueryState(
   base: BaseTraceQueryState,
   searchParams: URLSearchParams,
@@ -44,6 +49,11 @@ export function normalizeRequestTraceQueryState(
     date_range: base.date_range,
     operation: normalizeTraceOperation(searchParams.get("operation")),
     has_results: normalizeHasResults(searchParams.get("hasResults")),
+    channel: normalizeTraceChannel(
+      searchParams.get("channelTransport"),
+      searchParams.get("credentialKind"),
+      searchParams.get("credentialId"),
+    ),
     page: normalizeTracePage(base.page, base.page_size),
     page_size: normalizePageSize(base.page_size),
   };
@@ -95,6 +105,7 @@ export function requestTraceQueryPayload(
     has_results: query.has_results,
     date_range: query.date_range,
     entity_filters: entityFilters,
+    channel: query.channel,
     page: normalizeTracePage(query.page, query.page_size),
     page_size: normalizePageSize(query.page_size),
   };
@@ -120,6 +131,13 @@ export function toggleRequestTraceHasResults(
     ...query,
     has_results: query.has_results === true ? null : true,
   });
+}
+
+export function setRequestTraceChannel(
+  query: RequestTraceQueryState,
+  channel: SidecarTraceChannelFilter | null,
+): RequestTraceQueryState {
+  return resetRequestTraceQueryPage({ ...query, channel });
 }
 
 export function normalizeTracePage(
@@ -154,6 +172,7 @@ export function writeTraceControlUrl(
   current: URLSearchParams,
   operation: SidecarTraceQuery["operation"],
   hasResults: boolean | null,
+  channel: SidecarTraceChannelFilter | null,
 ): URLSearchParams {
   const next = new URLSearchParams(current.toString());
   writeOptional(next, "operation", operation);
@@ -162,7 +181,49 @@ export function writeTraceControlUrl(
     "hasResults",
     hasResults === null ? null : String(hasResults),
   );
+  writeOptional(next, "channelTransport", channel?.transport ?? null);
+  writeOptional(next, "credentialKind", channel?.credential_kind ?? null);
+  writeOptional(next, "credentialId", channel?.credential_id ?? null);
   return next;
+}
+
+export function traceChannelValue(
+  channel: SidecarTraceChannelFilter | null,
+): string {
+  if (channel === null) {
+    return "all";
+  }
+  return [
+    channel.transport,
+    channel.credential_kind,
+    channel.credential_id ?? "",
+  ]
+    .map(encodeURIComponent)
+    .join(":");
+}
+
+export function parseTraceChannelValue(
+  value: string,
+): SidecarTraceChannelFilter | null {
+  if (value === "all") {
+    return null;
+  }
+  const parts = value.split(":");
+  if (parts.length !== 3) {
+    return null;
+  }
+  try {
+    return normalizeTraceChannel(
+      decodeURIComponent(parts[0] ?? ""),
+      decodeURIComponent(parts[1] ?? ""),
+      decodeURIComponent(parts[2] ?? "") || null,
+    );
+  } catch (error) {
+    if (error instanceof URIError) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 export function nextTraceRequestGeneration(current: number): number {
@@ -211,6 +272,81 @@ function normalizeTraceOperation(
 function normalizeHasResults(value: string | null): boolean | null {
   if (value === "true") return true;
   return null;
+}
+
+function normalizeTraceChannel(
+  transport: string | null,
+  credentialKind: string | null,
+  credentialId: string | null,
+): SidecarTraceChannelFilter | null {
+  if (
+    transport === null ||
+    credentialKind === null ||
+    !isRequestTransport(transport) ||
+    !isCredentialKind(credentialKind)
+  ) {
+    return null;
+  }
+  const validTransports: Record<
+    SidecarCredentialKind,
+    ReadonlySet<SidecarRequestTransport>
+  > = {
+    core_api_key: new Set(["mcp", "rest"]),
+    legacy_static: new Set(["mcp"]),
+    operator_static: new Set(["rest"]),
+    session: new Set(["rest"]),
+    disabled: new Set(["mcp", "rest"]),
+    unknown: new Set(["system", "unknown"]),
+  };
+  if (!validTransports[credentialKind].has(transport)) {
+    return null;
+  }
+  if (credentialKind === "core_api_key") {
+    return isUuid(credentialId)
+      ? {
+          transport,
+          credential_kind: credentialKind,
+          credential_id: credentialId,
+        }
+      : null;
+  }
+  if (credentialId !== null) {
+    return null;
+  }
+  return {
+    transport,
+    credential_kind: credentialKind,
+    credential_id: null,
+  };
+}
+
+function isRequestTransport(value: string): value is SidecarRequestTransport {
+  return (
+    value === "mcp" ||
+    value === "rest" ||
+    value === "system" ||
+    value === "unknown"
+  );
+}
+
+function isCredentialKind(value: string): value is SidecarCredentialKind {
+  return (
+    value === "core_api_key" ||
+    value === "legacy_static" ||
+    value === "operator_static" ||
+    value === "session" ||
+    value === "disabled" ||
+    value === "unknown"
+  );
+}
+
+function isUuid(value: string | null): value is string {
+  return (
+    value !== null &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  );
 }
 
 function normalizePageSize(value: unknown): number {

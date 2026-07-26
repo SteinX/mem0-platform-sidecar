@@ -10,9 +10,10 @@ const dashboardBase = (
 const sidecarBase = (
   process.env.MEM0_E2E_SIDECAR_URL || "http://sidecar:8765"
 ).replace(/\/$/, "");
-const mem0Base = (
-  process.env.MEM0_E2E_MEM0_URL || "http://mem0:8000"
-).replace(/\/$/, "");
+const mem0Base = (process.env.MEM0_E2E_MEM0_URL || "http://mem0:8000").replace(
+  /\/$/,
+  "",
+);
 const projectId = process.env.MEM0_E2E_PROJECT_ID || "sidecar-e2e";
 const appId = process.env.MEM0_E2E_APP_ID || "sidecar-e2e-app";
 
@@ -111,10 +112,10 @@ class CdpSession {
 }
 
 async function openTarget() {
-  const response = await fetchWithTimeout(
-    `${cdpBase}/json/new?about%3Ablank`,
-    { method: "PUT", timeout: 5000 },
-  );
+  const response = await fetchWithTimeout(`${cdpBase}/json/new?about%3Ablank`, {
+    method: "PUT",
+    timeout: 5000,
+  });
   if (!response.ok) throw new Error(await responseDiagnostic(response));
   return response.json();
 }
@@ -155,7 +156,9 @@ async function seedFixtureThroughSidecar() {
   const payload = await response.json();
   const memoryId = payload?.event?.subject_id;
   if (typeof memoryId !== "string" || memoryId.length === 0) {
-    throw new Error(`Sidecar seed returned no real memory ID: ${JSON.stringify(payload)}`);
+    throw new Error(
+      `Sidecar seed returned no real memory ID: ${JSON.stringify(payload)}`,
+    );
   }
   return { memoryId, marker };
 }
@@ -197,6 +200,251 @@ function createBrowserDriver(cdp) {
   };
 
   return { evaluate, waitFor };
+}
+
+async function listCoreClientKeys() {
+  const response = await fetchWithTimeout(`${mem0Base}/api-keys`, {
+    timeout: 10000,
+  });
+  if (!response.ok) throw new Error(await responseDiagnostic(response));
+  const payload = await response.json();
+  if (!Array.isArray(payload)) {
+    throw new Error(
+      `Core key list was not an array: ${JSON.stringify(payload)}`,
+    );
+  }
+  return payload;
+}
+
+async function waitForCoreClientKey(label, expectedPresent) {
+  const deadline = Date.now() + 30000;
+  let matchingKey;
+  while (Date.now() < deadline) {
+    const keys = await listCoreClientKeys();
+    matchingKey = keys.find((key) => key?.label === label);
+    if (Boolean(matchingKey) === expectedPresent) return matchingKey || null;
+    await sleep(200);
+  }
+  throw new Error(
+    `Core client key ${label} presence remained ${String(Boolean(matchingKey))}`,
+  );
+}
+
+async function createClientKeyThroughDashboard(cdp, label) {
+  const { evaluate, waitFor } = createBrowserDriver(cdp);
+  await cdp.send("Page.navigate", {
+    url: `${dashboardBase}/dashboard/api-keys`,
+  });
+  await waitFor(
+    `document.body?.innerText?.includes("API & MCP Client Keys") === true`,
+    "Client Keys page",
+  );
+  const dialogOpened = await evaluate(`(() => {
+    const button = [...document.querySelectorAll("button")].find(
+      (item) => item.innerText.trim() === "Create client key",
+    );
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!dialogOpened) throw new Error("Create client key button was not found");
+  await waitFor(
+    `Boolean(document.querySelector("#api-key-label"))`,
+    "client-key label input",
+  );
+  const entered = await evaluate(`(() => {
+    const input = document.querySelector("#api-key-label");
+    if (!(input instanceof HTMLInputElement)) return false;
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    if (!setter) return false;
+    setter.call(input, ${JSON.stringify(label)});
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+  if (!entered) throw new Error("Client-key label could not be entered");
+  await waitFor(
+    `(() => {
+      const dialog = document.querySelector('[role="dialog"]');
+      const button = dialog &&
+        [...dialog.querySelectorAll("button")].find(
+          (item) => item.innerText.trim() === "Create",
+        );
+      return Boolean(button && !button.disabled);
+    })()`,
+    "enabled client-key create action",
+  );
+  const created = await evaluate(`(() => {
+    const dialog = document.querySelector('[role="dialog"]');
+    const button = dialog &&
+      [...dialog.querySelectorAll("button")].find(
+        (item) => item.innerText.trim() === "Create",
+      );
+    if (!button || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!created) throw new Error("Client-key create action was not available");
+  const secret = await waitFor(
+    `(() => {
+      const input = document.querySelector("#api-key-new");
+      return input instanceof HTMLInputElement && input.value.startsWith("m0sk_")
+        ? input.value
+        : "";
+    })()`,
+    "one-time client key",
+  );
+  const copyActionAvailable = await evaluate(
+    `Boolean(document.querySelector('[aria-label="Copy client key"]'))`,
+  );
+  if (!copyActionAvailable) {
+    throw new Error("Copy client key action was not available");
+  }
+  const descriptor = await waitForCoreClientKey(label, true);
+  if (
+    typeof descriptor?.id !== "string" ||
+    typeof descriptor?.key_prefix !== "string"
+  ) {
+    throw new Error(
+      `Core client-key descriptor is incomplete: ${JSON.stringify(descriptor)}`,
+    );
+  }
+  return { descriptor, secret };
+}
+
+async function assertClientKeyIsOneTimeOnly(cdp, label, descriptor, secret) {
+  const { evaluate, waitFor } = createBrowserDriver(cdp);
+  const closed = await evaluate(`(() => {
+    const dialog = document.querySelector('[role="dialog"]');
+    const button = dialog &&
+      [...dialog.querySelectorAll("button")].find(
+        (item) => item.innerText.trim() === "Done",
+      );
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!closed)
+    throw new Error("Client-key one-time dialog could not be closed");
+  const revokeSelector = `[aria-label="Revoke ${label}"]`;
+  await waitFor(
+    `Boolean(document.querySelector(${JSON.stringify(revokeSelector)}))`,
+    `listed client key ${label}`,
+  );
+  const persistedSecret = await evaluate(`(() => {
+    const values = [];
+    for (const storage of [localStorage, sessionStorage]) {
+      for (let index = 0; index < storage.length; index += 1) {
+        const key = storage.key(index);
+        if (key !== null) values.push(storage.getItem(key) || "");
+      }
+    }
+    return document.documentElement.innerHTML.includes(${JSON.stringify(secret)}) ||
+      values.some((value) => value.includes(${JSON.stringify(secret)}));
+  })()`);
+  if (persistedSecret) {
+    throw new Error("One-time client key remained in DOM or browser storage");
+  }
+  const prefixVisible = await evaluate(
+    `document.body?.innerText?.includes(${JSON.stringify(`${descriptor.key_prefix}...`)}) === true`,
+  );
+  if (!prefixVisible)
+    throw new Error(`Client key prefix was not listed for ${label}`);
+  await cdp.send("Page.navigate", {
+    url: `${dashboardBase}/dashboard/api-keys`,
+  });
+  await waitFor(
+    `Boolean(document.querySelector(${JSON.stringify(revokeSelector)}))`,
+    `reloaded client key ${label}`,
+  );
+  const secretAfterReload = await evaluate(
+    `document.documentElement.innerHTML.includes(${JSON.stringify(secret)})`,
+  );
+  if (secretAfterReload) {
+    throw new Error("One-time client key reappeared after page reload");
+  }
+}
+
+async function revokeClientKeyThroughDashboard(cdp, label) {
+  const { evaluate, waitFor } = createBrowserDriver(cdp);
+  const revokeSelector = `[aria-label="Revoke ${label}"]`;
+  const opened = await evaluate(`(() => {
+    const button = document.querySelector(${JSON.stringify(revokeSelector)});
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!opened) throw new Error(`Revoke action was not found for ${label}`);
+  await waitFor(
+    `document.querySelector('[role="dialog"]')?.innerText?.includes("Revoke client key") === true`,
+    "Revoke client key confirmation",
+  );
+  const entered = await evaluate(`(() => {
+    const dialog = document.querySelector('[role="dialog"]');
+    const input = dialog?.querySelector('input[placeholder="Enter name to confirm"]');
+    if (!(input instanceof HTMLInputElement)) return false;
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    if (!setter) return false;
+    setter.call(input, ${JSON.stringify(label)});
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+  if (!entered) throw new Error("Client-key revoke confirmation was not found");
+  await waitFor(
+    `(() => {
+      const dialog = document.querySelector('[role="dialog"]');
+      const button = dialog &&
+        [...dialog.querySelectorAll("button")].find(
+          (item) => item.innerText.trim() === "Revoke",
+        );
+      return Boolean(button && !button.disabled);
+    })()`,
+    "enabled client-key revoke action",
+  );
+  const confirmed = await evaluate(`(() => {
+    const dialog = document.querySelector('[role="dialog"]');
+    const button = dialog &&
+      [...dialog.querySelectorAll("button")].find(
+        (item) => item.innerText.trim() === "Revoke",
+      );
+    if (!button || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!confirmed)
+    throw new Error(`Client-key revoke was not enabled for ${label}`);
+  await waitForCoreClientKey(label, false);
+  await waitFor(
+    `!document.querySelector(${JSON.stringify(revokeSelector)})`,
+    `revoked client key ${label} to disappear`,
+  );
+}
+
+async function cleanupClientKey(label) {
+  const keys = await listCoreClientKeys();
+  const matchingKeys = keys.filter((key) => key?.label === label);
+  const failures = [];
+  for (const key of matchingKeys) {
+    if (typeof key?.id !== "string") {
+      failures.push(`missing ID: ${JSON.stringify(key)}`);
+      continue;
+    }
+    const response = await fetchWithTimeout(
+      `${mem0Base}/api-keys/${encodeURIComponent(key.id)}`,
+      { method: "DELETE", timeout: 10000 },
+    );
+    if (![200, 204, 404].includes(response.status)) {
+      failures.push(await responseDiagnostic(response));
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(`Client-key cleanup failed: ${failures.join("; ")}`);
+  }
 }
 
 async function openMemoryDetails(cdp, memoryId, marker) {
@@ -299,7 +547,8 @@ async function confirmExactMemoryId(cdp, memoryId) {
     buttons[0].click();
     return true;
   })()`);
-  if (!confirmed) throw new Error(`Exact-ID delete was not enabled for ${memoryId}`);
+  if (!confirmed)
+    throw new Error(`Exact-ID delete was not enabled for ${memoryId}`);
 }
 
 function observeExactDelete(cdp, memoryId) {
@@ -313,7 +562,12 @@ function observeExactDelete(cdp, memoryId) {
     resolveDelete = resolve;
     rejectDelete = reject;
     timeout = setTimeout(
-      () => reject(new Error(`No 2xx browser DELETE response observed for ${expectedPath}`)),
+      () =>
+        reject(
+          new Error(
+            `No 2xx browser DELETE response observed for ${expectedPath}`,
+          ),
+        ),
       30000,
     );
   });
@@ -323,7 +577,10 @@ function observeExactDelete(cdp, memoryId) {
     const url = request?.url;
     if (method === "DELETE" && typeof url === "string") {
       const parsed = new URL(url);
-      if (parsed.origin === dashboardOrigin && parsed.pathname === expectedPath) {
+      if (
+        parsed.origin === dashboardOrigin &&
+        parsed.pathname === expectedPath
+      ) {
         deleteRequests.add(requestId);
       }
     }
@@ -387,20 +644,26 @@ async function assertSidecarAbsent(memoryId) {
 async function classifyDirectMem0Get(response) {
   if (response.status === 404) return "absent";
   if (response.status !== 200) {
-    throw new Error(`direct Mem0 GET failed: ${await responseDiagnostic(response)}`);
+    throw new Error(
+      `direct Mem0 GET failed: ${await responseDiagnostic(response)}`,
+    );
   }
   const mediaType = (response.headers.get("content-type") || "")
     .split(";", 1)[0]
     .trim()
     .toLowerCase();
   if (mediaType !== "application/json" && !mediaType.endsWith("+json")) {
-    throw new Error(`direct Mem0 GET returned non-JSON content type: ${mediaType}`);
+    throw new Error(
+      `direct Mem0 GET returned non-JSON content type: ${mediaType}`,
+    );
   }
   let payload;
   try {
     payload = await response.json();
   } catch (error) {
-    throw new Error(`direct Mem0 GET returned invalid JSON: ${errorMessage(error)}`);
+    throw new Error(
+      `direct Mem0 GET returned invalid JSON: ${errorMessage(error)}`,
+    );
   }
   return payload === null ? "absent" : "present";
 }
@@ -421,7 +684,10 @@ async function cleanupFixture(memoryId) {
   const failures = [];
   for (const [label, url] of [
     ["sidecar cleanup DELETE", scopedSidecarUrl(memoryId)],
-    ["Mem0 cleanup DELETE", `${mem0Base}/memories/${encodeURIComponent(memoryId)}`],
+    [
+      "Mem0 cleanup DELETE",
+      `${mem0Base}/memories/${encodeURIComponent(memoryId)}`,
+    ],
   ]) {
     try {
       const response = await fetchWithTimeout(url, {
@@ -453,6 +719,7 @@ async function cleanupFixture(memoryId) {
 async function main() {
   let fixture;
   let cdp;
+  const clientKeyLabel = `browser-client-${Date.now()}-${crypto.randomUUID()}`;
   let stage = "seed fixture through direct sidecar";
   let primaryError;
   try {
@@ -482,6 +749,20 @@ async function main() {
       mobile: false,
     });
 
+    stage = "create client key through live dashboard";
+    const clientKey = await createClientKeyThroughDashboard(
+      cdp,
+      clientKeyLabel,
+    );
+    stage = "prove client key is visible only once";
+    await assertClientKeyIsOneTimeOnly(
+      cdp,
+      clientKeyLabel,
+      clientKey.descriptor,
+      clientKey.secret,
+    );
+    stage = "revoke client key through live dashboard";
+    await revokeClientKeyThroughDashboard(cdp, clientKeyLabel);
     stage = "open live Next list and exact memory detail";
     await openMemoryDetails(cdp, fixture.memoryId, fixture.marker);
     stage = "perform exact-ID UI delete and observe matched 2xx response";
@@ -521,6 +802,14 @@ async function main() {
           ? new Error(`${primaryError.message}\n${cleanupMessage}`)
           : new Error(cleanupMessage);
       }
+    }
+    try {
+      await cleanupClientKey(clientKeyLabel);
+    } catch (cleanupError) {
+      const cleanupMessage = `stage=finally client-key cleanup: ${errorMessage(cleanupError)}`;
+      primaryError = primaryError
+        ? new Error(`${primaryError.message}\n${cleanupMessage}`)
+        : new Error(cleanupMessage);
     }
   }
   if (primaryError) throw primaryError;

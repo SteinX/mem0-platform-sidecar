@@ -70,7 +70,11 @@ function filterAndPayloadContracts(state) {
   };
   const query = state.normalizeRequestTraceQueryState(
     base,
-    new URLSearchParams("operation=SEARCH&hasResults=true"),
+    new URLSearchParams(
+      "operation=SEARCH&hasResults=true" +
+        "&channelTransport=mcp&credentialKind=core_api_key" +
+        "&credentialId=9efe7b0e-1a0f-4fd8-8845-b450b9a692b3",
+    ),
   );
   assert.equal(query.match, "all", "Event API semantics are AND-only");
   assert.equal(
@@ -91,6 +95,11 @@ function filterAndPayloadContracts(state) {
     has_results: true,
     date_range: base.date_range,
     entity_filters: { user_id: "alice" },
+    channel: {
+      transport: "mcp",
+      credential_kind: "core_api_key",
+      credential_id: "9efe7b0e-1a0f-4fd8-8845-b450b9a692b3",
+    },
     page: 250,
     page_size: 20,
   });
@@ -105,7 +114,8 @@ function urlContracts(state) {
   const initial = new URLSearchParams(
     "match=all&filters=%5B%7B%22field%22%3A%22user_id%22%7D%5D" +
       "&from=2026-07-01T00%3A00%3A00Z&page=7&operation=ADD" +
-      "&hasResults=true&requestId=old%2Frequest&unknown=keep",
+      "&hasResults=true&requestId=old%2Frequest&unknown=keep" +
+      "&channelTransport=mcp&credentialKind=legacy_static",
   );
   const opened = state.setTraceRequestIdInUrl(initial, "next/request");
   assert.equal(opened.get("requestId"), "next/request");
@@ -114,20 +124,37 @@ function urlContracts(state) {
   assert.equal(opened.get("hasResults"), "true");
   assert.equal(opened.get("page"), "7");
   assert.equal(opened.get("unknown"), "keep");
+  assert.equal(opened.get("channelTransport"), "mcp");
+  assert.equal(opened.get("credentialKind"), "legacy_static");
   const closed = state.closeTraceRequestUrl(opened);
   assert.equal(closed.get("requestId"), null);
-  for (const key of ["filters", "operation", "hasResults", "page", "unknown"]) {
+  for (const key of [
+    "filters",
+    "operation",
+    "hasResults",
+    "page",
+    "unknown",
+    "channelTransport",
+    "credentialKind",
+  ]) {
     assert.equal(
       closed.get(key),
       opened.get(key),
       `closing must preserve ${key}`,
     );
   }
-  const controls = state.writeTraceControlUrl(initial, "GET_ALL", null);
+  const controls = state.writeTraceControlUrl(initial, "GET_ALL", null, {
+    transport: "rest",
+    credential_kind: "session",
+    credential_id: null,
+  });
   assert.equal(controls.get("operation"), "GET_ALL");
   assert.equal(controls.get("hasResults"), null);
   assert.equal(controls.get("requestId"), "old/request");
   assert.equal(controls.get("filters"), initial.get("filters"));
+  assert.equal(controls.get("channelTransport"), "rest");
+  assert.equal(controls.get("credentialKind"), "session");
+  assert.equal(controls.get("credentialId"), null);
 }
 
 function independentControlContracts(state) {
@@ -137,6 +164,7 @@ function independentControlContracts(state) {
     date_range: { from: null, to: null },
     operation: "SEARCH",
     has_results: true,
+    channel: null,
     page: 9,
     page_size: 20,
   };
@@ -176,6 +204,7 @@ function independentControlContracts(state) {
     new URLSearchParams("requestId=trace-1"),
     addWithResults.operation,
     addWithResults.has_results,
+    addWithResults.channel,
   );
   assert.equal(params.get("operation"), "ADD");
   assert.equal(params.get("hasResults"), "true");
@@ -187,9 +216,42 @@ function independentControlContracts(state) {
     has_results: true,
     date_range: combined.date_range,
     entity_filters: {},
+    channel: null,
     page: 1,
     page_size: 20,
   });
+}
+
+function channelContracts(state) {
+  const base = {
+    match: "all",
+    filters: [],
+    date_range: { from: null, to: null },
+    operation: null,
+    has_results: null,
+    channel: null,
+    page: 7,
+    page_size: 20,
+  };
+  const core = {
+    transport: "mcp",
+    credential_kind: "core_api_key",
+    credential_id: "9efe7b0e-1a0f-4fd8-8845-b450b9a692b3",
+  };
+  const selected = state.setRequestTraceChannel(base, core);
+  assert.deepEqual(selected, { ...base, channel: core, page: 1 });
+  const value = state.traceChannelValue(core);
+  assert.deepEqual(state.parseTraceChannelValue(value), core);
+  assert.equal(state.parseTraceChannelValue("all"), null);
+  assert.equal(
+    state.parseTraceChannelValue("rest:legacy_static:"),
+    null,
+    "incompatible forged channel values must fail closed",
+  );
+  assert.equal(
+    state.parseTraceChannelValue("mcp:core_api_key:not-a-uuid"),
+    null,
+  );
 }
 
 function generationContracts(state) {
@@ -257,7 +319,8 @@ function main() {
   independentControlContracts(state);
   generationContracts(state);
   pageBoundaryContracts(state);
-  console.log("request trace state harness: 5 contract groups passed");
+  channelContracts(state);
+  console.log("request trace state harness: 6 contract groups passed");
 }
 
 main();

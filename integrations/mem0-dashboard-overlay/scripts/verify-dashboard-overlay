@@ -25,6 +25,7 @@ REQUESTS_PAGE = "src/app/(root)/dashboard/requests/page.tsx"
 REQUEST_TRACE_DRAWER = (
     "src/app/(root)/dashboard/requests/request-trace-drawer.tsx"
 )
+API_KEYS_PAGE = "src/app/(root)/dashboard/api-keys/page.tsx"
 ENTITIES_PAGE = "src/app/(root)/dashboard/entities/page.tsx"
 DASHBOARD_DOCKERFILE = "Dockerfile"
 SIDECAR_PROXY = "src/utils/sidecar-proxy.ts"
@@ -434,7 +435,7 @@ def verify_responsive_nav_collapse(main_nav_content: str) -> str | None:
             "main-nav responsive collapse effect must invoke its collapse callback",
         ),
         (
-            r'sidebarMediaQuery\.addEventListener\(\s*["\']change["\']\s*,\s*collapseSidebarOnNarrowViewport\s*\)',
+            r'sidebarMediaQuery\.addEventListener\(\s*["\']change["\']\s*,\s*collapseSidebarOnNarrowViewport\s*,?\s*\)',
             "main-nav responsive collapse effect missing its change listener",
         ),
         (
@@ -1233,7 +1234,7 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
             "Requests page must close the drawer without clearing filters",
         ),
         (
-            "writeTraceControlUrl(next, query.operation, query.has_results)",
+            "writeTraceControlUrl(",
             "Requests page must persist operation query state",
         ),
         (
@@ -1247,6 +1248,22 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
         (
             'aria-label="Has results filter"',
             "Requests page must expose an independent result toggle",
+        ),
+        (
+            'aria-label="Request client filter"',
+            "Requests page must expose an accessible client filter",
+        ),
+        (
+            "pageData?.channels",
+            "Requests page must consume server-provided channel facets",
+        ),
+        (
+            "setRequestTraceChannel(query, channel)",
+            "Requests page must apply exact client filters",
+        ),
+        (
+            'label: "Client"',
+            "Requests table must display the authenticated client",
         ),
         (
             "<TraceEventButton",
@@ -1332,6 +1349,14 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
         ('document.execCommand("copy")', "Request drawer missing clipboard fallback"),
         ("Raw error", "Request drawer must expose failure payloads"),
         (
+            'label="Client"',
+            "Request drawer must display the authenticated client",
+        ),
+        (
+            'label="Client ID"',
+            "Request drawer must display exact client identity",
+        ),
+        (
             "<EntityBadges",
             "Request drawer must render shared entity badges",
         ),
@@ -1382,6 +1407,45 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
     ):
         if contract not in drawer_content:
             return error
+    return None
+
+
+def verify_api_keys_page(dashboard_dir: Path) -> str | None:
+    content = (dashboard_dir / API_KEYS_PAGE).read_text()
+    for contract, error in (
+        (
+            "API &amp; MCP Client Keys",
+            "Client Keys page must explain its shared REST and MCP purpose",
+        ),
+        (
+            "API_KEY_ENDPOINTS.BASE",
+            "Client Keys page must use Core API key management",
+        ),
+        (
+            "Authorization: Bearer &lt;key&gt;",
+            "Client Keys page must show the remote MCP credential shape",
+        ),
+        (
+            "It is shown only once.",
+            "Client Keys page must warn about one-time secret visibility",
+        ),
+        (
+            "hybrid-mode migration",
+            "Client Keys page must explain legacy static-token compatibility",
+        ),
+        (
+            'className="space-y-2 md:hidden"',
+            "Client Keys page must provide a mobile key list",
+        ),
+        (
+            'aria-label={`Revoke ${key.label}`}',
+            "Client Keys mobile revoke action must have an accessible name",
+        ),
+    ):
+        if contract not in content:
+            return error
+    if "UpgradeBanner" in content:
+        return "Client Keys page must not discourage supported multi-key usage"
     return None
 
 
@@ -1666,6 +1730,7 @@ def main() -> int:
         verify_export_page(dashboard_dir),
         verify_proxy_contract(dashboard_dir),
         verify_requests_page(dashboard_dir),
+        verify_api_keys_page(dashboard_dir),
         verify_entities_page(dashboard_dir),
         verify_public_api_placeholder(dashboard_dir),
     )

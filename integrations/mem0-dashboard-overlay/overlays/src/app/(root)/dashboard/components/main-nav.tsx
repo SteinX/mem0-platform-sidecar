@@ -147,7 +147,10 @@ export function MainNav({
     };
 
     collapseSidebarOnNarrowViewport();
-    sidebarMediaQuery.addEventListener("change", collapseSidebarOnNarrowViewport);
+    sidebarMediaQuery.addEventListener(
+      "change",
+      collapseSidebarOnNarrowViewport,
+    );
     return () => {
       sidebarMediaQuery.removeEventListener(
         "change",
@@ -278,7 +281,7 @@ export function MainNav({
                 )}
                 {[
                   {
-                    title: "API Keys",
+                    title: "Client Keys",
                     url: "/dashboard/api-keys",
                     icon: KeyRound,
                     active: pathname === "/dashboard/api-keys",

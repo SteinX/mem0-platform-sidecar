@@ -195,6 +195,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/app/(root)/dashboard/memories/memory-detail-drawer.tsx",
         "src/app/(root)/dashboard/requests/page.tsx",
         "src/app/(root)/dashboard/requests/request-trace-drawer.tsx",
+        "src/app/(root)/dashboard/api-keys/page.tsx",
         "src/app/(root)/dashboard/entities/page.tsx",
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/config/route.ts",
@@ -873,7 +874,7 @@ def test_request_trace_state_harness_executes_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "request trace state harness: 5 contract groups passed" in result.stdout
+    assert "request trace state harness: 6 contract groups passed" in result.stdout
 
 
 def test_request_trace_focus_restoration_contracts():
@@ -2404,8 +2405,10 @@ def test_verify_rejects_missing_live_responsive_change_listener(tmp_path):
     nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
     content = nav.read_text()
     active_listener = (
-        '    sidebarMediaQuery.addEventListener("change", '
-        "collapseSidebarOnNarrowViewport);\n"
+        "    sidebarMediaQuery.addEventListener(\n"
+        '      "change",\n'
+        "      collapseSidebarOnNarrowViewport,\n"
+        "    );\n"
     )
     assert active_listener in content
     nav.write_text(content.replace(active_listener, "", 1) + RESPONSIVE_SIDEBAR_DECOY)

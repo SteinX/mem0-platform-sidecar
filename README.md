@@ -3,15 +3,14 @@
 Control-plane sidecar for making self-hosted Mem0 OSS easier to use from
 Platform-shaped agent integrations.
 
-## Release 0.3.3
+## Release 0.3.4
 
-This hotfix completes the transparent Mem0 ingress security and projection
-contract introduced in 0.3.2. Ordinary principals now use server-owned default
-project/app scope across both OSS-compatible and Platform-shaped memory routes,
-project-wide access and reconciliation require an admin or system principal,
-and memory projections retain public metadata while separately recording
-verified internal scope markers. The runtime and package versions are also
-kept in lockstep by a regression test.
+This release adds first-class multi-client credential operations to the
+self-hosted dashboard. Client Keys reuses Core's existing API-key lifecycle,
+shows new secrets only once, and supports independent revocation without a
+second credential store. Requests now snapshots and filters the safe
+transport, credential UUID, label, kind, and prefix supplied by trusted
+private callers. Historical rows remain explicitly unattributed.
 
 The sidecar is not a fork of Mem0. Mem0 OSS remains the memory data plane and
 continues to own memory storage, embeddings, and vector search. This service
