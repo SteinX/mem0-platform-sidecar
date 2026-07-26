@@ -194,27 +194,6 @@ async function openTarget() {
   return response.json();
 }
 
-async function grantDashboardClipboardPermissions() {
-  const response = await fetchWithTimeout(`${cdpBase}/json/version`, {
-    timeout: 5000,
-  });
-  if (!response.ok) throw new Error(await responseDiagnostic(response));
-  const version = await response.json();
-  if (typeof version.webSocketDebuggerUrl !== "string") {
-    throw new Error("Chromium browser target omitted its debugger URL");
-  }
-  const browser = new CdpSession(version.webSocketDebuggerUrl);
-  await browser.open();
-  try {
-    await browser.send("Browser.grantPermissions", {
-      origin: new URL(dashboardBase).origin,
-      permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"],
-    });
-  } finally {
-    browser.close();
-  }
-}
-
 async function captureBrowserEvidence(cdp, filename) {
   await cdp.send("Runtime.evaluate", {
     expression: `document.querySelectorAll("nextjs-portal").forEach(
@@ -673,6 +652,23 @@ async function createClientKeyThroughDashboard(cdp, label) {
   if (!copyActionAvailable) {
     throw new Error("Copy client key action was not available");
   }
+  const clipboardCaptureInstalled = await evaluate(`(() => {
+    const clipboard = navigator.clipboard;
+    if (!clipboard || typeof clipboard.writeText !== "function") return false;
+    const nativeWriteText = clipboard.writeText.bind(clipboard);
+    globalThis.__mem0E2EClipboardWrites = [];
+    Object.defineProperty(clipboard, "writeText", {
+      configurable: true,
+      value: async (value) => {
+        await nativeWriteText(value);
+        globalThis.__mem0E2EClipboardWrites.push(String(value));
+      },
+    });
+    return true;
+  })()`);
+  if (!clipboardCaptureInstalled) {
+    throw new Error("Clipboard write capture could not be installed");
+  }
   const copied = await clickBySelector('[aria-label="Copy client key"]');
   if (!copied) throw new Error("Copy client key action could not be invoked");
   await waitFor(
@@ -682,9 +678,11 @@ async function createClientKeyThroughDashboard(cdp, label) {
       )`,
     "successful client-key copy state",
   );
-  const clipboardText = await evaluate("navigator.clipboard.readText()");
+  const clipboardText = await evaluate(
+    "globalThis.__mem0E2EClipboardWrites.at(-1)",
+  );
   if (clipboardText !== secret) {
-    throw new Error("Clipboard did not contain the one-time client key");
+    throw new Error("Clipboard write did not receive the one-time client key");
   }
   const evidenceRedacted = await evaluate(`(() => {
     const input = document.querySelector("#api-key-new");
@@ -1192,7 +1190,6 @@ async function main() {
     fixture = await seedFixtureThroughSidecar();
     stage = "connect to Chromium";
     await waitForBrowser();
-    await grantDashboardClipboardPermissions();
     const target = await openTarget();
     cdp = new CdpSession(target.webSocketDebuggerUrl);
     await cdp.open();
