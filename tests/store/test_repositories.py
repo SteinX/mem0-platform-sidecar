@@ -180,6 +180,80 @@ def test_event_query_filters_exact_client_id_and_returns_safe_channel_facets(
     ]
 
 
+def test_event_query_bounds_canonical_channel_facet_candidates(
+    db_session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    db_session.execute(
+        insert(Event),
+        [
+            {
+                "id": f"event-{index:05d}",
+                "project_id": "repo-a",
+                "app_id": "app-a",
+                "operation": "memory.search",
+                "status": EventStatus.SUCCEEDED,
+                "request_json": '{"app_id":"app-a"}',
+                "request_transport": "mcp",
+                "credential_kind": "legacy_static",
+            }
+            for index in range(repositories.EVENT_SCAN_LIMIT + 1)
+        ],
+    )
+    client_id = "e0544e3c-d217-40d9-bc9a-c1f64077542a"
+    db_session.add(
+        Event(
+            id="matching-client",
+            project_id="repo-a",
+            app_id="app-a",
+            operation="memory.search",
+            status=EventStatus.SUCCEEDED,
+            request_json='{"app_id":"app-a"}',
+            request_transport="mcp",
+            credential_kind="core_api_key",
+            credential_id=client_id,
+            credential_label="codex-devbox",
+            credential_prefix="m0sk_client_",
+        )
+    )
+    db_session.flush()
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(Event)
+        .where(
+            Event.credential_kind == "core_api_key",
+            Event.credential_id == client_id,
+        )
+    ) == 1
+
+    page = EventRepository(db_session).query_project_events(
+        "repo-a",
+        "app-a",
+        repositories.EventQuery(
+            channel=EventChannelFilter(
+                transport="mcp",
+                credential_kind="core_api_key",
+                credential_id=client_id,
+            ),
+            page=1,
+            page_size=20,
+        )
+    )
+
+    assert [event.id for event in page.items] == ["matching-client"]
+    assert sum(channel["count"] for channel in page.channels) == (
+        repositories.EVENT_SCAN_LIMIT
+    )
+    assert any(
+        channel["credential_id"] == client_id
+        for channel in page.channels
+    )
+
+
 def test_category_model_enforces_unique_name_per_project(db_session):
     constraints = {
         constraint.name: tuple(column.name for column in constraint.columns)
@@ -3905,10 +3979,10 @@ def test_event_query_sql_narrows_exact_channel_before_scan_limit(
     assert {
         channel["credential_kind"]: channel["count"]
         for channel in page.channels
-    } == {
-        "legacy_static": 5001,
-        "core_api_key": 1,
-    }
+        } == {
+            "legacy_static": 4999,
+            "core_api_key": 1,
+        }
 
 
 def test_event_channel_facet_grouping_is_bounded_in_sql(db_session) -> None:

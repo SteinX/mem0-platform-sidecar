@@ -532,6 +532,82 @@ def test_exact_source_revision_gate_binds_all_three_clean_sources(
     }
 
 
+def test_exact_source_revision_gate_requires_all_expected_shas(
+    monkeypatch,
+) -> None:
+    contexts = {
+        "sidecar": Path("/tmp/sidecar"),
+        "core": Path("/tmp/core"),
+        "mcp": Path("/tmp/mcp"),
+    }
+    monkeypatch.setattr(
+        compose_runner,
+        "_git_revision",
+        lambda _context: "a" * 40,
+    )
+    for variable in (
+        "MEM0_E2E_EXPECTED_SIDECAR_SHA",
+        "MEM0_E2E_EXPECTED_CORE_SHA",
+        "MEM0_E2E_EXPECTED_MCP_SHA",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    with pytest.raises(
+        RuntimeError,
+        match="MEM0_E2E_EXPECTED_SIDECAR_SHA is required",
+    ):
+        verify_source_revisions(
+            sidecar_context=contexts["sidecar"],
+            core_context=contexts["core"],
+            mcp_context=contexts["mcp"],
+        )
+
+
+def test_e2e_evidence_manifest_binds_sources_gates_and_screenshots(
+    tmp_path,
+) -> None:
+    for filename in (
+        *compose_runner.BROWSER_EVIDENCE_FILENAMES,
+        *compose_runner.E2E_TEST_REPORT_FILENAMES,
+    ):
+        (tmp_path / filename).write_bytes(
+            compose_runner.PNG_SIGNATURE + filename.encode("utf-8")
+        )
+    revisions = {
+        "sidecar": "a" * 40,
+        "core": "b" * 40,
+        "mcp": "c" * 40,
+    }
+    gates = (
+        "postgres_migration_smoke",
+        "live_service_tests",
+        "adoption_test",
+        "destructive_browser",
+        "mocked_browser",
+    )
+
+    compose_runner.write_e2e_evidence_manifest(
+        target=tmp_path,
+        revisions=revisions,
+        completed_gates=gates,
+    )
+
+    manifest = json.loads((tmp_path / "e2e-manifest.json").read_text())
+    assert manifest["sources"] == revisions
+    assert manifest["completed_gates"] == list(gates)
+    assert manifest["completed"] is True
+    assert set(manifest["artifacts"]) == set(
+        (
+            *compose_runner.BROWSER_EVIDENCE_FILENAMES,
+            *compose_runner.E2E_TEST_REPORT_FILENAMES,
+        )
+    )
+    assert all(
+        artifact["sha256"]
+        for artifact in manifest["artifacts"].values()
+    )
+
+
 def test_compose_command_uses_e2e_file_and_isolated_project() -> None:
     command = compose_command("sidecar-e2e-test")
 
@@ -781,6 +857,26 @@ def test_e2e_compose_keeps_unscoped_adoption_gate_on_dedicated_runner() -> None:
     assert 'MEM0_OSS_LIST_FETCH_LIMIT: "5000"' in content
 
 
+def _pin_compose_main_sources(monkeypatch) -> None:
+    revision = "a" * 40
+    for variable in (
+        "MEM0_E2E_EXPECTED_SIDECAR_SHA",
+        "MEM0_E2E_EXPECTED_CORE_SHA",
+        "MEM0_E2E_EXPECTED_MCP_SHA",
+    ):
+        monkeypatch.setenv(variable, revision)
+    monkeypatch.setattr(
+        compose_runner,
+        "_git_revision",
+        lambda _context: revision,
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "write_e2e_evidence_manifest",
+        lambda **_kwargs: None,
+    )
+
+
 def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
     monkeypatch,
 ) -> None:
@@ -788,6 +884,7 @@ def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
     monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    _pin_compose_main_sources(monkeypatch)
     monkeypatch.setattr(
         compose_runner,
         "run",
@@ -843,6 +940,7 @@ def test_compose_main_reports_cleanup_failure_without_primary(monkeypatch) -> No
     monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    _pin_compose_main_sources(monkeypatch)
     monkeypatch.setattr(compose_runner, "run", lambda command, *, env: None)
     monkeypatch.setattr(
         compose_runner,
@@ -880,6 +978,7 @@ def test_compose_main_reports_resource_cleanup_failure_without_primary(
     monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    _pin_compose_main_sources(monkeypatch)
     monkeypatch.setattr(compose_runner, "run", lambda command, *, env: None)
     monkeypatch.setattr(
         compose_runner,
@@ -931,6 +1030,7 @@ def test_compose_main_cleanup_does_not_mask_primary_failure(
     monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    _pin_compose_main_sources(monkeypatch)
     primary = PrimaryComposeFailure("primary runner failure")
     monkeypatch.setattr(
         compose_runner,

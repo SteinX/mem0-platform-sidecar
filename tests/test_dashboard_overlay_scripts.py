@@ -204,6 +204,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/lib/auth.tsx",
         "src/lib/dashboard-session.ts",
         "src/utils/api.ts",
+        "src/utils/dashboard-access-token.ts",
         "src/utils/dashboard-session-client.ts",
         "src/utils/dashboard-session-refresh.ts",
         "src/utils/sidecar-project.ts",
@@ -238,6 +239,7 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
     assert "src/app/api/sidecar/config/route.ts" in manifest["files"]
     assert "src/app/api/sidecar/[...path]/route.ts" in manifest["files"]
     assert "src/utils/sidecar-project.ts" in manifest["files"]
+    assert "src/utils/dashboard-access-token.ts" in manifest["files"]
     assert "src/utils/sidecar-proxy.ts" in manifest["files"]
     assert "src/utils/category-editor-state.ts" in manifest["files"]
     assert "src/components/ui/delete-confirmation-modal.tsx" in manifest["files"]
@@ -2013,6 +2015,50 @@ def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
     assert "dashboardSessionRefreshCoordinator.refresh(refreshToken)" in route_content
     assert 'result.status === "unauthorized"' in route_content
     assert 'result.status === "unavailable"' in route_content
+    assert "isAdminDashboardAccessToken(result.accessToken)" in route_content
+    assert "DashboardSessionForbiddenError" in route_content
+    assert "status: 403" in route_content
+
+
+def test_dashboard_access_token_admin_gate_runtime(tmp_path):
+    if not shutil.which("bun"):
+        pytest.skip("bun is required for the dashboard token runtime test")
+
+    helper = (
+        OVERLAY / "overlays/src/utils/dashboard-access-token.ts"
+    ).resolve()
+    harness = tmp_path / "dashboard-access-token.ts"
+    harness.write_text(
+        f"""
+import {{isAdminDashboardAccessToken}} from {json.dumps(helper.as_uri())};
+
+const token = (role: string) => [
+  "header",
+  Buffer.from(JSON.stringify({{role}})).toString("base64url"),
+  "signature",
+].join(".");
+
+if (!isAdminDashboardAccessToken(token("admin"))) {{
+  throw new Error("admin token was rejected");
+}}
+if (isAdminDashboardAccessToken(token("member"))) {{
+  throw new Error("member token was accepted");
+}}
+if (isAdminDashboardAccessToken("malformed")) {{
+  throw new Error("malformed token was accepted");
+}}
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bun", str(harness)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
 
 
 def test_apply_dashboard_overlay_forwards_server_only_sidecar_api_key(tmp_path):

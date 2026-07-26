@@ -1547,39 +1547,46 @@ class EventRepository:
                 continue
             matching_legacy_event_ids.append(event_id)
 
-        facet_scope = and_(*canonical_facet_conditions)
-        if matching_legacy_event_ids:
-            facet_scope = or_(
-                facet_scope,
-                Event.id.in_(matching_legacy_event_ids),
-            )
-        grouped_channels: dict[RequestAttribution, int] = {}
-        canonical_channel_rows = self.session.execute(
-            select(
-                *channel_columns,
-                func.count(Event.id),
-            )
-            .where(facet_scope)
-            .group_by(*channel_columns)
-            .order_by(func.count(Event.id).desc(), *channel_columns)
-            .limit(_EVENT_CHANNEL_FACET_LIMIT)
+        canonical_facet_event_ids = list(
+            self.session.execute(
+                select(Event.id)
+                .where(*canonical_facet_conditions)
+                .order_by(Event.created_at.desc(), Event.id.desc())
+                .limit(EVENT_SCAN_LIMIT)
+            ).scalars()
         )
-        for (
-            transport,
-            credential_kind,
-            credential_id,
-            credential_label,
-            credential_prefix,
-            count,
-        ) in canonical_channel_rows:
-            attribution = RequestAttribution.from_stored(
-                transport=transport,
-                credential_kind=credential_kind,
-                credential_id=credential_id,
-                credential_label=credential_label,
-                credential_prefix=credential_prefix,
+        facet_event_ids = [
+            *canonical_facet_event_ids,
+            *matching_legacy_event_ids,
+        ]
+        grouped_channels: dict[RequestAttribution, int] = {}
+        if facet_event_ids:
+            canonical_channel_rows = self.session.execute(
+                select(
+                    *channel_columns,
+                    func.count(Event.id),
+                )
+                .where(Event.id.in_(facet_event_ids))
+                .group_by(*channel_columns)
+                .order_by(func.count(Event.id).desc(), *channel_columns)
+                .limit(_EVENT_CHANNEL_FACET_LIMIT)
             )
-            grouped_channels[attribution] = count
+            for (
+                transport,
+                credential_kind,
+                credential_id,
+                credential_label,
+                credential_prefix,
+                count,
+            ) in canonical_channel_rows:
+                attribution = RequestAttribution.from_stored(
+                    transport=transport,
+                    credential_kind=credential_kind,
+                    credential_id=credential_id,
+                    credential_label=credential_label,
+                    credential_prefix=credential_prefix,
+                )
+                grouped_channels[attribution] = count
         channels = _event_channel_facet_payload(grouped_channels)
         rows = list(
             self.session.execute(

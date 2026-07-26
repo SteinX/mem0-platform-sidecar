@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 import shutil
@@ -30,6 +31,17 @@ BROWSER_EVIDENCE_FILENAMES = (
 )
 BROWSER_EVIDENCE_PREFIX = "MEM0_E2E_EVIDENCE_JSON="
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+E2E_TEST_REPORT_FILENAMES = (
+    "live-tests.xml",
+    "adoption-test.xml",
+)
+E2E_COMPLETED_GATES = (
+    "postgres_migration_smoke",
+    "live_service_tests",
+    "adoption_test",
+    "destructive_browser",
+    "mocked_browser",
+)
 
 
 def compose_command(project_name: str) -> list[str]:
@@ -106,7 +118,7 @@ def verify_source_revisions(
         revisions[name] = revision
         expected = os.environ.get(expected_variable)
         if expected is None:
-            continue
+            raise RuntimeError(f"{expected_variable} is required")
         if revision != expected:
             raise RuntimeError(
                 f"{name} source revision {revision} did not match "
@@ -293,6 +305,50 @@ def export_browser_evidence(
         destination = target / filename
         destination.write_bytes(data)
         destination.chmod(0o600)
+
+
+def write_e2e_evidence_manifest(
+    *,
+    target: Path,
+    revisions: dict[str, str],
+    completed_gates: tuple[str, ...],
+) -> None:
+    artifact_paths = {
+        filename: target / filename
+        for filename in (
+            *BROWSER_EVIDENCE_FILENAMES,
+            *E2E_TEST_REPORT_FILENAMES,
+        )
+    }
+    missing = [
+        filename
+        for filename, path in artifact_paths.items()
+        if not path.is_file()
+    ]
+    if missing:
+        raise RuntimeError(
+            f"E2E evidence artifacts are missing: {sorted(missing)}"
+        )
+    artifacts = {
+        filename: {
+            "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for filename, path in artifact_paths.items()
+    }
+    manifest = {
+        "schema_version": 1,
+        "completed": True,
+        "sources": revisions,
+        "completed_gates": list(completed_gates),
+        "artifacts": artifacts,
+    }
+    destination = target / "e2e-manifest.json"
+    destination.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    destination.chmod(0o600)
 
 
 def prepare_dashboard_context(upstream_context: Path, target: Path) -> Path:
@@ -498,7 +554,7 @@ def main() -> int:
     timeout_seconds = int(os.environ.get("MEM0_E2E_STARTUP_TIMEOUT", "180"))
     upstream_context = resolve_upstream_context()
     mcp_context = resolve_mcp_context()
-    verify_source_revisions(
+    source_revisions = verify_source_revisions(
         sidecar_context=ROOT,
         core_context=upstream_context,
         mcp_context=mcp_context,
@@ -523,6 +579,8 @@ def main() -> int:
             "/tmp/mem0-sidecar-e2e-evidence",
         )
     ).expanduser()
+    evidence_target.mkdir(parents=True, exist_ok=True)
+    (evidence_target / "e2e-manifest.json").unlink(missing_ok=True)
     runner_env = build_runner_env(project_id=project_id)
     runner_env["MEM0_E2E_DASHBOARD_CONTEXT"] = str(dashboard_context)
     runner_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(upstream_context)
@@ -561,6 +619,11 @@ def main() -> int:
         )
         print("\n=== mocked UI behavior smoke (not deployed-proxy acceptance) ===")
         run(mocked_browser_smoke_command(project_name), env=compose_env)
+        write_e2e_evidence_manifest(
+            target=evidence_target,
+            revisions=source_revisions,
+            completed_gates=E2E_COMPLETED_GATES,
+        )
     except Exception:
         dump_diagnostics(base_compose, env=compose_env)
         raise

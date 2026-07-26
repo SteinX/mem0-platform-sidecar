@@ -2,6 +2,7 @@ import { cookies } from "next/headers";
 import { NextRequest } from "next/server";
 import { dashboardSessionRefreshCoordinator } from "@/lib/dashboard-session";
 import type { DashboardSessionRefreshResult } from "@/utils/dashboard-session-refresh";
+import { isAdminDashboardAccessToken } from "@/utils/dashboard-access-token";
 import { proxySidecarRequest } from "@/utils/sidecar-proxy";
 
 const COOKIE_NAME = "mem0_refresh_token";
@@ -83,12 +84,16 @@ async function validateDashboardSession(
   if (result.status === "unavailable") {
     throw new DashboardSessionUnavailableError();
   }
+  if (!isAdminDashboardAccessToken(result.accessToken)) {
+    throw new DashboardSessionForbiddenError();
+  }
 
   onAuthenticated({ requestRefreshToken: refreshToken, result });
   return true;
 }
 
 class DashboardSessionUnavailableError extends Error {}
+class DashboardSessionForbiddenError extends Error {}
 
 async function proxy(
   request: NextRequest,
@@ -130,6 +135,12 @@ async function proxy(
       return Response.json(
         { error: "Authentication service temporarily unavailable" },
         { status: 503 },
+      );
+    }
+    if (error instanceof DashboardSessionForbiddenError) {
+      return Response.json(
+        { error: "Admin role required" },
+        { status: 403 },
       );
     }
     throw error;

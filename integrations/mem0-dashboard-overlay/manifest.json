@@ -21,6 +21,7 @@
     "src/lib/auth.tsx",
     "src/lib/dashboard-session.ts",
     "src/utils/api.ts",
+    "src/utils/dashboard-access-token.ts",
     "src/utils/dashboard-session-client.ts",
     "src/utils/dashboard-session-refresh.ts",
     "src/utils/sidecar-project.ts",

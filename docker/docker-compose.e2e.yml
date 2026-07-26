@@ -153,6 +153,8 @@ services:
       MEM0_E2E_SIDECAR_URL: http://sidecar:8765
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${MEM0_E2E_EVIDENCE_DIR:-/tmp/mem0-sidecar-e2e-evidence}:/evidence
     command:
       - python
       - -m
@@ -164,6 +166,7 @@ services:
       - "not adoption_e2e"
       - -p
       - no:cacheprovider
+      - --junitxml=/evidence/live-tests.xml
 
   e2e-adoption-runner:
     build:
@@ -180,6 +183,8 @@ services:
       MEM0_SIDECAR_ALLOW_ADOPT_UNSCOPED: "true"
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${MEM0_E2E_EVIDENCE_DIR:-/tmp/mem0-sidecar-e2e-evidence}:/evidence
     command:
       - python
       - -m
@@ -191,6 +196,7 @@ services:
       - "adoption_e2e"
       - -p
       - no:cacheprovider
+      - --junitxml=/evidence/adoption-test.xml
 
   dashboard:
     build:
