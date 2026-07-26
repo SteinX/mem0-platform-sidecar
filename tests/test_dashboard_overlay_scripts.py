@@ -998,12 +998,22 @@ def test_request_trace_verifier_rejects_missing_runtime_wiring(tmp_path):
             "Client Keys page must safely label historical empty descriptors",
         ),
         (
-            'className="w-full min-w-0 max-w-full space-y-5"',
-            'className="w-full max-w-full space-y-5"',
+            "const shellHorizontalSpace =",
+            "const missingShellHorizontalSpace =",
             (
                 "Client Keys page must bound intrinsic width inside the "
                 "dashboard scroll area"
             ),
+        ),
+        (
+            "COLLAPSED_SIDEBAR_WIDTH : SIDEBAR_WIDTH",
+            "SIDEBAR_WIDTH : SIDEBAR_WIDTH",
+            "Client Keys page must follow the dashboard sidebar width",
+        ),
+        (
+            'style={{ width: `calc(100vw - ${shellHorizontalSpace}px)` }}',
+            'style={{ width: "100%" }}',
+            "Client Keys page must reserve dashboard shell padding",
         ),
         (
             "if (creatingRef.current ||",

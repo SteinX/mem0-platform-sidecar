@@ -5,7 +5,12 @@ import { useEffect, useRef, useState } from "react";
 import { format } from "date-fns";
 import { Check, Copy, KeyRound, Plus, Trash2 } from "lucide-react";
 import { CopyToClipboard } from "react-copy-to-clipboard";
+import { useSelector } from "react-redux";
 
+import {
+  COLLAPSED_SIDEBAR_WIDTH,
+  SIDEBAR_WIDTH,
+} from "../../clientLayout";
 import { DataTable } from "@/components/shared/data-table";
 import { TableSkeleton } from "@/components/shared/table-skeleton";
 import { EmptyState } from "@/components/self-hosted/empty-state";
@@ -24,6 +29,7 @@ import { Label } from "@/components/ui/label";
 import { toast } from "@/components/ui/use-toast";
 import { useApiQuery } from "@/hooks/use-api-query";
 import { getErrorMessage } from "@/lib/error-message";
+import type { RootState } from "@/store/store";
 import type { ApiKey, ApiKeyCreateResponse } from "@/types/api";
 import { api } from "@/utils/api";
 import { API_KEY_ENDPOINTS } from "@/utils/api-endpoints";
@@ -41,6 +47,11 @@ function displayKeyLabel(key: Pick<ApiKey, "label" | "key_prefix">): string {
 }
 
 export default function ApiKeysPage() {
+  const isSidebarCollapsed = useSelector(
+    (state: RootState) => state.layout.isSidebarCollapsed,
+  );
+  const shellHorizontalSpace =
+    (isSidebarCollapsed ? COLLAPSED_SIDEBAR_WIDTH : SIDEBAR_WIDTH) + 8 + 48;
   const [createOpen, setCreateOpen] = useState(false);
   const [newLabel, setNewLabel] = useState("");
   const [newKey, setNewKey] = useState("");
@@ -217,7 +228,10 @@ export default function ApiKeysPage() {
   ];
 
   return (
-    <div className="w-full min-w-0 max-w-full space-y-5">
+    <div
+      className="min-w-0 max-w-full space-y-5"
+      style={{ width: `calc(100vw - ${shellHorizontalSpace}px)` }}
+    >
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 space-y-1">
           <h1 className="font-fustat text-xl font-semibold">

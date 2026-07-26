@@ -1504,8 +1504,16 @@ def verify_api_keys_page(dashboard_dir: Path) -> str | None:
             "Client Keys page must provide a compact key list",
         ),
         (
-            'className="w-full min-w-0 max-w-full space-y-5"',
+            "const shellHorizontalSpace =",
             "Client Keys page must bound intrinsic width inside the dashboard scroll area",
+        ),
+        (
+            "COLLAPSED_SIDEBAR_WIDTH : SIDEBAR_WIDTH",
+            "Client Keys page must follow the dashboard sidebar width",
+        ),
+        (
+            'style={{ width: `calc(100vw - ${shellHorizontalSpace}px)` }}',
+            "Client Keys page must reserve dashboard shell padding",
         ),
         (
             'aria-label={`Revoke ${displayKeyLabel(key)}`}',
