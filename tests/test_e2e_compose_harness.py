@@ -188,6 +188,8 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
         "MEM0_E2E_MEM0_URL",
         "proveSidecarRejectsMissingCredentials",
         "Sidecar default authentication did not fail closed",
+        "Sidecar operator authentication was not accepted",
+        "/v1/events/query",
         "seedFixtureThroughSidecar",
         "sidecarHeaders",
         "openMemoryDetails",

@@ -38,14 +38,28 @@ function sidecarHeaders(headers = {}) {
 }
 
 async function proveSidecarRejectsMissingCredentials() {
-  const path = `${sidecarBase}/v1/projects/${encodeURIComponent(projectId)}/capabilities`;
+  const path = `${sidecarBase}/v1/events/query`;
+  const body = JSON.stringify({
+    project_id: projectId,
+    app_id: appId,
+    page: 1,
+    page_size: 1,
+  });
   const health = await fetchWithTimeout(`${sidecarBase}/healthz`, {
     timeout: 5000,
   });
   if (!health.ok) throw new Error(await responseDiagnostic(health));
-  for (const headers of [{}, { "X-API-Key": "wrong-client-key" }]) {
+  for (const headers of [
+    { "Content-Type": "application/json" },
+    {
+      "Content-Type": "application/json",
+      "X-API-Key": "wrong-client-key",
+    },
+  ]) {
     const response = await fetchWithTimeout(path, {
+      method: "POST",
       headers,
+      body,
       timeout: 5000,
     });
     if (response.status !== 401) {
@@ -54,6 +68,18 @@ async function proveSidecarRejectsMissingCredentials() {
           (await responseDiagnostic(response)),
       );
     }
+  }
+  const authenticated = await fetchWithTimeout(path, {
+    method: "POST",
+    headers: sidecarHeaders({ "Content-Type": "application/json" }),
+    body,
+    timeout: 5000,
+  });
+  if (!authenticated.ok) {
+    throw new Error(
+      `Sidecar operator authentication was not accepted: ` +
+        (await responseDiagnostic(authenticated)),
+    );
   }
 }
 
