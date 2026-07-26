@@ -84,7 +84,7 @@ services:
       MEM0_SIDECAR_MEM0_BASE_URL: http://mem0:8000
       MEM0_SIDECAR_MEM0_API_KEY: e2e-sidecar-operator-key-00000001
       MEM0_SIDECAR_DEFAULT_PROJECT_ID: ${MEM0_E2E_PROJECT_ID:-sidecar-e2e}
-      MEM0_SIDECAR_CONSOLIDATION_ENABLED: "false"
+      MEM0_SIDECAR_CONSOLIDATION_ENABLED: "true"
       MEM0_SIDECAR_CONSOLIDATION_HARD_DELETE_ENABLED: "false"
       MEM0_SIDECAR_CONSOLIDATION_SCHEDULER_INTERVAL_SECONDS: "300"
       MEM0_SIDECAR_CONSOLIDATION_JOB_LEASE_SECONDS: "300"
@@ -115,11 +115,11 @@ services:
     environment:
       MEM0_OSS_BASE_URL: http://mem0:8000
       MEM0_OSS_API_KEY: e2e-sidecar-operator-key-00000001
-      MEM0_OSS_MCP_AUTH_MODE: hybrid
+      MEM0_OSS_MCP_AUTH_MODE: core_api_key
       MEM0_OSS_MCP_CLIENT_AUTH_URL: http://mem0:8000/auth/me
       MEM0_OSS_MCP_HOST: 0.0.0.0
       MEM0_OSS_MCP_PORT: "8080"
-      MEM0_OSS_MCP_TOKEN: e2e-legacy-shared-mcp-key-00000001
+      MEM0_OSS_MCP_TOKEN: ""
       MEM0_OSS_DEFAULT_APP_ID: ${MEM0_E2E_APP_ID:-sidecar-e2e-app}
       MEM0_SIDECAR_API_KEY: e2e-sidecar-operator-key-00000001
       MEM0_SIDECAR_BASE_URL: http://sidecar:8765

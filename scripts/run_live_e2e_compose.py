@@ -79,7 +79,7 @@ def resolve_mcp_context() -> Path:
     override = os.environ.get("MEM0_E2E_MCP_CONTEXT")
     if override:
         return Path(override).expanduser().resolve()
-    return (ROOT.parents[1] / "mem0-oss-mcp").resolve()
+    return (ROOT.parent / "mem0-oss-mcp").resolve()
 
 
 def _git_revision(context: Path) -> str:

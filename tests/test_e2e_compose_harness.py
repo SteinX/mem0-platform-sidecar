@@ -525,6 +525,19 @@ def test_resolve_mcp_context_prefers_explicit_env_override(monkeypatch) -> None:
     assert str(resolve_mcp_context()) == "/tmp/explicit-mcp"
 
 
+def test_resolve_mcp_context_defaults_to_sibling_checkout(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("MEM0_E2E_MCP_CONTEXT", raising=False)
+    monkeypatch.setattr(
+        compose_runner,
+        "ROOT",
+        Path("/repos/mem0/mem0-platform-sidecar"),
+    )
+
+    assert str(resolve_mcp_context()) == "/repos/mem0/mem0-oss-mcp"
+
+
 def test_exact_source_revision_gate_binds_all_three_clean_sources(
     monkeypatch,
 ) -> None:
@@ -804,16 +817,16 @@ def test_e2e_compose_runs_real_sidecar_with_ephemeral_database_and_health() -> N
     assert re.search(r"(?m)^  sidecar-data:\s*$", content)
 
 
-def test_e2e_compose_runs_hybrid_mcp_for_multi_token_revocation_gate() -> None:
+def test_e2e_compose_runs_core_key_mcp_for_final_cutover_gate() -> None:
     content = COMPOSE_FILE.read_text()
     mcp = _compose_service(content, "mcp")
     runner = _compose_service(content, "e2e-runner")
 
     for contract in (
         "context: ${MEM0_E2E_MCP_CONTEXT:?set MEM0_E2E_MCP_CONTEXT}",
-        "MEM0_OSS_MCP_AUTH_MODE: hybrid",
+        "MEM0_OSS_MCP_AUTH_MODE: core_api_key",
         "MEM0_OSS_MCP_CLIENT_AUTH_URL: http://mem0:8000/auth/me",
-        "MEM0_OSS_MCP_TOKEN: e2e-legacy-shared-mcp-key-00000001",
+        'MEM0_OSS_MCP_TOKEN: ""',
         'MEM0_SIDECAR_REQUIRED: "true"',
         "MEM0_SIDECAR_API_KEY: e2e-sidecar-operator-key-00000001",
         "http://127.0.0.1:8080/health",

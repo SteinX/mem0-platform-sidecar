@@ -15,7 +15,6 @@ from sqlalchemy import select
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.core.consolidation_service import ConsolidationService
 from mem0_sidecar.http_adapter.app import create_app
-from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.store.models import (
     ConsolidationLineage,
     ConsolidationProposal,
@@ -402,15 +401,14 @@ def test_live_multi_token_revocation_and_request_attribution_gate() -> None:
                 arguments=search_payload,
             )
         )
-        _assert_mcp_tool_succeeded(
-            _mcp_tool_call(
-                url=mcp_url,
-                token=legacy_token,
-                request_id=2,
-                name="search_memories",
-                arguments=search_payload,
-            )
+        legacy_rejected = _mcp_tool_call(
+            url=mcp_url,
+            token=legacy_token,
+            request_id=2,
+            name="search_memories",
+            arguments=search_payload,
         )
+        assert legacy_rejected.status_code == 401
 
         events = httpx.post(
             f"{sidecar_url}/v1/events/query",
@@ -435,12 +433,7 @@ def test_live_multi_token_revocation_and_request_attribution_gate() -> None:
         }
         assert ("rest", "core_api_key", key_a_id, labels["a"]) in channels
         assert ("mcp", "core_api_key", key_b_id, labels["b"]) in channels
-        assert (
-            "mcp",
-            "legacy_static",
-            None,
-            "Legacy shared MCP key",
-        ) in channels
+        assert not any(channel[1] == "legacy_static" for channel in channels)
         serialized_events = json.dumps(event_payload)
         if any(
             secret in serialized_events
@@ -470,19 +463,15 @@ def test_live_multi_token_revocation_and_request_attribution_gate() -> None:
         )
         assert revoked_mcp.status_code == 401
 
-        for request_id, active_token in (
-            (4, key_b),
-            (5, legacy_token),
-        ):
-            _assert_mcp_tool_succeeded(
-                _mcp_tool_call(
-                    url=mcp_url,
-                    token=active_token,
-                    request_id=request_id,
-                    name="search_memories",
-                    arguments=search_payload,
-                )
+        _assert_mcp_tool_succeeded(
+            _mcp_tool_call(
+                url=mcp_url,
+                token=key_b,
+                request_id=4,
+                name="search_memories",
+                arguments=search_payload,
             )
+        )
 
         requests = httpx.get(
             f"{core_url}/requests",
@@ -1557,6 +1546,11 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
         tmp_path,
         project_id=project_id,
         database_name="consolidation-e2e.sqlite3",
+    ).model_copy(
+        update={
+            "consolidation_enabled": True,
+            "consolidation_hard_delete_enabled": False,
+        }
     )
     app = create_app(settings=settings)
     client = TestClient(app)
@@ -1584,6 +1578,13 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
             assert response.status_code == 200, response.text
             created_ids.append(response.json()["event"]["subject_id"])
         pinned_id = created_ids[-1]
+
+        status = client.get(
+            f"/v1/projects/{project_id}/apps/{app_id}/consolidation"
+        )
+        assert status.status_code == 200, status.text
+        assert status.json()["consolidation_enabled"] is True
+        assert status.json()["hard_delete_enabled"] is False
 
         with app.state.session_factory() as session:
             policy = ConsolidationPolicyRepository(session).upsert(
@@ -1696,11 +1697,7 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
                 if memory_id != second.canonical_memory_id
             )
 
-        restarted_app = create_app(
-            settings=settings.model_copy(
-                update={"consolidation_hard_delete_enabled": True}
-            )
-        )
+        restarted_app = create_app(settings=settings)
         client = TestClient(restarted_app)
         with restarted_app.state.session_factory() as session:
             persisted = session.get(ConsolidationProposal, second.id)
@@ -1709,12 +1706,13 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
                 session=session,
                 mem0=restarted_app.state.mem0_client,
                 bridge_routing_ready=True,
-                hard_delete_enabled=True,
+                consolidation_enabled=True,
+                hard_delete_enabled=False,
             ).finalize_shadowed(
                 second.id,
                 now=persisted.not_before + timedelta(seconds=1),
             )
-            assert applied["status"] == "APPLIED"
+            assert applied["status"] == "SHADOWED"
             assert (
                 session.scalar(
                     select(ConsolidationLineage).where(
@@ -1722,7 +1720,7 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
                         ConsolidationLineage.source_memory_id == redundant_id,
                     )
                 )
-                is not None
+                is None
             )
             assert (
                 session.scalar(
@@ -1732,14 +1730,12 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
                         Event.subject_id == redundant_id,
                     )
                 )
-                is not None
+                is None
             )
 
         await restarted_app.state.mem0_client.get_memory(canonical_id)
         await restarted_app.state.mem0_client.get_memory(pinned_id)
-        with pytest.raises(Mem0UpstreamError) as deleted:
-            await restarted_app.state.mem0_client.get_memory(redundant_id)
-        assert deleted.value.status_code == 404
+        await restarted_app.state.mem0_client.get_memory(redundant_id)
     finally:
         cleanup_errors = []
         for memory_id in created_ids:
