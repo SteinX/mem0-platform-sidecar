@@ -14,6 +14,7 @@ from mem0_sidecar.store.models import (
 )
 from mem0_sidecar.store.repositories import (
     ConsolidationPolicyRepository,
+    ConsolidationRunRepository,
     JobRepository,
     MemoryIndexRepository,
     ProjectRepository,
@@ -103,6 +104,37 @@ def test_scheduler_enqueues_one_due_scope_and_refuses_duplicate(db_session) -> N
     assert job.job_type == "consolidation.scan"
 
 
+def test_scheduler_accepts_sqlite_naive_last_success_timestamp(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    policy = ConsolidationPolicyRepository(db_session).upsert(
+        project_id="repo-a",
+        app_id="app-a",
+        policy={
+            "enabled": True,
+            "mode": "OBSERVE",
+            "min_new_memories": 20,
+            "scan_interval_seconds": 3600,
+        },
+    )
+    completed_at = datetime(2026, 7, 23, 12, tzinfo=UTC)
+    runs = ConsolidationRunRepository(db_session)
+    run = runs.create(policy, now=completed_at - timedelta(minutes=5))
+    runs.mark_succeeded(run.id, counts={}, completed_at=completed_at)
+    db_session.commit()
+    db_session.expire_all()
+
+    enqueued = ConsolidationScheduler(db_session).enqueue_due_scopes(
+        now=completed_at + timedelta(hours=1)
+    )
+
+    assert enqueued == 1
+    assert db_session.query(Job).count() == 1
+
+
 def test_auto_safe_requires_current_bridge_routing_heartbeat(db_session) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",
@@ -139,6 +171,16 @@ def test_auto_safe_requires_current_bridge_routing_heartbeat(db_session) -> None
     assert failed.status == "FAILED"
     assert failed.error_code == "BRIDGE_ROUTING_REQUIRED"
     assert db_session.query(Job).count() == 0
+    db_session.commit()
+    db_session.expire_all()
+
+    assert (
+        ConsolidationScheduler(db_session).enqueue_due_scopes(
+            now=observed + timedelta(seconds=1)
+        )
+        == 0
+    )
+    assert db_session.query(ConsolidationRun).count() == 1
 
     capabilities = ServiceCapabilityRepository(db_session)
     capabilities.record_bridge_heartbeat(

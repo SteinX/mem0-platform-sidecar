@@ -536,6 +536,62 @@ def test_repositories_support_control_plane_flow(db_session) -> None:
     assert job_repo.claim_next().id == job.id
 
 
+def test_consolidation_status_accepts_mixed_sqlite_timestamps(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    jobs = JobRepository(db_session)
+    persisted = jobs.enqueue(
+        project_id="repo-a",
+        event_id=None,
+        job_type="consolidation.scan",
+        payload={"app_id": "app-a"},
+    )
+    jobs.mark_succeeded(persisted.id, result={})
+    persisted_pending = jobs.enqueue(
+        project_id="repo-a",
+        event_id=None,
+        job_type="consolidation.scan",
+        payload={"app_id": "app-a"},
+    )
+    db_session.commit()
+    db_session.expire_all()
+
+    fresh = jobs.enqueue(
+        project_id="repo-a",
+        event_id=None,
+        job_type="consolidation.scan",
+        payload={"app_id": "app-a"},
+    )
+    jobs.mark_succeeded(fresh.id, result={})
+    fresh_pending = jobs.enqueue(
+        project_id="repo-a",
+        event_id=None,
+        job_type="consolidation.scan",
+        payload={"app_id": "app-a"},
+    )
+    assert persisted.completed_at is not None
+    assert persisted.completed_at.tzinfo is None
+    assert fresh.completed_at is not None
+    assert fresh.completed_at.tzinfo is UTC
+    assert persisted_pending.created_at.tzinfo is None
+    assert fresh_pending.created_at.tzinfo is UTC
+
+    status = jobs.consolidation_status(
+        project_id="repo-a",
+        app_id="app-a",
+        now=datetime.now(UTC) + timedelta(seconds=1),
+    )
+
+    last_success_at = status["last_success_at"]
+    assert isinstance(last_success_at, datetime)
+    assert last_success_at.tzinfo is UTC
+    assert status["pending_count"] == 2
+    assert isinstance(status["oldest_pending_age_seconds"], float)
+
+
 def _entity_projection_signature(entities: list[Entity]) -> list[tuple[object, ...]]:
     return [
         (

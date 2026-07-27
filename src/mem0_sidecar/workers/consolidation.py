@@ -19,6 +19,12 @@ from mem0_sidecar.store.repositories import (
 from mem0_sidecar.workers.runner import AsyncWorkerRunner
 
 
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 class ConsolidationScheduler:
     def __init__(
         self,
@@ -30,7 +36,7 @@ class ConsolidationScheduler:
         self.bridge_routing_required = bridge_routing_required
 
     def enqueue_due_scopes(self, now: datetime | None = None) -> int:
-        now = now or datetime.now(UTC)
+        now = _as_utc(now or datetime.now(UTC))
         policies = ConsolidationPolicyRepository(self.session)
         runs = ConsolidationRunRepository(self.session)
         jobs = JobRepository(self.session)
@@ -53,7 +59,7 @@ class ConsolidationScheduler:
             interval_due = (
                 last_success is not None
                 and last_success.completed_at is not None
-                and last_success.completed_at
+                and _as_utc(last_success.completed_at)
                 <= now - timedelta(seconds=spec.scan_interval_seconds)
             )
             if len(dirty) < spec.min_new_memories and not interval_due:
@@ -77,7 +83,7 @@ class ConsolidationScheduler:
                     previous is not None
                     and previous.error_code == "BRIDGE_ROUTING_REQUIRED"
                     and previous.completed_at is not None
-                    and previous.completed_at
+                    and _as_utc(previous.completed_at)
                     > now - timedelta(seconds=spec.scan_interval_seconds)
                 ):
                     continue

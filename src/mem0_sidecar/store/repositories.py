@@ -3668,11 +3668,15 @@ class JobRepository:
         ]
         pending = [job for job in matching if job.status == JobStatus.PENDING]
         last_success = max(
-            (job.completed_at for job in succeeded if job.completed_at is not None),
+            (
+                _as_utc(job.completed_at)
+                for job in succeeded
+                if job.completed_at is not None
+            ),
             default=None,
         )
         oldest_pending = min(
-            (job.created_at for job in pending),
+            (_as_utc(job.created_at) for job in pending),
             default=None,
         )
         if now.tzinfo is None:

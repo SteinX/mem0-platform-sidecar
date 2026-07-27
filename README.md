@@ -3,6 +3,12 @@
 Control-plane sidecar for making self-hosted Mem0 OSS easier to use from
 Platform-shaped agent integrations.
 
+## Release 0.3.5
+
+This hotfix normalizes persisted consolidation timestamps to UTC before
+scheduler comparisons. It keeps the scheduler running on SQLite deployments,
+where timezone-aware values are read back as naive datetimes.
+
 ## Release 0.3.4
 
 This release adds first-class multi-client credential operations to the
