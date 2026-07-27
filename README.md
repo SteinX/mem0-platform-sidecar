@@ -3,6 +3,12 @@
 Control-plane sidecar for making self-hosted Mem0 OSS easier to use from
 Platform-shaped agent integrations.
 
+## Release 0.3.6
+
+This hotfix makes consolidation scan scheduling idempotent within each policy
+window. A completed scan job no longer causes repeated unique-key failures when
+new dirty anchors appear before the next window.
+
 ## Release 0.3.5
 
 This hotfix normalizes persisted consolidation timestamps to UTC before

@@ -3506,6 +3506,23 @@ class JobRepository:
         self.session.flush()
         return job
 
+    def find_by_dedupe(
+        self,
+        *,
+        project_id: str,
+        job_type: str,
+        dedupe_key: str,
+    ) -> Job | None:
+        return self.session.scalar(
+            select(Job)
+            .where(
+                Job.project_id == project_id,
+                Job.job_type == job_type,
+                Job.dedupe_key == dedupe_key,
+            )
+            .limit(1)
+        )
+
     def _claim_candidate_statement(
         self,
         *,

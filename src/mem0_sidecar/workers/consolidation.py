@@ -65,10 +65,21 @@ class ConsolidationScheduler:
             if len(dirty) < spec.min_new_memories and not interval_due:
                 continue
 
+            window = int(now.timestamp()) // spec.scan_interval_seconds
+            dedupe_key = f"{policy_row.app_id}:{window}"
             ProjectRepository(self.session).lock_for_mutation(
                 policy_row.project_id
             )
             if runs.active(policy_row.project_id, policy_row.app_id) is not None:
+                continue
+            if (
+                jobs.find_by_dedupe(
+                    project_id=policy_row.project_id,
+                    job_type="consolidation.scan",
+                    dedupe_key=dedupe_key,
+                )
+                is not None
+            ):
                 continue
             bridge_blocked = (
                 spec.mode == "AUTO_SAFE"
@@ -96,13 +107,12 @@ class ConsolidationScheduler:
                 )
                 continue
             run = runs.create(policy_row, now=now)
-            window = int(now.timestamp()) // spec.scan_interval_seconds
             jobs.enqueue(
                 project_id=policy_row.project_id,
                 event_id=None,
                 job_type="consolidation.scan",
                 payload={"app_id": policy_row.app_id, "run_id": run.id},
-                dedupe_key=f"{policy_row.app_id}:{window}",
+                dedupe_key=dedupe_key,
             )
             enqueued += 1
 
