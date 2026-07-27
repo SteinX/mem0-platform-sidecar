@@ -91,6 +91,101 @@ CONSOLIDATION_MEMORY_COLUMNS = {
     "consolidation_state",
     "shadowed_by_proposal_id",
 }
+REQUEST_CHANNEL_COLUMNS = {
+    "request_transport",
+    "credential_kind",
+    "credential_id",
+    "credential_label",
+    "credential_prefix",
+}
+REQUEST_CHANNEL_INDEX = "ix_events_project_app_channel_created"
+
+
+def test_request_channel_migration_preserves_historical_rows_as_unknown(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'request-channel.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0008_memory_consolidation")
+    engine = sa.create_engine(database_url, future=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO events (
+                    id, project_id, operation, status, request_json,
+                    response_json, error_json, result_count, has_results,
+                    created_at
+                ) VALUES (
+                    'event-before-attribution', 'repo-a', 'memory.search',
+                    'SUCCEEDED', '{}', '{}', '{}', 0, 0,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    command.upgrade(config, "0009_request_channel_attribution")
+
+    inspector = sa.inspect(engine)
+    columns = {
+        column["name"]: column for column in inspector.get_columns("events")
+    }
+    assert REQUEST_CHANNEL_COLUMNS.issubset(columns)
+    assert all(columns[name]["nullable"] for name in REQUEST_CHANNEL_COLUMNS)
+    indexes = {
+        index["name"]: tuple(index["column_names"])
+        for index in inspector.get_indexes("events")
+    }
+    assert indexes[REQUEST_CHANNEL_INDEX] == (
+        "project_id",
+        "app_id",
+        "request_transport",
+        "credential_kind",
+        "credential_id",
+        "created_at",
+    )
+    with engine.connect() as connection:
+        historical = connection.execute(
+            sa.text(
+                """
+                SELECT request_transport, credential_kind, credential_id,
+                       credential_label, credential_prefix
+                FROM events WHERE id = 'event-before-attribution'
+                """
+            )
+        ).mappings().one()
+        revision = connection.scalar(
+            sa.text("SELECT version_num FROM alembic_version")
+        )
+    assert set(historical.values()) == {None}
+    assert revision == "0009_request_channel_attribution"
+
+    command.downgrade(config, "0008_memory_consolidation")
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        historical = connection.execute(
+            sa.text(
+                """
+                SELECT request_transport, credential_kind, credential_id,
+                       credential_label, credential_prefix
+                FROM events WHERE id = 'event-before-attribution'
+                """
+            )
+        ).mappings().one()
+    assert set(historical.values()) == {None}
 
 
 def test_consolidation_migration_upgrades_from_mutation_intents(tmp_path) -> None:
@@ -125,7 +220,7 @@ def test_consolidation_migration_upgrades_from_mutation_intents(tmp_path) -> Non
             )
         )
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0008_memory_consolidation")
 
     inspector = sa.inspect(engine)
     assert CONSOLIDATION_TABLES.issubset(inspector.get_table_names())

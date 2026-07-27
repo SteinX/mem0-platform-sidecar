@@ -1,15 +1,22 @@
+import json
 import secrets
 from dataclasses import dataclass
-from typing import Literal
 
 import httpx
 
+from mem0_sidecar.request_attribution import (
+    AttributionRejected,
+    RequestAttribution,
+)
 
-@dataclass(frozen=True)
+_MAX_CORE_AUTH_RESPONSE_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
 class ClientPrincipal:
     subject_id: str | None
     role: str
-    credential_kind: Literal["bearer", "api_key", "disabled"]
+    attribution: RequestAttribution
 
 
 class ClientAuthenticationRejected(RuntimeError):
@@ -32,17 +39,6 @@ class ClientAuthenticationUnavailable(ClientAuthenticationRejected):
             status_code=503,
             detail="Authentication service is unavailable.",
         )
-
-
-def _credential_kind(
-    authorization: str | None,
-    x_api_key: str | None,
-) -> Literal["bearer", "api_key", "disabled"]:
-    if authorization is not None:
-        return "bearer"
-    if x_api_key is not None:
-        return "api_key"
-    return "disabled"
 
 
 def _redacted_detail(
@@ -76,6 +72,24 @@ def _safe_auth_challenge(value: str | None) -> dict[str, str]:
     return {"WWW-Authenticate": value}
 
 
+async def _read_bounded_auth_body(response: httpx.Response) -> bytes:
+    raw_content_length = response.headers.get("Content-Length")
+    if raw_content_length is not None:
+        try:
+            content_length = int(raw_content_length)
+        except ValueError as exc:
+            raise ClientAuthenticationUnavailable() from exc
+        if content_length < 0 or content_length > _MAX_CORE_AUTH_RESPONSE_BYTES:
+            raise ClientAuthenticationUnavailable()
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk)
+        if len(body) > _MAX_CORE_AUTH_RESPONSE_BYTES:
+            raise ClientAuthenticationUnavailable()
+    return bytes(body)
+
+
 class ClientAuthVerifier:
     def __init__(
         self,
@@ -105,12 +119,16 @@ class ClientAuthVerifier:
         *,
         authorization: str | None,
         x_api_key: str | None,
+        caller_context: str | None = None,
     ) -> ClientPrincipal:
         if not self.enabled:
             return ClientPrincipal(
                 subject_id=None,
                 role="system",
-                credential_kind="disabled",
+                attribution=RequestAttribution(
+                    transport="rest",
+                    credential_kind="disabled",
+                ),
             )
 
         if (
@@ -120,10 +138,26 @@ class ClientAuthVerifier:
             and self.admin_api_key is not None
             and secrets.compare_digest(x_api_key, self.admin_api_key)
         ):
+            if caller_context is None:
+                attribution = RequestAttribution(
+                    transport="rest",
+                    credential_kind="operator_static",
+                    credential_label="Legacy admin API key",
+                )
+            else:
+                try:
+                    attribution = RequestAttribution.from_internal_header(
+                        caller_context
+                    )
+                except AttributionRejected as exc:
+                    raise ClientAuthenticationRejected(
+                        status_code=400,
+                        detail="Invalid caller attribution.",
+                    ) from exc
             return ClientPrincipal(
                 subject_id=None,
                 role="admin",
-                credential_kind="api_key",
+                attribution=attribution,
             )
 
         headers: dict[str, str] = {}
@@ -139,17 +173,21 @@ class ClientAuthVerifier:
                 verify=self.ca_bundle or self.verify_tls,
                 follow_redirects=False,
             ) as client:
-                response = await client.get(
+                async with client.stream(
+                    "GET",
                     f"{self.base_url}{self.auth_path}",
                     headers=headers,
-                )
+                ) as response:
+                    status_code = response.status_code
+                    challenge = response.headers.get("WWW-Authenticate")
+                    response_body_bytes = await _read_bounded_auth_body(response)
         except httpx.RequestError as exc:
             raise ClientAuthenticationUnavailable() from exc
 
-        if response.status_code in {401, 403}:
+        if status_code in {401, 403}:
             try:
-                response_body = response.json()
-            except ValueError:
+                response_body = json.loads(response_body_bytes)
+            except (UnicodeError, ValueError):
                 response_body = {}
             detail = (
                 response_body.get("detail")
@@ -157,22 +195,20 @@ class ClientAuthVerifier:
                 else None
             )
             raise ClientAuthenticationRejected(
-                status_code=response.status_code,
+                status_code=status_code,
                 detail=_redacted_detail(
                     detail,
                     authorization=authorization,
                     x_api_key=x_api_key,
                 ),
-                headers=_safe_auth_challenge(
-                    response.headers.get("WWW-Authenticate")
-                ),
+                headers=_safe_auth_challenge(challenge),
             )
-        if response.status_code != 200:
+        if status_code != 200:
             raise ClientAuthenticationUnavailable()
 
         try:
-            response_body = response.json()
-        except ValueError as exc:
+            response_body = json.loads(response_body_bytes)
+        except (UnicodeError, ValueError) as exc:
             raise ClientAuthenticationUnavailable() from exc
         if not isinstance(response_body, dict):
             raise ClientAuthenticationUnavailable()
@@ -180,11 +216,18 @@ class ClientAuthVerifier:
         role = response_body.get("role")
         if not isinstance(subject_id, str) or not subject_id:
             raise ClientAuthenticationUnavailable()
-        if not isinstance(role, str) or not role:
+        if not isinstance(role, str) or not 1 <= len(role) <= 64:
             raise ClientAuthenticationUnavailable()
+        descriptor = response_body.get("credential")
+        if not isinstance(descriptor, dict):
+            raise ClientAuthenticationUnavailable()
+        try:
+            attribution = RequestAttribution.from_core_descriptor(descriptor)
+        except AttributionRejected as exc:
+            raise ClientAuthenticationUnavailable() from exc
 
         return ClientPrincipal(
             subject_id=subject_id,
             role=role,
-            credential_kind=_credential_kind(authorization, x_api_key),
+            attribution=attribution,
         )

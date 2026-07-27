@@ -162,6 +162,33 @@ export type SidecarTraceTimelineBucket = {
   count: number;
 };
 
+export type SidecarRequestTransport = "mcp" | "rest" | "system" | "unknown";
+
+export type SidecarCredentialKind =
+  | "core_api_key"
+  | "legacy_static"
+  | "operator_static"
+  | "session"
+  | "disabled"
+  | "unknown";
+
+export type SidecarTraceChannel = {
+  readonly transport: SidecarRequestTransport;
+  readonly credential_kind: SidecarCredentialKind;
+  readonly credential_id: string | null;
+  readonly label: string;
+  readonly key_prefix: string | null;
+};
+
+export type SidecarTraceChannelFilter = Pick<
+  SidecarTraceChannel,
+  "transport" | "credential_kind" | "credential_id"
+>;
+
+export type SidecarTraceChannelFacet = SidecarTraceChannel & {
+  readonly count: number;
+};
+
 export type SidecarTrace = {
   id: string;
   correlation_id: string | null;
@@ -174,6 +201,7 @@ export type SidecarTrace = {
     | "DELETE"
     | "OTHER";
   status: "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
+  channel: SidecarTraceChannel;
   entities: Array<{ type: "user" | "agent" | "app" | "run"; id: string }>;
   request: Record<string, unknown>;
   response: Record<string, unknown>;
@@ -196,6 +224,7 @@ export type SidecarTraceQuery = {
   entity_filters: Partial<
     Record<"user_id" | "agent_id" | "app_id" | "run_id", string>
   >;
+  channel: SidecarTraceChannelFilter | null;
   page: number;
   page_size: number;
 };
@@ -207,4 +236,5 @@ export type SidecarTracePage = {
   page_size: number;
   has_more: boolean;
   timeline: SidecarTraceTimelineBucket[];
+  channels: SidecarTraceChannelFacet[];
 };

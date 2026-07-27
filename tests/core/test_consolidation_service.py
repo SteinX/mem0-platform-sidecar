@@ -269,6 +269,18 @@ def expected_hashes() -> dict[str, str]:
     return {"duplicate-a": SAME_HASH, "duplicate-b": SAME_HASH}
 
 
+def test_status_reports_runtime_consolidation_safety_flags(db_session) -> None:
+    seed_scope(db_session)
+    status = ConsolidationService(
+        session=db_session,
+        consolidation_enabled=True,
+        hard_delete_enabled=False,
+    ).get_status("repo-a", "app-a")
+
+    assert status["consolidation_enabled"] is True
+    assert status["hard_delete_enabled"] is False
+
+
 @pytest.mark.asyncio
 async def test_observe_scan_creates_stable_proposals_without_upstream_write(
     db_session,
@@ -1074,6 +1086,13 @@ async def test_shadow_exact_duplicate_excludes_canonical_and_rolls_back(db_sessi
         agent_id=None,
         run_id=None,
     ) == {"duplicate-a", "duplicate-b"}
+    assert [
+        memory.mem0_memory_id
+        for memory in repository.list_dirty_anchors(
+            project_id="repo-a",
+            app_id="app-a",
+        )
+    ] == ["duplicate-b"]
     assert mem0.delete_calls == []
 
 

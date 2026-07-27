@@ -10,9 +10,10 @@ The self-hosted surface currently includes:
 - Memory Explorer at `/dashboard/memories`
 - Request Trace Explorer at `/dashboard/requests`
 - Entity Explorer at `/dashboard/entities`
+- API and remote MCP Client Keys at `/dashboard/api-keys`
 
-Categories, Export, Memory Explorer, Request Trace Explorer, and Entity Explorer
-appear as first-class self-hosted dashboard surfaces.
+Categories, Export, Memory Explorer, Request Trace Explorer, Entity Explorer,
+and Client Keys appear as first-class self-hosted dashboard surfaces.
 
 ## Apply and verify
 
@@ -209,7 +210,10 @@ The Requests page reads durable traces for sidecar `ADD`, `SEARCH`, and
 `GET ALL` operations (`memory.add`, `memory.search`, and `memory.list`). Both
 successful and failed operations are recorded. `POST /v1/events/query` accepts
 the configured project/app scope plus operation, status, has-results, date,
-entity, and paging filters. `GET /v1/event/{id}` supplies the selected drawer.
+entity, exact client channel, and paging filters. `GET /v1/event/{id}` supplies
+the selected drawer. The page displays the transport, safe key label and
+prefix, and exact non-secret key ID. Historical rows created before channel
+attribution are shown as unknown rather than guessed.
 The same-origin proxy permits only those read routes, overwrites project/app
 scope, and rejects a scoped JSON request body larger than 65,536 bytes.
 
@@ -219,6 +223,18 @@ logs without exposing an upstream credential. Search/list result counts and
 previews are computed only after project/app filtering. At most 20 memory
 previews are persisted and returned; `result_previews_omitted` and
 `result_previews_scan_truncated` disclose additional or unscanned results.
+
+## Client Keys
+
+`/dashboard/api-keys` creates and revokes Core-backed named API keys. Create one
+key per machine, coding agent, or integration. The secret is displayed only
+once. REST clients send the key as `X-API-Key`; remote MCP clients send the same
+value as `Authorization: Bearer <key>`.
+
+The legacy `MEM0_OSS_MCP_TOKEN` remains an intentionally separate compatibility
+credential during `hybrid` migration. It is not listed on the Client Keys page,
+cannot be attributed to an individual client, and should be removed after all
+clients move to named keys.
 
 ### Trace safety, retention, and backups
 

@@ -85,10 +85,22 @@ a production configuration example.
 Run the harness:
 
 ```bash
+MEM0_E2E_UPSTREAM_CONTEXT=/path/to/mem0-core \
+MEM0_E2E_MCP_CONTEXT=/path/to/mem0-oss-mcp \
+MEM0_E2E_EXPECTED_CORE_SHA=<full-core-sha> \
+MEM0_E2E_EXPECTED_MCP_SHA=<full-mcp-sha> \
+MEM0_E2E_EXPECTED_SIDECAR_SHA=<full-sidecar-sha> \
+MEM0_E2E_EVIDENCE_DIR=/tmp/mem0-sidecar-e2e-evidence \
 PYTHONDONTWRITEBYTECODE=1 python scripts/run_live_e2e_compose.py
 ```
 
-Optional controls:
+The three expected full SHAs are mandatory. The harness rejects a mismatched or
+dirty source checkout before building any image. A successful run writes
+`e2e-manifest.json`, two JUnit XML reports, and the six Client Keys screenshots
+to `MEM0_E2E_EVIDENCE_DIR`; the manifest binds each artifact checksum to the
+three reviewed source revisions.
+
+Additional controls:
 
 - `MEM0_E2E_PROJECT_ID` overrides the generated unique test project.
 - `MEM0_E2E_COMPOSE_PROJECT` overrides the generated unique Compose project.

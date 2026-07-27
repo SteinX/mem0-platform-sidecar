@@ -1224,6 +1224,32 @@ async function testUpstreamFailureDoesNotLeakInternalDetails(proxy) {
   });
 }
 
+async function testUpstreamRedirectIsNotFollowedOrExposed(proxy) {
+  let observedInit;
+  const response = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/memories/memory-one", {
+      method: "GET",
+    }),
+    "/v1/memories/memory-one",
+    proxyOptions(async (_url, init) => {
+      observedInit = init;
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: "http://attacker.invalid/capture-operator-key",
+        },
+      });
+    }),
+  );
+
+  assert.equal(observedInit.redirect, "manual");
+  assert.equal(response.status, 502);
+  assert.equal(response.headers.has("Location"), false);
+  assert.deepEqual(await response.json(), {
+    error: "Sidecar upstream request failed",
+  });
+}
+
 async function testRealSidecarEncodedIdRoundTrip(proxy, baseUrl) {
   const options = {
     baseUrl,
@@ -1546,6 +1572,7 @@ async function main() {
   );
   await testUnauthenticatedMemoryRequestIsRejected(proxySidecarRequest);
   await testUpstreamFailureDoesNotLeakInternalDetails(proxySidecarRequest);
+  await testUpstreamRedirectIsNotFollowedOrExposed(proxySidecarRequest);
   await testCategoryCollectionPostForcesConfiguredProject(proxySidecarRequest);
   await testCategoryMutationRejectsStreamedOversizedBody(proxySidecarRequest);
   await testPatchRewritesProjectEncodesCategoryAndForwardsBody(
@@ -1558,7 +1585,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 44 contracts passed");
+  console.log("sidecar proxy request harness: 45 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(

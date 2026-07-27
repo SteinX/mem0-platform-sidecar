@@ -98,6 +98,7 @@ class ConsolidationService:
         mem0: Any | None = None,
         source_snapshot_checker: Callable[[str, str], bool] | None = None,
         bridge_routing_ready: bool = False,
+        consolidation_enabled: bool = False,
         hard_delete_enabled: bool = False,
         shadow_lease_seconds: int = 600,
         scope_backfill_writes_paused: bool = False,
@@ -109,6 +110,7 @@ class ConsolidationService:
             lambda _project_id, _app_id: True
         )
         self.bridge_routing_ready = bridge_routing_ready
+        self.consolidation_enabled = consolidation_enabled
         self.hard_delete_enabled = hard_delete_enabled
         self.shadow_lease_seconds = shadow_lease_seconds
         self.scope_backfill_writes_paused = scope_backfill_writes_paused
@@ -571,6 +573,7 @@ class ConsolidationService:
             ):
                 source.consolidation_state = "ACTIVE"
                 source.shadowed_by_proposal_id = None
+                source.last_consolidation_scan_at = None
                 restored += 1
         proposal.not_before = None
         proposals.set_status(proposal, "ROLLED_BACK")
@@ -1180,6 +1183,8 @@ class ConsolidationService:
             "app_id": app_id,
             "policy": policy.to_mapping(),
             "configured": policy_row is not None,
+            "consolidation_enabled": self.consolidation_enabled,
+            "hard_delete_enabled": self.hard_delete_enabled,
             "dirty_count": dirty_count,
             "scope_marker_backfill_required": scope_marker_backfill_required,
             "scope_marker_backfill_outcomes": scope_marker_backfill_outcomes,

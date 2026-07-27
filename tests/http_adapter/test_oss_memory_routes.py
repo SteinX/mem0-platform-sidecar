@@ -12,6 +12,7 @@ from mem0_sidecar.http_adapter.client_auth import (
     ClientPrincipal,
 )
 from mem0_sidecar.mem0_client.client import Mem0RestClient, Mem0UpstreamError
+from mem0_sidecar.request_attribution import RequestAttribution
 from mem0_sidecar.store.models import Event, Project
 from mem0_sidecar.store.repositories import MemoryIndexRepository
 
@@ -117,11 +118,19 @@ class MemberVerifier:
         *,
         authorization: str | None,
         x_api_key: str | None,
+        caller_context: str | None = None,
     ) -> ClientPrincipal:
+        del caller_context
         return ClientPrincipal(
             subject_id="member-1",
             role="member",
-            credential_kind="api_key",
+            attribution=RequestAttribution(
+                transport="rest",
+                credential_kind="core_api_key",
+                credential_id="e0544e3c-d217-40d9-bc9a-c1f64077542a",
+                credential_label="member-test",
+                credential_prefix="m0sk_member_",
+            ),
         )
 
 
@@ -131,7 +140,9 @@ class RejectingVerifier:
         *,
         authorization: str | None,
         x_api_key: str | None,
+        caller_context: str | None = None,
     ) -> ClientPrincipal:
+        del caller_context
         raise ClientAuthenticationRejected(
             status_code=401,
             detail="Authentication required.",

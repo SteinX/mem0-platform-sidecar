@@ -8,6 +8,7 @@ from mem0_sidecar.core.trace_payloads import (
     bounded_trace_document,
     trace_result_summary,
 )
+from mem0_sidecar.request_attribution import RequestAttribution
 from mem0_sidecar.store.models import Event
 from mem0_sidecar.store.repositories import EventRepository, _safe_trace_document
 
@@ -142,7 +143,7 @@ def _preview_source_count(previews: list[object]) -> int:
 
 
 def _safe_latency(value: object) -> float | None:
-    if type(value) not in (int, float):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     latency = float(value)
     return latency if math.isfinite(latency) and latency >= 0 else None
@@ -166,6 +167,13 @@ def _event_status(event: Event) -> str:
 def event_to_trace_dict(event: Event) -> dict[str, Any]:
     """Serialize an event into the bounded public request-trace shape."""
 
+    channel = RequestAttribution.from_stored(
+        transport=getattr(event, "request_transport", None),
+        credential_kind=getattr(event, "credential_kind", None),
+        credential_id=getattr(event, "credential_id", None),
+        credential_label=getattr(event, "credential_label", None),
+        credential_prefix=getattr(event, "credential_prefix", None),
+    )
     stored_request = _safe_json_document(getattr(event, "request_json", "{}"))
     response = _safe_json_document(getattr(event, "response_json", "{}"))
     error = _safe_json_document(getattr(event, "error_json", "{}"))
@@ -203,6 +211,7 @@ def event_to_trace_dict(event: Event) -> dict[str, Any]:
         "operation": operation,
         "display_operation": DISPLAY_OPERATION.get(operation, "OTHER"),
         "status": _event_status(event),
+        "channel": channel.to_channel_dict(),
         "entities": _event_entities(event, stored_request),
         "request": _public_request(stored_request),
         "response": bounded_trace_document(response),

@@ -278,6 +278,15 @@ class Event(Base):
             "has_results",
             "created_at",
         ),
+        Index(
+            "ix_events_project_app_channel_created",
+            "project_id",
+            "app_id",
+            "request_transport",
+            "credential_kind",
+            "credential_id",
+            "created_at",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -296,6 +305,11 @@ class Event(Base):
     response_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     error_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     correlation_id: Mapped[str | None] = mapped_column(String(256))
+    request_transport: Mapped[str | None] = mapped_column(String(16))
+    credential_kind: Mapped[str | None] = mapped_column(String(32))
+    credential_id: Mapped[str | None] = mapped_column(String(36))
+    credential_label: Mapped[str | None] = mapped_column(String(255))
+    credential_prefix: Mapped[str | None] = mapped_column(String(12))
     latency_ms: Mapped[float | None] = mapped_column(Float)
     result_count: Mapped[int] = mapped_column(
         BigInteger, default=0, server_default=text("0"), nullable=False

@@ -11,9 +11,14 @@ from mem0_sidecar.http_adapter.project_scope import (
     resolve_project_app_id,
     resolve_project_id,
 )
+from mem0_sidecar.request_attribution_codec import (
+    parse_credential_kind,
+    parse_transport,
+)
 from mem0_sidecar.store.models import EventStatus
 from mem0_sidecar.store.repositories import (
     EVENT_SCAN_LIMIT,
+    EventChannelFilter,
     EventQuery,
     EventRepository,
 )
@@ -35,11 +40,13 @@ _QUERY_KEYS = frozenset(
         "has_results",
         "date_range",
         "entity_filters",
+        "channel",
         "page",
         "page_size",
     }
 )
 _DATE_RANGE_KEYS = frozenset({"from", "to"})
+_CHANNEL_KEYS = frozenset({"transport", "credential_kind", "credential_id"})
 
 
 def _explicit_scope_value(
@@ -71,6 +78,8 @@ def _resolve_event_scope(
         request.app.state.settings.default_project_id,
         field_name="project_id",
     )
+    if project_id is None:
+        raise ValueError("project_id is required")
     requested_app_id = _explicit_scope_value(request, payload, "app_id")
     app_id = resolve_project_app_id(
         session,
@@ -79,7 +88,10 @@ def _resolve_event_scope(
     )
     if app_id is None:
         raise HTTPException(status_code=404, detail="Project not found")
-    return project_id, validate_scope_id(app_id, field_name="app_id")
+    validated_app_id = validate_scope_id(app_id, field_name="app_id")
+    if validated_app_id is None:
+        raise ValueError("app_id is required")
+    return project_id, validated_app_id
 
 
 def _parse_event_query(payload: dict[str, Any]) -> EventQuery:
@@ -133,9 +145,43 @@ def _parse_event_query(payload: dict[str, Any]) -> EventQuery:
     for field_name, value in raw_entity_filters.items():
         if field_name not in _ENTITY_FILTER_FIELDS:
             raise ValueError(f"entity_filters.{field_name} is not allowed")
-        entity_filters[field_name] = validate_scope_id(
+        entity_id = validate_scope_id(
             value,
             field_name=field_name,
+        )
+        if entity_id is None:
+            raise ValueError(f"entity_filters.{field_name} is required")
+        entity_filters[field_name] = entity_id
+
+    raw_channel = payload.get("channel")
+    if raw_channel is None:
+        channel = None
+    elif not isinstance(raw_channel, dict):
+        raise ValueError("channel must be an object")
+    else:
+        unknown_channel_keys = set(raw_channel) - _CHANNEL_KEYS
+        if unknown_channel_keys:
+            names = ", ".join(sorted(str(key) for key in unknown_channel_keys))
+            raise ValueError(f"unknown channel fields: {names}")
+        if "transport" not in raw_channel or "credential_kind" not in raw_channel:
+            raise ValueError(
+                "channel requires transport and credential_kind"
+            )
+        raw_transport = raw_channel.get("transport")
+        if not isinstance(raw_transport, str):
+            raise ValueError("channel transport must be a string")
+        raw_credential_kind = raw_channel.get("credential_kind")
+        if not isinstance(raw_credential_kind, str):
+            raise ValueError("channel credential_kind must be a string")
+        raw_credential_id = raw_channel.get("credential_id")
+        if raw_credential_id is not None and not isinstance(
+            raw_credential_id, str
+        ):
+            raise ValueError("channel credential_id must be a string")
+        channel = EventChannelFilter(
+            transport=parse_transport(raw_transport),
+            credential_kind=parse_credential_kind(raw_credential_kind),
+            credential_id=raw_credential_id,
         )
 
     shared_query = parse_explorer_query(
@@ -155,6 +201,7 @@ def _parse_event_query(payload: dict[str, Any]) -> EventQuery:
         from_at=shared_query.date_range.from_at,
         to_at=shared_query.date_range.to_at,
         entity_filters=entity_filters,
+        channel=channel,
         page=shared_query.page,
         page_size=shared_query.page_size,
     )
@@ -186,6 +233,7 @@ def query_events(
         "page_size": query.page_size,
         "has_more": query.page * query.page_size < page.total,
         "timeline": page.buckets,
+        "channels": page.channels,
     }
 
 

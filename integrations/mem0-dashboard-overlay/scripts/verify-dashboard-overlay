@@ -25,6 +25,8 @@ REQUESTS_PAGE = "src/app/(root)/dashboard/requests/page.tsx"
 REQUEST_TRACE_DRAWER = (
     "src/app/(root)/dashboard/requests/request-trace-drawer.tsx"
 )
+API_KEYS_PAGE = "src/app/(root)/dashboard/api-keys/page.tsx"
+DELETE_CONFIRMATION_MODAL = "src/components/ui/delete-confirmation-modal.tsx"
 ENTITIES_PAGE = "src/app/(root)/dashboard/entities/page.tsx"
 DASHBOARD_DOCKERFILE = "Dockerfile"
 SIDECAR_PROXY = "src/utils/sidecar-proxy.ts"
@@ -434,7 +436,7 @@ def verify_responsive_nav_collapse(main_nav_content: str) -> str | None:
             "main-nav responsive collapse effect must invoke its collapse callback",
         ),
         (
-            r'sidebarMediaQuery\.addEventListener\(\s*["\']change["\']\s*,\s*collapseSidebarOnNarrowViewport\s*\)',
+            r'sidebarMediaQuery\.addEventListener\(\s*["\']change["\']\s*,\s*collapseSidebarOnNarrowViewport\s*,?\s*\)',
             "main-nav responsive collapse effect missing its change listener",
         ),
         (
@@ -1188,6 +1190,13 @@ def verify_proxy_contract(dashboard_dir: Path) -> str | None:
             return f"sidecar proxy missing category item {method} support"
     if 'const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH"]);' not in proxy_content:
         return "sidecar proxy METHODS_WITH_BODY must include PATCH"
+    if 'redirect: "manual"' not in proxy_content:
+        return "sidecar proxy must disable authenticated upstream redirects"
+    if (
+        "response.status >= 300 && response.status < 400"
+        not in proxy_content
+    ):
+        return "sidecar proxy must reject upstream redirect responses"
     for method in ("PATCH", "DELETE"):
         if (
             re.search(
@@ -1233,7 +1242,7 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
             "Requests page must close the drawer without clearing filters",
         ),
         (
-            "writeTraceControlUrl(next, query.operation, query.has_results)",
+            "writeTraceControlUrl(",
             "Requests page must persist operation query state",
         ),
         (
@@ -1247,6 +1256,22 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
         (
             'aria-label="Has results filter"',
             "Requests page must expose an independent result toggle",
+        ),
+        (
+            'aria-label="Request client filter"',
+            "Requests page must expose an accessible client filter",
+        ),
+        (
+            "pageData?.channels",
+            "Requests page must consume server-provided channel facets",
+        ),
+        (
+            "setRequestTraceChannel(query, channel)",
+            "Requests page must apply exact client filters",
+        ),
+        (
+            'label: "Client"',
+            "Requests table must display the authenticated client",
         ),
         (
             "<TraceEventButton",
@@ -1332,6 +1357,14 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
         ('document.execCommand("copy")', "Request drawer missing clipboard fallback"),
         ("Raw error", "Request drawer must expose failure payloads"),
         (
+            'label="Client"',
+            "Request drawer must display the authenticated client",
+        ),
+        (
+            'label="Client ID"',
+            "Request drawer must display exact client identity",
+        ),
+        (
             "<EntityBadges",
             "Request drawer must render shared entity badges",
         ),
@@ -1381,6 +1414,193 @@ def verify_requests_page(dashboard_dir: Path) -> str | None:
         ),
     ):
         if contract not in drawer_content:
+            return error
+    return None
+
+
+def verify_api_keys_page(dashboard_dir: Path) -> str | None:
+    content = (dashboard_dir / API_KEYS_PAGE).read_text()
+    create_body = extract_named_arrow_function_body(content, "handleCreate")
+    revoke_body = extract_named_arrow_function_body(content, "handleRevoke")
+    if create_body is None:
+        return "Client Keys page must define its create interaction"
+    if revoke_body is None:
+        return "Client Keys page must define its revoke interaction"
+    for contract, error in (
+        (
+            "API &amp; MCP Client Keys",
+            "Client Keys page must explain its shared REST and MCP purpose",
+        ),
+        (
+            "API_KEY_ENDPOINTS.BASE",
+            "Client Keys page must use Core API key management",
+        ),
+        (
+            "API_KEY_ENDPOINTS.BY_ID(target.id)",
+            "Client Keys page must revoke keys by exact Core key ID",
+        ),
+        (
+            "useApiQuery<ApiKey[]>",
+            "Client Keys list must use the secret-free key descriptor",
+        ),
+        (
+            'setNewKey("")',
+            "Client Keys page must clear the one-time secret on dialog close",
+        ),
+        (
+            "MEM0_OSS_MCP_TOKEN",
+            "Client Keys page must explain the compatible MCP token variable",
+        ),
+        (
+            "maxLength={255}",
+            "Client Keys labels must match the Core descriptor length bound",
+        ),
+        (
+            'aria-describedby="api-key-label-description"',
+            "Client Keys label input must describe how attribution uses the label",
+        ),
+        (
+            'className="block truncate" title={label}',
+            "Client Keys desktop labels must truncate with a full-value affordance",
+        ),
+        (
+            "Legacy client key (${key.key_prefix}...)",
+            "Client Keys page must safely label historical empty descriptors",
+        ),
+        (
+            "displayKeyLabel(key)",
+            "Client Keys page must normalize historical labels consistently",
+        ),
+        (
+            "mountedRef.current = true",
+            "Client Keys page must restore its mounted guard after Strict Mode remount",
+        ),
+        (
+            "mountedRef.current = false",
+            "Client Keys page must guard async completion after unmount",
+        ),
+        (
+            "API_KEY_ENDPOINTS.BY_ID(response.data.id)",
+            "Client Keys page must revoke a key whose one-time secret cannot be shown",
+        ),
+        (
+            'isCreating ? "Creating..." : "Create"',
+            "Client Keys page must lock the create interaction while pending",
+        ),
+        (
+            "Authorization: Bearer &lt;key&gt;",
+            "Client Keys page must show the remote MCP credential shape",
+        ),
+        (
+            "It is shown only once.",
+            "Client Keys page must warn about one-time secret visibility",
+        ),
+        (
+            "hybrid-mode migration",
+            "Client Keys page must explain legacy static-token compatibility",
+        ),
+        (
+            'className="space-y-2 lg:hidden"',
+            "Client Keys page must provide a compact key list",
+        ),
+        (
+            "const shellHorizontalSpace =",
+            "Client Keys page must bound intrinsic width inside the dashboard scroll area",
+        ),
+        (
+            "COLLAPSED_SIDEBAR_WIDTH : SIDEBAR_WIDTH",
+            "Client Keys page must follow the dashboard sidebar width",
+        ),
+        (
+            'style={{ width: `calc(100vw - ${shellHorizontalSpace}px)` }}',
+            "Client Keys page must reserve dashboard shell padding",
+        ),
+        (
+            'aria-label={`Revoke ${displayKeyLabel(key)}`}',
+            "Client Keys compact revoke action must have an accessible name",
+        ),
+        (
+            "onCopy={(_text, succeeded)",
+            "Client Keys copy state must use the actual clipboard result",
+        ),
+        (
+            'copied ? "Client key copied" : "Copy client key"',
+            "Client Keys copy action must expose its success state",
+        ),
+        (
+            'role="status" aria-live="polite"',
+            "Client Keys copy state must be announced accessibly",
+        ),
+        (
+            "isPending={isRevoking}",
+            "Client Keys revoke dialog must expose its pending state",
+        ),
+        (
+            'pendingButtonText="Revoking..."',
+            "Client Keys revoke dialog must describe pending work",
+        ),
+    ):
+        if contract not in content:
+            return error
+    if "if (creatingRef.current ||" not in create_body:
+        return "Client Keys creation must reject concurrent submissions"
+    if "if (keyToRevoke === null || revokingRef.current)" not in revoke_body:
+        return "Client Keys revocation must reject concurrent submissions"
+    for forbidden in ("localStorage", "sessionStorage", "console.log"):
+        if forbidden in content:
+            return (
+                "Client Keys page must not persist or log the one-time secret"
+            )
+    if "UpgradeBanner" in content:
+        return "Client Keys page must not discourage supported multi-key usage"
+    return None
+
+
+def verify_delete_confirmation_modal(dashboard_dir: Path) -> str | None:
+    content = (dashboard_dir / DELETE_CONFIRMATION_MODAL).read_text()
+    for contract, error in (
+        (
+            "showCloseIcon={!isPending}",
+            "Pending destructive actions must hide the close control",
+        ),
+        (
+            "disabled={isPending}",
+            "Pending destructive actions must disable dismissal",
+        ),
+        (
+            "disabled={!isDeleteEnabled}",
+            "Pending destructive actions must disable confirmation",
+        ),
+        (
+            "aria-busy={isPending}",
+            "Pending destructive actions must expose busy state",
+        ),
+        (
+            'role="status"',
+            "Pending destructive actions must announce progress",
+        ),
+        (
+            "if (!isPending && confirmationText === itemName)",
+            "Destructive confirmation must reject duplicate pending submissions",
+        ),
+        (
+            'className="break-all font-bold"',
+            "Destructive confirmation names must wrap without overflowing",
+        ),
+        (
+            "text-onSurface-default-secondary",
+            "Destructive confirmation must use semantic text colors",
+        ),
+        (
+            "<Label htmlFor={confirmationInputId}",
+            "Destructive confirmation input must have an accessible label",
+        ),
+        (
+            "aria-describedby={confirmationDescriptionId}",
+            "Destructive confirmation input must describe the required value",
+        ),
+    ):
+        if contract not in content:
             return error
     return None
 
@@ -1666,6 +1886,8 @@ def main() -> int:
         verify_export_page(dashboard_dir),
         verify_proxy_contract(dashboard_dir),
         verify_requests_page(dashboard_dir),
+        verify_api_keys_page(dashboard_dir),
+        verify_delete_confirmation_modal(dashboard_dir),
         verify_entities_page(dashboard_dir),
         verify_public_api_placeholder(dashboard_dir),
     )

@@ -1,7 +1,10 @@
+import time
+
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from mem0_sidecar.config import SidecarSettings
+from mem0_sidecar.http_adapter import app as app_module
 from mem0_sidecar.http_adapter.app import create_app
 from mem0_sidecar.store.models import Project
 
@@ -138,6 +141,52 @@ def test_consolidation_lifespan_starts_named_scheduler_and_worker(tmp_path) -> N
     assert worker_task.done()
 
 
+def test_consolidation_lifespan_restarts_transiently_failed_loops(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class FlakyRuntime:
+        scheduler_attempts = 0
+        worker_attempts = 0
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def scheduler_loop(self, stop) -> None:
+            type(self).scheduler_attempts += 1
+            if type(self).scheduler_attempts == 1:
+                raise RuntimeError("transient scheduler failure")
+            await stop.wait()
+
+        async def worker_loop(self, stop) -> None:
+            type(self).worker_attempts += 1
+            if type(self).worker_attempts == 1:
+                raise RuntimeError("transient worker failure")
+            await stop.wait()
+
+    monkeypatch.setattr(app_module, "ConsolidationRuntime", FlakyRuntime)
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            consolidation_enabled=True,
+            worker_poll_interval_seconds=0.1,
+        ),
+        mem0_client=object(),
+    )
+
+    with TestClient(app):
+        deadline = time.monotonic() + 2
+        while (
+            FlakyRuntime.scheduler_attempts < 2 or FlakyRuntime.worker_attempts < 2
+        ) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert FlakyRuntime.scheduler_attempts >= 2
+        assert FlakyRuntime.worker_attempts >= 2
+        assert not app.state.consolidation_scheduler_task.done()
+        assert not app.state.consolidation_worker_task.done()
+
+
 def test_bridge_routing_heartbeat_is_persisted_for_consolidation_status(
     tmp_path,
 ) -> None:
@@ -158,9 +207,7 @@ def test_bridge_routing_heartbeat_is_persisted_for_consolidation_status(
                 "routes_writes": True,
             },
         )
-        status = client.get(
-            "/v1/projects/default/apps/default/consolidation"
-        )
+        status = client.get("/v1/projects/default/apps/default/consolidation")
 
     assert heartbeat.status_code == 200
     assert heartbeat.json()["ready"] is True

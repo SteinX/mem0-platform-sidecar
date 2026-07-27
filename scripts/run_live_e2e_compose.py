@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -16,6 +20,28 @@ INTERNAL_MEM0_BASE_URL = "http://mem0:8000"
 MEM0_READY_CHECK = (
     "import urllib.request; "
     "urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=2)"
+)
+BROWSER_EVIDENCE_FILENAMES = (
+    "client-keys-unauthenticated-desktop.png",
+    "client-keys-create-dialog-desktop.png",
+    "client-keys-created-copied-desktop.png",
+    "client-keys-list-desktop.png",
+    "client-keys-list-compact.png",
+    "client-keys-revoke-pending-desktop.png",
+)
+BROWSER_EVIDENCE_PREFIX = "MEM0_E2E_EVIDENCE_JSON="
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+E2E_TEST_REPORT_FILENAMES = (
+    "live-tests.xml",
+    "adoption-test.xml",
+)
+E2E_TEST_REPORT_PREFIX = "MEM0_E2E_TEST_REPORTS_JSON="
+E2E_COMPLETED_GATES = (
+    "postgres_migration_smoke",
+    "live_service_tests",
+    "adoption_test",
+    "destructive_browser",
+    "mocked_browser",
 )
 
 
@@ -49,12 +75,76 @@ def resolve_upstream_context() -> Path:
     return (main_checkout_root.parent / "upstream").resolve()
 
 
-def build_runner_env(*, project_id: str) -> dict[str, str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key != "MEM0_E2E_API_KEY"
+def resolve_mcp_context() -> Path:
+    override = os.environ.get("MEM0_E2E_MCP_CONTEXT")
+    if override:
+        return Path(override).expanduser().resolve()
+    return (ROOT.parent / "mem0-oss-mcp").resolve()
+
+
+def _git_revision(context: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=context,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def verify_source_revisions(
+    *,
+    sidecar_context: Path,
+    core_context: Path,
+    mcp_context: Path,
+) -> dict[str, str]:
+    sources = {
+        "sidecar": (
+            sidecar_context,
+            "MEM0_E2E_EXPECTED_SIDECAR_SHA",
+        ),
+        "core": (
+            core_context,
+            "MEM0_E2E_EXPECTED_CORE_SHA",
+        ),
+        "mcp": (
+            mcp_context,
+            "MEM0_E2E_EXPECTED_MCP_SHA",
+        ),
     }
+    revisions: dict[str, str] = {}
+    for name, (context, expected_variable) in sources.items():
+        revision = _git_revision(context)
+        revisions[name] = revision
+        expected = os.environ.get(expected_variable)
+        if expected is None:
+            raise RuntimeError(f"{expected_variable} is required")
+        if revision != expected:
+            raise RuntimeError(
+                f"{name} source revision {revision} did not match "
+                f"{expected_variable}={expected}"
+            )
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=context,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if status.stdout.strip():
+            raise RuntimeError(
+                f"{name} source has uncommitted changes; exact-SHA E2E refused"
+            )
+    print(
+        "MEM0_E2E_SOURCE_REVISIONS=" + json.dumps(revisions, sort_keys=True),
+        flush=True,
+    )
+    return revisions
+
+
+def build_runner_env(*, project_id: str) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if key != "MEM0_E2E_API_KEY"}
     env["MEM0_E2E_BASE_URL"] = INTERNAL_MEM0_BASE_URL
     env["MEM0_E2E_PROJECT_ID"] = project_id
     env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(resolve_upstream_context())
@@ -72,6 +162,7 @@ def compose_up_command(project_name: str) -> list[str]:
         "postgres",
         "mem0",
         "sidecar",
+        "mcp",
         "dashboard",
         "browser",
     ]
@@ -138,6 +229,191 @@ def browser_destructive_smoke_command(project_name: str) -> list[str]:
     ]
 
 
+def browser_evidence_export_command(
+    project_name: str,
+    *,
+    filenames: tuple[str, ...] = BROWSER_EVIDENCE_FILENAMES,
+    prefix: str = BROWSER_EVIDENCE_PREFIX,
+) -> list[str]:
+    encoded_filenames = json.dumps(filenames)
+    source = (
+        'const fs=require("node:fs");'
+        f"const names={encoded_filenames};"
+        "const payload=Object.fromEntries(names.map((name)=>["
+        'name,fs.readFileSync(`/evidence/${name}`).toString("base64")'
+        "]));"
+        f'process.stdout.write("{prefix}"+JSON.stringify(payload));'
+    )
+    return [
+        *compose_command(project_name),
+        "run",
+        "--rm",
+        "--no-deps",
+        "browser-smoke",
+        "node",
+        "-e",
+        source,
+    ]
+
+
+def export_browser_evidence(
+    project_name: str,
+    *,
+    target: Path,
+    env: dict[str, str],
+) -> None:
+    result = subprocess.run(
+        browser_evidence_export_command(project_name),
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            "Could not export browser evidence from the Compose daemon: "
+            f"{diagnostic or result.returncode}"
+        )
+
+    evidence_line = next(
+        (
+            line
+            for line in reversed(result.stdout.splitlines())
+            if line.startswith(BROWSER_EVIDENCE_PREFIX)
+        ),
+        None,
+    )
+    if evidence_line is None:
+        raise RuntimeError("Browser evidence export returned no evidence payload")
+    try:
+        encoded_files = json.loads(evidence_line.removeprefix(BROWSER_EVIDENCE_PREFIX))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Browser evidence export returned invalid JSON") from exc
+    if not isinstance(encoded_files, dict):
+        raise RuntimeError("Browser evidence export returned a non-object payload")
+    if set(encoded_files) != set(BROWSER_EVIDENCE_FILENAMES):
+        raise RuntimeError(
+            f"Browser evidence export returned the wrong files: {sorted(encoded_files)}"
+        )
+
+    target.mkdir(parents=True, exist_ok=True)
+    for filename in BROWSER_EVIDENCE_FILENAMES:
+        try:
+            data = base64.b64decode(encoded_files[filename], validate=True)
+        except (binascii.Error, ValueError, TypeError) as exc:
+            raise RuntimeError(
+                f"Browser evidence {filename} was not valid base64"
+            ) from exc
+        if not data.startswith(PNG_SIGNATURE):
+            raise RuntimeError(f"Browser evidence {filename} was not a valid PNG")
+        destination = target / filename
+        destination.write_bytes(data)
+        destination.chmod(0o600)
+
+
+def export_e2e_test_reports(
+    project_name: str,
+    *,
+    target: Path,
+    env: dict[str, str],
+) -> None:
+    result = subprocess.run(
+        browser_evidence_export_command(
+            project_name,
+            filenames=E2E_TEST_REPORT_FILENAMES,
+            prefix=E2E_TEST_REPORT_PREFIX,
+        ),
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            "Could not export E2E test reports from the Compose daemon: "
+            f"{diagnostic or result.returncode}"
+        )
+    report_line = next(
+        (
+            line
+            for line in reversed(result.stdout.splitlines())
+            if line.startswith(E2E_TEST_REPORT_PREFIX)
+        ),
+        None,
+    )
+    if report_line is None:
+        raise RuntimeError("E2E test report export returned no payload")
+    try:
+        encoded_files = json.loads(report_line.removeprefix(E2E_TEST_REPORT_PREFIX))
+        reports = {
+            filename: base64.b64decode(encoded_files[filename], validate=True)
+            for filename in E2E_TEST_REPORT_FILENAMES
+        }
+    except (
+        binascii.Error,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise RuntimeError("E2E test report export returned invalid data") from exc
+    if set(encoded_files) != set(E2E_TEST_REPORT_FILENAMES):
+        raise RuntimeError("E2E test report export returned the wrong files")
+    target.mkdir(parents=True, exist_ok=True)
+    for filename, data in reports.items():
+        destination = target / filename
+        destination.write_bytes(data)
+        destination.chmod(0o600)
+
+
+def write_e2e_evidence_manifest(
+    *,
+    target: Path,
+    revisions: dict[str, str],
+    completed_gates: tuple[str, ...],
+) -> None:
+    artifact_paths = {
+        filename: target / filename
+        for filename in (
+            *BROWSER_EVIDENCE_FILENAMES,
+            *E2E_TEST_REPORT_FILENAMES,
+        )
+    }
+    missing = [
+        filename
+        for filename, path in artifact_paths.items()
+        if not path.is_file()
+    ]
+    if missing:
+        raise RuntimeError(
+            f"E2E evidence artifacts are missing: {sorted(missing)}"
+        )
+    artifacts = {
+        filename: {
+            "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for filename, path in artifact_paths.items()
+    }
+    manifest = {
+        "schema_version": 1,
+        "completed": True,
+        "sources": revisions,
+        "completed_gates": list(completed_gates),
+        "artifacts": artifacts,
+    }
+    destination = target / "e2e-manifest.json"
+    destination.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    destination.chmod(0o600)
+
+
 def prepare_dashboard_context(upstream_context: Path, target: Path) -> Path:
     source = upstream_context / "server" / "dashboard"
     if not (source / "package.json").is_file():
@@ -160,14 +436,6 @@ def prepare_dashboard_context(upstream_context: Path, target: Path) -> Path:
         / "apply-dashboard-overlay"
     )
     subprocess.run([str(apply_script), str(target)], cwd=ROOT, check=True)
-    shutil.copy2(
-        ROOT / "tests" / "e2e" / "dashboard_client_layout.browser-smoke.tsx",
-        target / "src" / "app" / "(root)" / "clientLayout.tsx",
-    )
-    shutil.copy2(
-        ROOT / "tests" / "e2e" / "dashboard_root_layout.browser-smoke.tsx",
-        target / "src" / "app" / "(root)" / "dashboard-client-layout.tsx",
-    )
     shutil.copy2(
         ROOT
         / "integrations"
@@ -321,6 +589,7 @@ def dump_diagnostics(base_compose: list[str], *, env: dict[str, str]) -> None:
             "--tail=240",
             "mem0",
             "sidecar",
+            "mcp",
             "postgres",
             "openai-stub",
             "e2e-runner",
@@ -347,6 +616,12 @@ def main() -> int:
     )
     timeout_seconds = int(os.environ.get("MEM0_E2E_STARTUP_TIMEOUT", "180"))
     upstream_context = resolve_upstream_context()
+    mcp_context = resolve_mcp_context()
+    source_revisions = verify_source_revisions(
+        sidecar_context=ROOT,
+        core_context=upstream_context,
+        mcp_context=mcp_context,
+    )
     dashboard_temp = tempfile.TemporaryDirectory(prefix="mem0-dashboard-smoke-")
     try:
         dashboard_context = prepare_dashboard_context(
@@ -358,11 +633,21 @@ def main() -> int:
         raise
     compose_env = os.environ.copy()
     compose_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(upstream_context)
+    compose_env["MEM0_E2E_MCP_CONTEXT"] = str(mcp_context)
     compose_env["MEM0_E2E_DASHBOARD_CONTEXT"] = str(dashboard_context)
     compose_env["MEM0_E2E_PROJECT_ID"] = project_id
+    evidence_target = Path(
+        os.environ.get(
+            "MEM0_E2E_EVIDENCE_DIR",
+            "/tmp/mem0-sidecar-e2e-evidence",
+        )
+    ).expanduser()
+    evidence_target.mkdir(parents=True, exist_ok=True)
+    (evidence_target / "e2e-manifest.json").unlink(missing_ok=True)
     runner_env = build_runner_env(project_id=project_id)
     runner_env["MEM0_E2E_DASHBOARD_CONTEXT"] = str(dashboard_context)
     runner_env["MEM0_E2E_UPSTREAM_CONTEXT"] = str(upstream_context)
+    runner_env["MEM0_E2E_MCP_CONTEXT"] = str(mcp_context)
     base_compose = compose_command(project_name)
 
     try:
@@ -388,10 +673,25 @@ def main() -> int:
             ),
             env=runner_env,
         )
+        export_e2e_test_reports(
+            project_name,
+            target=evidence_target,
+            env=runner_env,
+        )
         print("\n=== real destructive browser acceptance gate ===")
         run(browser_destructive_smoke_command(project_name), env=compose_env)
+        export_browser_evidence(
+            project_name,
+            target=evidence_target,
+            env=compose_env,
+        )
         print("\n=== mocked UI behavior smoke (not deployed-proxy acceptance) ===")
         run(mocked_browser_smoke_command(project_name), env=compose_env)
+        write_e2e_evidence_manifest(
+            target=evidence_target,
+            revisions=source_revisions,
+            completed_gates=E2E_COMPLETED_GATES,
+        )
     except Exception:
         dump_diagnostics(base_compose, env=compose_env)
         raise

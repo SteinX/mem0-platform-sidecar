@@ -1866,7 +1866,7 @@ class MemoryService:
                     **_memory_projection_fields(
                         _projection_record_with_metadata_fallback(
                             hydrated_records[memory_id],
-                            metadata,
+                            oss_payload["metadata"],
                         ),
                         observed_at=observed_at,
                     ),

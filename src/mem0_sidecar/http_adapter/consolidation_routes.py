@@ -16,6 +16,12 @@ def _service(request: Request, session: Session) -> ConsolidationService:
         session=session,
         mem0=request.app.state.mem0_client,
         bridge_routing_ready=False,
+        consolidation_enabled=(
+            request.app.state.settings.consolidation_enabled
+        ),
+        hard_delete_enabled=(
+            request.app.state.settings.consolidation_hard_delete_enabled
+        ),
     )
 
 

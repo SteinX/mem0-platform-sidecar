@@ -7,6 +7,10 @@ from fastapi.testclient import TestClient
 
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.http_adapter.app import create_app
+from mem0_sidecar.request_attribution import (
+    RequestAttribution,
+    bind_request_attribution,
+)
 from mem0_sidecar.store.models import Event, EventStatus, Project
 from mem0_sidecar.store.repositories import EventRepository, ProjectRepository
 
@@ -50,21 +54,25 @@ def _seed_event(
     created_at: datetime | None = None,
     user_id: str = "root",
     results: list[dict[str, Any]] | None = None,
+    attribution: RequestAttribution | None = None,
 ) -> str:
     with app.state.session_factory() as session:
         events = EventRepository(session)
-        event = events.create_event(
-            project_id=project_id,
-            app_id=app_id,
-            user_id=user_id,
-            operation=operation,
-            request={
-                "app_id": app_id,
-                "user_id": user_id,
-                "query": "hello",
-            },
-            correlation_id=f"request-{app_id}",
-        )
+        with bind_request_attribution(
+            attribution or RequestAttribution.system()
+        ):
+            event = events.create_event(
+                project_id=project_id,
+                app_id=app_id,
+                user_id=user_id,
+                operation=operation,
+                request={
+                    "app_id": app_id,
+                    "user_id": user_id,
+                    "query": "hello",
+                },
+                correlation_id=f"request-{app_id}",
+            )
         if status is EventStatus.SUCCEEDED:
             events.mark_succeeded(event.id, response={"results": results or []})
         elif status is EventStatus.FAILED:
@@ -126,6 +134,13 @@ def test_query_events_returns_scoped_paged_envelope_and_timeline(tmp_path) -> No
                 "operation": "memory.search",
                 "display_operation": "SEARCH",
                 "status": "SUCCEEDED",
+                "channel": {
+                    "transport": "system",
+                    "credential_kind": "unknown",
+                    "credential_id": None,
+                    "label": "System",
+                    "key_prefix": None,
+                },
                 "entities": [
                     {"type": "user", "id": "root"},
                     {"type": "app", "id": "app-a"},
@@ -148,6 +163,16 @@ def test_query_events_returns_scoped_paged_envelope_and_timeline(tmp_path) -> No
         "timeline": [
             {"timestamp": "2026-07-13T10:00:00Z", "count": 1},
             {"timestamp": "2026-07-13T11:00:00Z", "count": 1},
+        ],
+        "channels": [
+            {
+                "transport": "system",
+                "credential_kind": "unknown",
+                "credential_id": None,
+                "label": "System",
+                "key_prefix": None,
+                "count": 2,
+            }
         ],
     }
     assert older_id != newer_id
@@ -193,6 +218,31 @@ def test_query_events_rejects_non_object_json(tmp_path, payload) -> None:
         ("entity_filters", {"project_id": "repo-a"}),
         ("entity_filters", {"user_id": ""}),
         ("entity_filters", {"user_id": 7}),
+        ("channel", []),
+        ("channel", {"transport": "mcp"}),
+        (
+            "channel",
+            {"transport": [], "credential_kind": "core_api_key"},
+        ),
+        (
+            "channel",
+            {"transport": "mcp", "credential_kind": {}},
+        ),
+        (
+            "channel",
+            {
+                "transport": "mcp",
+                "credential_kind": "legacy_static",
+                "credential_id": "not-allowed",
+            },
+        ),
+        (
+            "channel",
+            {
+                "transport": "rest",
+                "credential_kind": "legacy_static",
+            },
+        ),
     ],
 )
 def test_query_events_rejects_invalid_filters(tmp_path, field, value) -> None:
@@ -204,6 +254,84 @@ def test_query_events_rejects_invalid_filters(tmp_path, field, value) -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_query_events_filters_exact_client_and_returns_channel_facets(
+    tmp_path,
+) -> None:
+    app = _create_test_app(tmp_path)
+    _seed_project(app, "repo-a", app_id="app-a")
+    client_id = "9efe7b0e-1a0f-4fd8-8845-b450b9a692b3"
+    matching_id = _seed_event(
+        app,
+        attribution=RequestAttribution(
+            transport="mcp",
+            credential_kind="core_api_key",
+            credential_id=client_id,
+            credential_label="OpenCode laptop",
+            credential_prefix="m0_live_abcd",
+        ),
+    )
+    _seed_event(
+        app,
+        attribution=RequestAttribution(
+            transport="mcp",
+            credential_kind="legacy_static",
+            credential_label="Legacy shared MCP key",
+        ),
+    )
+    _seed_event(app)
+
+    response = TestClient(app).post(
+        "/v1/events/query",
+        json={
+            "project_id": "repo-a",
+            "app_id": "app-a",
+            "channel": {
+                "transport": "mcp",
+                "credential_kind": "core_api_key",
+                "credential_id": client_id,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["id"] for item in body["results"]] == [matching_id]
+    assert body["total"] == 1
+    assert body["results"][0]["channel"] == {
+        "transport": "mcp",
+        "credential_kind": "core_api_key",
+        "credential_id": client_id,
+        "label": "OpenCode laptop",
+        "key_prefix": "m0_live_abcd",
+    }
+    assert body["channels"] == [
+        {
+            "transport": "mcp",
+            "credential_kind": "legacy_static",
+            "credential_id": None,
+            "label": "Legacy shared MCP key",
+            "key_prefix": None,
+            "count": 1,
+        },
+        {
+            "transport": "mcp",
+            "credential_kind": "core_api_key",
+            "credential_id": client_id,
+            "label": "OpenCode laptop",
+            "key_prefix": "m0_live_abcd",
+            "count": 1,
+        },
+        {
+            "transport": "system",
+            "credential_kind": "unknown",
+            "credential_id": None,
+            "label": "System",
+            "key_prefix": None,
+            "count": 1,
+        },
+    ]
 
 
 @pytest.mark.parametrize(

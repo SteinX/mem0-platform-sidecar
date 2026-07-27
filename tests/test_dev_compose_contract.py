@@ -1,0 +1,32 @@
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+COMPOSE = ROOT / "docker" / "docker-compose.dev.yml"
+ENV_EXAMPLE = ROOT / ".env.example"
+
+RUNTIME_ENV_VARS = (
+    "MEM0_SIDECAR_CLIENT_AUTH_ENABLED",
+    "MEM0_SIDECAR_CLIENT_AUTH_PATH",
+    "MEM0_SIDECAR_CLIENT_AUTH_TIMEOUT_SECONDS",
+    "MEM0_SIDECAR_CLIENT_AUTH_ALLOW_BOOTSTRAP_ADMIN",
+    "MEM0_SIDECAR_DIRECT_WRITE_SYNC_ENABLED",
+    "MEM0_SIDECAR_DIRECT_WRITE_SYNC_INTERVAL_SECONDS",
+    "MEM0_SIDECAR_DIRECT_WRITE_SYNC_SCAN_LIMIT",
+    "MEM0_SIDECAR_DIRECT_WRITE_SYNC_LEGACY_CAP",
+    "MEM0_SIDECAR_DIRECT_WRITE_SYNC_DEFAULT_APP_ID",
+    "MEM0_SIDECAR_WORKER_POLL_INTERVAL_SECONDS",
+    "MEM0_SIDECAR_CONSOLIDATION_ENABLED",
+    "MEM0_SIDECAR_CONSOLIDATION_SCHEDULER_INTERVAL_SECONDS",
+    "MEM0_SIDECAR_CONSOLIDATION_JOB_LEASE_SECONDS",
+    "MEM0_SIDECAR_CONSOLIDATION_HARD_DELETE_ENABLED",
+    "MEM0_SIDECAR_CONSOLIDATION_BRIDGE_ROUTING_REQUIRED",
+)
+
+
+def test_dev_compose_forwards_documented_auth_sync_and_consolidation_settings() -> None:
+    compose = COMPOSE.read_text()
+    env_example = ENV_EXAMPLE.read_text()
+
+    for variable in RUNTIME_ENV_VARS:
+        assert f"{variable}:" in compose
+        assert f"{variable}=" in env_example

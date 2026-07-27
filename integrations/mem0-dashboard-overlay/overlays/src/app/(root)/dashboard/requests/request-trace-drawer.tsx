@@ -268,6 +268,25 @@ export function RequestTraceDrawer({
                       label="Correlation ID"
                       value={detail.correlation_id ?? "--"}
                     />
+                    <TraceField label="Client" value={detail.channel.label} />
+                    <TraceField
+                      label="Channel"
+                      value={formatTransport(detail.channel.transport)}
+                    />
+                    <TraceField
+                      label="Credential"
+                      value={formatCredentialKind(
+                        detail.channel.credential_kind,
+                      )}
+                    />
+                    <TraceField
+                      label="Key prefix"
+                      value={detail.channel.key_prefix ?? "--"}
+                    />
+                    <TraceField
+                      label="Client ID"
+                      value={detail.channel.credential_id ?? "--"}
+                    />
                     <TraceField label="Status" value={detail.status} />
                     <TraceField
                       label="Latency"
@@ -501,7 +520,10 @@ async function copyText(value: string): Promise<void> {
       await navigator.clipboard.writeText(value);
       return;
     }
-  } catch {
+  } catch (error) {
+    if (!(error instanceof Error)) {
+      throw error;
+    }
     // The legacy selection fallback below also works when Clipboard API access is denied.
   }
   const textarea = document.createElement("textarea");
@@ -545,4 +567,24 @@ function formatLatency(value: number | null): string {
   return value === null || !Number.isFinite(value)
     ? "--"
     : `${value.toFixed(2)} ms`;
+}
+
+function formatTransport(
+  transport: SidecarTrace["channel"]["transport"],
+): string {
+  if (transport === "mcp") return "MCP";
+  if (transport === "rest") return "REST";
+  if (transport === "system") return "System";
+  return "Unknown";
+}
+
+function formatCredentialKind(
+  kind: SidecarTrace["channel"]["credential_kind"],
+): string {
+  if (kind === "core_api_key") return "API key";
+  if (kind === "legacy_static") return "Legacy shared MCP key";
+  if (kind === "operator_static") return "Legacy admin API key";
+  if (kind === "session") return "Authenticated session";
+  if (kind === "disabled") return "Authentication disabled";
+  return "Unknown";
 }

@@ -21,13 +21,26 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import type {
   ExplorerDateRange,
   ExplorerFilter,
   ExplorerMatch,
   ExplorerQueryPayload,
 } from "@/types/dashboard-explorer";
-import type { SidecarTrace, SidecarTracePage } from "@/types/sidecar";
+import type {
+  SidecarTrace,
+  SidecarTraceChannel,
+  SidecarTraceChannelFacet,
+  SidecarTraceChannelFilter,
+  SidecarTracePage,
+} from "@/types/sidecar";
 import {
   formatBrowserLocalTimestamp,
   formatBrowserRelativeTimestamp,
@@ -48,8 +61,11 @@ import {
   normalizeTracePage,
   requestTraceQueryPayload,
   resetRequestTraceQueryPage,
+  parseTraceChannelValue,
+  setRequestTraceChannel,
   setRequestTraceOperation,
   setTraceRequestIdInUrl,
+  traceChannelValue,
   toggleRequestTraceHasResults,
   writeTraceControlUrl,
   type RequestTraceQueryState,
@@ -76,6 +92,7 @@ const DEFAULT_QUERY: RequestTraceQueryState = {
   date_range: { from: null, to: null },
   operation: null,
   has_results: null,
+  channel: null,
   page: 1,
   page_size: 20,
 };
@@ -287,6 +304,13 @@ export default function RequestsPage() {
     writeQuery(toggleRequestTraceHasResults(query));
   }, [query, writeQuery]);
 
+  const selectChannel = useCallback(
+    (channel: SidecarTraceChannelFilter | null) => {
+      writeQuery(setRequestTraceChannel(query, channel));
+    },
+    [query, writeQuery],
+  );
+
   const setDrawerRequestId = useCallback(
     (id: string | null) => {
       const current = new URLSearchParams(search);
@@ -326,7 +350,7 @@ export default function RequestsPage() {
       {
         key: "requested_at",
         label: "Time",
-        width: 16,
+        width: 13,
         render: (value) => (
           <TraceTime value={typeof value === "string" ? value : null} />
         ),
@@ -334,15 +358,26 @@ export default function RequestsPage() {
       {
         key: "display_operation",
         label: "Type",
-        width: 13,
+        width: 10,
         render: (_value, row) => (
           <OperationBadge operation={row.display_operation} />
         ),
       },
       {
+        key: "channel",
+        label: "Client",
+        width: 18,
+        render: (_value, row) => (
+          <TraceChannel
+            channel={row.channel}
+            onSelect={(channel) => selectChannel(channel)}
+          />
+        ),
+      },
+      {
         key: "entities",
         label: "Entities",
-        width: 24,
+        width: 19,
         render: (_value, row) => (
           <div onClick={(event) => event.stopPropagation()}>
             <TraceEntities trace={row} onBadgeClick={addIdentityFilter} />
@@ -352,7 +387,7 @@ export default function RequestsPage() {
       {
         key: "request",
         label: "Event",
-        width: 29,
+        width: 24,
         render: (_value, row) => (
           <TraceEventButton
             trace={row}
@@ -363,20 +398,24 @@ export default function RequestsPage() {
       {
         key: "latency_ms",
         label: "Latency",
-        width: 10,
+        width: 8,
         render: (_value, row) => formatLatency(row.latency_ms),
       },
       {
         key: "status",
         label: "Status",
-        width: 13,
+        width: 8,
         render: (_value, row) => <StatusBadge status={row.status} />,
       },
     ],
-    [addIdentityFilter, openRequestTrace],
+    [addIdentityFilter, openRequestTrace, selectChannel],
   );
 
   const rows = pageData?.results ?? [];
+  const channelFacets = useMemo(
+    () => withSelectedChannel(pageData?.channels ?? [], query.channel),
+    [pageData?.channels, query.channel],
+  );
   const hasInitialError = loadError !== null && pageData === null;
   const hasNextPage =
     pageData?.has_more === true &&
@@ -449,6 +488,30 @@ export default function RequestsPage() {
 
       <div className="flex flex-wrap items-center gap-2">
         <DateRangeFilter value={query.date_range} onChange={changeDateRange} />
+        <Select
+          value={traceChannelValue(query.channel)}
+          onValueChange={(value) =>
+            selectChannel(parseTraceChannelValue(value))
+          }
+        >
+          <SelectTrigger
+            aria-label="Request client filter"
+            className="w-full sm:w-[280px]"
+          >
+            <SelectValue placeholder="All clients" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All clients</SelectItem>
+            {channelFacets.map((channel) => (
+              <SelectItem
+                key={traceChannelValue(channel)}
+                value={traceChannelValue(channel)}
+              >
+                {formatChannelOption(channel)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <FilterBuilder
           match="all"
           filters={query.filters}
@@ -571,6 +634,7 @@ export default function RequestsPage() {
                 <p className="whitespace-normal break-words text-sm">
                   {traceEventLabel(trace)}
                 </p>
+                <TraceChannel channel={trace.channel} />
                 <TraceEntities trace={trace} />
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-onSurface-default-secondary">
                   <TraceTime value={trace.requested_at} />
@@ -650,7 +714,12 @@ function writeRequestUrlState(
     sort: "created_at_desc",
   };
   const next = writeExplorerUrlState(current, sharedQuery);
-  return writeTraceControlUrl(next, query.operation, query.has_results);
+  return writeTraceControlUrl(
+    next,
+    query.operation,
+    query.has_results,
+    query.channel,
+  );
 }
 
 function requestQueriesEqual(
@@ -749,6 +818,109 @@ function StatusBadge({ status }: { status: SidecarTrace["status"] }) {
       {status}
     </Badge>
   );
+}
+
+function TraceChannel({
+  channel,
+  onSelect,
+}: {
+  channel: SidecarTraceChannel;
+  onSelect?: (channel: SidecarTraceChannelFilter) => void;
+}) {
+  const content = (
+    <>
+      <Badge variant="outline" className="shrink-0 whitespace-nowrap">
+        {formatTransport(channel.transport)}
+      </Badge>
+      <span className="min-w-0 truncate text-xs" title={channelTitle(channel)}>
+        {channel.label}
+      </span>
+    </>
+  );
+  if (onSelect === undefined) {
+    return <div className="flex min-w-0 items-center gap-2">{content}</div>;
+  }
+  return (
+    <button
+      type="button"
+      className="flex min-w-0 max-w-full items-center gap-2 rounded-sm text-left hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+      aria-label={`Filter requests by ${channel.label}`}
+      title={channelTitle(channel)}
+      onClick={(event) => {
+        event.stopPropagation();
+        onSelect({
+          transport: channel.transport,
+          credential_kind: channel.credential_kind,
+          credential_id: channel.credential_id,
+        });
+      }}
+    >
+      {content}
+    </button>
+  );
+}
+
+function withSelectedChannel(
+  facets: SidecarTraceChannelFacet[],
+  selected: SidecarTraceChannelFilter | null,
+): SidecarTraceChannelFacet[] {
+  if (
+    selected === null ||
+    facets.some((facet) => sameChannel(facet, selected))
+  ) {
+    return facets;
+  }
+  return [
+    ...facets,
+    {
+      ...selected,
+      label:
+        selected.credential_id === null
+          ? formatCredentialKind(selected.credential_kind)
+          : `Client ${selected.credential_id.slice(0, 8)}`,
+      key_prefix: null,
+      count: 0,
+    },
+  ];
+}
+
+function sameChannel(
+  left: SidecarTraceChannelFilter,
+  right: SidecarTraceChannelFilter,
+): boolean {
+  return (
+    left.transport === right.transport &&
+    left.credential_kind === right.credential_kind &&
+    left.credential_id === right.credential_id
+  );
+}
+
+function formatChannelOption(channel: SidecarTraceChannelFacet): string {
+  return `${formatTransport(channel.transport)} - ${channel.label} (${channel.count})`;
+}
+
+function channelTitle(channel: SidecarTraceChannel): string {
+  const prefix =
+    channel.key_prefix === null ? "" : `, key prefix ${channel.key_prefix}`;
+  return `${formatTransport(channel.transport)}, ${channel.label}${prefix}`;
+}
+
+function formatTransport(transport: SidecarTraceChannel["transport"]): string {
+  if (transport === "mcp") return "MCP";
+  if (transport === "rest") return "REST";
+  if (transport === "system") return "System";
+  return "Unknown";
+}
+
+function formatCredentialKind(
+  kind: SidecarTraceChannel["credential_kind"],
+): string {
+  if (kind === "core_api_key") return "API key";
+  if (kind === "legacy_static") return "Legacy shared MCP key";
+  if (kind === "operator_static") return "Legacy admin API key";
+  if (kind === "session") return "Authenticated session";
+  if (kind === "disabled") return "Authentication disabled";
+  return "Unknown";
 }
 
 function traceEventLabel(trace: SidecarTrace): string {

@@ -465,6 +465,7 @@ async def test_memory_service_adds_memory_indexes_projection_and_event(
     assert result["event"]["status"] == EventStatus.SUCCEEDED
     assert indexed.app_id == "repo-a"
     assert indexed.category == "decision"
+    assert indexed.scope_markers_verified == 1
     assert mem0.add_payloads[0]["user_id"] == "root"
     assert "app_id" not in mem0.add_payloads[0]
     mutation_marker = mem0.add_payloads[0]["metadata"].pop(

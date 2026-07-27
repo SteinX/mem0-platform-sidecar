@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -14,7 +15,6 @@ from sqlalchemy import select
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.core.consolidation_service import ConsolidationService
 from mem0_sidecar.http_adapter.app import create_app
-from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.store.models import (
     ConsolidationLineage,
     ConsolidationProposal,
@@ -38,9 +38,7 @@ def _live_settings(
     base_url = os.environ.get("MEM0_E2E_BASE_URL")
     if not base_url:
         pytest.skip("MEM0_E2E_BASE_URL is not set")
-    project_id = project_id or os.environ.get(
-        "MEM0_E2E_PROJECT_ID", "sidecar-e2e"
-    )
+    project_id = project_id or os.environ.get("MEM0_E2E_PROJECT_ID", "sidecar-e2e")
     return SidecarSettings(
         database_url=f"sqlite:///{tmp_path / database_name}",
         mem0_base_url=base_url,
@@ -82,6 +80,15 @@ def _scoped_params(*, project_id: str, app_id: str) -> dict[str, str]:
     return {"project_id": project_id, "app_id": app_id}
 
 
+def _upstream_headers(settings: SidecarSettings) -> dict[str, str]:
+    if not settings.mem0_api_key:
+        return {}
+    value = settings.mem0_api_key
+    if settings.mem0_api_key_prefix:
+        value = f"{settings.mem0_api_key_prefix} {value}"
+    return {settings.mem0_api_key_header_name: value}
+
+
 def _delete_scoped_memory(
     client: TestClient,
     *,
@@ -99,10 +106,7 @@ def _delete_scoped_memory(
     if response.status_code != 200:
         if response.status_code == 404:
             return "Scoped cleanup returned HTTP 404 with active projection"
-        return (
-            f"Scoped cleanup returned HTTP {response.status_code}: "
-            f"{response.text}"
-        )
+        return f"Scoped cleanup returned HTTP {response.status_code}: {response.text}"
     return None
 
 
@@ -116,6 +120,7 @@ def _add_direct_upstream_memory(
 ) -> str:
     response = httpx.post(
         f"{settings.mem0_base_url.rstrip('/')}/memories",
+        headers=_upstream_headers(settings),
         json={
             "messages": [{"role": "user", "content": text}],
             "user_id": user_id,
@@ -138,6 +143,7 @@ def _delete_direct_upstream_memory(
     try:
         response = httpx.delete(
             f"{settings.mem0_base_url.rstrip('/')}/memories/{memory_id}",
+            headers=_upstream_headers(settings),
             timeout=30,
         )
     except Exception as exc:
@@ -157,6 +163,7 @@ def _upstream_absence_error(
     try:
         response = httpx.get(
             f"{settings.mem0_base_url.rstrip('/')}/memories",
+            headers=_upstream_headers(settings),
             params={"top_k": 5000, "show_expired": "true"},
             timeout=30,
         )
@@ -212,8 +219,7 @@ def _projection_absence_error(
         return f"Projection cleanup raised {type(exc).__name__}: {exc}"
     if response.status_code != 200:
         return (
-            f"Projection cleanup returned HTTP {response.status_code}: "
-            f"{response.text}"
+            f"Projection cleanup returned HTTP {response.status_code}: {response.text}"
         )
     if active_projection() is not None:
         return f"Projection cleanup still found active {memory_id}"
@@ -279,6 +285,216 @@ def _report_cleanup_failures(errors: list[str | None]) -> None:
     _report_cleanup_failure(combined or None)
 
 
+def _mcp_tool_call(
+    *,
+    url: str,
+    token: str,
+    request_id: int,
+    name: str,
+    arguments: Mapping[str, object],
+) -> httpx.Response:
+    return httpx.post(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": dict(arguments)},
+        },
+        timeout=30,
+    )
+
+
+def _assert_mcp_tool_succeeded(response: httpx.Response) -> None:
+    assert response.status_code == 200
+    payload = response.json()
+    assert "error" not in payload
+    assert payload.get("result", {}).get("isError") is not True
+
+
+def test_live_multi_token_revocation_and_request_attribution_gate() -> None:
+    core_url = os.environ.get("MEM0_E2E_BASE_URL")
+    sidecar_url = os.environ.get("MEM0_E2E_SIDECAR_URL")
+    mcp_url = os.environ.get("MEM0_E2E_MCP_URL")
+    operator_key = os.environ.get("MEM0_E2E_API_KEY")
+    legacy_token = os.environ.get("MEM0_E2E_MCP_LEGACY_TOKEN")
+    if not all((core_url, sidecar_url, mcp_url, operator_key, legacy_token)):
+        pytest.skip("multi-token Compose endpoints are not configured")
+    assert core_url is not None
+    assert sidecar_url is not None
+    assert mcp_url is not None
+    assert operator_key is not None
+    assert legacy_token is not None
+
+    setup = httpx.get(f"{core_url}/auth/setup-status", timeout=10)
+    setup.raise_for_status()
+    admin_credentials = {
+        "name": "Browser E2E",
+        "email": "browser-e2e@example.com",
+        "password": "browser-e2e-password",
+    }
+    if setup.json().get("needsSetup"):
+        registration = httpx.post(
+            f"{core_url}/auth/register",
+            json=admin_credentials,
+            timeout=10,
+        )
+        registration.raise_for_status()
+
+    operator_headers = {"X-API-Key": operator_key}
+    token = uuid4().hex
+    labels = {
+        "a": f"e2e-rest-{token}",
+        "b": f"e2e-mcp-{token}",
+    }
+    created: dict[str, dict[str, object]] = {}
+    for name, label in labels.items():
+        response = httpx.post(
+            f"{core_url}/api-keys",
+            headers=operator_headers,
+            json={"label": label},
+            timeout=10,
+        )
+        response.raise_for_status()
+        created[name] = response.json()
+
+    key_a = created["a"]["key"]
+    key_b = created["b"]["key"]
+    key_a_id = created["a"]["id"]
+    key_b_id = created["b"]["id"]
+    assert isinstance(key_a, str)
+    assert isinstance(key_b, str)
+    assert isinstance(key_a_id, str)
+    assert isinstance(key_b_id, str)
+    project_id = os.environ.get("MEM0_E2E_PROJECT_ID", "sidecar-e2e")
+    app_id = os.environ.get("MEM0_E2E_APP_ID", "sidecar-e2e-app")
+    search_payload = {
+        "project_id": project_id,
+        "app_id": app_id,
+        "user_id": f"multi-token-{token}",
+        "query": f"empty attribution probe {token}",
+    }
+
+    try:
+        manager_denied = httpx.get(
+            f"{core_url}/api-keys",
+            headers={"X-API-Key": key_a},
+            timeout=10,
+        )
+        assert manager_denied.status_code == 403
+
+        rest_a = httpx.post(
+            f"{sidecar_url}/v3/memories/search/",
+            headers={"X-API-Key": key_a},
+            json=search_payload,
+            timeout=30,
+        )
+        rest_a.raise_for_status()
+
+        _assert_mcp_tool_succeeded(
+            _mcp_tool_call(
+                url=mcp_url,
+                token=key_b,
+                request_id=1,
+                name="search_memories",
+                arguments=search_payload,
+            )
+        )
+        legacy_rejected = _mcp_tool_call(
+            url=mcp_url,
+            token=legacy_token,
+            request_id=2,
+            name="search_memories",
+            arguments=search_payload,
+        )
+        assert legacy_rejected.status_code == 401
+
+        events = httpx.post(
+            f"{sidecar_url}/v1/events/query",
+            headers=operator_headers,
+            json={
+                "project_id": project_id,
+                "app_id": app_id,
+                "page_size": 100,
+            },
+            timeout=30,
+        )
+        events.raise_for_status()
+        event_payload = events.json()
+        channels = {
+            (
+                item.get("transport"),
+                item.get("credential_kind"),
+                item.get("credential_id"),
+                item.get("label"),
+            )
+            for item in event_payload["channels"]
+        }
+        assert ("rest", "core_api_key", key_a_id, labels["a"]) in channels
+        assert ("mcp", "core_api_key", key_b_id, labels["b"]) in channels
+        assert not any(channel[1] == "legacy_static" for channel in channels)
+        serialized_events = json.dumps(event_payload)
+        if any(
+            secret in serialized_events
+            for secret in (key_a, key_b, legacy_token, operator_key)
+        ):
+            raise AssertionError("request attribution exposed a credential")
+
+        revoke_a = httpx.delete(
+            f"{core_url}/api-keys/{key_a_id}",
+            headers=operator_headers,
+            timeout=10,
+        )
+        revoke_a.raise_for_status()
+        revoked_rest = httpx.post(
+            f"{sidecar_url}/v3/memories/search/",
+            headers={"X-API-Key": key_a},
+            json=search_payload,
+            timeout=30,
+        )
+        assert revoked_rest.status_code == 401
+        revoked_mcp = _mcp_tool_call(
+            url=mcp_url,
+            token=key_a,
+            request_id=3,
+            name="search_memories",
+            arguments=search_payload,
+        )
+        assert revoked_mcp.status_code == 401
+
+        _assert_mcp_tool_succeeded(
+            _mcp_tool_call(
+                url=mcp_url,
+                token=key_b,
+                request_id=4,
+                name="search_memories",
+                arguments=search_payload,
+            )
+        )
+
+        requests = httpx.get(
+            f"{core_url}/requests",
+            headers=operator_headers,
+            params={"limit": 200},
+            timeout=10,
+        )
+        requests.raise_for_status()
+        if any(
+            secret in requests.text
+            for secret in (key_a, key_b, legacy_token, operator_key)
+        ):
+            raise AssertionError("Core request logs exposed a credential")
+    finally:
+        for key_id in (key_a_id, key_b_id):
+            response = httpx.delete(
+                f"{core_url}/api-keys/{key_id}",
+                headers=operator_headers,
+                timeout=10,
+            )
+            assert response.status_code in {200, 400}
+
+
 def test_cleanup_failures_are_aggregated_before_reporting() -> None:
     with pytest.raises(AssertionError) as exc_info:
         _report_cleanup_failures(["first cleanup failed", None, "second failed"])
@@ -305,9 +521,7 @@ def test_cleanup_diagnostics_do_not_mask_active_fixture_failure(
             _report_cleanup_failures(["first cleanup failed", "second failed"])
 
     assert exc_info.value is primary
-    assert (
-        "first cleanup failed; second failed" in capsys.readouterr().err
-    )
+    assert "first cleanup failed; second failed" in capsys.readouterr().err
 
 
 def test_scoped_cleanup_reports_non_success_response() -> None:
@@ -393,8 +607,7 @@ def test_fixture_cleanup_falls_back_to_upstream_and_proves_absence(
         httpx,
         "delete",
         lambda *args, **kwargs: (
-            calls.append("direct")
-            or SimpleNamespace(status_code=200, text="deleted")
+            calls.append("direct") or SimpleNamespace(status_code=200, text="deleted")
         ),
     )
     monkeypatch.setattr(
@@ -532,9 +745,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
             },
         )
         assert foreign_add_response.status_code == 200, foreign_add_response.text
-        foreign_memory_ids = _extract_memory_ids(
-            foreign_add_response.json()["memory"]
-        )
+        foreign_memory_ids = _extract_memory_ids(foreign_add_response.json()["memory"])
         assert len(foreign_memory_ids) == 1, foreign_add_response.json()
         foreign_memory_id = foreign_memory_ids[0]
         assert foreign_memory_id != memory_id
@@ -589,9 +800,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         query_body = query_response.json()
         assert query_body["stale_skipped"] == 0
         assert [item["id"] for item in query_body["results"]] == [memory_id]
-        assert foreign_memory_id not in {
-            item["id"] for item in query_body["results"]
-        }
+        assert foreign_memory_id not in {item["id"] for item in query_body["results"]}
 
         detail_response = client.get(
             f"/v1/memories/{memory_id}",
@@ -682,15 +891,13 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
                     ],
                 },
             )
-            assert (
-                entity_memory_response.status_code == 200
-            ), entity_memory_response.text
+            assert entity_memory_response.status_code == 200, (
+                entity_memory_response.text
+            )
             entity_memories = entity_memory_response.json()
             assert entity_memories["total"] == entity["memory_count"]
             assert entity_memories["stale_skipped"] == 0
-            assert {item["id"] for item in entity_memories["results"]} == {
-                memory_id
-            }
+            assert {item["id"] for item in entity_memories["results"]} == {memory_id}
 
         assert entity_by_type["user"]["last_seen_at"] is not None
         assert entity_by_type["app"]["last_seen_at"] is not None
@@ -710,9 +917,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
                 ],
             },
         )
-        assert foreign_entity_response.status_code == 200, (
-            foreign_entity_response.text
-        )
+        assert foreign_entity_response.status_code == 200, foreign_entity_response.text
         assert foreign_entity_response.json()["total"] == 1
         assert foreign_entity_response.json()["results"][0]["memory_count"] == 1
 
@@ -752,17 +957,13 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
             json={"project_id": project_id, "app_id": app_id},
         )
         assert deleted_query.status_code == 200, deleted_query.text
-        assert all(
-            item["id"] != memory_id for item in deleted_query.json()["results"]
-        )
+        assert all(item["id"] != memory_id for item in deleted_query.json()["results"])
 
         deleted_entity_response = client.get(
             f"/v1/entities/user/{user_id}",
             params=_scoped_params(project_id=project_id, app_id=app_id),
         )
-        assert deleted_entity_response.status_code == 404, (
-            deleted_entity_response.text
-        )
+        assert deleted_entity_response.status_code == 404, deleted_entity_response.text
         surviving_entity_response = client.get(
             f"/v1/entities/user/{user_id}",
             params=_scoped_params(
@@ -792,9 +993,9 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         assert surviving_memory_response.status_code == 200, (
             surviving_memory_response.text
         )
-        assert {
-            item["id"] for item in surviving_memory_response.json()["results"]
-        } == {foreign_memory_id}
+        assert {item["id"] for item in surviving_memory_response.json()["results"]} == {
+            foreign_memory_id
+        }
         surviving_detail_response = client.get(
             f"/v1/memories/{foreign_memory_id}",
             params=_scoped_params(
@@ -988,9 +1189,7 @@ def test_live_reconcile_imports_only_marked_scope(tmp_path) -> None:
             },
         )
         assert other_scope_response.status_code == 200, other_scope_response.text
-        other_scope_memory_id = other_scope_response.json()["event"][
-            "subject_id"
-        ]
+        other_scope_memory_id = other_scope_response.json()["event"]["subject_id"]
         cleanup_targets.append((other_scope_memory_id, other_app_id))
 
         unscoped_memory_id = _add_direct_upstream_memory(
@@ -1115,9 +1314,7 @@ def test_live_reconcile_refuses_unscoped_adoption_without_runtime_gate(
         assert query_response.status_code == 200, query_response.text
         assert query_response.json()["results"] == []
     finally:
-        _report_cleanup_failure(
-            _cleanup_direct_fixture(settings, memory_id)
-        )
+        _report_cleanup_failure(_cleanup_direct_fixture(settings, memory_id))
 
 
 @pytest.mark.adoption_e2e
@@ -1349,6 +1546,11 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
         tmp_path,
         project_id=project_id,
         database_name="consolidation-e2e.sqlite3",
+    ).model_copy(
+        update={
+            "consolidation_enabled": True,
+            "consolidation_hard_delete_enabled": False,
+        }
     )
     app = create_app(settings=settings)
     client = TestClient(app)
@@ -1376,6 +1578,13 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
             assert response.status_code == 200, response.text
             created_ids.append(response.json()["event"]["subject_id"])
         pinned_id = created_ids[-1]
+
+        status = client.get(
+            f"/v1/projects/{project_id}/apps/{app_id}/consolidation"
+        )
+        assert status.status_code == 200, status.text
+        assert status.json()["consolidation_enabled"] is True
+        assert status.json()["hard_delete_enabled"] is False
 
         with app.state.session_factory() as session:
             policy = ConsolidationPolicyRepository(session).upsert(
@@ -1446,9 +1655,7 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
             "/v1/memories/query",
             json={"project_id": project_id, "app_id": app_id, "page_size": 20},
         )
-        assert {item["id"] for item in restored.json()["results"]} == set(
-            created_ids
-        )
+        assert {item["id"] for item in restored.json()["results"]} == set(created_ids)
 
         with app.state.session_factory() as session:
             policy = ConsolidationPolicyRepository(session).get(project_id, app_id)
@@ -1490,11 +1697,7 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
                 if memory_id != second.canonical_memory_id
             )
 
-        restarted_app = create_app(
-            settings=settings.model_copy(
-                update={"consolidation_hard_delete_enabled": True}
-            )
-        )
+        restarted_app = create_app(settings=settings)
         client = TestClient(restarted_app)
         with restarted_app.state.session_factory() as session:
             persisted = session.get(ConsolidationProposal, second.id)
@@ -1503,31 +1706,36 @@ async def test_live_consolidation_survives_restart_and_preserves_pinned(
                 session=session,
                 mem0=restarted_app.state.mem0_client,
                 bridge_routing_ready=True,
-                hard_delete_enabled=True,
+                consolidation_enabled=True,
+                hard_delete_enabled=False,
             ).finalize_shadowed(
                 second.id,
                 now=persisted.not_before + timedelta(seconds=1),
             )
-            assert applied["status"] == "APPLIED"
-            assert session.scalar(
-                select(ConsolidationLineage).where(
-                    ConsolidationLineage.proposal_id == second.id,
-                    ConsolidationLineage.source_memory_id == redundant_id,
+            assert applied["status"] == "SHADOWED"
+            assert (
+                session.scalar(
+                    select(ConsolidationLineage).where(
+                        ConsolidationLineage.proposal_id == second.id,
+                        ConsolidationLineage.source_memory_id == redundant_id,
+                    )
                 )
-            ) is not None
-            assert session.scalar(
-                select(Event).where(
-                    Event.project_id == project_id,
-                    Event.operation == "memory.delete",
-                    Event.subject_id == redundant_id,
+                is None
+            )
+            assert (
+                session.scalar(
+                    select(Event).where(
+                        Event.project_id == project_id,
+                        Event.operation == "memory.delete",
+                        Event.subject_id == redundant_id,
+                    )
                 )
-            ) is not None
+                is None
+            )
 
         await restarted_app.state.mem0_client.get_memory(canonical_id)
         await restarted_app.state.mem0_client.get_memory(pinned_id)
-        with pytest.raises(Mem0UpstreamError) as deleted:
-            await restarted_app.state.mem0_client.get_memory(redundant_id)
-        assert deleted.value.status_code == 404
+        await restarted_app.state.mem0_client.get_memory(redundant_id)
     finally:
         cleanup_errors = []
         for memory_id in created_ids:

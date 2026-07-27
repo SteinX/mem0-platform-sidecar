@@ -195,6 +195,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/app/(root)/dashboard/memories/memory-detail-drawer.tsx",
         "src/app/(root)/dashboard/requests/page.tsx",
         "src/app/(root)/dashboard/requests/request-trace-drawer.tsx",
+        "src/app/(root)/dashboard/api-keys/page.tsx",
         "src/app/(root)/dashboard/entities/page.tsx",
         "src/app/(root)/dashboard/export/page.tsx",
         "src/app/api/sidecar/config/route.ts",
@@ -203,6 +204,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/lib/auth.tsx",
         "src/lib/dashboard-session.ts",
         "src/utils/api.ts",
+        "src/utils/dashboard-access-token.ts",
         "src/utils/dashboard-session-client.ts",
         "src/utils/dashboard-session-refresh.ts",
         "src/utils/sidecar-project.ts",
@@ -220,6 +222,7 @@ def write_verify_fixture(dashboard: Path) -> None:
         "src/components/self-hosted/explorer/filter-builder.tsx",
         "src/components/self-hosted/explorer/entity-badges.tsx",
         "src/components/self-hosted/explorer/explorer-component-state.ts",
+        "src/components/ui/delete-confirmation-modal.tsx",
         "src/app/(root)/dashboard/components/main-nav.tsx",
     ]:
         target = dashboard / relative
@@ -236,8 +239,10 @@ def test_dashboard_overlay_manifest_lists_phase1_files():
     assert "src/app/api/sidecar/config/route.ts" in manifest["files"]
     assert "src/app/api/sidecar/[...path]/route.ts" in manifest["files"]
     assert "src/utils/sidecar-project.ts" in manifest["files"]
+    assert "src/utils/dashboard-access-token.ts" in manifest["files"]
     assert "src/utils/sidecar-proxy.ts" in manifest["files"]
     assert "src/utils/category-editor-state.ts" in manifest["files"]
+    assert "src/components/ui/delete-confirmation-modal.tsx" in manifest["files"]
 
 
 def test_dashboard_overlay_readme_documents_memory_explorer_operations():
@@ -430,6 +435,7 @@ def test_dashboard_overlay_includes_memory_explorer_page_and_drawer_contracts():
         "Source unavailable",
         "AlertDialog",
         "DeleteConfirmationModal",
+        "isPending={isDeleting}",
         "Copy ID",
         "overflow-x-hidden",
         "sm:max-w-2xl",
@@ -873,7 +879,7 @@ def test_request_trace_state_harness_executes_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "request trace state harness: 5 contract groups passed" in result.stdout
+    assert "request trace state harness: 6 contract groups passed" in result.stdout
 
 
 def test_request_trace_focus_restoration_contracts():
@@ -949,6 +955,221 @@ def test_request_trace_verifier_rejects_missing_runtime_wiring(tmp_path):
 
     assert result.returncode == 1
     assert "Requests page must query /v1/events/query" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("required", "replacement", "error"),
+    [
+        (
+            "API_KEY_ENDPOINTS.BY_ID(target.id)",
+            "API_KEY_ENDPOINTS.MISSING_BY_ID(target.id)",
+            "Client Keys page must revoke keys by exact Core key ID",
+        ),
+        (
+            "useApiQuery<ApiKey[]>",
+            "useApiQuery<ApiKeyCreateResponse[]>",
+            "Client Keys list must use the secret-free key descriptor",
+        ),
+        (
+            'setNewKey("")',
+            'setNewKey("retained")',
+            "Client Keys page must clear the one-time secret on dialog close",
+        ),
+        (
+            "MEM0_OSS_MCP_TOKEN",
+            "MISSING_MCP_TOKEN_VARIABLE",
+            "Client Keys page must explain the compatible MCP token variable",
+        ),
+        (
+            "maxLength={255}",
+            "maxLength={256}",
+            "Client Keys labels must match the Core descriptor length bound",
+        ),
+        (
+            'aria-describedby="api-key-label-description"',
+            'aria-label="Client label"',
+            "Client Keys label input must describe how attribution uses the label",
+        ),
+        (
+            'className="block truncate" title={label}',
+            'className="block" title={label}',
+            "Client Keys desktop labels must truncate with a full-value affordance",
+        ),
+        (
+            "Legacy client key (${key.key_prefix}...)",
+            "Legacy client key",
+            "Client Keys page must safely label historical empty descriptors",
+        ),
+        (
+            "const shellHorizontalSpace =",
+            "const missingShellHorizontalSpace =",
+            (
+                "Client Keys page must bound intrinsic width inside the "
+                "dashboard scroll area"
+            ),
+        ),
+        (
+            "COLLAPSED_SIDEBAR_WIDTH : SIDEBAR_WIDTH",
+            "SIDEBAR_WIDTH : SIDEBAR_WIDTH",
+            "Client Keys page must follow the dashboard sidebar width",
+        ),
+        (
+            'style={{ width: `calc(100vw - ${shellHorizontalSpace}px)` }}',
+            'style={{ width: "100%" }}',
+            "Client Keys page must reserve dashboard shell padding",
+        ),
+        (
+            "if (creatingRef.current ||",
+            "if (missingCreatingRef.current ||",
+            "Client Keys creation must reject concurrent submissions",
+        ),
+        (
+            "if (keyToRevoke === null || revokingRef.current)",
+            "if (keyToRevoke === null || missingRevokingRef.current)",
+            "Client Keys revocation must reject concurrent submissions",
+        ),
+        (
+            "mountedRef.current = true",
+            "missingMountedRef.current = true",
+            "Client Keys page must restore its mounted guard after Strict Mode remount",
+        ),
+        (
+            "mountedRef.current = false",
+            "missingMountedRef.current = false",
+            "Client Keys page must guard async completion after unmount",
+        ),
+        (
+            "API_KEY_ENDPOINTS.BY_ID(response.data.id)",
+            "API_KEY_ENDPOINTS.BY_ID(missingResponse.data.id)",
+            "Client Keys page must revoke a key whose one-time secret cannot be shown",
+        ),
+        (
+            'isCreating ? "Creating..." : "Create"',
+            '"Create"',
+            "Client Keys page must lock the create interaction while pending",
+        ),
+        (
+            "onCopy={(_text, succeeded)",
+            "onCopy={()",
+            "Client Keys copy state must use the actual clipboard result",
+        ),
+        (
+            'copied ? "Client key copied" : "Copy client key"',
+            '"Copy client key"',
+            "Client Keys copy action must expose its success state",
+        ),
+        (
+            "isPending={isRevoking}",
+            "isPending={false}",
+            "Client Keys revoke dialog must expose its pending state",
+        ),
+    ],
+)
+def test_client_keys_verifier_rejects_missing_secret_safety_contracts(
+    tmp_path,
+    required,
+    replacement,
+    error,
+):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/api-keys/page.tsx"
+    content = page.read_text()
+    assert required in content
+    page.write_text(content.replace(required, replacement, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert error in result.stderr
+
+
+@pytest.mark.parametrize("forbidden", ["localStorage", "sessionStorage", "console.log"])
+def test_client_keys_verifier_rejects_browser_secret_persistence(
+    tmp_path,
+    forbidden,
+):
+    dashboard = applied_overlay(tmp_path)
+    page = dashboard / "src/app/(root)/dashboard/api-keys/page.tsx"
+    page.write_text(page.read_text() + f"\n// {forbidden}\n")
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert (
+        "Client Keys page must not persist or log the one-time secret"
+        in result.stderr
+    )
+
+
+def test_browser_evidence_redacts_one_time_client_key():
+    script = (
+        OVERLAY / "scripts" / "run-browser-destructive-e2e.cjs"
+    ).read_text()
+
+    assert 'input.value = "[redacted one-time client key]"' in script
+    assert 'input.setAttribute("data-evidence-redacted", "true")' in script
+    assert (
+        "One-time client key could not be redacted for evidence"
+        in script
+    )
+
+
+@pytest.mark.parametrize(
+    ("required", "replacement", "error"),
+    [
+        (
+            "showCloseIcon={!isPending}",
+            "showCloseIcon={true}",
+            "Pending destructive actions must hide the close control",
+        ),
+        (
+            "aria-busy={isPending}",
+            "aria-busy={false}",
+            "Pending destructive actions must expose busy state",
+        ),
+        (
+            "if (!isPending && confirmationText === itemName)",
+            "if (confirmationText === itemName)",
+            "Destructive confirmation must reject duplicate pending submissions",
+        ),
+        (
+            'className="break-all font-bold"',
+            'className="font-bold"',
+            "Destructive confirmation names must wrap without overflowing",
+        ),
+        (
+            "text-onSurface-default-secondary",
+            "text-[#565553]",
+            "Destructive confirmation must use semantic text colors",
+        ),
+        (
+            "<Label htmlFor={confirmationInputId}",
+            "<Label>",
+            "Destructive confirmation input must have an accessible label",
+        ),
+        (
+            "aria-describedby={confirmationDescriptionId}",
+            'aria-label="Confirmation"',
+            "Destructive confirmation input must describe the required value",
+        ),
+    ],
+)
+def test_delete_confirmation_verifier_rejects_missing_pending_contract(
+    tmp_path,
+    required,
+    replacement,
+    error,
+):
+    dashboard = applied_overlay(tmp_path)
+    modal = dashboard / "src/components/ui/delete-confirmation-modal.tsx"
+    content = modal.read_text()
+    assert required in content
+    modal.write_text(content.replace(required, replacement, 1))
+
+    result = run_verify_without_typecheck(dashboard)
+
+    assert result.returncode == 1
+    assert error in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1619,7 +1840,7 @@ def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "sidecar proxy request harness: 44 contracts passed" in result.stdout
+    assert "sidecar proxy request harness: 45 contracts passed" in result.stdout
 
 
 def test_sidecar_proxy_harness_rejects_stale_applied_target(tmp_path):
@@ -1795,6 +2016,50 @@ def test_apply_dashboard_overlay_route_validates_dashboard_session(tmp_path):
     assert "dashboardSessionRefreshCoordinator.refresh(refreshToken)" in route_content
     assert 'result.status === "unauthorized"' in route_content
     assert 'result.status === "unavailable"' in route_content
+    assert "isAdminDashboardAccessToken(result.accessToken)" in route_content
+    assert "DashboardSessionForbiddenError" in route_content
+    assert "status: 403" in route_content
+
+
+def test_dashboard_access_token_admin_gate_runtime(tmp_path):
+    if not shutil.which("bun"):
+        pytest.skip("bun is required for the dashboard token runtime test")
+
+    helper = (
+        OVERLAY / "overlays/src/utils/dashboard-access-token.ts"
+    ).resolve()
+    harness = tmp_path / "dashboard-access-token.ts"
+    harness.write_text(
+        f"""
+import {{isAdminDashboardAccessToken}} from {json.dumps(helper.as_uri())};
+
+const token = (role: string) => [
+  "header",
+  Buffer.from(JSON.stringify({{role}})).toString("base64url"),
+  "signature",
+].join(".");
+
+if (!isAdminDashboardAccessToken(token("admin"))) {{
+  throw new Error("admin token was rejected");
+}}
+if (isAdminDashboardAccessToken(token("member"))) {{
+  throw new Error("member token was accepted");
+}}
+if (isAdminDashboardAccessToken("malformed")) {{
+  throw new Error("malformed token was accepted");
+}}
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bun", str(harness)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
 
 
 def test_apply_dashboard_overlay_forwards_server_only_sidecar_api_key(tmp_path):
@@ -1821,6 +2086,8 @@ def test_apply_dashboard_overlay_forwards_server_only_sidecar_api_key(tmp_path):
     assert "operatorApiKey: process.env.SIDECAR_INTERNAL_API_KEY" in route_content
     assert "operatorApiKey?: string;" in proxy_content
     assert 'headers.set("X-API-Key", operatorApiKey);' in proxy_content
+    assert 'redirect: "manual"' in proxy_content
+    assert "response.status >= 300 && response.status < 400" in proxy_content
     assert 'request.headers.get("X-API-Key")' not in proxy_content
     assert "NEXT_PUBLIC_SIDECAR_INTERNAL_API_KEY" not in route_content
     assert "NEXT_PUBLIC_SIDECAR_INTERNAL_API_KEY" not in proxy_content
@@ -2404,8 +2671,10 @@ def test_verify_rejects_missing_live_responsive_change_listener(tmp_path):
     nav = dashboard / "src/app/(root)/dashboard/components/main-nav.tsx"
     content = nav.read_text()
     active_listener = (
-        '    sidebarMediaQuery.addEventListener("change", '
-        "collapseSidebarOnNarrowViewport);\n"
+        "    sidebarMediaQuery.addEventListener(\n"
+        '      "change",\n'
+        "      collapseSidebarOnNarrowViewport,\n"
+        "    );\n"
     )
     assert active_listener in content
     nav.write_text(content.replace(active_listener, "", 1) + RESPONSIVE_SIDEBAR_DECOY)

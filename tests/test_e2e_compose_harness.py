@@ -1,3 +1,5 @@
+import base64
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -12,7 +14,9 @@ from scripts.run_live_e2e_compose import (
     compose_down_command,
     compose_run_command,
     compose_up_command,
+    resolve_mcp_context,
     resolve_upstream_context,
+    verify_source_revisions,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,9 +35,7 @@ REAL_BROWSER_SMOKE = (
     / "scripts"
     / "run-browser-destructive-e2e.cjs"
 )
-REAL_BROWSER_CONTRACT = (
-    ROOT / "tests" / "e2e" / "test-browser-destructive-contract.cjs"
-)
+REAL_BROWSER_CONTRACT = ROOT / "tests" / "e2e" / "test-browser-destructive-contract.cjs"
 
 
 def _compose_service(content: str, service_name: str) -> str:
@@ -62,12 +64,13 @@ def test_live_runner_retains_postgres_mocked_ui_and_real_browser_gates() -> None
         "node",
         "/app/run-browser-smoke.cjs",
     ]
-    assert compose_runner.browser_destructive_smoke_command(
-        "sidecar-e2e-test"
-    )[-2:] == [
+    assert compose_runner.browser_destructive_smoke_command("sidecar-e2e-test")[
+        -2:
+    ] == [
         "node",
         "/app/run-browser-destructive-e2e.cjs",
     ]
+    assert hasattr(compose_runner, "export_browser_evidence")
 
 
 def test_postgres_smoke_retains_phase2_exact_roundtrip_and_head_parity() -> None:
@@ -124,8 +127,7 @@ def test_browser_smoke_requires_response_detail_and_zero_browser_errors() -> Non
     browser_smoke = MOCKED_BROWSER_SMOKE.read_text()
 
     assert (
-        'await waitText("browser-smoke-detail-query-from-response");'
-        in browser_smoke
+        'await waitText("browser-smoke-detail-query-from-response");' in browser_smoke
     )
     assert "request drawer loaded response-derived detail content" in browser_smoke
     for zero_error_gate in (
@@ -180,15 +182,44 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
     for contract in (
         "MEM0_E2E_BROWSER_CDP",
         "MEM0_E2E_DASHBOARD_URL",
+        "MEM0_E2E_AUTH_DASHBOARD_URL",
         "MEM0_E2E_SIDECAR_URL",
+        "MEM0_E2E_SIDECAR_API_KEY",
         "MEM0_E2E_MEM0_URL",
+        "proveSidecarRejectsMissingCredentials",
+        "Sidecar default authentication did not fail closed",
+        "Sidecar operator authentication was not accepted",
+        "/v1/events/query",
         "seedFixtureThroughSidecar",
+        "sidecarHeaders",
         "openMemoryDetails",
         "confirmExactMemoryId",
         "waitForMemoryToDisappear",
         "assertSidecarAbsent",
         "assertMem0Absent",
         "cleanupFixture",
+        "createClientKeyThroughDashboard",
+        "assertClientKeyIsOneTimeOnly",
+        "revokeClientKeyThroughDashboard",
+        "waitForCoreClientKey",
+        "cleanupClientKey",
+        "proveUnauthenticatedClientKeysRedirect",
+        "/dashboard/api-keys",
+        "api-key-new",
+        "Copy client key",
+        "Client key copied",
+        "nativeExecCommand",
+        "__mem0E2ECopyPayloads",
+        '"globalThis.__mem0E2ECopyPayloads.at(-1)"',
+        "client-keys-created-copied-desktop.png",
+        'padEnd(\n      255,\n      "x",',
+        "clickBySelector",
+        '"Input.dispatchMouseEvent"',
+        "CDP ${method} timed out after ${timeoutMs}ms",
+        "Revoke client key",
+        "Revoking...",
+        "client-keys-revoke-pending-desktop.png",
+        "Network.emulateNetworkConditions",
         'cdp.on("Network.requestWillBeSent"',
         'cdp.on("Network.responseReceived"',
         'method === "DELETE"',
@@ -200,6 +231,78 @@ def test_real_browser_destructive_script_contract_is_end_to_end() -> None:
         assert contract in source
 
 
+def test_real_browser_auth_check_uses_an_auth_enabled_dashboard() -> None:
+    content = COMPOSE_FILE.read_text()
+    mem0 = _compose_service(content, "mem0")
+    auth_dashboard = _compose_service(content, "dashboard-auth-check")
+    browser = _compose_service(content, "browser")
+    browser_runner = _compose_service(content, "browser-smoke")
+
+    assert "DASHBOARD_URL: http://dashboard:3000" in mem0
+    assert 'AUTH_DISABLED: "false"' in mem0
+    assert 'AUTH_DISABLED: "false"' in auth_dashboard
+    assert "dashboard-auth-check:" in browser
+    assert (
+        "--unsafely-treat-insecure-origin-as-secure=http://dashboard:3000"
+        in browser
+    )
+    assert "condition: service_healthy" in browser
+    assert (
+        "MEM0_E2E_AUTH_DASHBOARD_URL: http://dashboard-auth-check:3000"
+        in browser_runner
+    )
+    assert "MEM0_E2E_BROWSER_EVIDENCE_DIR: /evidence" in browser_runner
+    assert "MEM0_E2E_SIDECAR_API_KEY:" in browser_runner
+    assert "MEM0_E2E_EVIDENCE_DIR" in browser_runner
+
+
+def test_e2e_sidecar_uses_a_private_operator_key() -> None:
+    content = COMPOSE_FILE.read_text()
+    mem0 = _compose_service(content, "mem0")
+    sidecar = _compose_service(content, "sidecar")
+    dashboard = _compose_service(content, "dashboard")
+    auth_dashboard = _compose_service(content, "dashboard-auth-check")
+
+    assert "ADMIN_API_KEY: e2e-sidecar-operator-key-00000001" in mem0
+    assert "MEM0_SIDECAR_MEM0_API_KEY: e2e-sidecar-operator-key-00000001" in sidecar
+    for service in (dashboard, auth_dashboard):
+        assert "SIDECAR_INTERNAL_API_KEY: e2e-sidecar-operator-key-00000001" in service
+
+
+def test_real_browser_capture_waits_for_stable_animations_and_compact_fit() -> None:
+    source = REAL_BROWSER_SMOKE.read_text()
+
+    assert "waitForVisualStability" in source
+    assert "document.getAnimations().every" in source
+    assert 'document.querySelectorAll("nextjs-portal")' in source
+    assert 'style.setProperty("display", "none", "important")' in source
+    assert "async function setViewport" in source
+    assert '"Browser.getWindowForTarget"' in source
+    assert '"Browser.setWindowBounds"' in source
+    assert '"Emulation.setVisibleSize"' in source
+    assert '"Emulation.setPageScaleFactor"' in source
+    assert "screenWidth: width" in source
+    assert "assertClientKeysFitViewport" in source
+    assert "document.documentElement.scrollWidth <= viewportWidth" in source
+    assert "window.visualViewport?.width" in source
+    narrow_metrics = source.index("await setViewport(cdp, {\n      width: 960")
+    assert "mobile: false" in source[narrow_metrics : narrow_metrics + 160]
+    first_desktop_metrics = source.index("await setViewport(cdp, {\n      width: 1440")
+    assert first_desktop_metrics < source.index(
+        'stage = "prove unauthenticated Client Keys redirect"'
+    )
+    assert source.index(
+        'await waitForVisualStability(cdp, "compact Client Keys list")'
+    ) < source.index(
+        'await captureBrowserEvidence(cdp, "client-keys-list-compact.png")'
+    )
+    assert source.index(
+        'await waitForVisualStability(cdp, "Client Keys revoke pending")'
+    ) < source.index(
+        'await captureBrowserEvidence(cdp, "client-keys-revoke-pending-desktop.png")'
+    )
+
+
 def test_real_browser_delete_finds_action_inside_radix_sheet_dialog() -> None:
     source = REAL_BROWSER_SMOKE.read_text()
     confirm_start = source.index("async function confirmExactMemoryId")
@@ -207,8 +310,8 @@ def test_real_browser_delete_finds_action_inside_radix_sheet_dialog() -> None:
     confirm_source = source[confirm_start:confirm_end]
 
     assert "!item.closest('[role=\"dialog\"]')" not in confirm_source
-    assert "item.innerText.includes(\"Memory details\")" in confirm_source
-    assert "drawer.querySelectorAll(\"button\")" in confirm_source
+    assert 'item.innerText.includes("Memory details")' in confirm_source
+    assert 'drawer.querySelectorAll("button")' in confirm_source
 
 
 def test_real_browser_direct_mem0_absence_contract_is_executable() -> None:
@@ -231,7 +334,119 @@ def test_browser_runner_image_contains_mocked_and_real_scripts() -> None:
     assert "run-browser-destructive-e2e.cjs" in dockerfile
 
 
-def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
+def test_browser_evidence_export_command_reads_exact_expected_files() -> None:
+    command = compose_runner.browser_evidence_export_command("sidecar-e2e-test")
+
+    assert command[-3:-1] == ["node", "-e"]
+    source = command[-1]
+    assert "/evidence/" in source
+    assert compose_runner.BROWSER_EVIDENCE_PREFIX in source
+    for filename in compose_runner.BROWSER_EVIDENCE_FILENAMES:
+        assert filename in source
+
+
+def test_export_browser_evidence_copies_valid_pngs_from_daemon(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    png = compose_runner.PNG_SIGNATURE + b"browser-evidence"
+    payload = {
+        filename: base64.b64encode(png).decode("ascii")
+        for filename in compose_runner.BROWSER_EVIDENCE_FILENAMES
+    }
+    stdout = (
+        "compose diagnostic\n"
+        f"{compose_runner.BROWSER_EVIDENCE_PREFIX}{json.dumps(payload)}"
+    )
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=stdout,
+            stderr="",
+        ),
+    )
+
+    compose_runner.export_browser_evidence(
+        "sidecar-e2e-test",
+        target=tmp_path,
+        env={},
+    )
+
+    for filename in compose_runner.BROWSER_EVIDENCE_FILENAMES:
+        destination = tmp_path / filename
+        assert destination.read_bytes() == png
+        assert destination.stat().st_mode & 0o777 == 0o600
+
+
+def test_export_browser_evidence_rejects_non_png_payload(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    payload = {
+        filename: base64.b64encode(b"not-a-png").decode("ascii")
+        for filename in compose_runner.BROWSER_EVIDENCE_FILENAMES
+    }
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(f"{compose_runner.BROWSER_EVIDENCE_PREFIX}{json.dumps(payload)}"),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="not a valid PNG"):
+        compose_runner.export_browser_evidence(
+            "sidecar-e2e-test",
+            target=tmp_path,
+            env={},
+        )
+
+
+def test_export_e2e_test_reports_copies_from_daemon_namespace(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    reports = {
+        filename: f"<testsuite name='{filename}'/>".encode()
+        for filename in compose_runner.E2E_TEST_REPORT_FILENAMES
+    }
+    payload = {
+        filename: base64.b64encode(content).decode("ascii")
+        for filename, content in reports.items()
+    }
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                f"{compose_runner.E2E_TEST_REPORT_PREFIX}"
+                f"{json.dumps(payload)}"
+            ),
+            stderr="",
+        ),
+    )
+
+    compose_runner.export_e2e_test_reports(
+        "sidecar-e2e-test",
+        target=tmp_path,
+        env={},
+    )
+
+    assert {
+        filename: (tmp_path / filename).read_bytes()
+        for filename in compose_runner.E2E_TEST_REPORT_FILENAMES
+    } == reports
+
+
+def test_prepare_dashboard_context_applies_overlay_and_retains_auth_shell(
     tmp_path,
 ) -> None:
     dashboard = tmp_path / "upstream" / "server" / "dashboard"
@@ -241,6 +456,12 @@ def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
     )
     (dashboard / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
     (dashboard / "pnpm-workspace.yaml").write_text("packages:\n  - '.'\n")
+    root_app = dashboard / "src" / "app" / "(root)"
+    root_app.mkdir(parents=True)
+    (root_app / "clientLayout.tsx").write_text("AuthLoadingState\nTooltipProvider\n")
+    (root_app / "dashboard-client-layout.tsx").write_text(
+        "AuthProvider\n<ClientLayout>{children}</ClientLayout>\n"
+    )
 
     prepared = compose_runner.prepare_dashboard_context(
         tmp_path / "upstream",
@@ -253,12 +474,12 @@ def test_prepare_dashboard_context_applies_overlay_and_browser_shell(
     client_layout = (
         prepared / "src" / "app" / "(root)" / "clientLayout.tsx"
     ).read_text()
-    assert "AuthLoadingState" not in client_layout
+    assert "AuthLoadingState" in client_layout
     assert "TooltipProvider" in client_layout
     dashboard_client_layout = (
         prepared / "src" / "app" / "(root)" / "dashboard-client-layout.tsx"
     ).read_text()
-    assert "AuthProvider" not in dashboard_client_layout
+    assert "AuthProvider" in dashboard_client_layout
     assert "<ClientLayout>{children}</ClientLayout>" in dashboard_client_layout
     assert (prepared / "Dockerfile.e2e").is_file()
     assert hasattr(compose_runner, "mocked_browser_smoke_command")
@@ -298,6 +519,146 @@ def test_resolve_upstream_context_prefers_explicit_env_override(monkeypatch) -> 
     assert str(resolve_upstream_context()) == "/tmp/explicit-upstream"
 
 
+def test_resolve_mcp_context_prefers_explicit_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("MEM0_E2E_MCP_CONTEXT", "/tmp/explicit-mcp")
+
+    assert str(resolve_mcp_context()) == "/tmp/explicit-mcp"
+
+
+def test_resolve_mcp_context_defaults_to_sibling_checkout(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("MEM0_E2E_MCP_CONTEXT", raising=False)
+    monkeypatch.setattr(
+        compose_runner,
+        "ROOT",
+        Path("/repos/mem0/mem0-platform-sidecar"),
+    )
+
+    assert str(resolve_mcp_context()) == "/repos/mem0/mem0-oss-mcp"
+
+
+def test_exact_source_revision_gate_binds_all_three_clean_sources(
+    monkeypatch,
+) -> None:
+    contexts = {
+        "sidecar": Path("/tmp/sidecar"),
+        "core": Path("/tmp/core"),
+        "mcp": Path("/tmp/mcp"),
+    }
+    revisions = {
+        contexts["sidecar"]: "a" * 40,
+        contexts["core"]: "b" * 40,
+        contexts["mcp"]: "c" * 40,
+    }
+    monkeypatch.setattr(
+        compose_runner,
+        "_git_revision",
+        lambda context: revisions[context],
+    )
+    monkeypatch.setattr(
+        compose_runner.subprocess,
+        "run",
+        lambda command, **kwargs: compose_runner.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="",
+            stderr="",
+        ),
+    )
+    monkeypatch.setenv("MEM0_E2E_EXPECTED_SIDECAR_SHA", "a" * 40)
+    monkeypatch.setenv("MEM0_E2E_EXPECTED_CORE_SHA", "b" * 40)
+    monkeypatch.setenv("MEM0_E2E_EXPECTED_MCP_SHA", "c" * 40)
+
+    observed = verify_source_revisions(
+        sidecar_context=contexts["sidecar"],
+        core_context=contexts["core"],
+        mcp_context=contexts["mcp"],
+    )
+
+    assert observed == {
+        "sidecar": "a" * 40,
+        "core": "b" * 40,
+        "mcp": "c" * 40,
+    }
+
+
+def test_exact_source_revision_gate_requires_all_expected_shas(
+    monkeypatch,
+) -> None:
+    contexts = {
+        "sidecar": Path("/tmp/sidecar"),
+        "core": Path("/tmp/core"),
+        "mcp": Path("/tmp/mcp"),
+    }
+    monkeypatch.setattr(
+        compose_runner,
+        "_git_revision",
+        lambda _context: "a" * 40,
+    )
+    for variable in (
+        "MEM0_E2E_EXPECTED_SIDECAR_SHA",
+        "MEM0_E2E_EXPECTED_CORE_SHA",
+        "MEM0_E2E_EXPECTED_MCP_SHA",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    with pytest.raises(
+        RuntimeError,
+        match="MEM0_E2E_EXPECTED_SIDECAR_SHA is required",
+    ):
+        verify_source_revisions(
+            sidecar_context=contexts["sidecar"],
+            core_context=contexts["core"],
+            mcp_context=contexts["mcp"],
+        )
+
+
+def test_e2e_evidence_manifest_binds_sources_gates_and_screenshots(
+    tmp_path,
+) -> None:
+    for filename in (
+        *compose_runner.BROWSER_EVIDENCE_FILENAMES,
+        *compose_runner.E2E_TEST_REPORT_FILENAMES,
+    ):
+        (tmp_path / filename).write_bytes(
+            compose_runner.PNG_SIGNATURE + filename.encode("utf-8")
+        )
+    revisions = {
+        "sidecar": "a" * 40,
+        "core": "b" * 40,
+        "mcp": "c" * 40,
+    }
+    gates = (
+        "postgres_migration_smoke",
+        "live_service_tests",
+        "adoption_test",
+        "destructive_browser",
+        "mocked_browser",
+    )
+
+    compose_runner.write_e2e_evidence_manifest(
+        target=tmp_path,
+        revisions=revisions,
+        completed_gates=gates,
+    )
+
+    manifest = json.loads((tmp_path / "e2e-manifest.json").read_text())
+    assert manifest["sources"] == revisions
+    assert manifest["completed_gates"] == list(gates)
+    assert manifest["completed"] is True
+    assert set(manifest["artifacts"]) == set(
+        (
+            *compose_runner.BROWSER_EVIDENCE_FILENAMES,
+            *compose_runner.E2E_TEST_REPORT_FILENAMES,
+        )
+    )
+    assert all(
+        artifact["sha256"]
+        for artifact in manifest["artifacts"].values()
+    )
+
+
 def test_compose_command_uses_e2e_file_and_isolated_project() -> None:
     command = compose_command("sidecar-e2e-test")
 
@@ -310,7 +671,7 @@ def test_compose_up_command_starts_local_stack_detached() -> None:
     command = compose_up_command("sidecar-e2e-test")
 
     assert command[:5] == ["docker", "compose", "-f", command[3], "-p"]
-    assert command[-9:] == [
+    assert command[-10:] == [
         "up",
         "-d",
         "--build",
@@ -318,6 +679,7 @@ def test_compose_up_command_starts_local_stack_detached() -> None:
         "postgres",
         "mem0",
         "sidecar",
+        "mcp",
         "dashboard",
         "browser",
     ]
@@ -372,9 +734,7 @@ def test_compose_cleanup_check_lists_remaining_project_resources() -> None:
 
 
 def test_compose_cleanup_checks_project_containers_networks_volumes_and_images():
-    commands = compose_runner.compose_cleanup_resource_commands(
-        "sidecar-e2e-test"
-    )
+    commands = compose_runner.compose_cleanup_resource_commands("sidecar-e2e-test")
 
     assert commands == {
         "containers": [
@@ -457,6 +817,29 @@ def test_e2e_compose_runs_real_sidecar_with_ephemeral_database_and_health() -> N
     assert re.search(r"(?m)^  sidecar-data:\s*$", content)
 
 
+def test_e2e_compose_runs_core_key_mcp_for_final_cutover_gate() -> None:
+    content = COMPOSE_FILE.read_text()
+    mcp = _compose_service(content, "mcp")
+    runner = _compose_service(content, "e2e-runner")
+
+    for contract in (
+        "context: ${MEM0_E2E_MCP_CONTEXT:?set MEM0_E2E_MCP_CONTEXT}",
+        "MEM0_OSS_MCP_AUTH_MODE: core_api_key",
+        "MEM0_OSS_MCP_CLIENT_AUTH_URL: http://mem0:8000/auth/me",
+        'MEM0_OSS_MCP_TOKEN: ""',
+        'MEM0_SIDECAR_REQUIRED: "true"',
+        "MEM0_SIDECAR_API_KEY: e2e-sidecar-operator-key-00000001",
+        "http://127.0.0.1:8080/health",
+    ):
+        assert contract in mcp
+    for contract in (
+        "MEM0_E2E_MCP_URL: http://mcp:8080/mcp",
+        "MEM0_E2E_SIDECAR_URL: http://sidecar:8765",
+        "MEM0_E2E_MCP_LEGACY_TOKEN: e2e-legacy-shared-mcp-key-00000001",
+    ):
+        assert contract in runner
+
+
 def test_dashboard_uses_healthy_sidecar_with_exact_project_and_app() -> None:
     content = COMPOSE_FILE.read_text()
     dashboard = _compose_service(content, "dashboard")
@@ -496,11 +879,13 @@ def test_sidecar_container_volume_image_and_logs_are_in_cleanup_contract() -> No
     assert '"sidecar"' in runner_source
     assert "-v" in compose_down_command("sidecar-e2e-test")
     assert "local" in compose_down_command("sidecar-e2e-test")
-    assert "label=com.docker.compose.project=sidecar-e2e-test" in (
-        resource_commands["containers"]
+    assert (
+        "label=com.docker.compose.project=sidecar-e2e-test"
+        in (resource_commands["containers"])
     )
-    assert "label=com.docker.compose.project=sidecar-e2e-test" in (
-        resource_commands["volumes"]
+    assert (
+        "label=com.docker.compose.project=sidecar-e2e-test"
+        in (resource_commands["volumes"])
     )
     assert "reference=sidecar-e2e-test-*" in resource_commands["images"]
 
@@ -523,6 +908,31 @@ def test_e2e_compose_keeps_unscoped_adoption_gate_on_dedicated_runner() -> None:
     assert 'MEM0_OSS_LIST_FETCH_LIMIT: "5000"' in content
 
 
+def _pin_compose_main_sources(monkeypatch) -> None:
+    revision = "a" * 40
+    for variable in (
+        "MEM0_E2E_EXPECTED_SIDECAR_SHA",
+        "MEM0_E2E_EXPECTED_CORE_SHA",
+        "MEM0_E2E_EXPECTED_MCP_SHA",
+    ):
+        monkeypatch.setenv(variable, revision)
+    monkeypatch.setattr(
+        compose_runner,
+        "_git_revision",
+        lambda _context: revision,
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "write_e2e_evidence_manifest",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "export_e2e_test_reports",
+        lambda *args, **kwargs: None,
+    )
+
+
 def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
     monkeypatch,
 ) -> None:
@@ -530,6 +940,7 @@ def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
     monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    _pin_compose_main_sources(monkeypatch)
     monkeypatch.setattr(
         compose_runner,
         "run",
@@ -544,6 +955,18 @@ def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
         compose_runner,
         "prepare_dashboard_context",
         lambda upstream, target: target,
+    )
+    evidence_export = ["export-browser-evidence"]
+    report_export = ["export-test-reports"]
+    monkeypatch.setattr(
+        compose_runner,
+        "export_browser_evidence",
+        lambda *args, **kwargs: commands.append(evidence_export),
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "export_e2e_test_reports",
+        lambda *args, **kwargs: commands.append(report_export),
     )
 
     def fake_subprocess_run(command, **kwargs):
@@ -568,18 +991,19 @@ def test_compose_main_runs_api_runners_real_gate_then_mocked_ui_smoke(
     assert hasattr(compose_runner, "mocked_browser_smoke_command")
     assert hasattr(compose_runner, "browser_destructive_smoke_command")
     mocked_command = compose_runner.mocked_browser_smoke_command("unique-compose")
-    real_command = compose_runner.browser_destructive_smoke_command(
-        "unique-compose"
-    )
+    real_command = compose_runner.browser_destructive_smoke_command("unique-compose")
     assert mocked_command in commands
     assert real_command in commands
-    assert commands.index(real_command) < commands.index(mocked_command)
+    assert commands.index(report_export) < commands.index(real_command)
+    assert commands.index(real_command) < commands.index(evidence_export)
+    assert commands.index(evidence_export) < commands.index(mocked_command)
 
 
 def test_compose_main_reports_cleanup_failure_without_primary(monkeypatch) -> None:
     monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    _pin_compose_main_sources(monkeypatch)
     monkeypatch.setattr(compose_runner, "run", lambda command, *, env: None)
     monkeypatch.setattr(
         compose_runner,
@@ -590,6 +1014,11 @@ def test_compose_main_reports_cleanup_failure_without_primary(monkeypatch) -> No
         compose_runner,
         "prepare_dashboard_context",
         lambda upstream, target: target,
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "export_browser_evidence",
+        lambda *args, **kwargs: None,
     )
 
     def fail_down(command, **kwargs):
@@ -612,6 +1041,7 @@ def test_compose_main_reports_resource_cleanup_failure_without_primary(
     monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    _pin_compose_main_sources(monkeypatch)
     monkeypatch.setattr(compose_runner, "run", lambda command, *, env: None)
     monkeypatch.setattr(
         compose_runner,
@@ -622,6 +1052,11 @@ def test_compose_main_reports_resource_cleanup_failure_without_primary(
         compose_runner,
         "prepare_dashboard_context",
         lambda upstream, target: target,
+    )
+    monkeypatch.setattr(
+        compose_runner,
+        "export_browser_evidence",
+        lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         compose_runner.subprocess,
@@ -658,6 +1093,7 @@ def test_compose_main_cleanup_does_not_mask_primary_failure(
     monkeypatch.setenv("MEM0_E2E_PROJECT_ID", "unique-project")
     monkeypatch.setenv("MEM0_E2E_COMPOSE_PROJECT", "unique-compose")
     monkeypatch.setenv("MEM0_E2E_UPSTREAM_CONTEXT", "/tmp/upstream")
+    _pin_compose_main_sources(monkeypatch)
     primary = PrimaryComposeFailure("primary runner failure")
     monkeypatch.setattr(
         compose_runner,
@@ -697,9 +1133,7 @@ def test_compose_main_cleanup_does_not_mask_primary_failure(
         compose_runner.main()
 
     assert exc_info.value is primary
-    assert f"{cleanup_failure.rstrip('s')} cleanup failed" in (
-        capsys.readouterr().err
-    )
+    assert f"{cleanup_failure.rstrip('s')} cleanup failed" in (capsys.readouterr().err)
 
 
 def test_e2e_docs_cover_explorer_reconcile_and_cleanup_contracts() -> None:

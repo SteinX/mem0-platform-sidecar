@@ -118,6 +118,13 @@ def test_event_to_trace_dict_exposes_safe_public_trace_shape(db_session) -> None
         "operation": "memory.search",
         "display_operation": "SEARCH",
         "status": "SUCCEEDED",
+        "channel": {
+            "transport": "system",
+            "credential_kind": "unknown",
+            "credential_id": None,
+            "label": "System",
+            "key_prefix": None,
+        },
         "entities": [
             {"type": "user", "id": "alice"},
             {"type": "agent", "id": "agent-a"},
