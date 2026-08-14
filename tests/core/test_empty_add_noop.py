@@ -78,3 +78,23 @@ async def test_empty_direct_add_remains_a_protocol_error(db_session) -> None:
         )
 
     assert mem0.add_count == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_null_infer_uses_default_inference(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    db_session.commit()
+    mem0 = NoOpThenSuccessfulMem0Client()
+
+    result = await MemoryService(session=db_session, mem0=mem0).add_memory(
+        project_id="repo-a",
+        payload={"text": "nothing durable", "app_id": "app-a", "infer": None},
+    )
+
+    assert result["memory"] == {"results": []}
+    assert result["event"]["status"] == "SUCCEEDED"
+    assert result["event"]["subject_id"] is None

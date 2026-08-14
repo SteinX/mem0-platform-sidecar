@@ -1857,7 +1857,7 @@ class MemoryService:
             memory_ids = extract_memory_ids(memory_response)
             if not memory_ids and (
                 memory_response.get("results") != []
-                or oss_payload.get("infer", True) is not True
+                or oss_payload.get("infer") is False
             ):
                 raise MemoryUpstreamProtocolError(
                     f"Could not extract memory id from response: {memory_response!r}"
