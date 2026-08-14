@@ -1381,13 +1381,10 @@ class MemoryService:
         project_id = intent.project_id
         app_id = intent.app_id
         category = payload.get("category")
-        observed_noop_response = payload.get("observed_noop_response")
+        observed_noop = payload.get("observed_noop") is True
         self.session.rollback()
 
-        if (
-            isinstance(observed_noop_response, dict)
-            and observed_noop_response.get("results") == []
-        ):
+        if observed_noop:
             ProjectRepository(self.session).lock_for_mutation(project_id)
             intent_repo = MutationIntentRepository(self.session)
             intent = intent_repo.require_active_attempt(
@@ -1398,12 +1395,12 @@ class MemoryService:
             event.subject_id = None
             EventRepository(self.session).mark_succeeded(
                 event.id,
-                response=observed_noop_response,
+                response={"results": []},
             )
             result = intent_repo.sanitize_payload(
                 project_id,
                 {
-                    "memory": observed_noop_response,
+                    "memory": {"results": []},
                     "event": _event_payload(event),
                 },
             )
@@ -1866,7 +1863,7 @@ class MemoryService:
                 intent_repo = MutationIntentRepository(self.session)
                 intent = intent_repo.require_active_attempt(intent_id, attempt_token)
                 intent_payload = intent_repo.payload(intent)
-                intent_payload["observed_noop_response"] = memory_response
+                intent_payload["observed_noop"] = True
                 intent_repo.update_payload(intent_id, intent_payload)
                 self.session.commit()
             observed_at = datetime.now(UTC)

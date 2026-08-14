@@ -603,7 +603,10 @@ async def test_cancelled_empty_add_finalization_recovers_from_durable_observatio
 
     async def add_noop(payload: dict[str, Any]) -> dict[str, Any]:
         client.add_calls += 1
-        return {"results": []}
+        return {
+            "results": [],
+            **{f"padding-{index}": "x" * 4096 for index in range(50)},
+        }
 
     client.add_memory = add_noop
     real_commit = factory.class_.commit
@@ -627,7 +630,7 @@ async def test_cancelled_empty_add_finalization_recovers_from_durable_observatio
     assert result == {"recovered": 1, "failed": 0}
     state = _intent_state(factory)
     assert state["status"] == "COMPLETED"
-    assert state["payload"]["observed_noop_response"] == {"results": []}
+    assert state["payload"]["observed_noop"] is True
     assert client.add_calls == 1
     assert client.list_calls == 0
     with factory() as session:
