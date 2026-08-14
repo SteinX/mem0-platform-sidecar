@@ -1375,9 +1375,6 @@ class MemoryService:
         intent_repo = MutationIntentRepository(self.session)
         intent = intent_repo.get(intent_id)
         payload = intent_repo.payload(intent)
-        marker = payload.get("mutation_id")
-        if not isinstance(marker, str) or not marker:
-            raise RuntimeError("Add recovery marker is unavailable")
         project_id = intent.project_id
         app_id = intent.app_id
         category = payload.get("category")
@@ -1406,6 +1403,10 @@ class MemoryService:
             )
             intent_repo.complete(intent_id, result=result)
             return
+
+        marker = payload.get("mutation_id")
+        if not isinstance(marker, str) or not marker:
+            raise RuntimeError("Add recovery marker is unavailable")
 
         async def marked_records() -> list[dict[str, Any]]:
             response = await self.mem0.list_memories(
@@ -1865,7 +1866,32 @@ class MemoryService:
                 intent_payload = intent_repo.payload(intent)
                 intent_payload["observed_noop"] = True
                 intent_repo.update_payload(intent_id, intent_payload)
-                self.session.commit()
+                try:
+                    self.session.commit()
+                except BaseException:
+                    self.session.rollback()
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    intent_repo = MutationIntentRepository(self.session)
+                    intent = intent_repo.require_active_attempt(
+                        intent_id,
+                        attempt_token,
+                    )
+                    event = EventRepository(self.session).get(intent.event_id)
+                    event.subject_id = None
+                    EventRepository(self.session).mark_succeeded(
+                        event.id,
+                        response={"results": []},
+                    )
+                    result = intent_repo.sanitize_payload(
+                        project_id,
+                        {
+                            "memory": {"results": []},
+                            "event": _event_payload(event),
+                        },
+                    )
+                    intent_repo.complete(intent_id, result=result)
+                    self.session.commit()
+                    raise
             observed_at = datetime.now(UTC)
             hydrated_records = await _hydrate_memory_records(
                 self.mem0,

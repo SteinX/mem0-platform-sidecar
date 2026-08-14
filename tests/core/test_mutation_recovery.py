@@ -594,9 +594,19 @@ async def test_cancelled_add_after_apply_is_unknown_then_observed_complete(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failed_commit", "initial_status", "expected_recovery"),
+    [
+        (2, "COMPLETED", {"recovered": 0, "failed": 0}),
+        (3, "UNKNOWN", {"recovered": 1, "failed": 0}),
+    ],
+)
 async def test_cancelled_empty_add_finalization_recovers_from_durable_observation(
     tmp_path,
     monkeypatch,
+    failed_commit: int,
+    initial_status: str,
+    expected_recovery: dict[str, int],
 ) -> None:
     factory = _session_factory(tmp_path)
     client = _StatefulRecoveryClient()
@@ -611,26 +621,49 @@ async def test_cancelled_empty_add_finalization_recovers_from_durable_observatio
     client.add_memory = add_noop
     real_commit = factory.class_.commit
     commit_calls = 0
+    commit_failed = False
 
     def cancel_final_commit(self) -> None:
-        nonlocal commit_calls
+        nonlocal commit_calls, commit_failed
         commit_calls += 1
-        if commit_calls == 3:
+        if commit_calls == failed_commit and not commit_failed:
+            commit_failed = True
             raise asyncio.CancelledError()
         real_commit(self)
 
     monkeypatch.setattr(factory.class_, "commit", cancel_final_commit)
     with pytest.raises(asyncio.CancelledError):
-        await _invoke_mutation(factory, client, "add")
+        with factory() as session:
+            await MemoryService(session=session, mem0=client).add_memory(
+                project_id=PROJECT_ID,
+                payload={
+                    "text": "hello",
+                    "app_id": APP_ID,
+                    "metadata": {
+                        f"padding-{index}": "x" * 4096 for index in range(50)
+                    },
+                },
+            )
 
-    assert _intent_state(factory)["status"] == "UNKNOWN"
+    state = _intent_state(factory)
+    assert state["status"] == initial_status
+    if failed_commit == 3:
+        assert state["payload"]["observed_noop"] is True
+        with factory() as session:
+            intent = session.scalar(select(MutationIntent))
+            assert intent is not None
+            intent.payload_json = json.dumps(
+                {"_trace_truncated": True, "observed_noop": True}
+            )
+            session.commit()
     monkeypatch.setattr(factory.class_, "commit", real_commit)
     result = await _recover(factory, client)
 
-    assert result == {"recovered": 1, "failed": 0}
+    assert result == expected_recovery
     state = _intent_state(factory)
     assert state["status"] == "COMPLETED"
-    assert state["payload"]["observed_noop"] is True
+    if failed_commit == 3:
+        assert state["payload"]["observed_noop"] is True
     assert client.add_calls == 1
     assert client.list_calls == 0
     with factory() as session:
