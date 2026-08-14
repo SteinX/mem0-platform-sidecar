@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from pydantic import TypeAdapter
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -45,6 +46,7 @@ _MAX_UPDATE_METADATA_FIELDS = 48
 _RECONCILE_SCAN_LIMIT = 5000
 _HYDRATION_BUFFER = 20
 _HYDRATION_CONCURRENCY = 8
+_INFER_ADAPTER = TypeAdapter(bool)
 _DIRTY_TRACE_SESSION_ERROR = (
     "traced memory operation requires a clean session write-set"
 )
@@ -206,6 +208,8 @@ def _oss_add_payload(payload: dict[str, Any], *, scope: Scope) -> dict[str, Any]
     oss_payload = dict(payload)
     oss_payload.pop("project_id", None)
     oss_payload.pop("app_id", None)
+    if oss_payload.get("infer") is not None:
+        oss_payload["infer"] = _INFER_ADAPTER.validate_python(oss_payload["infer"])
     oss_payload["metadata"] = _metadata_with_sidecar_scope(
         payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None,
         scope=scope,

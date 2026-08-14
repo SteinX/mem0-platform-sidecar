@@ -58,7 +58,11 @@ async def test_empty_inferred_add_does_not_block_the_next_add(db_session) -> Non
 
 
 @pytest.mark.asyncio
-async def test_empty_direct_add_remains_a_protocol_error(db_session) -> None:
+@pytest.mark.parametrize("infer_value", [False, 0, "false", "no", "off"])
+async def test_empty_direct_add_remains_a_protocol_error(
+    db_session,
+    infer_value,
+) -> None:
     ProjectRepository(db_session).upsert_default_project(
         project_id="repo-a",
         name="Repo A",
@@ -73,7 +77,7 @@ async def test_empty_direct_add_remains_a_protocol_error(db_session) -> None:
             payload={
                 "text": "must be stored directly",
                 "app_id": "app-a",
-                "infer": False,
+                "infer": infer_value,
             },
         )
 
