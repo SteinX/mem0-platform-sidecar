@@ -780,6 +780,51 @@ async def test_empty_add_checkpoint_precheck_failure_completes_known_noop(
 
 
 @pytest.mark.asyncio
+async def test_empty_add_recovery_clears_stale_event_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+
+    async def add_noop(payload: dict[str, Any]) -> dict[str, Any]:
+        client.add_calls += 1
+        return {"results": []}
+
+    client.add_memory = add_noop
+    real_mark_succeeded = EventRepository.mark_succeeded
+    finalization_failed = False
+
+    def fail_finalization_once(self, event_id: str, *, response: dict[str, Any]):
+        nonlocal finalization_failed
+        if not finalization_failed:
+            finalization_failed = True
+            raise RuntimeError("injected no-op finalization failure")
+        return real_mark_succeeded(self, event_id, response=response)
+
+    monkeypatch.setattr(
+        EventRepository,
+        "mark_succeeded",
+        fail_finalization_once,
+    )
+    with pytest.raises(RuntimeError, match="no-op finalization failure"):
+        await _invoke_mutation(factory, client, "add")
+
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    result = await _recover(factory, client)
+
+    assert result == {"recovered": 1, "failed": 0}
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.add_calls == 1
+    assert client.list_calls == 0
+    with factory() as session:
+        event = session.scalar(select(Event))
+        assert event is not None
+        assert event.status.value == "SUCCEEDED"
+        assert json.loads(event.error_json) == {}
+
+
+@pytest.mark.asyncio
 async def test_cancelled_update_after_apply_completes_only_on_effect_match(
     tmp_path,
 ) -> None:
