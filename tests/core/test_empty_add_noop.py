@@ -47,6 +47,8 @@ async def test_empty_inferred_add_does_not_block_the_next_add(db_session) -> Non
 
     # Then the no-op is complete and no mutation intent blocks the later write.
     assert first["memory"] == {"results": []}
+    assert first["event"]["status"] == "SUCCEEDED"
+    assert first["event"]["subject_id"] is None
     assert second["memory"]["id"] == "mem-after-noop"
     assert mem0.add_count == 2
     assert MutationIntentRepository(db_session).list_blocking(
