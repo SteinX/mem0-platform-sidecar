@@ -649,6 +649,11 @@ async def test_cancelled_empty_add_finalization_recovers_from_durable_observatio
     assert state["status"] == initial_status
     if failed_commit == 3:
         assert state["payload"]["observed_noop"] is True
+        assert set(state["payload"]) == {
+            "mutation_id",
+            "observed_noop",
+            "request_fingerprint",
+        }
         with factory() as session:
             intent = session.scalar(select(MutationIntent))
             assert intent is not None

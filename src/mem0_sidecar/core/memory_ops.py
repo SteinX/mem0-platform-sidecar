@@ -1874,9 +1874,14 @@ class MemoryService:
                         intent_id,
                         attempt_token,
                     )
-                    intent_payload = intent_repo.payload(intent)
-                    intent_payload["observed_noop"] = True
-                    intent_repo.update_payload(intent_id, intent_payload)
+                    intent_repo.update_payload(
+                        intent.id,
+                        {
+                            "mutation_id": mutation_id,
+                            "request_fingerprint": request_fingerprint,
+                            "observed_noop": True,
+                        },
+                    )
                     self.session.commit()
                 except BaseException:
                     self.session.rollback()
