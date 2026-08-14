@@ -1830,7 +1830,7 @@ class MemoryService:
             memory_response = await self.mem0.add_memory(oss_payload)
             upstream_completed = True
             memory_ids = extract_memory_ids(memory_response)
-            if not memory_ids:
+            if not memory_ids and memory_response.get("results") != []:
                 raise MemoryUpstreamProtocolError(
                     f"Could not extract memory id from response: {memory_response!r}"
                 )
@@ -1881,7 +1881,7 @@ class MemoryService:
             )
             event_repo = EventRepository(self.session)
             event = event_repo.get(event_id)
-            event.subject_id = memory_ids[0]
+            event.subject_id = memory_ids[0] if memory_ids else None
             event_repo.mark_succeeded(event_id, response=memory_response)
             result = intent_repo.sanitize_payload(
                 project_id,
