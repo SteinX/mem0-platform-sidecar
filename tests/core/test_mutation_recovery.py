@@ -594,6 +594,50 @@ async def test_cancelled_add_after_apply_is_unknown_then_observed_complete(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_empty_add_finalization_recovers_from_durable_observation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+
+    async def add_noop(payload: dict[str, Any]) -> dict[str, Any]:
+        client.add_calls += 1
+        return {"results": []}
+
+    client.add_memory = add_noop
+    real_commit = factory.class_.commit
+    commit_calls = 0
+
+    def cancel_final_commit(self) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 3:
+            raise asyncio.CancelledError()
+        real_commit(self)
+
+    monkeypatch.setattr(factory.class_, "commit", cancel_final_commit)
+    with pytest.raises(asyncio.CancelledError):
+        await _invoke_mutation(factory, client, "add")
+
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    monkeypatch.setattr(factory.class_, "commit", real_commit)
+    result = await _recover(factory, client)
+
+    assert result == {"recovered": 1, "failed": 0}
+    state = _intent_state(factory)
+    assert state["status"] == "COMPLETED"
+    assert state["payload"]["observed_noop_response"] == {"results": []}
+    assert client.add_calls == 1
+    assert client.list_calls == 0
+    with factory() as session:
+        event = session.scalar(select(Event))
+        assert event is not None
+        assert event.status.value == "SUCCEEDED"
+        assert event.subject_id is None
+
+
+@pytest.mark.asyncio
 async def test_cancelled_update_after_apply_completes_only_on_effect_match(
     tmp_path,
 ) -> None:

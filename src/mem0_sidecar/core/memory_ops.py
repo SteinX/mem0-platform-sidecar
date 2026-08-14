@@ -1381,7 +1381,34 @@ class MemoryService:
         project_id = intent.project_id
         app_id = intent.app_id
         category = payload.get("category")
+        observed_noop_response = payload.get("observed_noop_response")
         self.session.rollback()
+
+        if (
+            isinstance(observed_noop_response, dict)
+            and observed_noop_response.get("results") == []
+        ):
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            intent_repo = MutationIntentRepository(self.session)
+            intent = intent_repo.require_active_attempt(
+                intent_id,
+                expected_attempt_count,
+            )
+            event = EventRepository(self.session).get(intent.event_id)
+            event.subject_id = None
+            EventRepository(self.session).mark_succeeded(
+                event.id,
+                response=observed_noop_response,
+            )
+            result = intent_repo.sanitize_payload(
+                project_id,
+                {
+                    "memory": observed_noop_response,
+                    "event": _event_payload(event),
+                },
+            )
+            intent_repo.complete(intent_id, result=result)
+            return
 
         async def marked_records() -> list[dict[str, Any]]:
             response = await self.mem0.list_memories(
@@ -1834,6 +1861,14 @@ class MemoryService:
                 raise MemoryUpstreamProtocolError(
                     f"Could not extract memory id from response: {memory_response!r}"
                 )
+            if not memory_ids:
+                ProjectRepository(self.session).lock_for_mutation(project_id)
+                intent_repo = MutationIntentRepository(self.session)
+                intent = intent_repo.require_active_attempt(intent_id, attempt_token)
+                intent_payload = intent_repo.payload(intent)
+                intent_payload["observed_noop_response"] = memory_response
+                intent_repo.update_payload(intent_id, intent_payload)
+                self.session.commit()
             observed_at = datetime.now(UTC)
             hydrated_records = await _hydrate_memory_records(
                 self.mem0,
