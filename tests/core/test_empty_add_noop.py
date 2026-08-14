@@ -1,6 +1,6 @@
 import pytest
 
-from mem0_sidecar.core.memory_ops import MemoryService
+from mem0_sidecar.core.memory_ops import MemoryService, MemoryUpstreamProtocolError
 from mem0_sidecar.store.repositories import (
     MutationIntentRepository,
     ProjectRepository,
@@ -55,3 +55,26 @@ async def test_empty_inferred_add_does_not_block_the_next_add(db_session) -> Non
         "repo-a",
         "app-a",
     ) == []
+
+
+@pytest.mark.asyncio
+async def test_empty_direct_add_remains_a_protocol_error(db_session) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    db_session.commit()
+    mem0 = NoOpThenSuccessfulMem0Client()
+
+    with pytest.raises(MemoryUpstreamProtocolError):
+        await MemoryService(session=db_session, mem0=mem0).add_memory(
+            project_id="repo-a",
+            payload={
+                "text": "must be stored directly",
+                "app_id": "app-a",
+                "infer": False,
+            },
+        )
+
+    assert mem0.add_count == 1

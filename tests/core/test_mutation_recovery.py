@@ -719,6 +719,62 @@ async def test_empty_add_checkpoint_flush_failure_completes_known_noop(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["lock", "fence_query"])
+async def test_empty_add_checkpoint_precheck_failure_completes_known_noop(
+    tmp_path,
+    monkeypatch,
+    failure_point: str,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+
+    async def add_noop(payload: dict[str, Any]) -> dict[str, Any]:
+        client.add_calls += 1
+        return {"results": []}
+
+    client.add_memory = add_noop
+    failure_injected = False
+    if failure_point == "lock":
+        real_precheck = ProjectRepository.lock_for_mutation
+
+        def fail_precheck(self, project_id: str):
+            nonlocal failure_injected
+            if client.add_calls == 1 and not failure_injected:
+                failure_injected = True
+                raise RuntimeError("injected checkpoint lock failure")
+            return real_precheck(self, project_id)
+
+        monkeypatch.setattr(ProjectRepository, "lock_for_mutation", fail_precheck)
+    else:
+        real_precheck = MutationIntentRepository.require_active_attempt
+
+        def fail_precheck(self, intent_id: str, expected_attempt_count: int):
+            nonlocal failure_injected
+            if not failure_injected:
+                failure_injected = True
+                raise RuntimeError("injected checkpoint query failure")
+            return real_precheck(self, intent_id, expected_attempt_count)
+
+        monkeypatch.setattr(
+            MutationIntentRepository,
+            "require_active_attempt",
+            fail_precheck,
+        )
+
+    with pytest.raises(RuntimeError, match="checkpoint (lock|query) failure"):
+        await _invoke_mutation(factory, client, "add")
+
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.add_calls == 1
+    assert client.list_calls == 0
+    with factory() as session:
+        event = session.scalar(select(Event))
+        assert event is not None
+        assert event.status.value == "SUCCEEDED"
+        assert event.subject_id is None
+
+
+@pytest.mark.asyncio
 async def test_cancelled_update_after_apply_completes_only_on_effect_match(
     tmp_path,
 ) -> None:

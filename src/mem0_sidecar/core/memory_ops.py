@@ -1855,17 +1855,23 @@ class MemoryService:
             memory_response = await self.mem0.add_memory(oss_payload)
             upstream_completed = True
             memory_ids = extract_memory_ids(memory_response)
-            if not memory_ids and memory_response.get("results") != []:
+            if not memory_ids and (
+                memory_response.get("results") != []
+                or oss_payload.get("infer", True) is not True
+            ):
                 raise MemoryUpstreamProtocolError(
                     f"Could not extract memory id from response: {memory_response!r}"
                 )
             if not memory_ids:
-                ProjectRepository(self.session).lock_for_mutation(project_id)
-                intent_repo = MutationIntentRepository(self.session)
-                intent = intent_repo.require_active_attempt(intent_id, attempt_token)
-                intent_payload = intent_repo.payload(intent)
-                intent_payload["observed_noop"] = True
                 try:
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    intent_repo = MutationIntentRepository(self.session)
+                    intent = intent_repo.require_active_attempt(
+                        intent_id,
+                        attempt_token,
+                    )
+                    intent_payload = intent_repo.payload(intent)
+                    intent_payload["observed_noop"] = True
                     intent_repo.update_payload(intent_id, intent_payload)
                     self.session.commit()
                 except BaseException:
