@@ -674,6 +674,51 @@ async def test_cancelled_empty_add_finalization_recovers_from_durable_observatio
 
 
 @pytest.mark.asyncio
+async def test_empty_add_checkpoint_flush_failure_completes_known_noop(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+
+    async def add_noop(payload: dict[str, Any]) -> dict[str, Any]:
+        client.add_calls += 1
+        return {"results": []}
+
+    client.add_memory = add_noop
+    real_update_payload = MutationIntentRepository.update_payload
+    update_failed = False
+
+    def fail_checkpoint_flush(
+        self,
+        intent_id: str,
+        payload: dict[str, Any],
+    ) -> MutationIntent:
+        nonlocal update_failed
+        if not update_failed:
+            update_failed = True
+            raise RuntimeError("injected checkpoint flush failure")
+        return real_update_payload(self, intent_id, payload)
+
+    monkeypatch.setattr(
+        MutationIntentRepository,
+        "update_payload",
+        fail_checkpoint_flush,
+    )
+    with pytest.raises(RuntimeError, match="checkpoint flush failure"):
+        await _invoke_mutation(factory, client, "add")
+
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.add_calls == 1
+    assert client.list_calls == 0
+    with factory() as session:
+        event = session.scalar(select(Event))
+        assert event is not None
+        assert event.status.value == "SUCCEEDED"
+        assert event.subject_id is None
+
+
+@pytest.mark.asyncio
 async def test_cancelled_update_after_apply_completes_only_on_effect_match(
     tmp_path,
 ) -> None:

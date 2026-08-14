@@ -1865,8 +1865,8 @@ class MemoryService:
                 intent = intent_repo.require_active_attempt(intent_id, attempt_token)
                 intent_payload = intent_repo.payload(intent)
                 intent_payload["observed_noop"] = True
-                intent_repo.update_payload(intent_id, intent_payload)
                 try:
+                    intent_repo.update_payload(intent_id, intent_payload)
                     self.session.commit()
                 except BaseException:
                     self.session.rollback()
