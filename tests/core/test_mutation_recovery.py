@@ -594,6 +594,237 @@ async def test_cancelled_add_after_apply_is_unknown_then_observed_complete(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failed_commit", "initial_status", "expected_recovery"),
+    [
+        (2, "COMPLETED", {"recovered": 0, "failed": 0}),
+        (3, "UNKNOWN", {"recovered": 1, "failed": 0}),
+    ],
+)
+async def test_cancelled_empty_add_finalization_recovers_from_durable_observation(
+    tmp_path,
+    monkeypatch,
+    failed_commit: int,
+    initial_status: str,
+    expected_recovery: dict[str, int],
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+
+    async def add_noop(payload: dict[str, Any]) -> dict[str, Any]:
+        client.add_calls += 1
+        return {
+            "results": [],
+            **{f"padding-{index}": "x" * 4096 for index in range(50)},
+        }
+
+    client.add_memory = add_noop
+    real_commit = factory.class_.commit
+    commit_calls = 0
+    commit_failed = False
+
+    def cancel_final_commit(self) -> None:
+        nonlocal commit_calls, commit_failed
+        commit_calls += 1
+        if commit_calls == failed_commit and not commit_failed:
+            commit_failed = True
+            raise asyncio.CancelledError()
+        real_commit(self)
+
+    monkeypatch.setattr(factory.class_, "commit", cancel_final_commit)
+    with pytest.raises(asyncio.CancelledError):
+        with factory() as session:
+            await MemoryService(session=session, mem0=client).add_memory(
+                project_id=PROJECT_ID,
+                payload={
+                    "text": "hello",
+                    "app_id": APP_ID,
+                    "metadata": {
+                        f"padding-{index}": "x" * 4096 for index in range(50)
+                    },
+                },
+            )
+
+    state = _intent_state(factory)
+    assert state["status"] == initial_status
+    if failed_commit == 3:
+        assert state["payload"]["observed_noop"] is True
+        assert set(state["payload"]) == {
+            "mutation_id",
+            "observed_noop",
+            "request_fingerprint",
+        }
+        with factory() as session:
+            intent = session.scalar(select(MutationIntent))
+            assert intent is not None
+            intent.payload_json = json.dumps(
+                {"_trace_truncated": True, "observed_noop": True}
+            )
+            session.commit()
+    monkeypatch.setattr(factory.class_, "commit", real_commit)
+    result = await _recover(factory, client)
+
+    assert result == expected_recovery
+    state = _intent_state(factory)
+    assert state["status"] == "COMPLETED"
+    if failed_commit == 3:
+        assert state["payload"]["observed_noop"] is True
+    assert client.add_calls == 1
+    assert client.list_calls == 0
+    with factory() as session:
+        event = session.scalar(select(Event))
+        assert event is not None
+        assert event.status.value == "SUCCEEDED"
+        assert event.subject_id is None
+
+
+@pytest.mark.asyncio
+async def test_empty_add_checkpoint_flush_failure_completes_known_noop(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+
+    async def add_noop(payload: dict[str, Any]) -> dict[str, Any]:
+        client.add_calls += 1
+        return {"results": []}
+
+    client.add_memory = add_noop
+    real_update_payload = MutationIntentRepository.update_payload
+    update_failed = False
+
+    def fail_checkpoint_flush(
+        self,
+        intent_id: str,
+        payload: dict[str, Any],
+    ) -> MutationIntent:
+        nonlocal update_failed
+        if not update_failed:
+            update_failed = True
+            raise RuntimeError("injected checkpoint flush failure")
+        return real_update_payload(self, intent_id, payload)
+
+    monkeypatch.setattr(
+        MutationIntentRepository,
+        "update_payload",
+        fail_checkpoint_flush,
+    )
+    with pytest.raises(RuntimeError, match="checkpoint flush failure"):
+        await _invoke_mutation(factory, client, "add")
+
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.add_calls == 1
+    assert client.list_calls == 0
+    with factory() as session:
+        event = session.scalar(select(Event))
+        assert event is not None
+        assert event.status.value == "SUCCEEDED"
+        assert event.subject_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["lock", "fence_query"])
+async def test_empty_add_checkpoint_precheck_failure_completes_known_noop(
+    tmp_path,
+    monkeypatch,
+    failure_point: str,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+
+    async def add_noop(payload: dict[str, Any]) -> dict[str, Any]:
+        client.add_calls += 1
+        return {"results": []}
+
+    client.add_memory = add_noop
+    failure_injected = False
+    if failure_point == "lock":
+        real_precheck = ProjectRepository.lock_for_mutation
+
+        def fail_precheck(self, project_id: str):
+            nonlocal failure_injected
+            if client.add_calls == 1 and not failure_injected:
+                failure_injected = True
+                raise RuntimeError("injected checkpoint lock failure")
+            return real_precheck(self, project_id)
+
+        monkeypatch.setattr(ProjectRepository, "lock_for_mutation", fail_precheck)
+    else:
+        real_precheck = MutationIntentRepository.require_active_attempt
+
+        def fail_precheck(self, intent_id: str, expected_attempt_count: int):
+            nonlocal failure_injected
+            if not failure_injected:
+                failure_injected = True
+                raise RuntimeError("injected checkpoint query failure")
+            return real_precheck(self, intent_id, expected_attempt_count)
+
+        monkeypatch.setattr(
+            MutationIntentRepository,
+            "require_active_attempt",
+            fail_precheck,
+        )
+
+    with pytest.raises(RuntimeError, match="checkpoint (lock|query) failure"):
+        await _invoke_mutation(factory, client, "add")
+
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.add_calls == 1
+    assert client.list_calls == 0
+    with factory() as session:
+        event = session.scalar(select(Event))
+        assert event is not None
+        assert event.status.value == "SUCCEEDED"
+        assert event.subject_id is None
+
+
+@pytest.mark.asyncio
+async def test_empty_add_recovery_clears_stale_event_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+
+    async def add_noop(payload: dict[str, Any]) -> dict[str, Any]:
+        client.add_calls += 1
+        return {"results": []}
+
+    client.add_memory = add_noop
+    real_mark_succeeded = EventRepository.mark_succeeded
+    finalization_failed = False
+
+    def fail_finalization_once(self, event_id: str, *, response: dict[str, Any]):
+        nonlocal finalization_failed
+        if not finalization_failed:
+            finalization_failed = True
+            raise RuntimeError("injected no-op finalization failure")
+        return real_mark_succeeded(self, event_id, response=response)
+
+    monkeypatch.setattr(
+        EventRepository,
+        "mark_succeeded",
+        fail_finalization_once,
+    )
+    with pytest.raises(RuntimeError, match="no-op finalization failure"):
+        await _invoke_mutation(factory, client, "add")
+
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    result = await _recover(factory, client)
+
+    assert result == {"recovered": 1, "failed": 0}
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.add_calls == 1
+    assert client.list_calls == 0
+    with factory() as session:
+        event = session.scalar(select(Event))
+        assert event is not None
+        assert event.status.value == "SUCCEEDED"
+        assert json.loads(event.error_json) == {}
+
+
+@pytest.mark.asyncio
 async def test_cancelled_update_after_apply_completes_only_on_effect_match(
     tmp_path,
 ) -> None:

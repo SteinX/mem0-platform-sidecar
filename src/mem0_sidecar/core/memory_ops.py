@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from pydantic import TypeAdapter
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -45,6 +46,7 @@ _MAX_UPDATE_METADATA_FIELDS = 48
 _RECONCILE_SCAN_LIMIT = 5000
 _HYDRATION_BUFFER = 20
 _HYDRATION_CONCURRENCY = 8
+_INFER_ADAPTER = TypeAdapter(bool)
 _DIRTY_TRACE_SESSION_ERROR = (
     "traced memory operation requires a clean session write-set"
 )
@@ -206,6 +208,8 @@ def _oss_add_payload(payload: dict[str, Any], *, scope: Scope) -> dict[str, Any]
     oss_payload = dict(payload)
     oss_payload.pop("project_id", None)
     oss_payload.pop("app_id", None)
+    if oss_payload.get("infer") is not None:
+        oss_payload["infer"] = _INFER_ADAPTER.validate_python(oss_payload["infer"])
     oss_payload["metadata"] = _metadata_with_sidecar_scope(
         payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None,
         scope=scope,
@@ -1375,13 +1379,38 @@ class MemoryService:
         intent_repo = MutationIntentRepository(self.session)
         intent = intent_repo.get(intent_id)
         payload = intent_repo.payload(intent)
-        marker = payload.get("mutation_id")
-        if not isinstance(marker, str) or not marker:
-            raise RuntimeError("Add recovery marker is unavailable")
         project_id = intent.project_id
         app_id = intent.app_id
         category = payload.get("category")
+        observed_noop = payload.get("observed_noop") is True
         self.session.rollback()
+
+        if observed_noop:
+            ProjectRepository(self.session).lock_for_mutation(project_id)
+            intent_repo = MutationIntentRepository(self.session)
+            intent = intent_repo.require_active_attempt(
+                intent_id,
+                expected_attempt_count,
+            )
+            event = EventRepository(self.session).get(intent.event_id)
+            event.subject_id = None
+            EventRepository(self.session).mark_succeeded(
+                event.id,
+                response={"results": []},
+            )
+            result = intent_repo.sanitize_payload(
+                project_id,
+                {
+                    "memory": {"results": []},
+                    "event": _event_payload(event),
+                },
+            )
+            intent_repo.complete(intent_id, result=result)
+            return
+
+        marker = payload.get("mutation_id")
+        if not isinstance(marker, str) or not marker:
+            raise RuntimeError("Add recovery marker is unavailable")
 
         async def marked_records() -> list[dict[str, Any]]:
             response = await self.mem0.list_memories(
@@ -1830,10 +1859,54 @@ class MemoryService:
             memory_response = await self.mem0.add_memory(oss_payload)
             upstream_completed = True
             memory_ids = extract_memory_ids(memory_response)
-            if not memory_ids:
+            if not memory_ids and (
+                memory_response.get("results") != []
+                or oss_payload.get("infer") is False
+            ):
                 raise MemoryUpstreamProtocolError(
                     f"Could not extract memory id from response: {memory_response!r}"
                 )
+            if not memory_ids:
+                try:
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    intent_repo = MutationIntentRepository(self.session)
+                    intent = intent_repo.require_active_attempt(
+                        intent_id,
+                        attempt_token,
+                    )
+                    intent_repo.update_payload(
+                        intent.id,
+                        {
+                            "mutation_id": mutation_id,
+                            "request_fingerprint": request_fingerprint,
+                            "observed_noop": True,
+                        },
+                    )
+                    self.session.commit()
+                except BaseException:
+                    self.session.rollback()
+                    ProjectRepository(self.session).lock_for_mutation(project_id)
+                    intent_repo = MutationIntentRepository(self.session)
+                    intent = intent_repo.require_active_attempt(
+                        intent_id,
+                        attempt_token,
+                    )
+                    event = EventRepository(self.session).get(intent.event_id)
+                    event.subject_id = None
+                    EventRepository(self.session).mark_succeeded(
+                        event.id,
+                        response={"results": []},
+                    )
+                    result = intent_repo.sanitize_payload(
+                        project_id,
+                        {
+                            "memory": {"results": []},
+                            "event": _event_payload(event),
+                        },
+                    )
+                    intent_repo.complete(intent_id, result=result)
+                    self.session.commit()
+                    raise
             observed_at = datetime.now(UTC)
             hydrated_records = await _hydrate_memory_records(
                 self.mem0,
@@ -1881,7 +1954,7 @@ class MemoryService:
             )
             event_repo = EventRepository(self.session)
             event = event_repo.get(event_id)
-            event.subject_id = memory_ids[0]
+            event.subject_id = memory_ids[0] if memory_ids else None
             event_repo.mark_succeeded(event_id, response=memory_response)
             result = intent_repo.sanitize_payload(
                 project_id,

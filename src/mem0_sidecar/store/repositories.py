@@ -1379,6 +1379,7 @@ class EventRepository:
         if scan_truncated:
             response_document["result_previews_scan_truncated"] = True
         event.status = EventStatus.SUCCEEDED
+        event.error_json = _trace_json({})
         event.response_json = _trace_json(
             _safe_trace_document(
                 response_document,
