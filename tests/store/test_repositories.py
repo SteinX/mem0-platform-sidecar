@@ -254,6 +254,48 @@ def test_event_query_bounds_canonical_channel_facet_candidates(
     )
 
 
+def test_project_wide_channel_facets_share_combined_scope_horizon(
+    db_session,
+    monkeypatch,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 8, 18, tzinfo=UTC)
+    db_session.add_all(
+        [
+            Event(
+                id=f"mixed-scope-{index}",
+                project_id="repo-a",
+                app_id="app-a",
+                user_id="root" if index % 2 == 0 else None,
+                operation="memory.search",
+                status=EventStatus.SUCCEEDED,
+                request_json='{"app_id":"app-a","user_id":"root"}',
+                created_at=created_at + timedelta(seconds=index),
+            )
+            for index in range(6)
+        ]
+    )
+    db_session.flush()
+    monkeypatch.setattr(repositories, "EVENT_SCAN_LIMIT", 4)
+
+    page = EventRepository(db_session).query_project_events(
+        "repo-a",
+        None,
+        repositories.EventQuery(
+            entity_filters={"user_id": "root"},
+            page=1,
+            page_size=20,
+        ),
+    )
+
+    assert page.total == 4
+    assert sum(channel["count"] for channel in page.channels) == page.total
+
+
 def test_category_model_enforces_unique_name_per_project(db_session):
     constraints = {
         constraint.name: tuple(column.name for column in constraint.columns)

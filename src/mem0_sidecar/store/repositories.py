@@ -1465,29 +1465,24 @@ class EventRepository:
             conditions.append(Event.created_at >= _as_utc(query.from_at))
         if query.to_at is not None:
             conditions.append(Event.created_at <= _as_utc(query.to_at))
-        canonical_facet_conditions = [*conditions]
         legacy_scope_conditions: list[ColumnElement[bool]] = []
         if app_id is not None:
-            canonical_facet_conditions.append(Event.app_id == app_id)
             legacy_scope_conditions.append(Event.app_id.is_(None))
         elif "app_id" in validated_entity_filters:
-            canonical_facet_conditions.append(
-                Event.app_id == validated_entity_filters["app_id"]
-            )
             legacy_scope_conditions.append(Event.app_id.is_(None))
-        for field_name, expected in validated_entity_filters.items():
+        for field_name in validated_entity_filters:
             if field_name == "app_id":
                 continue
             column = entity_columns.get(field_name)
             if column is None:
                 continue
-            canonical_facet_conditions.append(column == expected)
             legacy_scope_conditions.append(column.is_(None))
         legacy_facet_conditions = (
             [*conditions, or_(*legacy_scope_conditions)]
             if legacy_scope_conditions
             else None
         )
+        facet_conditions = tuple(conditions)
         conditions.extend(_event_channel_sql_conditions(query.channel))
 
         for _attempt in range(_EVENT_QUERY_MAX_ATTEMPTS):
@@ -1497,7 +1492,7 @@ class EventRepository:
                 query=query,
                 entity_filters=validated_entity_filters,
                 conditions=conditions,
-                canonical_facet_conditions=canonical_facet_conditions,
+                facet_conditions=facet_conditions,
                 legacy_facet_conditions=legacy_facet_conditions,
             )
             if page is not None:
@@ -1512,7 +1507,7 @@ class EventRepository:
         query: EventQuery,
         entity_filters: Mapping[str, str],
         conditions: Sequence[ColumnElement[bool]],
-        canonical_facet_conditions: Sequence[ColumnElement[bool]],
+        facet_conditions: Sequence[ColumnElement[bool]],
         legacy_facet_conditions: Sequence[ColumnElement[bool]] | None,
     ) -> EventPage | None:
         channel_columns = (
@@ -1525,35 +1520,44 @@ class EventRepository:
         legacy_facet_rows = (
             list(
                 self.session.execute(
-                    select(
-                        Event.id,
-                        Event.app_id,
-                        Event.user_id,
-                        Event.agent_id,
-                        Event.run_id,
-                        Event.request_json,
-                    )
+                    select(Event.id)
                     .where(*legacy_facet_conditions)
                     .limit(EVENT_SCAN_LIMIT + 1)
                 )
             )
-            if legacy_facet_conditions is not None
+            if app_id is not None and legacy_facet_conditions is not None
             else []
         )
         if len(legacy_facet_rows) > EVENT_SCAN_LIMIT:
             raise ValueError(
                 "legacy event scope facet scan exceeds 5000 records"
             )
-        matching_legacy_event_ids: list[str] = []
-        for (
-            event_id,
-            canonical_app_id,
-            canonical_user_id,
-            canonical_agent_id,
-            canonical_run_id,
-            request_json,
-        ) in legacy_facet_rows:
-            if not _matches_event_scope(
+        facet_candidates = list(
+            self.session.execute(
+                select(
+                    Event.id,
+                    Event.app_id,
+                    Event.user_id,
+                    Event.agent_id,
+                    Event.run_id,
+                    Event.request_json,
+                )
+                .where(*facet_conditions)
+                .order_by(Event.created_at.desc(), Event.id.desc())
+                .limit(EVENT_SCAN_LIMIT)
+            )
+        )
+        facet_event_ids = [
+            event_id
+            for (
+                event_id,
+                canonical_app_id,
+                canonical_user_id,
+                canonical_agent_id,
+                canonical_run_id,
+                request_json,
+            ) in facet_candidates
+            if _matches_event_scope(
                 request_json,
                 app_id,
                 entity_filters,
@@ -1561,21 +1565,7 @@ class EventRepository:
                 canonical_user_id,
                 canonical_agent_id,
                 canonical_run_id,
-            ):
-                continue
-            matching_legacy_event_ids.append(event_id)
-
-        canonical_facet_event_ids = list(
-            self.session.execute(
-                select(Event.id)
-                .where(*canonical_facet_conditions)
-                .order_by(Event.created_at.desc(), Event.id.desc())
-                .limit(EVENT_SCAN_LIMIT)
-            ).scalars()
-        )
-        facet_event_ids = [
-            *canonical_facet_event_ids,
-            *matching_legacy_event_ids,
+            )
         ]
         grouped_channels: dict[RequestAttribution, int] = {}
         if facet_event_ids:
