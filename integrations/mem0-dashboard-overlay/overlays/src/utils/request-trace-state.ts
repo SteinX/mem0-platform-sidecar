@@ -33,6 +33,7 @@ type BaseTraceQueryState = Pick<
 
 const EVENT_SCAN_HORIZON = 5_000;
 const DEFAULT_PAGE_SIZE = 20;
+export const REQUEST_TRACE_REFRESH_INTERVAL_MS = 30_000;
 const ENTITY_FIELDS = new Set<ExplorerFilter["field"]>([
   "user_id",
   "agent_id",
@@ -236,6 +237,13 @@ export function isCurrentTraceListRequest(
   mounted: boolean,
 ): boolean {
   return mounted && requestGeneration === currentGeneration;
+}
+
+export function shouldAutoRefreshRequestTraces(
+  visibilityState: DocumentVisibilityState,
+  requestInFlight: boolean,
+): boolean {
+  return visibilityState === "visible" && !requestInFlight;
 }
 
 export function beginTraceDetailRequest(

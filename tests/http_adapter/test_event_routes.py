@@ -444,6 +444,99 @@ def test_query_events_isolates_project_and_app_scope(tmp_path) -> None:
     assert response.json()["total"] == 1
 
 
+def test_query_events_project_wide_returns_latest_horizon_across_apps(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app = _create_test_app(tmp_path)
+    _seed_project(app, "repo-a", app_id="app-a")
+    _seed_event(
+        app,
+        project_id="repo-a",
+        app_id="app-a",
+        created_at=datetime(2026, 8, 18, 10, 0, tzinfo=UTC),
+    )
+    middle_id = _seed_event(
+        app,
+        project_id="repo-a",
+        app_id="app-b",
+        created_at=datetime(2026, 8, 18, 11, 0, tzinfo=UTC),
+    )
+    latest_id = _seed_event(
+        app,
+        project_id="repo-a",
+        app_id="app-a",
+        created_at=datetime(2026, 8, 18, 12, 0, tzinfo=UTC),
+    )
+    monkeypatch.setattr("mem0_sidecar.store.repositories.EVENT_SCAN_LIMIT", 2)
+
+    response = TestClient(app).post(
+        "/v1/events/query",
+        json={
+            "project_id": "repo-a",
+            "project_wide": True,
+            "page_size": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["results"]] == [
+        latest_id,
+        middle_id,
+    ]
+    assert response.json()["total"] == 2
+
+
+def test_query_events_project_wide_allows_project_without_default_app(
+    tmp_path,
+) -> None:
+    app = _create_test_app(tmp_path)
+    _seed_project(app, "repo-a", app_id="app-a")
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        assert project is not None
+        project.default_app_id = None
+        session.commit()
+    event_id = _seed_event(app, project_id="repo-a", app_id="app-b")
+
+    response = TestClient(app).post(
+        "/v1/events/query",
+        json={"project_id": "repo-a", "project_wide": True},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["results"]] == [event_id]
+
+
+def test_project_wide_event_detail_returns_non_default_app_event(tmp_path) -> None:
+    app = _create_test_app(tmp_path)
+    _seed_project(app, "repo-a", app_id="app-a")
+    event_id = _seed_event(app, project_id="repo-a", app_id="app-b")
+
+    response = TestClient(app).get(
+        f"/v1/event/{event_id}",
+        params={"project_id": "repo-a", "project_wide": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == event_id
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"project_wide": 1},
+        {"project_wide": True, "app_id": "app-a"},
+    ],
+)
+def test_query_events_rejects_invalid_project_wide_scope(tmp_path, payload) -> None:
+    app = _create_test_app(tmp_path)
+
+    response = TestClient(app).post("/v1/events/query", json=payload)
+
+    assert response.status_code == 422
+
+
 def test_query_events_treats_app_only_scope_as_app_within_default_project(
     tmp_path,
 ) -> None:

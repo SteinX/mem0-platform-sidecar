@@ -308,6 +308,13 @@ function pageBoundaryContracts(state) {
   );
 }
 
+function autoRefreshContracts(state) {
+  assert.equal(state.REQUEST_TRACE_REFRESH_INTERVAL_MS, 30_000);
+  assert.equal(state.shouldAutoRefreshRequestTraces("visible", false), true);
+  assert.equal(state.shouldAutoRefreshRequestTraces("visible", true), false);
+  assert.equal(state.shouldAutoRefreshRequestTraces("hidden", false), false);
+}
+
 function main() {
   if (process.argv.length !== 3) {
     throw new Error("usage: test-request-trace-state.cjs <dashboard-dir>");
@@ -320,7 +327,8 @@ function main() {
   generationContracts(state);
   pageBoundaryContracts(state);
   channelContracts(state);
-  console.log("request trace state harness: 6 contract groups passed");
+  autoRefreshContracts(state);
+  console.log("request trace state harness: 7 contract groups passed");
 }
 
 main();

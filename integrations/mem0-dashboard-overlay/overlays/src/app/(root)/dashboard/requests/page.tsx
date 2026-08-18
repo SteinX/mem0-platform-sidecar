@@ -53,6 +53,7 @@ import {
 } from "@/utils/explorer-query-state";
 import { sidecarQuery } from "@/utils/sidecar-api";
 import {
+  REQUEST_TRACE_REFRESH_INTERVAL_MS,
   closeTraceRequestUrl,
   isCurrentTraceListRequest,
   nextTraceRequestGeneration,
@@ -65,6 +66,7 @@ import {
   setRequestTraceChannel,
   setRequestTraceOperation,
   setTraceRequestIdInUrl,
+  shouldAutoRefreshRequestTraces,
   traceChannelValue,
   toggleRequestTraceHasResults,
   writeTraceControlUrl,
@@ -255,6 +257,35 @@ export default function RequestsPage() {
   const refresh = useCallback(() => {
     setRefreshVersion((value) => value + 1);
   }, []);
+
+  useEffect(() => {
+    if (!hydrated) {
+      return;
+    }
+    const pageDocument = globalThis["document"];
+    const refreshVisibleRequests = () => {
+      if (
+        shouldAutoRefreshRequestTraces(
+          pageDocument.visibilityState,
+          isLoading || isRefreshing,
+        )
+      ) {
+        setRefreshVersion((value) => value + 1);
+      }
+    };
+    const intervalId = setInterval(
+      refreshVisibleRequests,
+      REQUEST_TRACE_REFRESH_INTERVAL_MS,
+    );
+    pageDocument.addEventListener("visibilitychange", refreshVisibleRequests);
+    return () => {
+      clearInterval(intervalId);
+      pageDocument.removeEventListener(
+        "visibilitychange",
+        refreshVisibleRequests,
+      );
+    };
+  }, [hydrated, isLoading, isRefreshing]);
 
   const applyCriteria = useCallback(
     (_match: ExplorerMatch, filters: ExplorerFilter[]) => {

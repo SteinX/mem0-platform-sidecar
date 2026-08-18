@@ -15,7 +15,7 @@ from mem0_sidecar.request_attribution_codec import (
     parse_credential_kind,
     parse_transport,
 )
-from mem0_sidecar.store.models import EventStatus
+from mem0_sidecar.store.models import EventStatus, Project
 from mem0_sidecar.store.repositories import (
     EVENT_SCAN_LIMIT,
     EventChannelFilter,
@@ -35,6 +35,7 @@ _QUERY_KEYS = frozenset(
     {
         "project_id",
         "app_id",
+        "project_wide",
         "operation",
         "statuses",
         "has_results",
@@ -68,7 +69,7 @@ def _resolve_event_scope(
     request: Request,
     session: Session,
     payload: dict[str, Any] | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str | None]:
     explicit_project_id = _explicit_scope_value(
         request,
         payload,
@@ -81,6 +82,13 @@ def _resolve_event_scope(
     if project_id is None:
         raise ValueError("project_id is required")
     requested_app_id = _explicit_scope_value(request, payload, "app_id")
+    project_wide = _resolve_project_wide(request, payload)
+    if project_wide:
+        if requested_app_id is not None:
+            raise ValueError("app_id cannot be combined with project_wide")
+        if session.get(Project, project_id) is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return project_id, None
     app_id = resolve_project_app_id(
         session,
         project_id=project_id,
@@ -92,6 +100,29 @@ def _resolve_event_scope(
     if validated_app_id is None:
         raise ValueError("app_id is required")
     return project_id, validated_app_id
+
+
+def _resolve_project_wide(
+    request: Request,
+    payload: dict[str, Any] | None = None,
+) -> bool:
+    value: Any = None
+    if payload is not None and "project_wide" in payload:
+        value = payload["project_wide"]
+    elif "project_wide" in request.query_params:
+        value = request.query_params["project_wide"]
+
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError("project_wide must be a boolean")
 
 
 def _parse_event_query(payload: dict[str, Any]) -> EventQuery:

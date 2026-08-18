@@ -773,7 +773,7 @@ def _event_matches_candidate(event: object, candidate: _EventCandidate) -> bool:
 
 def _matches_event_scope(
     request_json: object,
-    app_id: str,
+    app_id: str | None,
     entity_filters: Mapping[str, str],
     canonical_app_id: str | None,
     canonical_user_id: str | None,
@@ -782,12 +782,14 @@ def _matches_event_scope(
 ) -> bool:
     effective_app_id = canonical_app_id
     request: dict[str, object] | None = None
-    if effective_app_id is None:
+    if effective_app_id is None and (
+        app_id is not None or "app_id" in entity_filters
+    ):
         request = _event_request(request_json)
         if request is None:
             return False
         effective_app_id = _request_app_id(request)
-    if effective_app_id != app_id:
+    if app_id is not None and effective_app_id != app_id:
         return False
 
     canonical_entities = {
@@ -1336,18 +1338,22 @@ class EventRepository:
     def get_project_event(
         self,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         event_id: str,
     ) -> Event:
-        app_id = validate_scope_id(app_id, field_name="app_id")
+        conditions: list[ColumnElement[bool]] = [
+            Event.project_id == project_id,
+            Event.id == event_id,
+        ]
+        if app_id is not None:
+            app_id = validate_scope_id(app_id, field_name="app_id")
+            conditions.append(or_(Event.app_id == app_id, Event.app_id.is_(None)))
         event = self.session.scalar(
-            select(Event).where(
-                Event.project_id == project_id,
-                Event.id == event_id,
-                or_(Event.app_id == app_id, Event.app_id.is_(None)),
-            )
+            select(Event).where(*conditions)
         )
-        if event is None or not _matches_event_scope(
+        if event is None:
+            raise KeyError(event_id)
+        if app_id is not None and not _matches_event_scope(
             event.request_json,
             app_id,
             {},
@@ -1419,14 +1425,13 @@ class EventRepository:
     def query_project_events(
         self,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         query: EventQuery,
     ) -> EventPage:
-        app_id = validate_scope_id(app_id, field_name="app_id")
-        conditions: list[ColumnElement[bool]] = [
-            Event.project_id == project_id,
-            or_(Event.app_id == app_id, Event.app_id.is_(None)),
-        ]
+        conditions: list[ColumnElement[bool]] = [Event.project_id == project_id]
+        if app_id is not None:
+            app_id = validate_scope_id(app_id, field_name="app_id")
+            conditions.append(or_(Event.app_id == app_id, Event.app_id.is_(None)))
         entity_columns = {
             "user_id": Event.user_id,
             "agent_id": Event.agent_id,
@@ -1438,6 +1443,10 @@ class EventRepository:
                 validated_entity_filters[field_name] = validate_scope_id(
                     expected, field_name=field_name
                 )
+                if app_id is None:
+                    conditions.append(
+                        or_(Event.app_id == expected, Event.app_id.is_(None))
+                    )
                 continue
             column = entity_columns.get(field_name)
             if column is None:
@@ -1456,25 +1465,24 @@ class EventRepository:
             conditions.append(Event.created_at >= _as_utc(query.from_at))
         if query.to_at is not None:
             conditions.append(Event.created_at <= _as_utc(query.to_at))
-        canonical_facet_conditions = [
-            *conditions,
-            Event.app_id == app_id,
-        ]
-        legacy_scope_conditions: list[ColumnElement[bool]] = [
-            Event.app_id.is_(None)
-        ]
-        for field_name, expected in validated_entity_filters.items():
+        legacy_scope_conditions: list[ColumnElement[bool]] = []
+        if app_id is not None:
+            legacy_scope_conditions.append(Event.app_id.is_(None))
+        elif "app_id" in validated_entity_filters:
+            legacy_scope_conditions.append(Event.app_id.is_(None))
+        for field_name in validated_entity_filters:
             if field_name == "app_id":
                 continue
             column = entity_columns.get(field_name)
             if column is None:
                 continue
-            canonical_facet_conditions.append(column == expected)
             legacy_scope_conditions.append(column.is_(None))
-        legacy_facet_conditions = [
-            *conditions,
-            or_(*legacy_scope_conditions),
-        ]
+        legacy_facet_conditions = (
+            [*conditions, or_(*legacy_scope_conditions)]
+            if legacy_scope_conditions
+            else None
+        )
+        facet_conditions = tuple(conditions)
         conditions.extend(_event_channel_sql_conditions(query.channel))
 
         for _attempt in range(_EVENT_QUERY_MAX_ATTEMPTS):
@@ -1484,7 +1492,7 @@ class EventRepository:
                 query=query,
                 entity_filters=validated_entity_filters,
                 conditions=conditions,
-                canonical_facet_conditions=canonical_facet_conditions,
+                facet_conditions=facet_conditions,
                 legacy_facet_conditions=legacy_facet_conditions,
             )
             if page is not None:
@@ -1495,12 +1503,12 @@ class EventRepository:
         self,
         *,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         query: EventQuery,
         entity_filters: Mapping[str, str],
         conditions: Sequence[ColumnElement[bool]],
-        canonical_facet_conditions: Sequence[ColumnElement[bool]],
-        legacy_facet_conditions: Sequence[ColumnElement[bool]],
+        facet_conditions: Sequence[ColumnElement[bool]],
+        legacy_facet_conditions: Sequence[ColumnElement[bool]] | None,
     ) -> EventPage | None:
         channel_columns = (
             Event.request_transport,
@@ -1509,57 +1517,106 @@ class EventRepository:
             Event.credential_label,
             Event.credential_prefix,
         )
-        legacy_facet_rows = list(
-            self.session.execute(
-                select(
-                    Event.id,
-                    Event.app_id,
-                    Event.user_id,
-                    Event.agent_id,
-                    Event.run_id,
-                    Event.request_json,
+        candidate_columns = (
+            Event.id,
+            Event.app_id,
+            Event.user_id,
+            Event.agent_id,
+            Event.run_id,
+            *channel_columns,
+            Event.request_json,
+            Event.created_at,
+            Event.operation,
+            Event.status,
+            Event.has_results,
+            Event.result_count,
+            Event.correlation_id,
+            Event.latency_ms,
+            Event.started_at,
+            Event.completed_at,
+            Event.subject_type,
+            Event.subject_id,
+        )
+        legacy_facet_rows = (
+            list(
+                self.session.execute(
+                    select(Event.id)
+                    .where(*legacy_facet_conditions)
+                    .limit(EVENT_SCAN_LIMIT + 1)
                 )
-                .where(*legacy_facet_conditions)
-                .limit(EVENT_SCAN_LIMIT + 1)
             )
+            if app_id is not None and legacy_facet_conditions is not None
+            else []
         )
         if len(legacy_facet_rows) > EVENT_SCAN_LIMIT:
             raise ValueError(
                 "legacy event scope facet scan exceeds 5000 records"
             )
-        matching_legacy_event_ids: list[str] = []
-        for (
-            event_id,
-            canonical_app_id,
-            canonical_user_id,
-            canonical_agent_id,
-            canonical_run_id,
-            request_json,
-        ) in legacy_facet_rows:
-            if not _matches_event_scope(
-                request_json,
-                app_id,
-                entity_filters,
-                canonical_app_id,
-                canonical_user_id,
-                canonical_agent_id,
-                canonical_run_id,
-            ):
-                continue
-            matching_legacy_event_ids.append(event_id)
-
-        canonical_facet_event_ids = list(
-            self.session.execute(
-                select(Event.id)
-                .where(*canonical_facet_conditions)
-                .order_by(Event.created_at.desc(), Event.id.desc())
-                .limit(EVENT_SCAN_LIMIT)
-            ).scalars()
-        )
-        facet_event_ids = [
-            *canonical_facet_event_ids,
-            *matching_legacy_event_ids,
-        ]
+        project_wide_scope_matches: list[_EventCandidate] | None = None
+        if app_id is None:
+            project_wide_candidates = [
+                _EventCandidate(*row)
+                for row in self.session.execute(
+                    select(*candidate_columns)
+                    .where(*facet_conditions)
+                    .order_by(Event.created_at.desc(), Event.id.desc())
+                    .limit(EVENT_SCAN_LIMIT)
+                )
+            ]
+            project_wide_scope_matches = [
+                candidate
+                for candidate in project_wide_candidates
+                if _matches_event_scope(
+                    candidate.request_json,
+                    app_id,
+                    entity_filters,
+                    candidate.app_id,
+                    candidate.user_id,
+                    candidate.agent_id,
+                    candidate.run_id,
+                )
+            ]
+            del project_wide_candidates
+            facet_event_ids = [
+                candidate.event_id for candidate in project_wide_scope_matches
+            ]
+        else:
+            facet_candidates = list(
+                self.session.execute(
+                    select(
+                        Event.id,
+                        Event.app_id,
+                        Event.user_id,
+                        Event.agent_id,
+                        Event.run_id,
+                        Event.request_json,
+                    )
+                    .where(*facet_conditions)
+                    .order_by(Event.created_at.desc(), Event.id.desc())
+                    .limit(EVENT_SCAN_LIMIT)
+                )
+            )
+            facet_event_ids = [
+                event_id
+                for (
+                    event_id,
+                    canonical_app_id,
+                    canonical_user_id,
+                    canonical_agent_id,
+                    canonical_run_id,
+                    request_json,
+                ) in facet_candidates
+                if _matches_event_scope(
+                    request_json,
+                    app_id,
+                    entity_filters,
+                    canonical_app_id,
+                    canonical_user_id,
+                    canonical_agent_id,
+                    canonical_run_id,
+                )
+            ]
+            del facet_candidates
         grouped_channels: dict[RequestAttribution, int] = {}
         if facet_event_ids:
             canonical_channel_rows = self.session.execute(
@@ -1589,53 +1646,33 @@ class EventRepository:
                 )
                 grouped_channels[attribution] = count
         channels = _event_channel_facet_payload(grouped_channels)
-        rows = list(
-            self.session.execute(
-                select(
-                    Event.id,
-                    Event.app_id,
-                    Event.user_id,
-                    Event.agent_id,
-                    Event.run_id,
-                    Event.request_transport,
-                    Event.credential_kind,
-                    Event.credential_id,
-                    Event.credential_label,
-                    Event.credential_prefix,
-                    Event.request_json,
-                    Event.created_at,
-                    Event.operation,
-                    Event.status,
-                    Event.has_results,
-                    Event.result_count,
-                    Event.correlation_id,
-                    Event.latency_ms,
-                    Event.started_at,
-                    Event.completed_at,
-                    Event.subject_type,
-                    Event.subject_id,
+        if project_wide_scope_matches is None:
+            rows = list(
+                self.session.execute(
+                    select(*candidate_columns)
+                    .where(*conditions)
+                    .order_by(Event.created_at.desc(), Event.id.desc())
+                    .limit(EVENT_SCAN_LIMIT + 1)
                 )
-                .where(*conditions)
-                .order_by(Event.created_at.desc(), Event.id.desc())
-                .limit(EVENT_SCAN_LIMIT + 1)
             )
-        )
-        if len(rows) > EVENT_SCAN_LIMIT:
-            raise ValueError("entity filter scan exceeds 5000 records")
-        candidates = [_EventCandidate(*row) for row in rows]
-        scope_matches = [
-            candidate
-            for candidate in candidates
-            if _matches_event_scope(
-                candidate.request_json,
-                app_id,
-                entity_filters,
-                candidate.app_id,
-                candidate.user_id,
-                candidate.agent_id,
-                candidate.run_id,
-            )
-        ]
+            if len(rows) > EVENT_SCAN_LIMIT:
+                raise ValueError("entity filter scan exceeds 5000 records")
+            candidates = [_EventCandidate(*row) for row in rows]
+            scope_matches = [
+                candidate
+                for candidate in candidates
+                if _matches_event_scope(
+                    candidate.request_json,
+                    app_id,
+                    entity_filters,
+                    candidate.app_id,
+                    candidate.user_id,
+                    candidate.agent_id,
+                    candidate.run_id,
+                )
+            ]
+        else:
+            scope_matches = project_wide_scope_matches
         matches = [
             candidate
             for candidate in scope_matches
