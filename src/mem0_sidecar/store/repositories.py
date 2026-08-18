@@ -1517,6 +1517,26 @@ class EventRepository:
             Event.credential_label,
             Event.credential_prefix,
         )
+        candidate_columns = (
+            Event.id,
+            Event.app_id,
+            Event.user_id,
+            Event.agent_id,
+            Event.run_id,
+            *channel_columns,
+            Event.request_json,
+            Event.created_at,
+            Event.operation,
+            Event.status,
+            Event.has_results,
+            Event.result_count,
+            Event.correlation_id,
+            Event.latency_ms,
+            Event.started_at,
+            Event.completed_at,
+            Event.subject_type,
+            Event.subject_id,
+        )
         legacy_facet_rows = (
             list(
                 self.session.execute(
@@ -1532,41 +1552,71 @@ class EventRepository:
             raise ValueError(
                 "legacy event scope facet scan exceeds 5000 records"
             )
-        facet_candidates = list(
-            self.session.execute(
-                select(
-                    Event.id,
-                    Event.app_id,
-                    Event.user_id,
-                    Event.agent_id,
-                    Event.run_id,
-                    Event.request_json,
+        project_wide_scope_matches: list[_EventCandidate] | None = None
+        if app_id is None:
+            project_wide_candidates = [
+                _EventCandidate(*row)
+                for row in self.session.execute(
+                    select(*candidate_columns)
+                    .where(*facet_conditions)
+                    .order_by(Event.created_at.desc(), Event.id.desc())
+                    .limit(EVENT_SCAN_LIMIT)
                 )
-                .where(*facet_conditions)
-                .order_by(Event.created_at.desc(), Event.id.desc())
-                .limit(EVENT_SCAN_LIMIT)
+            ]
+            project_wide_scope_matches = [
+                candidate
+                for candidate in project_wide_candidates
+                if _matches_event_scope(
+                    candidate.request_json,
+                    app_id,
+                    entity_filters,
+                    candidate.app_id,
+                    candidate.user_id,
+                    candidate.agent_id,
+                    candidate.run_id,
+                )
+            ]
+            del project_wide_candidates
+            facet_event_ids = [
+                candidate.event_id for candidate in project_wide_scope_matches
+            ]
+        else:
+            facet_candidates = list(
+                self.session.execute(
+                    select(
+                        Event.id,
+                        Event.app_id,
+                        Event.user_id,
+                        Event.agent_id,
+                        Event.run_id,
+                        Event.request_json,
+                    )
+                    .where(*facet_conditions)
+                    .order_by(Event.created_at.desc(), Event.id.desc())
+                    .limit(EVENT_SCAN_LIMIT)
+                )
             )
-        )
-        facet_event_ids = [
-            event_id
-            for (
-                event_id,
-                canonical_app_id,
-                canonical_user_id,
-                canonical_agent_id,
-                canonical_run_id,
-                request_json,
-            ) in facet_candidates
-            if _matches_event_scope(
-                request_json,
-                app_id,
-                entity_filters,
-                canonical_app_id,
-                canonical_user_id,
-                canonical_agent_id,
-                canonical_run_id,
-            )
-        ]
+            facet_event_ids = [
+                event_id
+                for (
+                    event_id,
+                    canonical_app_id,
+                    canonical_user_id,
+                    canonical_agent_id,
+                    canonical_run_id,
+                    request_json,
+                ) in facet_candidates
+                if _matches_event_scope(
+                    request_json,
+                    app_id,
+                    entity_filters,
+                    canonical_app_id,
+                    canonical_user_id,
+                    canonical_agent_id,
+                    canonical_run_id,
+                )
+            ]
+            del facet_candidates
         grouped_channels: dict[RequestAttribution, int] = {}
         if facet_event_ids:
             canonical_channel_rows = self.session.execute(
@@ -1596,53 +1646,33 @@ class EventRepository:
                 )
                 grouped_channels[attribution] = count
         channels = _event_channel_facet_payload(grouped_channels)
-        rows = list(
-            self.session.execute(
-                select(
-                    Event.id,
-                    Event.app_id,
-                    Event.user_id,
-                    Event.agent_id,
-                    Event.run_id,
-                    Event.request_transport,
-                    Event.credential_kind,
-                    Event.credential_id,
-                    Event.credential_label,
-                    Event.credential_prefix,
-                    Event.request_json,
-                    Event.created_at,
-                    Event.operation,
-                    Event.status,
-                    Event.has_results,
-                    Event.result_count,
-                    Event.correlation_id,
-                    Event.latency_ms,
-                    Event.started_at,
-                    Event.completed_at,
-                    Event.subject_type,
-                    Event.subject_id,
+        if project_wide_scope_matches is None:
+            rows = list(
+                self.session.execute(
+                    select(*candidate_columns)
+                    .where(*conditions)
+                    .order_by(Event.created_at.desc(), Event.id.desc())
+                    .limit(EVENT_SCAN_LIMIT + 1)
                 )
-                .where(*conditions)
-                .order_by(Event.created_at.desc(), Event.id.desc())
-                .limit(EVENT_SCAN_LIMIT + (1 if app_id is not None else 0))
             )
-        )
-        if app_id is not None and len(rows) > EVENT_SCAN_LIMIT:
-            raise ValueError("entity filter scan exceeds 5000 records")
-        candidates = [_EventCandidate(*row) for row in rows]
-        scope_matches = [
-            candidate
-            for candidate in candidates
-            if _matches_event_scope(
-                candidate.request_json,
-                app_id,
-                entity_filters,
-                candidate.app_id,
-                candidate.user_id,
-                candidate.agent_id,
-                candidate.run_id,
-            )
-        ]
+            if len(rows) > EVENT_SCAN_LIMIT:
+                raise ValueError("entity filter scan exceeds 5000 records")
+            candidates = [_EventCandidate(*row) for row in rows]
+            scope_matches = [
+                candidate
+                for candidate in candidates
+                if _matches_event_scope(
+                    candidate.request_json,
+                    app_id,
+                    entity_filters,
+                    candidate.app_id,
+                    candidate.user_id,
+                    candidate.agent_id,
+                    candidate.run_id,
+                )
+            ]
+        else:
+            scope_matches = project_wide_scope_matches
         matches = [
             candidate
             for candidate in scope_matches

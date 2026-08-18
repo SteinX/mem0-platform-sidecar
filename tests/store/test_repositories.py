@@ -296,6 +296,71 @@ def test_project_wide_channel_facets_share_combined_scope_horizon(
     assert sum(channel["count"] for channel in page.channels) == page.total
 
 
+def test_project_wide_channel_filter_stays_within_facet_horizon(
+    db_session,
+    monkeypatch,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a",
+        name="Repo A",
+        mem0_base_url="http://mem0:8000",
+    )
+    created_at = datetime(2026, 8, 18, tzinfo=UTC)
+    db_session.add_all(
+        [
+            Event(
+                id=f"project-wide-channel-{index}",
+                project_id="repo-a",
+                app_id="app-a",
+                operation="memory.search",
+                status=EventStatus.SUCCEEDED,
+                request_json='{"app_id":"app-a"}',
+                request_transport="mcp",
+                credential_kind=(
+                    "core_api_key" if index < 2 else "legacy_static"
+                ),
+                credential_id=(
+                    "e0544e3c-d217-40d9-bc9a-c1f64077542a"
+                    if index < 2
+                    else None
+                ),
+                credential_label=(
+                    "codex-devbox"
+                    if index < 2
+                    else "Legacy shared MCP key"
+                ),
+                credential_prefix="m0sk_client_" if index < 2 else None,
+                created_at=created_at + timedelta(seconds=index),
+            )
+            for index in range(6)
+        ]
+    )
+    db_session.flush()
+    monkeypatch.setattr(repositories, "EVENT_SCAN_LIMIT", 4)
+
+    page = EventRepository(db_session).query_project_events(
+        "repo-a",
+        None,
+        repositories.EventQuery(
+            channel=EventChannelFilter(
+                transport="mcp",
+                credential_kind="core_api_key",
+                credential_id="e0544e3c-d217-40d9-bc9a-c1f64077542a",
+            ),
+            page=1,
+            page_size=20,
+        ),
+    )
+
+    assert page.items == []
+    assert page.total == 0
+    assert sum(channel["count"] for channel in page.channels) == 4
+    assert all(
+        channel["credential_kind"] != "core_api_key"
+        for channel in page.channels
+    )
+
+
 def test_category_model_enforces_unique_name_per_project(db_session):
     constraints = {
         constraint.name: tuple(column.name for column in constraint.columns)
