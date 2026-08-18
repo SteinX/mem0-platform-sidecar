@@ -773,7 +773,7 @@ def _event_matches_candidate(event: object, candidate: _EventCandidate) -> bool:
 
 def _matches_event_scope(
     request_json: object,
-    app_id: str,
+    app_id: str | None,
     entity_filters: Mapping[str, str],
     canonical_app_id: str | None,
     canonical_user_id: str | None,
@@ -782,12 +782,14 @@ def _matches_event_scope(
 ) -> bool:
     effective_app_id = canonical_app_id
     request: dict[str, object] | None = None
-    if effective_app_id is None:
+    if effective_app_id is None and (
+        app_id is not None or "app_id" in entity_filters
+    ):
         request = _event_request(request_json)
         if request is None:
             return False
         effective_app_id = _request_app_id(request)
-    if effective_app_id != app_id:
+    if app_id is not None and effective_app_id != app_id:
         return False
 
     canonical_entities = {
@@ -1336,18 +1338,22 @@ class EventRepository:
     def get_project_event(
         self,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         event_id: str,
     ) -> Event:
-        app_id = validate_scope_id(app_id, field_name="app_id")
+        conditions: list[ColumnElement[bool]] = [
+            Event.project_id == project_id,
+            Event.id == event_id,
+        ]
+        if app_id is not None:
+            app_id = validate_scope_id(app_id, field_name="app_id")
+            conditions.append(or_(Event.app_id == app_id, Event.app_id.is_(None)))
         event = self.session.scalar(
-            select(Event).where(
-                Event.project_id == project_id,
-                Event.id == event_id,
-                or_(Event.app_id == app_id, Event.app_id.is_(None)),
-            )
+            select(Event).where(*conditions)
         )
-        if event is None or not _matches_event_scope(
+        if event is None:
+            raise KeyError(event_id)
+        if app_id is not None and not _matches_event_scope(
             event.request_json,
             app_id,
             {},
@@ -1419,14 +1425,13 @@ class EventRepository:
     def query_project_events(
         self,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         query: EventQuery,
     ) -> EventPage:
-        app_id = validate_scope_id(app_id, field_name="app_id")
-        conditions: list[ColumnElement[bool]] = [
-            Event.project_id == project_id,
-            or_(Event.app_id == app_id, Event.app_id.is_(None)),
-        ]
+        conditions: list[ColumnElement[bool]] = [Event.project_id == project_id]
+        if app_id is not None:
+            app_id = validate_scope_id(app_id, field_name="app_id")
+            conditions.append(or_(Event.app_id == app_id, Event.app_id.is_(None)))
         entity_columns = {
             "user_id": Event.user_id,
             "agent_id": Event.agent_id,
@@ -1438,6 +1443,10 @@ class EventRepository:
                 validated_entity_filters[field_name] = validate_scope_id(
                     expected, field_name=field_name
                 )
+                if app_id is None:
+                    conditions.append(
+                        or_(Event.app_id == expected, Event.app_id.is_(None))
+                    )
                 continue
             column = entity_columns.get(field_name)
             if column is None:
@@ -1456,13 +1465,16 @@ class EventRepository:
             conditions.append(Event.created_at >= _as_utc(query.from_at))
         if query.to_at is not None:
             conditions.append(Event.created_at <= _as_utc(query.to_at))
-        canonical_facet_conditions = [
-            *conditions,
-            Event.app_id == app_id,
-        ]
-        legacy_scope_conditions: list[ColumnElement[bool]] = [
-            Event.app_id.is_(None)
-        ]
+        canonical_facet_conditions = [*conditions]
+        legacy_scope_conditions: list[ColumnElement[bool]] = []
+        if app_id is not None:
+            canonical_facet_conditions.append(Event.app_id == app_id)
+            legacy_scope_conditions.append(Event.app_id.is_(None))
+        elif "app_id" in validated_entity_filters:
+            canonical_facet_conditions.append(
+                Event.app_id == validated_entity_filters["app_id"]
+            )
+            legacy_scope_conditions.append(Event.app_id.is_(None))
         for field_name, expected in validated_entity_filters.items():
             if field_name == "app_id":
                 continue
@@ -1471,10 +1483,11 @@ class EventRepository:
                 continue
             canonical_facet_conditions.append(column == expected)
             legacy_scope_conditions.append(column.is_(None))
-        legacy_facet_conditions = [
-            *conditions,
-            or_(*legacy_scope_conditions),
-        ]
+        legacy_facet_conditions = (
+            [*conditions, or_(*legacy_scope_conditions)]
+            if legacy_scope_conditions
+            else None
+        )
         conditions.extend(_event_channel_sql_conditions(query.channel))
 
         for _attempt in range(_EVENT_QUERY_MAX_ATTEMPTS):
@@ -1500,7 +1513,7 @@ class EventRepository:
         entity_filters: Mapping[str, str],
         conditions: Sequence[ColumnElement[bool]],
         canonical_facet_conditions: Sequence[ColumnElement[bool]],
-        legacy_facet_conditions: Sequence[ColumnElement[bool]],
+        legacy_facet_conditions: Sequence[ColumnElement[bool]] | None,
     ) -> EventPage | None:
         channel_columns = (
             Event.request_transport,
@@ -1509,19 +1522,23 @@ class EventRepository:
             Event.credential_label,
             Event.credential_prefix,
         )
-        legacy_facet_rows = list(
-            self.session.execute(
-                select(
-                    Event.id,
-                    Event.app_id,
-                    Event.user_id,
-                    Event.agent_id,
-                    Event.run_id,
-                    Event.request_json,
+        legacy_facet_rows = (
+            list(
+                self.session.execute(
+                    select(
+                        Event.id,
+                        Event.app_id,
+                        Event.user_id,
+                        Event.agent_id,
+                        Event.run_id,
+                        Event.request_json,
+                    )
+                    .where(*legacy_facet_conditions)
+                    .limit(EVENT_SCAN_LIMIT + 1)
                 )
-                .where(*legacy_facet_conditions)
-                .limit(EVENT_SCAN_LIMIT + 1)
             )
+            if legacy_facet_conditions is not None
+            else []
         )
         if len(legacy_facet_rows) > EVENT_SCAN_LIMIT:
             raise ValueError(
@@ -1617,10 +1634,10 @@ class EventRepository:
                 )
                 .where(*conditions)
                 .order_by(Event.created_at.desc(), Event.id.desc())
-                .limit(EVENT_SCAN_LIMIT + 1)
+                .limit(EVENT_SCAN_LIMIT + (1 if app_id is not None else 0))
             )
         )
-        if len(rows) > EVENT_SCAN_LIMIT:
+        if app_id is not None and len(rows) > EVENT_SCAN_LIMIT:
             raise ValueError("entity filter scan exceeds 5000 records")
         candidates = [_EventCandidate(*row) for row in rows]
         scope_matches = [

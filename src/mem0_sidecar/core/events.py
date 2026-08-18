@@ -270,7 +270,7 @@ class EventService:
     def get_project_event(
         self,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         event_id: str,
     ) -> dict[str, Any]:
         return _event_to_dict(

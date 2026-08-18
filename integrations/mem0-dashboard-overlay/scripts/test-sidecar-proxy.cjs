@@ -298,6 +298,48 @@ async function testEventDetailEncodesIdAndForcesRuntimeScope(proxy) {
   assert.equal(calls[0].init.body, undefined);
 }
 
+async function testEventProjectWideSentinelNeverBecomesLiteralAppScope(proxy) {
+  const calls = [];
+  const options = traceProxyOptions(
+    async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return Response.json({ results: [] });
+    },
+    { configuredAppId: "*" },
+  );
+
+  const query = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/events/query", {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ app_id: "forged", project_wide: false }),
+    }),
+    "/v1/events/query",
+    options,
+  );
+  const detail = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/event/event-one?app_id=forged",
+      { method: "GET" },
+    ),
+    "/v1/event/event-one",
+    options,
+  );
+
+  assert.equal(query.status, 200);
+  assert.equal(detail.status, 200);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    project_id: "runtime-project",
+    project_wide: true,
+  });
+  assert.equal(
+    calls[1].url,
+    "http://sidecar.internal/v1/event/event-one?project_id=runtime-project&project_wide=true",
+  );
+  assert.equal(calls.some((call) => call.url.includes("app_id=%2A")), false);
+}
+
 async function testEventRoutesRejectMutationsAndNearMatches(proxy) {
   const rejected = [
     ["GET", "/v1/events/query"],
@@ -1525,6 +1567,9 @@ async function main() {
   await testUnauthenticatedEntityRequestsAreRejected(proxySidecarRequest);
   await testEventQueryForcesRuntimeScope(proxySidecarRequest);
   await testEventDetailEncodesIdAndForcesRuntimeScope(proxySidecarRequest);
+  await testEventProjectWideSentinelNeverBecomesLiteralAppScope(
+    proxySidecarRequest,
+  );
   await testEventRoutesRejectMutationsAndNearMatches(proxySidecarRequest);
   await testEventDetailRejectsUnsafeEncodedIds(proxySidecarRequest);
   await testEventRoutesFailClosedWithoutPortableRuntimeScope(
@@ -1585,7 +1630,7 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 45 contracts passed");
+  console.log("sidecar proxy request harness: 46 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(

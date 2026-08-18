@@ -425,6 +425,7 @@ export async function proxySidecarRequest(
   const isMemoryRequest = isMemoryPath(request.method, requestPath);
   const projectWideMemoryScope = isMemoryRequest && configuredAppId === "*";
   const isEntityRequest = isEntityPath(request.method, requestPath);
+  const projectWideEventScope = isEventRequest && configuredAppId === "*";
   const url = new URL(`${baseUrl}${scopedPath}`);
   if (!isMemoryRequest && !isEntityRequest && !isEventRequest) {
     new URL(request.url).searchParams.forEach((value, key) => {
@@ -452,7 +453,9 @@ export async function proxySidecarRequest(
   }
   if (isEventItemPath(request.method, requestPath)) {
     url.searchParams.set("project_id", configuredProjectId);
-    if (scopedAppId !== undefined) {
+    if (projectWideEventScope) {
+      url.searchParams.set("project_wide", "true");
+    } else if (scopedAppId !== undefined) {
       url.searchParams.set("app_id", scopedAppId);
     }
   }
@@ -492,7 +495,7 @@ export async function proxySidecarRequest(
               bodyText,
               configuredProjectId,
               scopedAppId,
-              projectWideMemoryScope,
+              projectWideMemoryScope || projectWideEventScope,
             );
       if (rewrittenBody instanceof Response) {
         return rewrittenBody;
