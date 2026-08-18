@@ -15,7 +15,7 @@ from mem0_sidecar.request_attribution_codec import (
     parse_credential_kind,
     parse_transport,
 )
-from mem0_sidecar.store.models import EventStatus
+from mem0_sidecar.store.models import EventStatus, Project
 from mem0_sidecar.store.repositories import (
     EVENT_SCAN_LIMIT,
     EventChannelFilter,
@@ -86,11 +86,7 @@ def _resolve_event_scope(
     if project_wide:
         if requested_app_id is not None:
             raise ValueError("app_id cannot be combined with project_wide")
-        if resolve_project_app_id(
-            session,
-            project_id=project_id,
-            request_app_id=None,
-        ) is None:
+        if session.get(Project, project_id) is None:
             raise HTTPException(status_code=404, detail="Project not found")
         return project_id, None
     app_id = resolve_project_app_id(

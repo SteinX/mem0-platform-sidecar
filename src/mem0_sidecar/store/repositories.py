@@ -1508,7 +1508,7 @@ class EventRepository:
         self,
         *,
         project_id: str,
-        app_id: str,
+        app_id: str | None,
         query: EventQuery,
         entity_filters: Mapping[str, str],
         conditions: Sequence[ColumnElement[bool]],

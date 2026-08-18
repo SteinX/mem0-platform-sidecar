@@ -310,8 +310,9 @@ function pageBoundaryContracts(state) {
 
 function autoRefreshContracts(state) {
   assert.equal(state.REQUEST_TRACE_REFRESH_INTERVAL_MS, 30_000);
-  assert.equal(state.shouldAutoRefreshRequestTraces("visible"), true);
-  assert.equal(state.shouldAutoRefreshRequestTraces("hidden"), false);
+  assert.equal(state.shouldAutoRefreshRequestTraces("visible", false), true);
+  assert.equal(state.shouldAutoRefreshRequestTraces("visible", true), false);
+  assert.equal(state.shouldAutoRefreshRequestTraces("hidden", false), false);
 }
 
 function main() {

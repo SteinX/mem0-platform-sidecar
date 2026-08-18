@@ -241,8 +241,9 @@ export function isCurrentTraceListRequest(
 
 export function shouldAutoRefreshRequestTraces(
   visibilityState: DocumentVisibilityState,
+  requestInFlight: boolean,
 ): boolean {
-  return visibilityState === "visible";
+  return visibilityState === "visible" && !requestInFlight;
 }
 
 export function beginTraceDetailRequest(

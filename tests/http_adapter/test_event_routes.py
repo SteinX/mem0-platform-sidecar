@@ -487,6 +487,27 @@ def test_query_events_project_wide_returns_latest_horizon_across_apps(
     assert response.json()["total"] == 2
 
 
+def test_query_events_project_wide_allows_project_without_default_app(
+    tmp_path,
+) -> None:
+    app = _create_test_app(tmp_path)
+    _seed_project(app, "repo-a", app_id="app-a")
+    with app.state.session_factory() as session:
+        project = session.get(Project, "repo-a")
+        assert project is not None
+        project.default_app_id = None
+        session.commit()
+    event_id = _seed_event(app, project_id="repo-a", app_id="app-b")
+
+    response = TestClient(app).post(
+        "/v1/events/query",
+        json={"project_id": "repo-a", "project_wide": True},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["results"]] == [event_id]
+
+
 def test_project_wide_event_detail_returns_non_default_app_event(tmp_path) -> None:
     app = _create_test_app(tmp_path)
     _seed_project(app, "repo-a", app_id="app-a")

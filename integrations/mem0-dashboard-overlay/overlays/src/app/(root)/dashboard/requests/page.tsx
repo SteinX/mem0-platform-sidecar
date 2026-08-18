@@ -264,7 +264,12 @@ export default function RequestsPage() {
     }
     const pageDocument = globalThis["document"];
     const refreshVisibleRequests = () => {
-      if (shouldAutoRefreshRequestTraces(pageDocument.visibilityState)) {
+      if (
+        shouldAutoRefreshRequestTraces(
+          pageDocument.visibilityState,
+          isLoading || isRefreshing,
+        )
+      ) {
         setRefreshVersion((value) => value + 1);
       }
     };
@@ -280,7 +285,7 @@ export default function RequestsPage() {
         refreshVisibleRequests,
       );
     };
-  }, [hydrated]);
+  }, [hydrated, isLoading, isRefreshing]);
 
   const applyCriteria = useCallback(
     (_match: ExplorerMatch, filters: ExplorerFilter[]) => {
