@@ -453,7 +453,7 @@ export default function RequestsPage() {
     normalizeTracePage(query.page + 1, query.page_size) > query.page;
 
   return (
-    <div className="min-w-0 space-y-5">
+    <div className="w-full min-w-0 max-w-full [contain:inline-size] space-y-5">
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 space-y-1">
           <h1
