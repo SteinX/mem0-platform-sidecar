@@ -1411,11 +1411,24 @@ class MemoryService:
         marker = payload.get("mutation_id")
         if not isinstance(marker, str) or not marker:
             raise RuntimeError("Add recovery marker is unavailable")
+        upstream_payload = payload.get("upstream_payload")
+        observation_params: dict[str, Any] = {
+            "top_k": _RECONCILE_SCAN_LIMIT,
+            "show_expired": True,
+            SIDECAR_MUTATION_ID_METADATA_KEY: marker,
+        }
+        if isinstance(upstream_payload, dict):
+            observation_params.update(
+                {
+                    key: value
+                    for key in ("user_id", "agent_id", "run_id")
+                    if isinstance((value := upstream_payload.get(key)), str)
+                    and value
+                }
+            )
 
         async def marked_records() -> list[dict[str, Any]]:
-            response = await self.mem0.list_memories(
-                {"top_k": _RECONCILE_SCAN_LIMIT, "show_expired": True}
-            )
+            response = await self.mem0.list_memories(observation_params)
             records: list[dict[str, Any]] = []
             for item in _bounded_list_results(
                 response,

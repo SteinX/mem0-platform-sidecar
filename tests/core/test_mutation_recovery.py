@@ -34,6 +34,7 @@ class _StatefulRecoveryClient:
         self.get_ids: list[str] = []
         self.update_ids: list[str] = []
         self.list_calls = 0
+        self.list_params: list[dict[str, Any]] = []
 
     def _cancel_once(self, operation: str) -> None:
         if self.cancel_operation == operation and not self.cancelled:
@@ -95,6 +96,7 @@ class _StatefulRecoveryClient:
 
     async def list_memories(self, params: dict[str, Any]) -> dict[str, Any]:
         self.list_calls += 1
+        self.list_params.append(dict(params))
         return {"results": list(self.records.values()), "total": len(self.records)}
 
 
@@ -1200,6 +1202,52 @@ async def test_add_recovery_rejects_results_beyond_observation_limit(
 
 
 @pytest.mark.asyncio
+async def test_add_recovery_queries_exact_marker_instead_of_global_window(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient(cancel_operation="add")
+
+    with pytest.raises(asyncio.CancelledError):
+        with factory() as session:
+            await MemoryService(session=session, mem0=client).add_memory(
+                project_id=PROJECT_ID,
+                payload={
+                    "text": "hello",
+                    "user_id": "recovery-user",
+                    "app_id": APP_ID,
+                },
+            )
+    applied = dict(client.records["added-1"])
+
+    async def exact_only_observation(params: dict[str, Any]) -> dict[str, Any]:
+        client.list_calls += 1
+        client.list_params.append(dict(params))
+        if params.get(MUTATION_MARKER) == applied["metadata"][MUTATION_MARKER]:
+            return {"results": [applied], "total": 1}
+        return {
+            "results": [
+                {"id": f"unrelated-{index}", "metadata": {}}
+                for index in range(5000)
+            ],
+            "total": 5000,
+        }
+
+    client.list_memories = exact_only_observation
+
+    assert await _recover(factory, client) == {"recovered": 1, "failed": 0}
+    assert client.list_params == [
+        {
+            "top_k": 5000,
+            "show_expired": True,
+            "user_id": "recovery-user",
+            MUTATION_MARKER: applied["metadata"][MUTATION_MARKER],
+        }
+    ]
+    assert _intent_state(factory)["status"] == "COMPLETED"
+
+
+@pytest.mark.asyncio
 async def test_recovery_exhaustion_persists_and_continues_blocking_scope(
     tmp_path,
 ) -> None:
@@ -1230,8 +1278,58 @@ async def test_recovery_exhaustion_persists_and_continues_blocking_scope(
                 project_id=PROJECT_ID,
                 payload={"text": "blocked", "app_id": APP_ID},
             )
-    assert client.list_calls == observed_calls
+    assert client.list_calls == observed_calls + 1
     assert client.add_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_exhausted_add_recovers_when_exact_marker_appears_late(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient(cancel_operation="add")
+    marker_visible = False
+
+    async def delayed_observation(params: dict[str, Any]) -> dict[str, Any]:
+        client.list_calls += 1
+        client.list_params.append(dict(params))
+        if marker_visible:
+            return {"results": list(client.records.values()), "total": 1}
+        return {"results": [], "total": 0}
+
+    client.list_memories = delayed_observation
+    with pytest.raises(asyncio.CancelledError):
+        with factory() as session:
+            await MemoryService(session=session, mem0=client).add_memory(
+                project_id=PROJECT_ID,
+                payload={
+                    "text": "late result",
+                    "user_id": "recovery-user",
+                    "app_id": APP_ID,
+                },
+            )
+
+    with pytest.raises(MutationConflictError, match="unresolved"):
+        await _recover(factory, client)
+    with pytest.raises(MutationConflictError, match="exhausted"):
+        await _recover(factory, client)
+    assert _intent_state(factory)["status"] == "EXHAUSTED"
+
+    marker_visible = True
+    with factory() as session:
+        result = await MemoryService(session=session, mem0=client).add_memory(
+            project_id=PROJECT_ID,
+            payload={
+                "text": "unblocked",
+                "user_id": "recovery-user",
+                "app_id": APP_ID,
+            },
+        )
+
+    assert result["memory"]["id"] == "added-2"
+    with factory() as session:
+        intents = list(session.scalars(select(MutationIntent)))
+    assert [intent.status for intent in intents] == ["COMPLETED", "COMPLETED"]
 
 
 @pytest.mark.asyncio

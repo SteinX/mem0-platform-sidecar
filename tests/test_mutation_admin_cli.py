@@ -805,6 +805,7 @@ def test_sqlite_resolution_releases_project_lock_during_marker_observation(
     entered = threading.Event()
     release = threading.Event()
     client = _BlockingObservationClient(entered, release)
+    recovery_client = _AdminTestClient()
     resolution_result: list[tuple[int, object, str]] = []
     recovery_result: list[object] = []
     failures: list[BaseException] = []
@@ -824,7 +825,7 @@ def test_sqlite_resolution_releases_project_lock_during_marker_observation(
                     asyncio.run(
                         MemoryService(
                             session=session,
-                            mem0=client,
+                            mem0=recovery_client,
                         ).recover_pending_mutations(
                             project_id=PROJECT_ID,
                             app_id=APP_ID,
