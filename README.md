@@ -280,7 +280,7 @@ images with the requested `image_tag` and a short commit SHA tag; set
 
 The dashboard image is built from `mem0ai/mem0` at `mem0_ref` after applying
 and verifying the dashboard overlay in this repository. The default manual
-`mem0_ref` is the reviewed stable baseline `v2.0.12`.
+`mem0_ref` is the reviewed stable baseline `v2.0.19`.
 
 ## Add To An Existing Mem0 OSS Compose Stack
 

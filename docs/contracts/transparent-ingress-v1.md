@@ -88,15 +88,15 @@ Query parameters:
 - `top_k`: integer from 0 through the configured Core list limit;
 - `show_expired`: boolean, default false.
 
-Pinned Core `v2.0.12-steinx.1` returns a top-level array for a scoped list, so
+Pinned Core `v2.0.19-steinx.1` returns an object for a scoped list, so
 success is `200` with:
 
 ```json
-[{"id": "memory-id", "memory": "Prefers tea"}]
+{"results": [{"id": "memory-id", "memory": "Prefers tea"}]}
 ```
 
-If a future Core response is an object, the sidecar preserves that object and
-its stable keys instead of synthesizing a different envelope.
+The sidecar preserves the upstream object and its stable keys instead of
+synthesizing a different envelope. Legacy array responses remain arrays.
 
 When no entity identifier is supplied, a non-admin principal receives `403`.
 
