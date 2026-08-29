@@ -165,28 +165,20 @@ def _upstream_absence_error(
 ) -> str | None:
     try:
         response = httpx.get(
-            f"{settings.mem0_base_url.rstrip('/')}/memories",
+            f"{settings.mem0_base_url.rstrip('/')}/memories/{memory_id}",
             headers=_upstream_headers(settings),
-            params={"top_k": 1000, "show_expired": "true"},
             timeout=30,
         )
     except Exception as exc:
         return f"Upstream cleanup verification raised {type(exc).__name__}: {exc}"
+    if response.status_code == 404:
+        return None
     if response.status_code != 200:
         return (
             f"Upstream cleanup verification returned HTTP "
             f"{response.status_code}: {response.text}"
         )
-    try:
-        memory_ids = _extract_memory_ids(response.json())
-    except Exception as exc:
-        return (
-            "Upstream cleanup verification could not decode the list response: "
-            f"{type(exc).__name__}: {exc}"
-        )
-    if memory_id in memory_ids:
-        return f"Upstream cleanup verification still found {memory_id}"
-    return None
+    return f"Upstream cleanup verification still found {memory_id}"
 
 
 def _projection_absence_error(
