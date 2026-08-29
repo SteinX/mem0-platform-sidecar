@@ -15,6 +15,7 @@ from mem0_sidecar.store.repositories import (
     EntityRepository,
     EventRepository,
     MemoryIndexRepository,
+    MutationIntentFenceError,
     MutationIntentRepository,
     ProjectRepository,
 )
@@ -1238,7 +1239,7 @@ async def test_add_recovery_queries_exact_marker_instead_of_global_window(
     assert await _recover(factory, client) == {"recovered": 1, "failed": 0}
     assert client.list_params == [
         {
-            "top_k": 5000,
+            "top_k": 1000,
             "show_expired": True,
             "user_id": "recovery-user",
             MUTATION_MARKER: applied["metadata"][MUTATION_MARKER],
@@ -1280,6 +1281,68 @@ async def test_recovery_exhaustion_persists_and_continues_blocking_scope(
             )
     assert client.list_calls == observed_calls + 1
     assert client.add_calls == 1
+
+
+def test_reclaimed_exhausted_add_rejects_stale_claim_owner(tmp_path) -> None:
+    factory = _session_factory(tmp_path)
+    with factory() as session:
+        event = EventRepository(session).create_event(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            operation="memory.add",
+            request={"app_id": APP_ID},
+            subject_type="memory",
+        )
+        repo = MutationIntentRepository(session)
+        intent = repo.create(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            event_id=event.id,
+            operation="memory.add",
+            payload={"mutation_id": "a" * 64},
+        )
+        intent.status = "EXHAUSTED"
+        intent.attempt_count = repo.MAX_ATTEMPTS
+        intent.lease_expires_at = None
+        session.commit()
+
+    with factory() as session:
+        repo = MutationIntentRepository(session)
+        intent = session.scalar(select(MutationIntent))
+        assert intent is not None and repo.claim_recovery(intent)
+        stale_claim_updated_at = intent.updated_at
+        attempt_count = intent.attempt_count
+        session.commit()
+
+    with factory() as session:
+        repo = MutationIntentRepository(session)
+        intent = session.scalar(select(MutationIntent))
+        assert intent is not None
+        assert repo.claim_recovery(intent) is False
+        assert intent.status == "EXHAUSTED"
+        session.commit()
+
+    with factory() as session:
+        repo = MutationIntentRepository(session)
+        intent = session.scalar(select(MutationIntent))
+        assert intent is not None and repo.claim_recovery(intent)
+        current_claim_updated_at = intent.updated_at
+        assert intent.attempt_count == attempt_count
+        assert current_claim_updated_at != stale_claim_updated_at
+        with pytest.raises(MutationIntentFenceError):
+            repo.require_active_attempt(
+                intent.id,
+                attempt_count,
+                expected_claim_updated_at=stale_claim_updated_at,
+            )
+        assert (
+            repo.require_active_attempt(
+                intent.id,
+                attempt_count,
+                expected_claim_updated_at=current_claim_updated_at,
+            ).id
+            == intent.id
+        )
 
 
 @pytest.mark.asyncio

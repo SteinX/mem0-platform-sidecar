@@ -167,7 +167,7 @@ def _upstream_absence_error(
         response = httpx.get(
             f"{settings.mem0_base_url.rstrip('/')}/memories",
             headers=_upstream_headers(settings),
-            params={"top_k": 5000, "show_expired": "true"},
+            params={"top_k": 1000, "show_expired": "true"},
             timeout=30,
         )
     except Exception as exc:

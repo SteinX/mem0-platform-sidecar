@@ -2078,17 +2078,22 @@ class MutationIntentRepository:
         self,
         intent_id: str,
         expected_attempt_count: int,
+        *,
+        expected_claim_updated_at: datetime | None = None,
     ) -> MutationIntent:
         if type(expected_attempt_count) is not int or expected_attempt_count < 1:
             raise ValueError("expected mutation attempt count is invalid")
-        intent = self.session.scalar(
-            select(MutationIntent)
-            .where(
-                MutationIntent.id == intent_id,
-                MutationIntent.status == "ACTIVE",
-                MutationIntent.attempt_count == expected_attempt_count,
+        statement = select(MutationIntent).where(
+            MutationIntent.id == intent_id,
+            MutationIntent.status == "ACTIVE",
+            MutationIntent.attempt_count == expected_attempt_count,
+        )
+        if expected_claim_updated_at is not None:
+            statement = statement.where(
+                MutationIntent.updated_at == expected_claim_updated_at
             )
-            .execution_options(populate_existing=True)
+        intent = self.session.scalar(
+            statement.execution_options(populate_existing=True)
         )
         if intent is None:
             raise MutationIntentFenceError(
