@@ -1438,11 +1438,31 @@ class MemoryService:
 
         async def marked_records() -> list[dict[str, Any]]:
             response = await self.mem0.list_memories(observation_params)
-            records: list[dict[str, Any]] = []
-            for item in _bounded_list_results(
+            bounded_results = _bounded_list_results(
                 response,
                 limit=_MUTATION_MARKER_LOOKUP_LIMIT,
+            )
+            response_total = response.get("total")
+            if "total" in response and (
+                isinstance(response_total, bool)
+                or not isinstance(response_total, int)
+                or response_total < len(bounded_results)
             ):
+                raise MemoryUpstreamProtocolError(
+                    "Upstream exact-marker response total is invalid"
+                )
+            if (
+                isinstance(response_total, int)
+                and response_total > len(bounded_results)
+            ) or (
+                response_total is None
+                and len(bounded_results) == _MUTATION_MARKER_LOOKUP_LIMIT
+            ):
+                raise MemoryUpstreamProtocolError(
+                    "Upstream exact-marker response is truncated"
+                )
+            records: list[dict[str, Any]] = []
+            for item in bounded_results:
                 if not isinstance(item, dict):
                     continue
                 metadata = item.get("metadata")

@@ -1203,6 +1203,31 @@ async def test_add_recovery_rejects_results_beyond_observation_limit(
 
 
 @pytest.mark.asyncio
+async def test_add_recovery_rejects_truncated_exact_marker_response(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient(cancel_operation="add")
+
+    with pytest.raises(asyncio.CancelledError):
+        await _invoke_mutation(factory, client, "add")
+    applied = dict(client.records["added-1"])
+
+    async def truncated_observation(params: dict[str, Any]) -> dict[str, Any]:
+        client.list_calls += 1
+        return {"results": [applied], "total": 2}
+
+    client.list_memories = truncated_observation
+    with pytest.raises(MutationConflictError, match="unresolved"):
+        await _recover(factory, client)
+
+    state = _intent_state(factory)
+    assert state["status"] == "UNKNOWN"
+    assert state["attempt_count"] == 2
+    assert client.add_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_add_recovery_queries_exact_marker_instead_of_global_window(
     tmp_path,
 ) -> None:
