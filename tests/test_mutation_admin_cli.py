@@ -176,11 +176,17 @@ def _seed_blocker(
     marker: str = "marker-one",
     operation_key: str = "operation-key-one",
     secret: str = "sk-payload-must-never-leak",
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    run_id: str | None = None,
 ) -> str:
     with factory() as session:
         event = EventRepository(session).create_event(
             project_id=project_id,
             app_id=app_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            run_id=run_id,
             operation="memory.add",
             request={"app_id": app_id, "text": secret},
             subject_type="memory",
@@ -196,6 +202,15 @@ def _seed_blocker(
                 "request_fingerprint": "fingerprint",
                 "upstream_payload": {
                     "text": secret,
+                    **{
+                        key: value
+                        for key, value in {
+                            "user_id": user_id,
+                            "agent_id": agent_id,
+                            "run_id": run_id,
+                        }.items()
+                        if value is not None
+                    },
                     "metadata": {"api_key": secret},
                 },
             },
@@ -595,6 +610,36 @@ def test_resolution_uses_default_compatible_bounded_marker_scan(tmp_path) -> Non
     assert resolved["intent"]["status"] == "FAILED"
 
 
+def test_resolution_uses_canonical_event_entity_filters(tmp_path) -> None:
+    factory = _session_factory(tmp_path)
+    canonical_user_id = "sk-abcdef"
+    intent_id = _seed_blocker(factory, user_id=canonical_user_id)
+    client = _AdminTestClient()
+    observed_params: list[dict[str, Any]] = []
+
+    async def capture_list(params: dict[str, Any]) -> dict[str, Any]:
+        observed_params.append(dict(params))
+        return {"results": [], "total": 0}
+
+    client.list_memories = capture_list
+    code, resolved, error = _run_cli(
+        factory,
+        client,
+        *_resolve_args(intent_id),
+    )
+
+    assert code == 0, error
+    assert resolved["intent"]["status"] == "FAILED"
+    assert observed_params == [
+        {
+            "top_k": 1000,
+            "show_expired": True,
+            "user_id": canonical_user_id,
+            SIDECAR_MUTATION_ID_METADATA_KEY: "marker-one",
+        }
+    ]
+
+
 def test_resolution_refuses_oversized_add_marker_observation(
     tmp_path,
 ) -> None:
@@ -805,6 +850,7 @@ def test_sqlite_resolution_releases_project_lock_during_marker_observation(
     entered = threading.Event()
     release = threading.Event()
     client = _BlockingObservationClient(entered, release)
+    recovery_client = _AdminTestClient()
     resolution_result: list[tuple[int, object, str]] = []
     recovery_result: list[object] = []
     failures: list[BaseException] = []
@@ -824,7 +870,7 @@ def test_sqlite_resolution_releases_project_lock_during_marker_observation(
                     asyncio.run(
                         MemoryService(
                             session=session,
-                            mem0=client,
+                            mem0=recovery_client,
                         ).recover_pending_mutations(
                             project_id=PROJECT_ID,
                             app_id=APP_ID,

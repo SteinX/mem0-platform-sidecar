@@ -20,10 +20,13 @@ from mem0_sidecar.store.models import (
     ConsolidationProposal,
     Event,
     MemoryIndex,
+    MutationIntent,
 )
 from mem0_sidecar.store.repositories import (
     ConsolidationPolicyRepository,
     ConsolidationRunRepository,
+    EventRepository,
+    MutationIntentRepository,
 )
 
 pytestmark = pytest.mark.e2e
@@ -162,28 +165,34 @@ def _upstream_absence_error(
 ) -> str | None:
     try:
         response = httpx.get(
-            f"{settings.mem0_base_url.rstrip('/')}/memories",
+            f"{settings.mem0_base_url.rstrip('/')}/memories/{memory_id}",
             headers=_upstream_headers(settings),
-            params={"top_k": 5000, "show_expired": "true"},
             timeout=30,
         )
     except Exception as exc:
         return f"Upstream cleanup verification raised {type(exc).__name__}: {exc}"
+    if response.status_code == 404:
+        return None
     if response.status_code != 200:
         return (
             f"Upstream cleanup verification returned HTTP "
             f"{response.status_code}: {response.text}"
         )
     try:
-        memory_ids = _extract_memory_ids(response.json())
+        payload = response.json()
     except Exception as exc:
         return (
-            "Upstream cleanup verification could not decode the list response: "
+            "Upstream cleanup verification could not decode the direct response: "
             f"{type(exc).__name__}: {exc}"
         )
-    if memory_id in memory_ids:
+    if payload is None:
+        return None
+    if isinstance(payload, dict) and memory_id in _extract_memory_ids(payload):
         return f"Upstream cleanup verification still found {memory_id}"
-    return None
+    return (
+        "Upstream cleanup verification returned an unexpected non-empty "
+        f"response for {memory_id}: {payload!r}"
+    )
 
 
 def _projection_absence_error(
@@ -615,8 +624,8 @@ def test_fixture_cleanup_falls_back_to_upstream_and_proves_absence(
         "get",
         lambda *args, **kwargs: SimpleNamespace(
             status_code=200,
-            text='{"results": []}',
-            json=lambda: {"results": []},
+            text="null",
+            json=lambda: None,
         ),
     )
 
@@ -630,6 +639,28 @@ def test_fixture_cleanup_falls_back_to_upstream_and_proves_absence(
 
     assert error is None
     assert calls == ["scoped", "direct"]
+
+
+def test_upstream_absence_checks_the_specific_memory_id(monkeypatch) -> None:
+    requested_urls: list[str] = []
+
+    def get(url, **kwargs):
+        requested_urls.append(url)
+        return SimpleNamespace(
+            status_code=200,
+            text='{"id": "mem-1"}',
+            json=lambda: {"id": "mem-1"},
+        )
+
+    monkeypatch.setattr(httpx, "get", get)
+
+    error = _upstream_absence_error(
+        SidecarSettings(mem0_base_url="http://mem0.local"),
+        "mem-1",
+    )
+
+    assert error == "Upstream cleanup verification still found mem-1"
+    assert requested_urls == ["http://mem0.local/memories/mem-1"]
 
 
 def _wait_for_history_update(
@@ -1052,6 +1083,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
                 )
         _report_cleanup_failures(cleanup_errors)
 
+
     events_response = client.get("/v1/events")
     assert events_response.status_code == 200, events_response.text
     operations = [event["operation"] for event in events_response.json()["results"]]
@@ -1131,6 +1163,126 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
         for event in raw_events
         for document in (event.request_json, event.response_json, event.error_json)
     )
+
+
+def test_live_exhausted_add_recovers_through_exact_core_marker_lookup(
+    tmp_path,
+) -> None:
+    token = uuid4().hex
+    marker = token * 2
+    project_id = f"recovery-project-{token}"
+    app_id = f"recovery-app-{token}"
+    user_id = f"recovery-user-{token}"
+    run_id = f"recovery-run-{token}"
+    settings = _live_settings(tmp_path, project_id=project_id)
+    app = create_app(settings=settings)
+    client = TestClient(app)
+    recovered_memory_id: str | None = None
+    new_memory_id: str | None = None
+
+    try:
+        recovered_memory_id = _add_direct_upstream_memory(
+            settings,
+            text=f"Late upstream result {token}",
+            user_id=user_id,
+            run_id=run_id,
+            metadata={
+                "_mem0_sidecar_mutation_id": marker,
+                "_mem0_sidecar_project_id": project_id,
+                "_mem0_sidecar_app_id": app_id,
+            },
+        )
+        with app.state.session_factory() as session:
+            event = EventRepository(session).create_event(
+                project_id=project_id,
+                app_id=app_id,
+                user_id=user_id,
+                run_id=run_id,
+                operation="memory.add",
+                request={"app_id": app_id, "text": f"Late upstream result {token}"},
+                subject_type="memory",
+            )
+            intent = MutationIntentRepository(session).create(
+                project_id=project_id,
+                app_id=app_id,
+                event_id=event.id,
+                operation="memory.add",
+                operation_key=marker,
+                payload={
+                    "mutation_id": marker,
+                    "request_fingerprint": f"fingerprint-{token}",
+                    "upstream_payload": {
+                        "text": f"Late upstream result {token}",
+                        "user_id": user_id,
+                        "run_id": run_id,
+                        "metadata": {
+                            "_mem0_sidecar_mutation_id": marker,
+                            "_mem0_sidecar_project_id": project_id,
+                            "_mem0_sidecar_app_id": app_id,
+                        },
+                    },
+                    "category": None,
+                },
+            )
+            intent.status = "EXHAUSTED"
+            intent.attempt_count = MutationIntentRepository.MAX_ATTEMPTS
+            intent.lease_expires_at = None
+            exhausted_intent_id = intent.id
+            session.commit()
+
+        response = client.post(
+            "/v3/memories/add/",
+            json={
+                "text": f"Unblocked add {token}",
+                "project_id": project_id,
+                "user_id": user_id,
+                "app_id": app_id,
+                "run_id": run_id,
+                "infer": False,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["event"]["status"] == "SUCCEEDED"
+        new_ids = _extract_memory_ids(body["memory"])
+        assert len(new_ids) == 1, body
+        new_memory_id = new_ids[0]
+
+        with app.state.session_factory() as session:
+            exhausted_intent = session.get(MutationIntent, exhausted_intent_id)
+            assert exhausted_intent is not None
+            assert exhausted_intent.status == "COMPLETED"
+            assert (
+                exhausted_intent.attempt_count
+                == MutationIntentRepository.MAX_ATTEMPTS
+            )
+            result = json.loads(exhausted_intent.result_json)
+            assert result["memory"]["id"] == recovered_memory_id
+            intents = list(
+                session.scalars(
+                    select(MutationIntent).where(
+                        MutationIntent.project_id == project_id,
+                        MutationIntent.app_id == app_id,
+                    )
+                )
+            )
+            assert len(intents) == 2
+            assert all(intent.status == "COMPLETED" for intent in intents)
+    finally:
+        cleanup_errors = []
+        for memory_id in (new_memory_id, recovered_memory_id):
+            if memory_id is not None:
+                cleanup_errors.append(
+                    _cleanup_memory_fixture(
+                        client,
+                        settings,
+                        memory_id=memory_id,
+                        project_id=project_id,
+                        app_id=app_id,
+                    )
+                )
+        _report_cleanup_failures(cleanup_errors)
 
 
 def test_live_reconcile_imports_only_marked_scope(tmp_path) -> None:

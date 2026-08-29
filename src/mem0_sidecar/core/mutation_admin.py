@@ -130,11 +130,19 @@ class MutationAdminService:
 
         intent_repo = MutationIntentRepository(self.session)
         marker: str | None = None
+        entity_filters: dict[str, str] = {}
         if intent.operation == "memory.add":
-            marker_value = intent_repo.payload(intent).get("mutation_id")
+            payload = intent_repo.payload(intent)
+            marker_value = payload.get("mutation_id")
             if type(marker_value) is not str or not marker_value:
                 raise MutationAdminError("add intent marker is unavailable")
             marker = marker_value
+            event = EventRepository(self.session).get(intent.event_id)
+            entity_filters = {
+                key: value
+                for key in ("user_id", "agent_id", "run_id")
+                if type(value := getattr(event, key)) is str and value
+            }
         operation = intent.operation
         self.session.rollback()
 
@@ -143,6 +151,7 @@ class MutationAdminService:
                 marker=marker,
                 project_id=project_id,
                 app_id=app_id,
+                entity_filters=entity_filters,
             )
 
         ProjectRepository(self.session).lock_for_mutation(project_id)
@@ -208,9 +217,15 @@ class MutationAdminService:
         marker: str,
         project_id: str,
         app_id: str,
+        entity_filters: dict[str, str],
     ) -> None:
         response = await self.mem0.list_memories(
-            {"top_k": MARKER_SCAN_LIMIT, "show_expired": True}
+            {
+                "top_k": MARKER_SCAN_LIMIT,
+                "show_expired": True,
+                **entity_filters,
+                SIDECAR_MUTATION_ID_METADATA_KEY: marker,
+            }
         )
         results = response.get("results") if isinstance(response, dict) else None
         if type(results) is not list:

@@ -1731,7 +1731,7 @@ class MutationIntentRepository:
     RECOVERY_LIMIT = 100
     LEASE_SECONDS = 300
     MAX_ATTEMPTS = 3
-    RECOVERABLE_STATUSES = ("ACTIVE", "UNKNOWN", "PENDING")
+    RECOVERABLE_STATUSES = ("ACTIVE", "UNKNOWN", "PENDING", "EXHAUSTED")
     BLOCKING_STATUSES = ("ACTIVE", "UNKNOWN", "PENDING", "EXHAUSTED")
     TERMINAL_STATUSES = ("COMPLETED", "FAILED", "PARTIAL")
 
@@ -1937,6 +1937,10 @@ class MutationIntentRepository:
                     or_(
                         MutationIntent.status.in_(("UNKNOWN", "PENDING")),
                         and_(
+                            MutationIntent.status == "EXHAUSTED",
+                            MutationIntent.operation == "memory.add",
+                        ),
+                        and_(
                             MutationIntent.status == "ACTIVE",
                             or_(
                                 MutationIntent.lease_expires_at.is_(None),
@@ -2030,7 +2034,18 @@ class MutationIntentRepository:
 
     def claim_recovery(self, intent: MutationIntent) -> bool:
         now = _utc_now()
-        if intent.attempt_count >= self.MAX_ATTEMPTS:
+        if (
+            intent.status == "ACTIVE"
+            and intent.lease_expires_at is not None
+            and _as_utc(intent.lease_expires_at) > now
+        ):
+            return False
+        observe_exhausted_add = (
+            intent.operation == "memory.add"
+            and intent.status == "EXHAUSTED"
+            and intent.attempt_count >= self.MAX_ATTEMPTS
+        )
+        if intent.attempt_count >= self.MAX_ATTEMPTS and not observe_exhausted_add:
             self.mark_unresolved(
                 intent.id,
                 error={"message": "Mutation recovery attempts exhausted"},
@@ -2047,7 +2062,11 @@ class MutationIntentRepository:
                 MutationIntent.attempt_count == expected_attempt_count,
             )
             .values(
-                attempt_count=expected_attempt_count + 1,
+                attempt_count=(
+                    expected_attempt_count
+                    if observe_exhausted_add
+                    else expected_attempt_count + 1
+                ),
                 status="ACTIVE",
                 lease_expires_at=now + timedelta(seconds=self.LEASE_SECONDS),
                 updated_at=now,
@@ -2065,17 +2084,22 @@ class MutationIntentRepository:
         self,
         intent_id: str,
         expected_attempt_count: int,
+        *,
+        expected_claim_updated_at: datetime | None = None,
     ) -> MutationIntent:
         if type(expected_attempt_count) is not int or expected_attempt_count < 1:
             raise ValueError("expected mutation attempt count is invalid")
-        intent = self.session.scalar(
-            select(MutationIntent)
-            .where(
-                MutationIntent.id == intent_id,
-                MutationIntent.status == "ACTIVE",
-                MutationIntent.attempt_count == expected_attempt_count,
+        statement = select(MutationIntent).where(
+            MutationIntent.id == intent_id,
+            MutationIntent.status == "ACTIVE",
+            MutationIntent.attempt_count == expected_attempt_count,
+        )
+        if expected_claim_updated_at is not None:
+            statement = statement.where(
+                MutationIntent.updated_at == expected_claim_updated_at
             )
-            .execution_options(populate_existing=True)
+        intent = self.session.scalar(
+            statement.execution_options(populate_existing=True)
         )
         if intent is None:
             raise MutationIntentFenceError(

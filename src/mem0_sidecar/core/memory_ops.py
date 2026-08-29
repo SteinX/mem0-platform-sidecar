@@ -44,6 +44,7 @@ _MEMORY_PATCH_FIELDS = frozenset({"text", "metadata", "expiration_date"})
 # sanitized. Mutation-intent trace objects retain at most 50 fields.
 _MAX_UPDATE_METADATA_FIELDS = 48
 _RECONCILE_SCAN_LIMIT = 5000
+_MUTATION_MARKER_LOOKUP_LIMIT = 1000
 _HYDRATION_BUFFER = 20
 _HYDRATION_CONCURRENCY = 8
 _INFER_ADAPTER = TypeAdapter(bool)
@@ -1256,6 +1257,7 @@ class MemoryService:
         for intent_id in intent_ids:
             claimed = False
             attempt_token: int | None = None
+            claim_updated_at: datetime | None = None
             try:
                 ProjectRepository(self.session).lock_for_mutation(project_id)
                 intent_repo = MutationIntentRepository(self.session)
@@ -1266,13 +1268,19 @@ class MemoryService:
                 claimed = intent_repo.claim_recovery(intent)
                 attempt_token = intent.attempt_count
                 operation = intent.operation
+                if operation == "memory.add":
+                    claim_updated_at = intent.updated_at
                 self.session.commit()
                 if not claimed:
                     failed += 1
                     continue
 
                 if operation == "memory.add":
-                    await self._recover_add_intent(intent_id, attempt_token)
+                    await self._recover_add_intent(
+                        intent_id,
+                        attempt_token,
+                        expected_claim_updated_at=claim_updated_at,
+                    )
                 elif operation == "memory.update":
                     await self._recover_update_intent(intent_id, attempt_token)
                 elif operation in {"memory.delete", "entity.delete"}:
@@ -1317,6 +1325,7 @@ class MemoryService:
                         intent_repo.require_active_attempt(
                             intent_id,
                             attempt_token,
+                            expected_claim_updated_at=claim_updated_at,
                         )
                         intent = intent_repo.mark_unresolved(
                             intent_id,
@@ -1375,14 +1384,22 @@ class MemoryService:
         self,
         intent_id: str,
         expected_attempt_count: int,
+        *,
+        expected_claim_updated_at: datetime | None,
     ) -> None:
         intent_repo = MutationIntentRepository(self.session)
         intent = intent_repo.get(intent_id)
         payload = intent_repo.payload(intent)
+        event = EventRepository(self.session).get(intent.event_id)
         project_id = intent.project_id
         app_id = intent.app_id
         category = payload.get("category")
         observed_noop = payload.get("observed_noop") is True
+        entity_filters = {
+            key: value
+            for key in ("user_id", "agent_id", "run_id")
+            if isinstance((value := getattr(event, key)), str) and value
+        }
         self.session.rollback()
 
         if observed_noop:
@@ -1391,6 +1408,7 @@ class MemoryService:
             intent = intent_repo.require_active_attempt(
                 intent_id,
                 expected_attempt_count,
+                expected_claim_updated_at=expected_claim_updated_at,
             )
             event = EventRepository(self.session).get(intent.event_id)
             event.subject_id = None
@@ -1411,16 +1429,40 @@ class MemoryService:
         marker = payload.get("mutation_id")
         if not isinstance(marker, str) or not marker:
             raise RuntimeError("Add recovery marker is unavailable")
+        observation_params: dict[str, Any] = {
+            "top_k": _MUTATION_MARKER_LOOKUP_LIMIT,
+            "show_expired": True,
+            SIDECAR_MUTATION_ID_METADATA_KEY: marker,
+            **entity_filters,
+        }
 
         async def marked_records() -> list[dict[str, Any]]:
-            response = await self.mem0.list_memories(
-                {"top_k": _RECONCILE_SCAN_LIMIT, "show_expired": True}
-            )
-            records: list[dict[str, Any]] = []
-            for item in _bounded_list_results(
+            response = await self.mem0.list_memories(observation_params)
+            bounded_results = _bounded_list_results(
                 response,
-                limit=_RECONCILE_SCAN_LIMIT,
+                limit=_MUTATION_MARKER_LOOKUP_LIMIT,
+            )
+            response_total = response.get("total")
+            if "total" in response and (
+                isinstance(response_total, bool)
+                or not isinstance(response_total, int)
+                or response_total < len(bounded_results)
             ):
+                raise MemoryUpstreamProtocolError(
+                    "Upstream exact-marker response total is invalid"
+                )
+            if (
+                isinstance(response_total, int)
+                and response_total > len(bounded_results)
+            ) or (
+                response_total is None
+                and len(bounded_results) == _MUTATION_MARKER_LOOKUP_LIMIT
+            ):
+                raise MemoryUpstreamProtocolError(
+                    "Upstream exact-marker response is truncated"
+                )
+            records: list[dict[str, Any]] = []
+            for item in bounded_results:
                 if not isinstance(item, dict):
                     continue
                 metadata = item.get("metadata")
@@ -1451,6 +1493,7 @@ class MemoryService:
         intent = intent_repo.require_active_attempt(
             intent_id,
             expected_attempt_count,
+            expected_claim_updated_at=expected_claim_updated_at,
         )
         memory_repo = MemoryIndexRepository(self.session)
         affected_projections: list[_MemoryProjectionSnapshot] = []
