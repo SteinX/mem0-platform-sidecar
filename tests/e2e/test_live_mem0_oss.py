@@ -178,7 +178,21 @@ def _upstream_absence_error(
             f"Upstream cleanup verification returned HTTP "
             f"{response.status_code}: {response.text}"
         )
-    return f"Upstream cleanup verification still found {memory_id}"
+    try:
+        payload = response.json()
+    except Exception as exc:
+        return (
+            "Upstream cleanup verification could not decode the direct response: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if payload is None:
+        return None
+    if isinstance(payload, dict) and memory_id in _extract_memory_ids(payload):
+        return f"Upstream cleanup verification still found {memory_id}"
+    return (
+        "Upstream cleanup verification returned an unexpected non-empty "
+        f"response for {memory_id}: {payload!r}"
+    )
 
 
 def _projection_absence_error(
@@ -610,8 +624,8 @@ def test_fixture_cleanup_falls_back_to_upstream_and_proves_absence(
         "get",
         lambda *args, **kwargs: SimpleNamespace(
             status_code=200,
-            text='{"results": []}',
-            json=lambda: {"results": []},
+            text="null",
+            json=lambda: None,
         ),
     )
 
@@ -625,6 +639,28 @@ def test_fixture_cleanup_falls_back_to_upstream_and_proves_absence(
 
     assert error is None
     assert calls == ["scoped", "direct"]
+
+
+def test_upstream_absence_checks_the_specific_memory_id(monkeypatch) -> None:
+    requested_urls: list[str] = []
+
+    def get(url, **kwargs):
+        requested_urls.append(url)
+        return SimpleNamespace(
+            status_code=200,
+            text='{"id": "mem-1"}',
+            json=lambda: {"id": "mem-1"},
+        )
+
+    monkeypatch.setattr(httpx, "get", get)
+
+    error = _upstream_absence_error(
+        SidecarSettings(mem0_base_url="http://mem0.local"),
+        "mem-1",
+    )
+
+    assert error == "Upstream cleanup verification still found mem-1"
+    assert requested_urls == ["http://mem0.local/memories/mem-1"]
 
 
 def _wait_for_history_update(
