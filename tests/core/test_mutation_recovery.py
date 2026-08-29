@@ -1318,6 +1318,7 @@ def test_reclaimed_exhausted_add_rejects_stale_claim_owner(tmp_path) -> None:
         repo = MutationIntentRepository(session)
         intent = session.scalar(select(MutationIntent))
         assert intent is not None
+        intent.lease_expires_at = None
         assert repo.claim_recovery(intent) is False
         assert intent.status == "EXHAUSTED"
         session.commit()
@@ -1340,6 +1341,56 @@ def test_reclaimed_exhausted_add_rejects_stale_claim_owner(tmp_path) -> None:
                 intent.id,
                 attempt_count,
                 expected_claim_updated_at=current_claim_updated_at,
+            ).id
+            == intent.id
+        )
+
+
+def test_live_exhausted_add_claim_is_not_revoked_by_concurrent_recovery(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+    with factory() as session:
+        event = EventRepository(session).create_event(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            operation="memory.add",
+            request={"app_id": APP_ID},
+            subject_type="memory",
+        )
+        repo = MutationIntentRepository(session)
+        intent = repo.create(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            event_id=event.id,
+            operation="memory.add",
+            payload={"mutation_id": "a" * 64},
+        )
+        intent.status = "EXHAUSTED"
+        intent.attempt_count = repo.MAX_ATTEMPTS
+        intent.lease_expires_at = None
+        session.commit()
+
+    with factory() as session:
+        repo = MutationIntentRepository(session)
+        intent = session.scalar(select(MutationIntent))
+        assert intent is not None and repo.claim_recovery(intent)
+        claim_updated_at = intent.updated_at
+        attempt_count = intent.attempt_count
+        session.commit()
+
+    with factory() as session:
+        repo = MutationIntentRepository(session)
+        intent = session.scalar(select(MutationIntent))
+        assert intent is not None
+        assert repo.claim_recovery(intent) is False
+        assert intent.status == "ACTIVE"
+        assert intent.updated_at == claim_updated_at
+        assert (
+            repo.require_active_attempt(
+                intent.id,
+                attempt_count,
+                expected_claim_updated_at=claim_updated_at,
             ).id
             == intent.id
         )

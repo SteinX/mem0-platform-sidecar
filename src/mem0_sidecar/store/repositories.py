@@ -2034,6 +2034,12 @@ class MutationIntentRepository:
 
     def claim_recovery(self, intent: MutationIntent) -> bool:
         now = _utc_now()
+        if (
+            intent.status == "ACTIVE"
+            and intent.lease_expires_at is not None
+            and _as_utc(intent.lease_expires_at) > now
+        ):
+            return False
         observe_exhausted_add = (
             intent.operation == "memory.add"
             and intent.status == "EXHAUSTED"
