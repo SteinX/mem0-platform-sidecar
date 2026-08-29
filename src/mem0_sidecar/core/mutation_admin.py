@@ -137,13 +137,12 @@ class MutationAdminService:
             if type(marker_value) is not str or not marker_value:
                 raise MutationAdminError("add intent marker is unavailable")
             marker = marker_value
-            upstream_payload = payload.get("upstream_payload")
-            if type(upstream_payload) is dict:
-                entity_filters = {
-                    key: value
-                    for key in ("user_id", "agent_id", "run_id")
-                    if type(value := upstream_payload.get(key)) is str and value
-                }
+            event = EventRepository(self.session).get(intent.event_id)
+            entity_filters = {
+                key: value
+                for key in ("user_id", "agent_id", "run_id")
+                if type(value := getattr(event, key)) is str and value
+            }
         operation = intent.operation
         self.session.rollback()
 

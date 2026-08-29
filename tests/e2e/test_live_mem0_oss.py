@@ -1053,7 +1053,7 @@ def test_live_memory_explorer_lifecycle_is_scoped_against_mem0_oss(
                 cleanup_errors.append(
                     f"Category cleanup raised {type(exc).__name__}: {exc}"
                 )
-    _report_cleanup_failures(cleanup_errors)
+        _report_cleanup_failures(cleanup_errors)
 
 
     events_response = client.get("/v1/events")

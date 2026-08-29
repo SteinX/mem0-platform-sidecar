@@ -1208,6 +1208,7 @@ async def test_add_recovery_queries_exact_marker_instead_of_global_window(
 ) -> None:
     factory = _session_factory(tmp_path)
     client = _StatefulRecoveryClient(cancel_operation="add")
+    canonical_user_id = "sk-abcdef"
 
     with pytest.raises(asyncio.CancelledError):
         with factory() as session:
@@ -1215,11 +1216,16 @@ async def test_add_recovery_queries_exact_marker_instead_of_global_window(
                 project_id=PROJECT_ID,
                 payload={
                     "text": "hello",
-                    "user_id": "recovery-user",
+                    "user_id": canonical_user_id,
                     "app_id": APP_ID,
                 },
             )
     applied = dict(client.records["added-1"])
+    with factory() as session:
+        intent = session.scalar(select(MutationIntent))
+        assert intent is not None
+        stored_payload = MutationIntentRepository(session).payload(intent)
+        assert stored_payload["upstream_payload"]["user_id"] == "[REDACTED]"
 
     async def exact_only_observation(params: dict[str, Any]) -> dict[str, Any]:
         client.list_calls += 1
@@ -1241,7 +1247,7 @@ async def test_add_recovery_queries_exact_marker_instead_of_global_window(
         {
             "top_k": 1000,
             "show_expired": True,
-            "user_id": "recovery-user",
+            "user_id": canonical_user_id,
             MUTATION_MARKER: applied["metadata"][MUTATION_MARKER],
         }
     ]

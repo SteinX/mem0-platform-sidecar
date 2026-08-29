@@ -1390,10 +1390,16 @@ class MemoryService:
         intent_repo = MutationIntentRepository(self.session)
         intent = intent_repo.get(intent_id)
         payload = intent_repo.payload(intent)
+        event = EventRepository(self.session).get(intent.event_id)
         project_id = intent.project_id
         app_id = intent.app_id
         category = payload.get("category")
         observed_noop = payload.get("observed_noop") is True
+        entity_filters = {
+            key: value
+            for key in ("user_id", "agent_id", "run_id")
+            if isinstance((value := getattr(event, key)), str) and value
+        }
         self.session.rollback()
 
         if observed_noop:
@@ -1423,21 +1429,12 @@ class MemoryService:
         marker = payload.get("mutation_id")
         if not isinstance(marker, str) or not marker:
             raise RuntimeError("Add recovery marker is unavailable")
-        upstream_payload = payload.get("upstream_payload")
         observation_params: dict[str, Any] = {
             "top_k": _MUTATION_MARKER_LOOKUP_LIMIT,
             "show_expired": True,
             SIDECAR_MUTATION_ID_METADATA_KEY: marker,
+            **entity_filters,
         }
-        if isinstance(upstream_payload, dict):
-            observation_params.update(
-                {
-                    key: value
-                    for key in ("user_id", "agent_id", "run_id")
-                    if isinstance((value := upstream_payload.get(key)), str)
-                    and value
-                }
-            )
 
         async def marked_records() -> list[dict[str, Any]]:
             response = await self.mem0.list_memories(observation_params)
