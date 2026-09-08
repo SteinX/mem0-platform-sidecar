@@ -9,7 +9,11 @@ def create_engine_from_url(database_url: str) -> Engine:
         connect_args = {"check_same_thread": False}
     else:
         connect_args = {}
-    return create_engine(database_url, connect_args=connect_args, future=True)
+    engine = create_engine(database_url, connect_args=connect_args, future=True)
+    if engine.dialect.name == "sqlite":
+        with engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+    return engine
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:

@@ -3,6 +3,31 @@
 Control-plane sidecar for making self-hosted Mem0 OSS easier to use from
 Platform-shaped agent integrations.
 
+## SQLite concurrency and upstream failures
+
+SQLite databases use write-ahead logging (WAL) so a reader does not block a
+query's audit-event commit. Store the database on a local filesystem that
+supports SQLite shared-memory locking, and mount its directory rather than
+only the database file. WAL still permits only one writer at a time.
+
+The Docker image builds checksum-verified SQLite 3.53.4. Non-Docker deployments
+should use SQLite 3.51.3 or later, or a vendor build containing the
+[WAL-reset fix](https://www.sqlite.org/wal.html#walreset), before starting the
+sidecar. Check the library Python actually loads with
+`python -c 'import sqlite3; print(sqlite3.sqlite_version)'`.
+
+Use SQLite's backup API for live backups; copying only the database file can
+omit committed data still in its `-wal` file. To return to rollback-journal
+mode, stop all sidecar processes and other database users, then run
+`PRAGMA wal_checkpoint(TRUNCATE)` followed by `PRAGMA journal_mode=DELETE`
+before starting the older service.
+
+Uncaught Mem0 upstream errors return HTTP 502 with a sanitized message and a
+request ID, rather than an unhandled HTTP 500. Failed writes remain visible in
+the event log; existing route-specific validation and not-found responses
+retain their status codes. A 502 does not prove an upstream write was rolled
+back, so this handler does not automatically replay mutations.
+
 ## Release 0.3.6
 
 This hotfix makes consolidation scan scheduling idempotent within each policy
