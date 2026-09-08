@@ -19,7 +19,7 @@ from mem0_sidecar.http_adapter.event_routes import event_router
 from mem0_sidecar.http_adapter.export_routes import export_router
 from mem0_sidecar.http_adapter.memory_routes import memory_router
 from mem0_sidecar.http_adapter.oss_memory_routes import oss_memory_router
-from mem0_sidecar.mem0_client.client import Mem0RestClient
+from mem0_sidecar.mem0_client.client import Mem0RestClient, Mem0UpstreamError
 from mem0_sidecar.observability import RequestLoggingMiddleware, configure_logging
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base
@@ -107,7 +107,7 @@ def create_app(
     async def lifespan(app: FastAPI):
         task = None
         stop = None
-        consolidation_tasks: list[asyncio.Task] = []
+        consolidation_tasks: list[asyncio.Task[None]] = []
         consolidation_stop = None
         if settings.direct_write_sync_enabled:
             stop = asyncio.Event()
@@ -193,6 +193,16 @@ def create_app(
         exc: MutationConflictError,
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(Mem0UpstreamError)
+    async def upstream_error_handler(
+        _request: Request,
+        _exc: Mem0UpstreamError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": "Mem0 upstream request failed"},
+        )
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
