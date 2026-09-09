@@ -1,5 +1,8 @@
 import logging
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 from urllib.parse import quote
 
@@ -60,6 +63,35 @@ class Mem0RestClient:
         self.memories_path = memories_path
         self.search_path = search_path
         self.transport = transport
+        self._pooled_client: httpx.AsyncClient | None = None
+
+    def _new_http_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            headers=self._headers(),
+            cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
+            transport=self.transport,
+            timeout=self._timeout(),
+            verify=self._verify(),
+        )
+
+    @asynccontextmanager
+    async def connection_pool(self) -> AsyncIterator[None]:
+        if self._pooled_client is not None:
+            raise RuntimeError("Mem0 connection pool is already open")
+        async with self._new_http_client() as client:
+            self._pooled_client = client
+            try:
+                yield
+            finally:
+                self._pooled_client = None
+
+    @asynccontextmanager
+    async def _request_client(self) -> AsyncIterator[httpx.AsyncClient]:
+        if self._pooled_client is not None:
+            yield self._pooled_client
+        else:
+            async with self._new_http_client() as client:
+                yield client
 
     def _headers(self) -> dict[str, str]:
         headers = dict(self.extra_headers)
@@ -97,12 +129,7 @@ class Mem0RestClient:
     ) -> Any:
         url = self._url(path)
         started_at = time.perf_counter()
-        async with httpx.AsyncClient(
-            headers=self._headers(),
-            transport=self.transport,
-            timeout=self._timeout(),
-            verify=self._verify(),
-        ) as client:
+        async with self._request_client() as client:
             try:
                 response = await client.request(
                     method,

@@ -57,6 +57,41 @@ from mem0_sidecar.store.repositories import (
 )
 
 
+def test_project_wide_event_facets_do_not_reread_candidate_rows(
+    db_session: Session,
+) -> None:
+    ProjectRepository(db_session).upsert_default_project(
+        project_id="repo-a", name="Repo A", mem0_base_url="http://mem0:8000"
+    )
+    repository = EventRepository(db_session)
+    repository.create_event(
+        project_id="repo-a", app_id="app-a", operation="memory.search",
+        request={"app_id": "app-a"},
+    )
+    db_session.commit()
+    statements: list[str] = []
+
+    def capture(
+        connection: object, cursor: object, statement: str, parameters: object,
+        context: object, executemany: bool,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    engine = db_session.get_bind()
+    sqlalchemy_event.listen(engine, "before_cursor_execute", capture)
+    try:
+        page = repository.query_project_events(
+            "repo-a", None, repositories.EventQuery(page_size=20)
+        )
+    finally:
+        sqlalchemy_event.remove(engine, "before_cursor_execute", capture)
+    assert page.total == 1
+    assert len(page.channels) == 1
+    assert page.channels[0]["count"] == 1
+    assert len(statements) == 2
+
+
 def test_event_repository_snapshots_request_attribution_columns(
     db_session,
 ) -> None:
