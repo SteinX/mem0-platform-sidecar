@@ -4,6 +4,7 @@ import json
 import re
 import secrets
 import uuid
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -1618,7 +1619,40 @@ class EventRepository:
             ]
             del facet_candidates
         grouped_channels: dict[RequestAttribution, int] = {}
-        if facet_event_ids:
+        if (
+            project_wide_scope_matches is not None
+            and self.session.get_bind().dialect.name == "sqlite"
+        ):
+            raw_channels = Counter(
+                (
+                    candidate.request_transport,
+                    candidate.credential_kind,
+                    candidate.credential_id,
+                    candidate.credential_label,
+                    candidate.credential_prefix,
+                )
+                for candidate in project_wide_scope_matches
+            )
+            ordered_channels = sorted(
+                raw_channels.items(),
+                key=lambda item: (
+                    -item[1],
+                    tuple(
+                        (value is not None, value or "")
+                        for value in item[0]
+                    ),
+                ),
+            )[:_EVENT_CHANNEL_FACET_LIMIT]
+            for raw_channel, count in ordered_channels:
+                attribution = RequestAttribution.from_stored(
+                    transport=raw_channel[0],
+                    credential_kind=raw_channel[1],
+                    credential_id=raw_channel[2],
+                    credential_label=raw_channel[3],
+                    credential_prefix=raw_channel[4],
+                )
+                grouped_channels[attribution] = count
+        elif facet_event_ids:
             canonical_channel_rows = self.session.execute(
                 select(
                     *channel_columns,
