@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -104,7 +104,7 @@ def create_app(
         )
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def worker_lifespan(app: FastAPI):
         task = None
         stop = None
         consolidation_tasks: list[asyncio.Task[None]] = []
@@ -167,6 +167,14 @@ def create_app(
             for consolidation_task in consolidation_tasks:
                 with suppress(asyncio.CancelledError):
                     await consolidation_task
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with AsyncExitStack() as stack:
+            if isinstance(mem0_client, Mem0RestClient):
+                await stack.enter_async_context(mem0_client.connection_pool())
+            await stack.enter_async_context(worker_lifespan(app))
+            yield
 
     app = FastAPI(title="Mem0 Platform Sidecar", lifespan=lifespan)
     app.state.settings = settings
