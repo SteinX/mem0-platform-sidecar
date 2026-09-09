@@ -16,7 +16,17 @@ def test_upstream_connections_live_until_app_shutdown(tmp_path: Path) -> None:
             self.closes += 1
             await super().aclose()
 
-    transport = Transport(lambda request: httpx.Response(200, json={"results": []}))
+    cookies_seen: list[str | None] = []
+
+    def upstream_response(request: httpx.Request) -> httpx.Response:
+        cookies_seen.append(request.headers.get("cookie"))
+        return httpx.Response(
+            200,
+            json={"results": []},
+            headers={"Set-Cookie": "upstream_session=synthetic; Path=/"},
+        )
+
+    transport = Transport(upstream_response)
     upstream = Mem0RestClient(base_url="http://upstream.test", transport=transport)
     app = create_app(
         settings=SidecarSettings(database_url=f"sqlite:///{tmp_path / 'db.sqlite3'}"),
@@ -30,4 +40,5 @@ def test_upstream_connections_live_until_app_shutdown(tmp_path: Path) -> None:
             )
             assert response.status_code == 200, response.text
         assert transport.closes == 0
+        assert cookies_seen == [None, None]
     assert transport.closes == 1

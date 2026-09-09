@@ -2,6 +2,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 from urllib.parse import quote
 
@@ -67,6 +68,7 @@ class Mem0RestClient:
     def _new_http_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             headers=self._headers(),
+            cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
             transport=self.transport,
             timeout=self._timeout(),
             verify=self._verify(),
