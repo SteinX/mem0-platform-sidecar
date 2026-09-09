@@ -61,6 +61,10 @@ class MutationConflictError(RuntimeError):
     """A scoped logical mutation cannot safely be issued again."""
 
 
+class MemoryProjectionConflictError(MutationConflictError):
+    pass
+
+
 @dataclass(frozen=True)
 class _MemoryProjectionSnapshot:
     row_id: str
@@ -2369,6 +2373,8 @@ class MemoryService:
                 )
 
             if conflict is not None:
+                if forced_conflict is None:
+                    raise MemoryProjectionConflictError(conflict)
                 raise MutationConflictError(conflict)
 
             ordered_results = [

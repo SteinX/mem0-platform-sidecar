@@ -13,6 +13,7 @@ from mem0_sidecar.core.explorer_filters import (
     parse_explorer_query,
 )
 from mem0_sidecar.core.memory_ops import (
+    MemoryProjectionConflictError,
     MemoryService,
     MutationConflictError,
     validate_idempotency_key,
@@ -289,12 +290,20 @@ async def query_memories(
             query_payload,
             allowed_fields=MEMORY_FILTER_FIELDS,
         )
-        result = await service.query_memories(
-            project_id=project_id,
-            app_id=app_id,
-            project_wide=project_wide,
-            query=query,
-        )
+        try:
+            result = await service.query_memories(
+                project_id=project_id,
+                app_id=app_id,
+                project_wide=project_wide,
+                query=query,
+            )
+        except MemoryProjectionConflictError:
+            result = await service.query_memories(
+                project_id=project_id,
+                app_id=app_id,
+                project_wide=project_wide,
+                query=query,
+            )
         session.commit()
     except HTTPException:
         session.rollback()
