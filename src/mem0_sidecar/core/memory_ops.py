@@ -1230,6 +1230,7 @@ class MemoryService:
         *,
         project_id: str,
         app_id: str,
+        add_only: bool = False,
     ) -> dict[str, int]:
         """Observe bounded incomplete intents before the next scoped mutation."""
 
@@ -1237,7 +1238,9 @@ class MemoryService:
         initial_repo = MutationIntentRepository(self.session)
         intent_ids = [
             intent.id
-            for intent in initial_repo.list_recoverable(project_id, app_id)
+            for intent in initial_repo.list_recoverable(
+                project_id, app_id, operation="memory.add" if add_only else None
+            )
         ]
         if not intent_ids:
             blockers = initial_repo.list_blocking(project_id, app_id)
@@ -1406,6 +1409,44 @@ class MemoryService:
         }
         self.session.rollback()
 
+        marker = payload.get("mutation_id")
+        if not observed_noop and (not isinstance(marker, str) or not marker):
+            raise RuntimeError("Add recovery marker is unavailable")
+        receipt_reader = getattr(self.mem0, "get_add_receipt", None)
+        receipt = (
+            await receipt_reader(marker)
+            if not observed_noop and callable(receipt_reader)
+            else None
+        )
+        if receipt is not None:
+            if (receipt.project_id, receipt.app_id, receipt.mutation_id) != (
+                project_id,
+                app_id,
+                marker,
+            ):
+                raise MemoryUpstreamProtocolError("Add receipt identity mismatch")
+            if receipt.status == "RUNNING":
+                raise MutationConflictError(
+                    "Core add is still running; no replay issued"
+                )
+            if receipt.status == "FAILED":
+                ProjectRepository(self.session).lock_for_mutation(project_id)
+                intent_repo = MutationIntentRepository(self.session)
+                intent = intent_repo.require_active_attempt(
+                    intent_id,
+                    expected_attempt_count,
+                    expected_claim_updated_at=expected_claim_updated_at,
+                )
+                error = {
+                    "message": "Core confirmed add execution failed; no replay issued"
+                }
+                EventRepository(self.session).mark_failed(intent.event_id, error=error)
+                intent_repo.fail(intent_id, error=error)
+                return
+            observed_noop = receipt.result == {"results": []} or (
+                isinstance(receipt.result, dict) and receipt.result.get("results") == []
+            )
+
         if observed_noop:
             ProjectRepository(self.session).lock_for_mutation(project_id)
             intent_repo = MutationIntentRepository(self.session)
@@ -1430,9 +1471,6 @@ class MemoryService:
             intent_repo.complete(intent_id, result=result)
             return
 
-        marker = payload.get("mutation_id")
-        if not isinstance(marker, str) or not marker:
-            raise RuntimeError("Add recovery marker is unavailable")
         observation_params: dict[str, Any] = {
             "top_k": _MUTATION_MARKER_LOOKUP_LIMIT,
             "show_expired": True,
@@ -1481,6 +1519,11 @@ class MemoryService:
             return records
 
         records = await marked_records()
+        if receipt is not None:
+            expected_ids = set(extract_memory_ids(receipt.result))
+            observed_ids = {record.get("id") for record in records}
+            if not expected_ids or not expected_ids.issubset(observed_ids):
+                raise MemoryUpstreamProtocolError("Add receipt records are incomplete")
         if not records:
             raise MutationConflictError(
                 "Add outcome remains unknown; retry with the original "
@@ -1833,14 +1876,10 @@ class MemoryService:
                 request_fingerprint=request_fingerprint,
             )
 
-        recovery = await self.recover_pending_mutations(
+        await self.recover_pending_mutations(
             project_id=project_id,
             app_id=scope.app_id,
         )
-        if recovery["failed"]:
-            raise MutationConflictError(
-                "Scoped mutation recovery remains unresolved; no add was issued"
-            )
         oss_payload["metadata"][SIDECAR_MUTATION_ID_METADATA_KEY] = mutation_id
 
         event_repo = EventRepository(self.session)

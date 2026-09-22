@@ -8,6 +8,7 @@ from urllib.parse import quote
 
 import httpx
 
+from mem0_sidecar.mem0_client.receipts import AddReceipt
 from mem0_sidecar.observability import get_request_id
 
 LOGGER = logging.getLogger("mem0_sidecar.mem0_client")
@@ -156,7 +157,17 @@ class Mem0RestClient:
                     path=path,
                     status_code=exc.response.status_code,
                     response_text=response_text,
-                    outcome_unknown=False,
+                    outcome_unknown=(
+                        method == "POST"
+                        and path == self.memories_path
+                        and isinstance(payload, dict)
+                        and isinstance(payload.get("metadata"), dict)
+                        and bool(payload["metadata"].get("_mem0_sidecar_mutation_id"))
+                        and (
+                            exc.response.status_code >= 500
+                            or exc.response.status_code == 409
+                        )
+                    ),
                     message=(
                         f"Mem0 upstream {method} {path} failed with "
                         f"HTTP {exc.response.status_code}: {response_text}"
@@ -177,7 +188,10 @@ class Mem0RestClient:
                 raise Mem0UpstreamError(
                     method=method,
                     path=path,
-                    outcome_unknown=True,
+                    outcome_unknown=not isinstance(
+                        exc,
+                        (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout),
+                    ),
                     message=f"Mem0 upstream {method} {path} request failed: {exc}",
                 ) from exc
 
@@ -243,6 +257,17 @@ class Mem0RestClient:
             "error_type": error_type,
         }
 
+    async def get_add_receipt(self, marker: str) -> AddReceipt | None:
+        try:
+            response = await self._request(
+                "GET", f"/internal/mutations/{quote(marker, safe='')}"
+            )
+        except Mem0UpstreamError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return AddReceipt.model_validate(response)
+
     async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
         request_payload = dict(payload)
         if "messages" not in request_payload:
@@ -263,9 +288,7 @@ class Mem0RestClient:
         normalized: list[Any] = []
         changed = False
         for item in results:
-            if not isinstance(item, dict) or not isinstance(
-                item.get("memory"), dict
-            ):
+            if not isinstance(item, dict) or not isinstance(item.get("memory"), dict):
                 normalized.append(item)
                 continue
             record = dict(item["memory"])

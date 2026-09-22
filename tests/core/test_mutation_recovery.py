@@ -157,6 +157,8 @@ class _RealHttpOutcomeClient:
 
     def _lost_response(self, request: httpx.Request) -> httpx.Response:
         self.failure_injected = True
+        if self.failure_kind == "http500":
+            return httpx.Response(500, json={"detail": "receipt persistence failed"})
         if self.failure_kind == "read-timeout":
             raise httpx.ReadTimeout("response timed out", request=request)
         if self.failure_kind == "disconnect":
@@ -211,6 +213,9 @@ class _RealHttpOutcomeClient:
                     "total": len(self.records),
                 },
             )
+
+        if path.startswith("/internal/mutations/"):
+            return httpx.Response(404, json={"detail": "not found"})
 
         assert path.startswith("/memories/")
         memory_id = path.removeprefix("/memories/")
@@ -365,13 +370,17 @@ async def test_interrupted_reconcile_is_failed_without_replaying_scan(tmp_path) 
 
 def _assert_recovered(factory, client, operation: str) -> None:
     with factory() as session:
-        intents = session.execute(
-            text(
-                "SELECT operation, status FROM mutation_intents "
-                "WHERE project_id = :project_id AND app_id = :app_id"
-            ),
-            {"project_id": PROJECT_ID, "app_id": APP_ID},
-        ).mappings().all()
+        intents = (
+            session.execute(
+                text(
+                    "SELECT operation, status FROM mutation_intents "
+                    "WHERE project_id = :project_id AND app_id = :app_id"
+                ),
+                {"project_id": PROJECT_ID, "app_id": APP_ID},
+            )
+            .mappings()
+            .all()
+        )
         assert intents and all(row["status"] == "COMPLETED" for row in intents)
         assert all(
             event.status.value == "SUCCEEDED"
@@ -390,9 +399,7 @@ def _assert_recovered(factory, client, operation: str) -> None:
                 select(MemoryIndex).where(MemoryIndex.mem0_memory_id == "memory-one")
             )
             assert memory is not None
-            assert json.loads(memory.metadata_projection_json) == {
-                "version": "new"
-            }
+            assert json.loads(memory.metadata_projection_json) == {"version": "new"}
             assert memory.scope_markers_verified == 1
         elif operation == "delete":
             memory = session.scalar(
@@ -506,9 +513,7 @@ async def test_real_http_lost_response_is_unknown_then_converges_by_reads_only(
         with factory() as session:
             local_deleted_at = list(
                 session.scalars(
-                    select(MemoryIndex.deleted_at).order_by(
-                        MemoryIndex.mem0_memory_id
-                    )
+                    select(MemoryIndex.deleted_at).order_by(MemoryIndex.mem0_memory_id)
                 )
             )
         assert sum(value is not None for value in local_deleted_at) == 1
@@ -522,9 +527,7 @@ async def test_real_http_lost_response_is_unknown_then_converges_by_reads_only(
     assert client.read_calls
     with factory() as session:
         active = list(
-            session.scalars(
-                select(MemoryIndex).where(MemoryIndex.deleted_at.is_(None))
-            )
+            session.scalars(select(MemoryIndex).where(MemoryIndex.deleted_at.is_(None)))
         )
     if operation in {"delete", "entity"}:
         assert active == []
@@ -559,9 +562,7 @@ async def test_unclassified_exception_after_upstream_attempt_defaults_unknown(
         with factory() as session:
             local_deleted_at = list(
                 session.scalars(
-                    select(MemoryIndex.deleted_at).order_by(
-                        MemoryIndex.mem0_memory_id
-                    )
+                    select(MemoryIndex.deleted_at).order_by(MemoryIndex.mem0_memory_id)
                 )
             )
         assert sum(value is not None for value in local_deleted_at) == 1
@@ -642,9 +643,7 @@ async def test_cancelled_empty_add_finalization_recovers_from_durable_observatio
                 payload={
                     "text": "hello",
                     "app_id": APP_ID,
-                    "metadata": {
-                        f"padding-{index}": "x" * 4096 for index in range(50)
-                    },
+                    "metadata": {f"padding-{index}": "x" * 4096 for index in range(50)},
                 },
             )
 
@@ -1185,10 +1184,7 @@ async def test_add_recovery_rejects_results_beyond_observation_limit(
         client.list_calls += 1
         return {
             "results": [applied]
-            + [
-                {"id": f"unrelated-{index}", "metadata": {}}
-                for index in range(5000)
-            ],
+            + [{"id": f"unrelated-{index}", "metadata": {}} for index in range(5000)],
             "total": 5001,
         }
 
@@ -1259,8 +1255,7 @@ async def test_add_recovery_queries_exact_marker_instead_of_global_window(
             return {"results": [applied], "total": 1}
         return {
             "results": [
-                {"id": f"unrelated-{index}", "metadata": {}}
-                for index in range(5000)
+                {"id": f"unrelated-{index}", "metadata": {}} for index in range(5000)
             ],
             "total": 5000,
         }
@@ -1585,9 +1580,7 @@ async def test_local_commit_failure_leaves_durable_intent_and_recovery_converges
                     request_app_id=APP_ID,
                 )
             else:
-                await service.delete_entity(
-                    PROJECT_ID, APP_ID, "user", "alice"
-                )
+                await service.delete_entity(PROJECT_ID, APP_ID, "user", "alice")
 
     result = await _recover(factory, client)
     assert result["recovered"] == 1
@@ -1973,9 +1966,11 @@ async def test_lossy_sanitized_add_stays_unknown_without_replay_or_secret(
     assert client.add_calls == 0
     with factory() as session:
         assert session.scalar(select(Event)).status.value == "FAILED"
-        row = session.execute(
-            text("SELECT status, payload_json FROM mutation_intents")
-        ).mappings().one()
+        row = (
+            session.execute(text("SELECT status, payload_json FROM mutation_intents"))
+            .mappings()
+            .one()
+        )
         assert row["status"] == "UNKNOWN"
         assert "sk-sensitive-value" not in row["payload_json"]
 
@@ -1987,3 +1982,209 @@ async def test_lossy_sanitized_add_stays_unknown_without_replay_or_secret(
             )
     assert len(seen_payloads) == 1
     assert client.records == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_status", ["SUCCEEDED", "FAILED", "RUNNING"])
+async def test_lost_empty_or_failed_add_response_uses_receipt(
+    tmp_path, receipt_status
+) -> None:
+    from types import SimpleNamespace
+
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+    original_add = client.add_memory
+
+    async def lose_response(payload):
+        client.add_calls += 1
+        raise Mem0UpstreamError(
+            method="POST", path="/memories", message="lost response"
+        )
+
+    async def receipt(marker):
+        return SimpleNamespace(
+            status=receipt_status,
+            mutation_id=marker,
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            result={"results": []},
+        )
+
+    client.add_memory = lose_response
+    client.get_add_receipt = receipt
+    with pytest.raises(Mem0UpstreamError):
+        await _invoke_mutation(factory, client, "add")
+    client.add_memory = original_add
+    if receipt_status == "RUNNING":
+        with pytest.raises(MutationConflictError):
+            await _recover(factory, client)
+        assert _intent_state(factory)["status"] == "UNKNOWN"
+    else:
+        result = await _recover(factory, client)
+        assert result == {
+            "recovered": int(receipt_status == "SUCCEEDED"),
+            "failed": int(receipt_status == "FAILED"),
+        }
+        assert _intent_state(factory)["status"] == (
+            "COMPLETED" if receipt_status == "SUCCEEDED" else "FAILED"
+        )
+    assert client.add_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_running_receipt_does_not_finalize_partial_markers(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient(cancel_operation="add")
+
+    async def receipt(marker):
+        return SimpleNamespace(
+            status="RUNNING",
+            mutation_id=marker,
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            result=None,
+        )
+
+    client.get_add_receipt = receipt
+    with pytest.raises(asyncio.CancelledError):
+        await _invoke_mutation(factory, client, "add")
+    with pytest.raises(MutationConflictError):
+        await _recover(factory, client)
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    assert client.add_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_background_observer_recovers_without_a_new_add(tmp_path) -> None:
+    from mem0_sidecar.workers.add_recovery import AddRecoveryWorker
+
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient(cancel_operation="add")
+    with pytest.raises(asyncio.CancelledError):
+        await _invoke_mutation(factory, client, "add")
+    worker = AddRecoveryWorker(session_factory=factory, mem0_client=client)
+    assert await worker.run_once() == 1
+    assert _intent_state(factory)["status"] == "COMPLETED"
+    assert client.add_calls == 1
+    assert await worker.run_once() == 0
+
+
+@pytest.mark.asyncio
+async def test_background_observer_does_not_touch_live_add_or_replay_delete(
+    tmp_path,
+) -> None:
+    from mem0_sidecar.workers.add_recovery import AddRecoveryWorker
+
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+    with factory() as session:
+        event = EventRepository(session).create_event(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            operation="memory.add",
+            request={"app_id": APP_ID},
+            subject_type="memory",
+        )
+        MutationIntentRepository(session).create(
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            event_id=event.id,
+            operation="memory.add",
+            payload={},
+            operation_key="live-add",
+        )
+        session.commit()
+    worker = AddRecoveryWorker(session_factory=factory, mem0_client=client)
+    assert await worker.run_once() == 0
+    assert client.list_calls == 0
+    assert client.add_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_confirmed_failed_receipt_does_not_reject_next_add(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+    original = client.add_memory
+
+    async def failed_response(payload):
+        client.add_calls += 1
+        raise Mem0UpstreamError(
+            method="POST", path="/memories", message="lost error response"
+        )
+
+    async def receipt(marker):
+        return SimpleNamespace(
+            status="FAILED",
+            mutation_id=marker,
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            result=None,
+        )
+
+    client.add_memory = failed_response
+    client.get_add_receipt = receipt
+    with pytest.raises(Mem0UpstreamError):
+        await _invoke_mutation(factory, client, "add")
+    client.add_memory = original
+    with factory() as session:
+        await MemoryService(session=session, mem0=client).add_memory(
+            project_id=PROJECT_ID,
+            payload={"text": "next independent request", "app_id": APP_ID},
+        )
+    assert client.add_calls == 2
+    with factory() as session:
+        states = list(session.scalars(select(MutationIntent.status)))
+    assert sorted(states) == ["COMPLETED", "FAILED"]
+
+
+@pytest.mark.asyncio
+async def test_marked_http500_after_apply_stays_recoverable(tmp_path) -> None:
+    factory = _session_factory(tmp_path)
+    client = _RealHttpOutcomeClient(operation="add", failure_kind="http500")
+    with pytest.raises(Mem0UpstreamError):
+        await _invoke_mutation(factory, client, "add")
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    assert await _recover(factory, client) == {"recovered": 1, "failed": 0}
+    assert client.write_calls == [("POST", "/memories")]
+
+
+@pytest.mark.asyncio
+async def test_recovery_rotates_bounded_unresolved_intents(
+    tmp_path, monkeypatch
+) -> None:
+    from mem0_sidecar.workers.add_recovery import AddRecoveryWorker
+
+    factory = _session_factory(tmp_path)
+    client = _StatefulRecoveryClient()
+    monkeypatch.setattr(MutationIntentRepository, "RECOVERY_LIMIT", 2)
+    with factory() as session:
+        repo = MutationIntentRepository(session)
+        for number in range(3):
+            marker = f"{number:064x}"
+            event = EventRepository(session).create_event(
+                project_id=PROJECT_ID,
+                app_id=APP_ID,
+                operation="memory.add",
+                request={"app_id": APP_ID},
+                subject_type="memory",
+            )
+            intent = repo.create(
+                project_id=PROJECT_ID,
+                app_id=APP_ID,
+                event_id=event.id,
+                operation="memory.add",
+                payload={"mutation_id": marker},
+                operation_key=marker,
+            )
+            repo.mark_unresolved(intent.id)
+        session.commit()
+    worker = AddRecoveryWorker(session_factory=factory, mem0_client=client)
+    await worker.run_once()
+    await worker.run_once()
+    observed = {params[MUTATION_MARKER] for params in client.list_params}
+    assert observed == {f"{number:064x}" for number in range(3)}
+    assert client.add_calls == 0

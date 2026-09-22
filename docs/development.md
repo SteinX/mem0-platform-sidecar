@@ -160,6 +160,26 @@ Set `MEM0_SIDECAR_LOG_FORMAT=json` for container logs. Each request receives or
 propagates the configured request ID header and emits structured request logs;
 Mem0 OSS upstream calls also emit structured success/failure logs.
 
+## Automatic add recovery
+
+The sidecar observes incomplete add intents every 30 seconds, with bounded,
+fair batches. Observation only reads Core execution receipts and exact mutation
+markers; it never replays an upstream add or autonomously retries deletes.
+
+A receipt-capable Core durably records RUNNING before executing a marked add,
+then SUCCEEDED (including an empty inference result) or FAILED when execution
+ends. Lost HTTP responses no longer require an operator to decide whether an
+empty result means failure. Same-key retries retain their no-replay fence.
+Connection and pool failures before transmission are terminal locally; marked
+add HTTP 409/5xx and post-transmission failures wait for execution evidence.
+
+Deploy Core with its additive receipt migration before the sidecar. Older Core
+404 responses retain exact-marker recovery. Roll back binaries without dropping
+the receipt table. A missing receipt or RUNNING record after a hard process crash
+is still unknown, not proof of failure; it intentionally needs investigation.
+The observer cannot prevent provider outages or guarantee crash-atomic writes
+across the Core receipt database and vector store.
+
 ## Resolve an ambiguous mutation intent
 
 An interrupted upstream mutation can remain `UNKNOWN` or become `EXHAUSTED`.
