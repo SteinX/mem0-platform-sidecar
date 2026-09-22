@@ -3,7 +3,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 import anyio
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.memory_ops import MemoryService, MutationConflictError
@@ -26,20 +26,19 @@ class AddRecoveryWorker:
         self.interval_seconds = interval_seconds
 
     async def run_once(self) -> int:
+        now = datetime.now(UTC)
         with self.session_factory() as session:
             scopes = session.execute(
                 select(MutationIntent.project_id, MutationIntent.app_id)
                 .where(
                     MutationIntent.operation == "memory.add",
+                    MutationIntent.status.in_(
+                        ("UNKNOWN", "EXHAUSTED", "PENDING", "ACTIVE")
+                    ),
                     or_(
-                        MutationIntent.status.in_(("UNKNOWN", "EXHAUSTED", "PENDING")),
-                        and_(
-                            MutationIntent.status == "ACTIVE",
-                            or_(
-                                MutationIntent.lease_expires_at.is_(None),
-                                MutationIntent.lease_expires_at <= datetime.now(UTC),
-                            ),
-                        ),
+                        MutationIntent.status != "ACTIVE",
+                        MutationIntent.lease_expires_at.is_(None),
+                        MutationIntent.lease_expires_at <= now,
                     ),
                 )
                 .group_by(MutationIntent.project_id, MutationIntent.app_id)

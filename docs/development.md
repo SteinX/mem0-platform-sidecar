@@ -165,6 +165,10 @@ Mem0 OSS upstream calls also emit structured success/failure logs.
 The sidecar observes incomplete add intents every 30 seconds, with bounded,
 fair batches. Observation only reads Core execution receipts and exact mutation
 markers; it never replays an upstream add or autonomously retries deletes.
+The Sidecar migration adds a composite recovery index so each poll can seek
+eligible operation/status rows without scanning completed add history. Include
+the migration when upgrading an existing database; metadata creation alone does
+not add indexes to tables that already exist.
 
 A receipt-capable Core durably records RUNNING before executing a marked add,
 then SUCCEEDED (including an empty inference result) or FAILED when execution
