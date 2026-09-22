@@ -306,9 +306,7 @@ async def test_mem0_client_raw_compatibility_methods_preserve_arrays() -> None:
     )
 
     assert await client.list_memories_raw({}) == [{"id": "mem-1"}]
-    assert await client.search_memories_raw({"query": "tea"}) == [
-        {"id": "search-1"}
-    ]
+    assert await client.search_memories_raw({"query": "tea"}) == [{"id": "search-1"}]
     assert await client.get_memory_history_raw("mem-1") == [{"id": "event-1"}]
 
 
@@ -526,8 +524,9 @@ async def test_mem0_client_classifies_statusless_response_loss_as_ambiguous(
 
 
 @pytest.mark.asyncio
-async def test_mem0_client_wraps_2xx_invalid_json_as_ambiguous_without_body_leak(
-) -> None:
+async def test_mem0_client_wraps_2xx_invalid_json_as_ambiguous_without_body_leak() -> (
+    None
+):
     secret_body = "not-json sk-response-body-secret"
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -554,8 +553,9 @@ async def test_mem0_client_wraps_2xx_invalid_json_as_ambiguous_without_body_leak
 
 
 @pytest.mark.asyncio
-async def test_mem0_client_wraps_deep_valid_2xx_json_exception_without_body_leak(
-) -> None:
+async def test_mem0_client_wraps_deep_valid_2xx_json_exception_without_body_leak() -> (
+    None
+):
     secret_body = "sk-deep-response-body-secret"
     deep_json = ("[" * 20_000 + f'"{secret_body}"' + "]" * 20_000).encode()
 
@@ -580,3 +580,55 @@ async def test_mem0_client_wraps_deep_valid_2xx_json_exception_without_body_leak
     assert error.response_text is None
     assert secret_body not in str(error)
     assert _decoder_graph_state(error, secret_body) == (None, None, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type", [httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout]
+)
+async def test_pre_send_failure_is_not_an_ambiguous_write(error_type) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise error_type("injected before request transmission", request=request)
+
+    client = Mem0RestClient(
+        base_url="http://core", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(Mem0UpstreamError) as caught:
+        await client.add_memory({"text": "new memory"})
+    assert caught.value.outcome_unknown is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type", [httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError]
+)
+async def test_post_send_failure_remains_ambiguous(error_type) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise error_type("injected after possible transmission", request=request)
+
+    client = Mem0RestClient(
+        base_url="http://core", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(Mem0UpstreamError) as caught:
+        await client.add_memory({"text": "new memory"})
+    assert caught.value.outcome_unknown is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [409, 500, 502, 503, 504])
+async def test_marked_add_http_error_requires_receipt_before_terminalizing(
+    status,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status, json={"detail": "response lost after possible apply"}
+        )
+
+    client = Mem0RestClient(
+        base_url="http://core", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(Mem0UpstreamError) as caught:
+        await client.add_memory(
+            {"text": "x", "metadata": {"_mem0_sidecar_mutation_id": "a" * 64}}
+        )
+    assert caught.value.outcome_unknown is True

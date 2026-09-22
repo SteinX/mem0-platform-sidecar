@@ -99,6 +99,15 @@ REQUEST_CHANNEL_COLUMNS = {
     "credential_prefix",
 }
 REQUEST_CHANNEL_INDEX = "ix_events_project_app_channel_created"
+ADD_RECOVERY_SCAN_INDEX = "ix_mutation_intents_add_recovery_scan"
+ADD_RECOVERY_SCAN_INDEX_COLUMNS = (
+    "operation",
+    "status",
+    "updated_at",
+    "project_id",
+    "app_id",
+    "lease_expires_at",
+)
 
 
 def test_request_channel_migration_preserves_historical_rows_as_unknown(
@@ -186,6 +195,92 @@ def test_request_channel_migration_preserves_historical_rows_as_unknown(
             )
         ).mappings().one()
     assert set(historical.values()) == {None}
+
+
+def test_add_recovery_scan_index_migration_preserves_intent_history(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'add-recovery-index.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0009_request_channel_attribution")
+    engine = sa.create_engine(database_url, future=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO projects (
+                    id, name, mem0_base_url, created_at, updated_at
+                ) VALUES (
+                    'repo-a', 'Repo A', 'http://mem0:8000',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO events (
+                    id, project_id, app_id, operation, status, request_json,
+                    response_json, error_json, result_count, has_results, created_at
+                ) VALUES (
+                    'event-before-index', 'repo-a', 'app-a', 'memory.add',
+                    'SUCCEEDED', '{}', '{}', '{}', 0, 0, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO mutation_intents (
+                    id, project_id, app_id, event_id, operation, operation_key,
+                    status, payload_json, result_json, error_json, attempt_count,
+                    created_at, updated_at, completed_at
+                ) VALUES (
+                    'intent-before-index', 'repo-a', 'app-a', 'event-before-index',
+                    'memory.add', 'completed-before-index', 'COMPLETED', '{}', '{}',
+                    '{}', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    command.upgrade(config, "0010_add_recovery_scan_index")
+
+    indexes = {
+        index["name"]: tuple(index["column_names"])
+        for index in sa.inspect(engine).get_indexes("mutation_intents")
+    }
+    assert indexes[ADD_RECOVERY_SCAN_INDEX] == ADD_RECOVERY_SCAN_INDEX_COLUMNS
+    assert "ix_mutation_intents_scope_status_created" in indexes
+    with engine.connect() as connection:
+        status = connection.scalar(
+            sa.text(
+                "SELECT status FROM mutation_intents WHERE id = 'intent-before-index'"
+            )
+        )
+        revision = connection.scalar(
+            sa.text("SELECT version_num FROM alembic_version")
+        )
+    assert status == "COMPLETED"
+    assert revision == "0010_add_recovery_scan_index"
+
+    command.downgrade(config, "0009_request_channel_attribution")
+
+    downgraded_indexes = {
+        index["name"]
+        for index in sa.inspect(engine).get_indexes("mutation_intents")
+    }
+    assert ADD_RECOVERY_SCAN_INDEX not in downgraded_indexes
+    assert "ix_mutation_intents_scope_status_created" in downgraded_indexes
+    with engine.connect() as connection:
+        status = connection.scalar(
+            sa.text(
+                "SELECT status FROM mutation_intents WHERE id = 'intent-before-index'"
+            )
+        )
+    assert status == "COMPLETED"
 
 
 def test_consolidation_migration_upgrades_from_mutation_intents(tmp_path) -> None:

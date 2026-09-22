@@ -1960,7 +1960,9 @@ class MutationIntentRepository:
         self.session.flush()
         return intent
 
-    def list_recoverable(self, project_id: str, app_id: str) -> list[MutationIntent]:
+    def list_recoverable(
+        self, project_id: str, app_id: str, *, operation: str | None = None
+    ) -> list[MutationIntent]:
         now = _utc_now()
         return list(
             self.session.scalars(
@@ -1968,6 +1970,7 @@ class MutationIntentRepository:
                 .where(
                     MutationIntent.project_id == project_id,
                     MutationIntent.app_id == app_id,
+                    *([MutationIntent.operation == operation] if operation else []),
                     or_(
                         MutationIntent.status.in_(("UNKNOWN", "PENDING")),
                         and_(
@@ -1983,7 +1986,11 @@ class MutationIntentRepository:
                         ),
                     ),
                 )
-                .order_by(MutationIntent.created_at, MutationIntent.id)
+                .order_by(
+                    MutationIntent.updated_at,
+                    MutationIntent.created_at,
+                    MutationIntent.id,
+                )
                 .limit(self.RECOVERY_LIMIT)
             )
         )

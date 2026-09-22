@@ -3,6 +3,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 
+import anyio
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -24,6 +25,7 @@ from mem0_sidecar.observability import RequestLoggingMiddleware, configure_loggi
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base
 from mem0_sidecar.store.repositories import ProjectRepository
+from mem0_sidecar.workers.add_recovery import AddRecoveryWorker
 from mem0_sidecar.workers.consolidation import ConsolidationRuntime
 from mem0_sidecar.workers.direct_write_sync import DirectWriteSyncWorker
 
@@ -105,6 +107,16 @@ def create_app(
 
     @asynccontextmanager
     async def worker_lifespan(app: FastAPI):
+        recovery_stop = anyio.Event()
+        recovery_worker = AddRecoveryWorker(
+            session_factory=session_factory,
+            mem0_client=mem0_client,
+        )
+        recovery_task = asyncio.create_task(
+            recovery_worker.run_forever(recovery_stop),
+            name="mem0-add-recovery",
+        )
+        app.state.add_recovery_task = recovery_task
         task = None
         stop = None
         consolidation_tasks: list[asyncio.Task[None]] = []
@@ -154,6 +166,10 @@ def create_app(
         try:
             yield
         finally:
+            recovery_stop.set()
+            recovery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await recovery_task
             if stop is not None:
                 stop.set()
             if task is not None:

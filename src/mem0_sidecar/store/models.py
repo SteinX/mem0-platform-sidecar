@@ -383,6 +383,15 @@ class MutationIntent(Base):
             "status",
             "created_at",
         ),
+        Index(
+            "ix_mutation_intents_add_recovery_scan",
+            "operation",
+            "status",
+            "updated_at",
+            "project_id",
+            "app_id",
+            "lease_expires_at",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
