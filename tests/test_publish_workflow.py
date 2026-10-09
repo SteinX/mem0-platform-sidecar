@@ -73,3 +73,12 @@ def test_publish_workflow_tags_release_manual_latest_and_sha():
     assert "type=raw,value=${{ inputs.image_tag }}" in workflow
     assert "type=raw,value=latest" in workflow
     assert "type=sha,format=short" in workflow
+
+
+def test_prereleases_preserve_latest_for_both_images() -> None:
+    workflow = WORKFLOW.read_text()
+    assert (
+        "github.event_name == 'release' && !github.event.release.prerelease" in workflow
+    )
+    assert "github.event_name == 'workflow_dispatch' && inputs.push_latest" in workflow
+    assert workflow.count("type=raw,value=latest,enable=${{ env.PUSH_LATEST }}") == 2
