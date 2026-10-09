@@ -309,6 +309,10 @@ with the release tag and a short commit SHA tag. Stable releases also update
 publish images. Manual runs tag both
 images with the requested `image_tag` and a short commit SHA tag; set
 `push_latest` only when intentionally moving the `latest` tag outside a release.
+Publications for both images share a queue. Automatic builds update `latest`
+only while their tag remains GitHub's latest stable Release after both immutable
+images are pushed, immediately before promoting their digests. A delayed older
+build cannot replace a newer alias.
 
 The dashboard image is built from the reviewed self-hosted `SteinX/mem0` release
 `v2.2.1-steinx.1` after applying and verifying the checked-in overlay. The

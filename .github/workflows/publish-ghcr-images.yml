@@ -39,8 +39,9 @@ jobs:
     name: Build and publish images
     runs-on: ubuntu-latest
     concurrency:
-      group: ghcr-publish-${{ github.ref }}
+      group: sidecar-image-publication
       cancel-in-progress: false
+      queue: max
 
     steps:
       - name: Checkout sidecar
@@ -131,7 +132,6 @@ jobs:
           tags: |
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
             type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable=${{ env.PUSH_LATEST }}
             type=sha,format=short,prefix=sha-
 
       - name: Dashboard image metadata
@@ -145,10 +145,10 @@ jobs:
           tags: |
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
             type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable=${{ env.PUSH_LATEST }}
             type=sha,format=short,prefix=sha-
 
       - name: Build and push sidecar image
+        id: sidecar-build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -160,6 +160,7 @@ jobs:
           cache-to: type=gha,scope=sidecar,mode=max
 
       - name: Build and push dashboard image
+        id: dashboard-build
         uses: docker/build-push-action@v6
         with:
           context: mem0-upstream/server/dashboard
@@ -169,3 +170,32 @@ jobs:
           labels: ${{ steps.dashboard-meta.outputs.labels }}
           cache-from: type=gha,scope=dashboard
           cache-to: type=gha,scope=dashboard,mode=max
+
+      - name: Resolve latest promotion
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          latest="$PUSH_LATEST"
+          if [ "$GITHUB_EVENT_NAME" = "release" ] && [ "$latest" = "true" ]; then
+            current_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+            if [ "$current_tag" != "$RELEASE_TAG" ]; then
+              latest=false
+            fi
+          fi
+          echo "push_latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Promote latest images
+        id: promote
+        if: steps.latest.outputs.push_latest == 'true'
+        env:
+          SIDECAR_DIGEST: ${{ steps.sidecar-build.outputs.digest }}
+          DASHBOARD_DIGEST: ${{ steps.dashboard-build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$SIDECAR_IMAGE:latest" "$SIDECAR_IMAGE@$SIDECAR_DIGEST"
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$DASHBOARD_IMAGE:latest" "$DASHBOARD_IMAGE@$DASHBOARD_DIGEST"
