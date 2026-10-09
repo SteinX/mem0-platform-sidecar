@@ -303,9 +303,12 @@ with the release tag, `latest`, and a short commit SHA tag. Manual runs tag both
 images with the requested `image_tag` and a short commit SHA tag; set
 `push_latest` only when intentionally moving the `latest` tag outside a release.
 
-The dashboard image is built from `mem0ai/mem0` at `mem0_ref` after applying
+The dashboard image is built from the self-hosted `SteinX/mem0` fork at `mem0_ref` after applying
 and verifying the dashboard overlay in this repository. The default manual
-`mem0_ref` is the reviewed stable baseline `v2.0.19`.
+`mem0_ref` is the reviewed stable baseline `v2.2.1-steinx.1`.
+
+The Dashboard baseline includes the production Node 24 Dockerfile and pnpm workspace inputs. Publish the matching Core release before this Sidecar release.
+
 
 ## Add To An Existing Mem0 OSS Compose Stack
 

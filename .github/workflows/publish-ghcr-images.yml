@@ -11,9 +11,9 @@ on:
         default: manual
         type: string
       mem0_ref:
-        description: Upstream mem0ai/mem0 ref used for the dashboard overlay build.
+        description: Reviewed SteinX/mem0 ref used for the dashboard overlay build.
         required: false
-        default: v2.0.19
+        default: v2.2.1-steinx.1
         type: string
       push_latest:
         description: Also publish the latest tag during a manual run.
@@ -46,8 +46,8 @@ jobs:
       - name: Checkout upstream Mem0
         uses: actions/checkout@v4
         with:
-          repository: mem0ai/mem0
-          ref: ${{ inputs.mem0_ref || 'v2.0.19' }}
+          repository: SteinX/mem0
+          ref: ${{ inputs.mem0_ref || 'v2.2.1-steinx.1' }}
           path: mem0-upstream
 
       - name: Set up Python
@@ -61,7 +61,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install dashboard dependencies
         working-directory: mem0-upstream/server/dashboard
