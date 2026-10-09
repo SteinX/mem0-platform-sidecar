@@ -28,6 +28,7 @@ env:
   MEM0_UPSTREAM_DASHBOARD: ${{ github.workspace }}/mem0-upstream/server/dashboard
   DASHBOARD_CORE_REF: v2.2.1-steinx.1
   DASHBOARD_CORE_TREE: 33e59cf2e753e5f26f77f59783ccfcfd970a3b50
+  PUSH_LATEST: ${{ (github.event_name == 'release' && !github.event.release.prerelease) || (github.event_name == 'workflow_dispatch' && inputs.push_latest) }}
 
 permissions:
   contents: read
@@ -130,7 +131,7 @@ jobs:
           tags: |
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
             type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'release' || inputs.push_latest }}
+            type=raw,value=latest,enable=${{ env.PUSH_LATEST }}
             type=sha,format=short,prefix=sha-
 
       - name: Dashboard image metadata
@@ -144,7 +145,7 @@ jobs:
           tags: |
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
             type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'release' || inputs.push_latest }}
+            type=raw,value=latest,enable=${{ env.PUSH_LATEST }}
             type=sha,format=short,prefix=sha-
 
       - name: Build and push sidecar image

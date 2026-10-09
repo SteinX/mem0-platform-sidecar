@@ -304,7 +304,9 @@ GitHub Actions publishes release-ready images to GitHub Container Registry:
 
 Publishing runs when a GitHub release is published, and can also be started
 manually from the `Publish GHCR Images` workflow. Release runs tag both images
-with the release tag, `latest`, and a short commit SHA tag. Manual runs tag both
+with the release tag and a short commit SHA tag. Stable releases also update
+`latest`; prereleases do not. Draft releases and Git tag pushes alone do not
+publish images. Manual runs tag both
 images with the requested `image_tag` and a short commit SHA tag; set
 `push_latest` only when intentionally moving the `latest` tag outside a release.
 
