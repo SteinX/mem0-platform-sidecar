@@ -75,7 +75,8 @@ def test_publish_workflow_tags_release_manual_latest_and_sha():
 
     assert "type=raw,value=${{ github.event.release.tag_name }}" in workflow
     assert "type=raw,value=${{ inputs.image_tag }}" in workflow
-    assert "type=raw,value=latest" in workflow
+    assert '--tag "$SIDECAR_IMAGE:latest"' in workflow
+    assert '--tag "$DASHBOARD_IMAGE:latest"' in workflow
     assert "type=sha,format=short" in workflow
 
 
@@ -85,12 +86,8 @@ def test_prereleases_preserve_latest_for_both_images() -> None:
         "github.event_name == 'release' && !github.event.release.prerelease" in workflow
     )
     assert "github.event_name == 'workflow_dispatch' && inputs.push_latest" in workflow
-    assert (
-        workflow.count(
-            "type=raw,value=latest,enable=${{ steps.latest.outputs.push_latest }}"
-        )
-        == 2
-    )
+    assert "type=raw,value=latest" not in workflow
+    assert "if: steps.latest.outputs.push_latest == 'true'" in workflow
     assert "group: sidecar-image-publication" in workflow
     assert "queue: max" in workflow
 
@@ -129,3 +126,46 @@ def test_latest_promotion_checks_the_current_release(
     )
     assert result.returncode == 0, result.stderr
     assert output.read_text().strip() == f"push_latest={str(expected).lower()}"
+
+
+def test_latest_promotion_after_immutable_builds() -> None:
+    workflow = WORKFLOW.read_text()
+    assert (
+        workflow.index("- name: Build and push dashboard image")
+        < workflow.index("- name: Resolve latest promotion")
+        < workflow.index("- name: Promote latest images")
+    )
+    assert "if: steps.latest.outputs.push_latest == 'true'" in workflow
+
+
+def test_latest_promotion_uses_the_built_source(tmp_path: Path) -> None:
+    sidecar = "ghcr.io/steinx/mem0-platform-sidecar"
+    dashboard = "ghcr.io/steinx/mem0-dashboard-sidecar"
+    sidecar_digest = "sha256:" + "a" * 64
+    dashboard_digest = "sha256:" + "b" * 64
+    docker = tmp_path / "docker"
+    docker.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$DOCKER_CALLS"\n')
+    docker.chmod(0o755)
+    calls = tmp_path / "docker-calls.txt"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", workflow_script("promote")],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "DOCKER_CALLS": str(calls),
+            "SIDECAR_IMAGE": sidecar,
+            "DASHBOARD_IMAGE": dashboard,
+            "SIDECAR_DIGEST": sidecar_digest,
+            "DASHBOARD_DIGEST": dashboard_digest,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text().splitlines() == [
+        "buildx imagetools create --prefer-index=false "
+        f"--tag {sidecar}:latest {sidecar}@{sidecar_digest}",
+        "buildx imagetools create --prefer-index=false "
+        f"--tag {dashboard}:latest {dashboard}@{dashboard_digest}",
+    ]
