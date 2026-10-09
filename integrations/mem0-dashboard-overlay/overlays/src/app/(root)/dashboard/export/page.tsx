@@ -12,18 +12,14 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { toast } from "@/components/ui/use-toast";
 import {
-  SidecarExportDownload,
   SidecarExportFilters,
   SidecarExportJob,
   SidecarExportListResponse,
 } from "@/types/sidecar";
-import { sidecarGet, sidecarPost } from "@/utils/sidecar-api";
+import { sidecarGet, sidecarGetBlob, sidecarPost } from "@/utils/sidecar-api";
 import { getSidecarProjectId } from "@/utils/sidecar-project";
 
-function downloadJson(filename: string, payload: SidecarExportDownload) {
-  const blob = new Blob([JSON.stringify(payload, null, 2)], {
-    type: "application/json",
-  });
+function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -150,11 +146,11 @@ export default function ExportPage() {
     }
 
     try {
-      const payload = await sidecarGet<SidecarExportDownload>(
+      const blob = await sidecarGetBlob(
         `/v1/exports/${job.id}/download`,
         { project_id: projectId },
       );
-      downloadJson(`mem0-export-${job.id}.json`, payload);
+      downloadBlob(`mem0-export-${job.id}.json`, blob);
     } catch (error) {
       toast({
         title: "Failed to download export",

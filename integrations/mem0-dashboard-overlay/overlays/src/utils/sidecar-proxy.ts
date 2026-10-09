@@ -32,7 +32,9 @@ function isExportPath(method: string, path: string): boolean {
   if ((method === "GET" || method === "POST") && path === "/v1/exports") {
     return true;
   }
-  return method === "GET" && /^\/v1\/exports\/[^/]+\/download$/.test(path);
+  return (
+    method === "GET" && /^\/v1\/exports\/[^/]+(?:\/download)?$/.test(path)
+  );
 }
 
 function isMemoryQueryPath(method: string, path: string): boolean {
@@ -279,6 +281,7 @@ function scopedJsonBody(
   configuredProjectId: string,
   configuredAppId?: string,
   projectWide = false,
+  scopeExportFilters = false,
 ): string | Response {
   const payloadText = bodyText.trim() || "{}";
   let payload: unknown;
@@ -303,8 +306,16 @@ function scopedJsonBody(
   scopedPayload.project_id = configuredProjectId;
   if (projectWide) {
     scopedPayload.project_wide = true;
-  } else if (configuredAppId !== undefined) {
+  } else if (configuredAppId !== undefined && !scopeExportFilters) {
     scopedPayload.app_id = configuredAppId;
+  }
+  if (scopeExportFilters && configuredAppId !== undefined) {
+    const filters = scopedPayload.filters;
+    if (filters === undefined || filters === null) {
+      scopedPayload.filters = { app_id: configuredAppId };
+    } else if (typeof filters === "object" && !Array.isArray(filters)) {
+      scopedPayload.filters = { ...filters, app_id: configuredAppId };
+    }
   }
   return JSON.stringify(scopedPayload);
 }
@@ -436,6 +447,9 @@ export async function proxySidecarRequest(
   }
   if (isExportPath(request.method, scopedPath)) {
     url.searchParams.set("project_id", configuredProjectId);
+    if (scopedAppId !== undefined) {
+      url.searchParams.set("app_id", scopedAppId);
+    }
   }
   if (isMemoryItemRequest || isMemoryHistoryRequest) {
     url.searchParams.set("project_id", configuredProjectId);
@@ -490,7 +504,13 @@ export async function proxySidecarRequest(
       }
       const rewrittenBody =
         request.method === "POST" && scopedPath === "/v1/exports"
-          ? scopedJsonBody(bodyText, configuredProjectId)
+          ? scopedJsonBody(
+              bodyText,
+              configuredProjectId,
+              scopedAppId,
+              false,
+              true,
+            )
           : scopedJsonBody(
               bodyText,
               configuredProjectId,
@@ -520,12 +540,20 @@ export async function proxySidecarRequest(
     return jsonError("Sidecar upstream request failed", 502);
   }
 
-  const responseBody = response.body === null ? null : await response.text();
-  return new Response(responseBody, {
+  const responseHeaders = new Headers({
+    "Content-Type": response.headers.get("Content-Type") ?? "application/json",
+  });
+  if (requestPath.endsWith("/download")) {
+    const contentDisposition = response.headers.get("Content-Disposition");
+    if (
+      contentDisposition !== null &&
+      /^attachment(?:;|$)/i.test(contentDisposition.trim())
+    ) {
+      responseHeaders.set("Content-Disposition", contentDisposition);
+    }
+  }
+  return new Response(response.body, {
     status: response.status,
-    headers: {
-      "Content-Type":
-        response.headers.get("Content-Type") ?? "application/json",
-    },
+    headers: responseHeaders,
   });
 }

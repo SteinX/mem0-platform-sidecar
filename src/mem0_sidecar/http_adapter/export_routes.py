@@ -5,7 +5,11 @@ from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.exports import ExportService, ExportValidationError
 from mem0_sidecar.http_adapter.dependencies import get_mem0_client, get_session
-from mem0_sidecar.http_adapter.project_scope import ensure_project, resolve_project_id
+from mem0_sidecar.http_adapter.project_scope import (
+    ensure_project,
+    resolve_app_id,
+    resolve_project_id,
+)
 from mem0_sidecar.store.repositories import ExportJobRepository, MemoryIndexRepository
 
 export_router = APIRouter()
@@ -59,6 +63,7 @@ async def create_export(
     try:
         result = await _service(session, mem0).create_export(
             project_id=project_id,
+            app_id=resolve_app_id(request, payload),
             export_format=str(payload.get("format", "json")),
             filters=_extract_filters(payload),
         )
@@ -75,7 +80,7 @@ def list_exports(
     mem0: Mem0Dependency,
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
-    return _service(session, mem0).list_exports(project_id)
+    return _service(session, mem0).list_exports(project_id, resolve_app_id(request))
 
 
 @export_router.get("/v1/exports/{job_id}")
@@ -87,7 +92,9 @@ def get_export(
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
     try:
-        return _service(session, mem0).get_export(project_id, job_id)
+        return _service(session, mem0).get_export(
+            project_id, job_id, resolve_app_id(request)
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Export not found") from exc
 
@@ -101,7 +108,9 @@ def download_export(
 ) -> dict[str, Any]:
     project_id = resolve_project_id(request)
     try:
-        return _service(session, mem0).download_export(project_id, job_id)
+        return _service(session, mem0).download_export(
+            project_id, job_id, resolve_app_id(request)
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Export not found") from exc
     except ExportValidationError as exc:

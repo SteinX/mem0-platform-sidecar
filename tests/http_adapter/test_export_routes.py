@@ -1,6 +1,8 @@
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from mem0_sidecar.config import SidecarSettings
 from mem0_sidecar.http_adapter.app import create_app
@@ -195,3 +197,93 @@ def test_export_routes_isolate_access_by_project(tmp_path):
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Export not found"
+
+
+@pytest.mark.asyncio
+async def test_export_routes_force_and_enforce_optional_app_scope(tmp_path):
+    app = _app(tmp_path, ExportFakeMem0Client())
+    with app.state.session_factory() as session:
+        repository = ExportJobRepository(session)
+        app_job = repository.create(
+            project_id="default",
+            export_format="json",
+            filters={"app_id": "app-a"},
+        )
+        foreign_job = repository.create(
+            project_id="default",
+            export_format="json",
+            filters={"app_id": "app-b"},
+        )
+        global_job = repository.create(
+            project_id="default",
+            export_format="json",
+            filters={},
+        )
+        null_job = repository.create(
+            project_id="default",
+            export_format="json",
+            filters={"app_id": None},
+        )
+        wildcard_job = repository.create(
+            project_id="default",
+            export_format="json",
+            filters={"app_id": "*"},
+        )
+        session.commit()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        scoped_list = await client.get(
+            "/v1/exports", params={"project_id": "default", "app_id": "app-a"}
+        )
+        assert scoped_list.status_code == 200
+        assert [job["id"] for job in scoped_list.json()["results"]] == [app_job.id]
+
+        project_wide_list = await client.get(
+            "/v1/exports", params={"project_id": "default"}
+        )
+        assert {job["id"] for job in project_wide_list.json()["results"]} == {
+            app_job.id,
+            foreign_job.id,
+            global_job.id,
+            null_job.id,
+            wildcard_job.id,
+        }
+
+        for inaccessible_job in (
+            foreign_job,
+            global_job,
+            null_job,
+            wildcard_job,
+        ):
+            status_response = await client.get(
+                f"/v1/exports/{inaccessible_job.id}",
+                params={"project_id": "default", "app_id": "app-a"},
+            )
+            download_response = await client.get(
+                f"/v1/exports/{inaccessible_job.id}/download",
+                params={"project_id": "default", "app_id": "app-a"},
+            )
+            assert status_response.status_code == 404
+            assert download_response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [{}, {"app_id": None}, {"app_id": "*"}, {"app_id": "foreign"}],
+)
+@pytest.mark.asyncio
+async def test_export_route_forces_create_app_scope(tmp_path, filters):
+    app = _app(tmp_path, ExportFakeMem0Client())
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/v1/exports",
+            params={"project_id": "default", "app_id": "runtime-app"},
+            json={"format": "json", "filters": filters},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["filters"]["app_id"] == "runtime-app"

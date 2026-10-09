@@ -1840,7 +1840,7 @@ def test_sidecar_proxy_harness_executes_the_applied_target(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "sidecar proxy request harness: 46 contracts passed" in result.stdout
+    assert "sidecar proxy request harness: 47 contracts passed" in result.stdout
 
 
 def test_sidecar_proxy_harness_rejects_stale_applied_target(tmp_path):
@@ -3583,10 +3583,8 @@ def test_apply_dashboard_overlay_replaces_export_with_sidecar_export_page(tmp_pa
     assert "sidecarGet<SidecarExportListResponse>" in content
     assert 'await sidecarPost<SidecarExportJob>("/v1/exports"' in content
     assert '`/v1/exports/${job.id}/download`' in content
-    assert (
-        "function downloadJson(filename: string, payload: SidecarExportDownload)"
-        in content
-    )
+    assert "function downloadBlob(filename: string, blob: Blob)" in content
+    assert "const blob = await sidecarGetBlob(" in content
     assert 'import { getSidecarProjectId } from "@/utils/sidecar-project";' in content
     assert "await getSidecarProjectId()" in content
     assert 'const PROJECT_ID = "default";' not in content
@@ -3634,7 +3632,10 @@ def test_apply_dashboard_overlay_export_page_uses_safe_blob_download_cleanup(tmp
     assert result.returncode == 0, result.stderr
 
     content = (dashboard / "src/app/(root)/dashboard/export/page.tsx").read_text()
+    helper = (dashboard / "src/utils/sidecar-api.ts").read_text()
 
+    assert "return response.blob();" in helper
+    assert "JSON.stringify(payload, null, 2)" not in content
     assert "document.body.appendChild(anchor);" in content
     assert "anchor.click();" in content
     assert "window.setTimeout(() => {" in content

@@ -27,7 +27,7 @@ env:
   DASHBOARD_IMAGE: ghcr.io/steinx/mem0-dashboard-sidecar
   MEM0_UPSTREAM_DASHBOARD: ${{ github.workspace }}/mem0-upstream/server/dashboard
   DASHBOARD_CORE_REF: v2.2.1-steinx.1
-  DASHBOARD_CORE_TREE: 6db2aa8854cbb7a91cb9ff325295b71441091e9a
+  DASHBOARD_CORE_TREE: 425aa05184d0ae03117613e1ff122cc4aa95725e
 
 permissions:
   contents: read
