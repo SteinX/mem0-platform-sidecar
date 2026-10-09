@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import shutil
@@ -2740,3 +2741,60 @@ def test_reconcile_passes_default_project_and_commits_adoption(tmp_path) -> None
             app_id="app-a",
         )
     assert adopted is not None
+
+
+def test_add_and_completed_replay_return_persisted_mcp_channel(tmp_path) -> None:
+    mem0 = FakeMem0Client()
+    app = create_app(
+        settings=SidecarSettings(
+            database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
+            mem0_base_url="http://mem0.local",
+            default_project_id="repo-a",
+            client_auth_enabled=True,
+            mem0_api_key="fixture-operator",
+        ),
+        mem0_client=mem0,
+    )
+    client = TestClient(app)
+    attribution = {
+        "v": 1,
+        "transport": "mcp",
+        "credential_kind": "core_api_key",
+        "credential_id": "e0544e3c-d217-40d9-bc9a-c1f64077542a",
+        "label": "client-test",
+        "key_prefix": "m0sk_client_",
+    }
+    caller = (
+        base64.urlsafe_b64encode(json.dumps(attribution).encode()).rstrip(b"=").decode()
+    )
+    request = {
+        "headers": {
+            "X-API-Key": "fixture-operator",
+            "Idempotency-Key": "channel-add",
+            "X-Mem0-Caller-Context": caller,
+        },
+        "json": {
+            "text": "hello",
+            "project_id": "repo-a",
+            "app_id": "app-a",
+            "metadata": {"channel": {"credential_id": "foreign-client"}},
+        },
+    }
+    first = client.post("/v3/memories/add/", **request)
+    assert first.status_code == 200
+    event_id = first.json()["event"]["id"]
+    canonical = client.get(
+        f"/v1/event/{event_id}",
+        params={"project_id": "repo-a", "app_id": "app-a"},
+        headers={"X-API-Key": "fixture-operator"},
+    )
+    assert canonical.status_code == 200
+    channel = canonical.json()["channel"]
+    assert channel["transport"] == "mcp"
+    assert channel["credential_kind"] == "core_api_key"
+    assert channel["credential_id"] == "e0544e3c-d217-40d9-bc9a-c1f64077542a"
+    assert first.json()["event"]["channel"] == channel
+    replay = client.post("/v3/memories/add/", **request)
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert len(mem0.add_payloads) == 1

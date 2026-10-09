@@ -32,7 +32,9 @@ from mem0_sidecar.http_adapter.project_scope import (
     resolve_project_app_id,
     resolve_project_id,
 )
+from mem0_sidecar.request_attribution import RequestAttribution
 from mem0_sidecar.store.models import Project
+from mem0_sidecar.store.repositories import EventRepository
 
 
 class _SingleDecodeMemoryRoute(APIRoute):
@@ -223,6 +225,14 @@ async def add_memory(
             payload=service_payload,
             idempotency_key=idempotency_key,
         )
+        event = EventRepository(session).get(result["event"]["id"])
+        result["event"]["channel"] = RequestAttribution.from_stored(
+            transport=event.request_transport,
+            credential_kind=event.credential_kind,
+            credential_id=event.credential_id,
+            credential_label=event.credential_label,
+            credential_prefix=event.credential_prefix,
+        ).to_channel_dict()
         return result
     except MutationConflictError as exc:
         session.rollback()

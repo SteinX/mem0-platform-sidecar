@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 WORKFLOW = Path(__file__).parents[1] / ".github/workflows/publish-ghcr-images.yml"
-TAG = "v0.3.11"
+TAG = "v0.3.12"
 
 
 def workflow_script(step_id: str) -> str:

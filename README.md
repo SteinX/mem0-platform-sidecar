@@ -119,6 +119,11 @@ Important modules:
 | `GET` | `/v1/event/{event_id}` | Read one sidecar event for a project |
 
 This is a compatibility layer, not a complete Mem0 Cloud or Platform clone.
+
+MCP bridge 0.1.5 requires Sidecar 0.3.12 or later so add responses include the
+persisted event's credential channel, including completed idempotent replays.
+Upgrade Sidecar before MCP. Sidecar 0.3.12 preserves compatibility with bridge
+0.1.4 and does not introduce a database migration.
 Dashboard, billing, analytics, hosted auth, webhooks, and full project
 management APIs are intentionally outside the current implementation.
 
