@@ -1,7 +1,20 @@
+import re
 from pathlib import Path
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "publish-ghcr-images.yml"
+
+
+def test_publication_workflow_parses_with_top_level_source_pin():
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+
+    assert isinstance(workflow, dict)
+    environment = workflow["env"]
+    assert isinstance(environment, dict)
+    assert re.fullmatch(r"[0-9a-f]{40}", environment["DASHBOARD_CORE_TREE"])
+    assert isinstance(workflow["jobs"]["publish"]["steps"], list)
 
 
 def test_publish_workflow_publishes_sidecar_and_dashboard_images():
