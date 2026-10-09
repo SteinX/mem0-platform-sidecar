@@ -11,9 +11,9 @@ on:
         default: manual
         type: string
       mem0_ref:
-        description: Upstream mem0ai/mem0 ref used for the dashboard overlay build.
+        description: Must match the reviewed Dashboard Core release tag.
         required: false
-        default: v2.0.19
+        default: v2.2.1-steinx.1
         type: string
       push_latest:
         description: Also publish the latest tag during a manual run.
@@ -26,6 +26,8 @@ env:
   SIDECAR_IMAGE: ghcr.io/steinx/mem0-platform-sidecar
   DASHBOARD_IMAGE: ghcr.io/steinx/mem0-dashboard-sidecar
   MEM0_UPSTREAM_DASHBOARD: ${{ github.workspace }}/mem0-upstream/server/dashboard
+  DASHBOARD_CORE_REF: v2.2.1-steinx.1
+  DASHBOARD_CORE_TREE: 33e59cf2e753e5f26f77f59783ccfcfd970a3b50
 
 permissions:
   contents: read
@@ -42,13 +44,41 @@ jobs:
     steps:
       - name: Checkout sidecar
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.sha }}
+          persist-credentials: false
+
+      - name: Verify publication source
+        id: source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REQUESTED_CORE_REF: ${{ inputs.mem0_ref }}
+        run: |
+          set -euo pipefail
+          source_sha=$(git rev-parse HEAD)
+          test "$source_sha" = "$GITHUB_SHA"
+          if [ -n "$RELEASE_TAG" ]; then
+            test "$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")" = "$source_sha"
+          fi
+          if [ -n "$REQUESTED_CORE_REF" ]; then
+            test "$REQUESTED_CORE_REF" = "$DASHBOARD_CORE_REF"
+          fi
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
 
       - name: Checkout upstream Mem0
         uses: actions/checkout@v4
         with:
-          repository: mem0ai/mem0
-          ref: ${{ inputs.mem0_ref || 'v2.0.19' }}
+          repository: SteinX/mem0
+          ref: ${{ env.DASHBOARD_CORE_REF }}
           path: mem0-upstream
+          persist-credentials: false
+
+      - name: Verify reviewed Dashboard source
+        id: core-source
+        run: |
+          set -euo pipefail
+          test "$(git -C mem0-upstream rev-parse HEAD^{tree})" = "$DASHBOARD_CORE_TREE"
+          echo "sha=$(git -C mem0-upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -61,7 +91,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install dashboard dependencies
         working-directory: mem0-upstream/server/dashboard
@@ -108,6 +138,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.DASHBOARD_IMAGE }}
+          labels: |
+            io.steinx.mem0.core.revision=${{ steps.core-source.outputs.sha }}
+            io.steinx.mem0.core.tree=${{ env.DASHBOARD_CORE_TREE }}
           tags: |
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
             type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}

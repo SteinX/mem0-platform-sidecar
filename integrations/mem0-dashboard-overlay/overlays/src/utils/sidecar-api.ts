@@ -39,6 +39,17 @@ export async function sidecarGet<T>(
   return parseResponse<T>(response);
 }
 
+export async function sidecarGetBlob(
+  path: string,
+  params?: Record<string, string>,
+): Promise<Blob> {
+  const response = await fetch(withParams(path, params), { method: "GET" });
+  if (!response.ok) {
+    return parseResponse<never>(response);
+  }
+  return response.blob();
+}
+
 async function sidecarRequest<T>(
   method: "POST" | "PUT" | "PATCH",
   path: string,

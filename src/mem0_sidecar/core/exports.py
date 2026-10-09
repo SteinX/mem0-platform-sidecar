@@ -29,6 +29,13 @@ def _job_to_dict(job: ExportJob) -> dict[str, Any]:
     }
 
 
+def _job_matches_app_scope(job: ExportJob, app_id: str | None) -> bool:
+    if app_id is None:
+        return True
+    filters = json.loads(job.filters_json)
+    return isinstance(filters, dict) and filters.get("app_id") == app_id
+
+
 def _error_payload(exc: Exception) -> dict[str, Any]:
     payload: dict[str, Any] = {"error_type": type(exc).__name__, "message": str(exc)}
     if request_id := get_request_id():
@@ -58,6 +65,7 @@ class ExportService:
         self,
         *,
         project_id: str,
+        app_id: str | None = None,
         export_format: str,
         filters: dict[str, Any],
         release_before_upstream: bool = False,
@@ -65,16 +73,20 @@ class ExportService:
         if export_format != "json":
             raise ExportValidationError("Only json export format is supported")
 
+        scoped_filters = dict(filters)
+        if app_id is not None:
+            scoped_filters["app_id"] = app_id
+
         job = self.exports.create(
             project_id=project_id,
             export_format=export_format,
-            filters=filters,
+            filters=scoped_filters,
         )
         self.exports.mark_running(project_id, job.id)
 
         candidates = self.memories.list_export_candidates(
             project_id=project_id,
-            filters=filters,
+            filters=scoped_filters,
         )
         candidate_ids = [candidate.mem0_memory_id for candidate in candidates]
         if release_before_upstream:
@@ -113,7 +125,7 @@ class ExportService:
             result = {
                 "project_id": project_id,
                 "format": export_format,
-                "filters": filters,
+                "filters": scoped_filters,
                 "memories": exported,
                 "skipped": skipped,
             }
@@ -134,19 +146,31 @@ class ExportService:
             )
             return _job_to_dict(job)
 
-    def list_exports(self, project_id: str) -> dict[str, Any]:
+    def list_exports(
+        self, project_id: str, app_id: str | None = None
+    ) -> dict[str, Any]:
         return {
             "results": [
                 _job_to_dict(job)
                 for job in self.exports.list_project_exports(project_id)
+                if _job_matches_app_scope(job, app_id)
             ]
         }
 
-    def get_export(self, project_id: str, job_id: str) -> dict[str, Any]:
-        return _job_to_dict(self.exports.get(project_id, job_id))
-
-    def download_export(self, project_id: str, job_id: str) -> dict[str, Any]:
+    def get_export(
+        self, project_id: str, job_id: str, app_id: str | None = None
+    ) -> dict[str, Any]:
         job = self.exports.get(project_id, job_id)
+        if not _job_matches_app_scope(job, app_id):
+            raise KeyError(job_id)
+        return _job_to_dict(job)
+
+    def download_export(
+        self, project_id: str, job_id: str, app_id: str | None = None
+    ) -> dict[str, Any]:
+        job = self.exports.get(project_id, job_id)
+        if not _job_matches_app_scope(job, app_id):
+            raise KeyError(job_id)
         if job.status != ExportStatus.SUCCEEDED:
             raise ExportValidationError("Export is not complete")
         return json.loads(job.result_json)

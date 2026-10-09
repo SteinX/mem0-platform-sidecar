@@ -1404,6 +1404,29 @@ async function testCategoryMutationRejectsStreamedOversizedBody(proxy) {
   assert.equal(fetchCalled, false);
 }
 
+async function testCategoryMutationsRejectTraversalIds(proxy) {
+  const categoryPath =
+    "/v1/projects/caller/categories/..\\projects\\victim\\categories\\secret";
+  for (const method of ["PATCH", "DELETE"]) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request("http://dashboard.local/api/sidecar/category", {
+        method,
+        headers: method === "PATCH" ? jsonHeaders() : undefined,
+        body: method === "PATCH" ? "{}" : undefined,
+      }),
+      categoryPath,
+      proxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+
+    assert.equal(response.status, 403, method);
+    assert.equal(fetchCalled, false, method);
+  }
+}
+
 async function testPatchRewritesProjectEncodesCategoryAndForwardsBody(proxy) {
   const calls = [];
   const payload = { description: "Updated", enabled: false };
@@ -1500,23 +1523,26 @@ async function testExportPostForcesConfiguredProjectInBodyAndQuery(proxy) {
       },
     ),
     "/v1/exports",
-    proxyOptions(async (url, init) => {
-      calls.push({ url: url.toString(), init });
-      return Response.json({ id: "export-1", status: "pending" });
-    }),
+    proxyOptions(
+      async (url, init) => {
+        calls.push({ url: url.toString(), init });
+        return Response.json({ id: "export-1", status: "pending" });
+      },
+      { configuredAppId: "runtime-app" },
+    ),
   );
 
   assert.equal(response.status, 200);
   assert.equal(calls.length, 1);
   assert.equal(
     calls[0].url,
-    "http://sidecar.internal/v1/exports?trace=export&project_id=runtime+project",
+    "http://sidecar.internal/v1/exports?trace=export&project_id=runtime+project&app_id=runtime-app",
   );
   assert.equal(calls[0].init.method, "POST");
   assert.equal(calls[0].init.headers.get("Content-Type"), "application/json");
   assert.equal(calls[0].init.headers.get("X-Request-ID"), "export-create-123");
   assert.deepEqual(JSON.parse(calls[0].init.body), {
-    filters: payload.filters,
+    filters: { ...payload.filters, app_id: "runtime-app" },
     format: payload.format,
     project_id: "runtime project",
   });
@@ -1533,22 +1559,154 @@ async function testExportListForcesConfiguredProjectInQuery(proxy) {
       },
     ),
     "/v1/exports",
-    proxyOptions(async (url, init) => {
-      calls.push({ url: url.toString(), init });
-      return Response.json({ exports: [] });
-    }),
+    proxyOptions(
+      async (url, init) => {
+        calls.push({ url: url.toString(), init });
+        return Response.json({ exports: [] });
+      },
+      { configuredAppId: "runtime-app" },
+    ),
   );
 
   assert.equal(response.status, 200);
   assert.equal(calls.length, 1);
   assert.equal(
     calls[0].url,
-    "http://sidecar.internal/v1/exports?limit=25&project_id=runtime+project",
+    "http://sidecar.internal/v1/exports?limit=25&project_id=runtime+project&app_id=runtime-app",
   );
   assert.equal(calls[0].init.method, "GET");
   assert.equal(calls[0].init.headers.get("Content-Type"), "application/json");
   assert.equal(calls[0].init.headers.get("X-Request-ID"), "export-list-123");
   assert.equal(calls[0].init.body, undefined);
+}
+
+async function testExportStatusAndDownloadForceScopeAndStream(proxy) {
+  const calls = [];
+  let releaseTail;
+  const tailGate = new Promise((resolve) => {
+    releaseTail = resolve;
+  });
+  const responsePromise = proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/exports/job-1/download"),
+    "/v1/exports/job-1/download",
+    proxyOptions(
+      async (url, init) => {
+        calls.push({ url: url.toString(), init });
+        const body = new ReadableStream({
+          async start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"first":'));
+            await tailGate;
+            controller.enqueue(new TextEncoder().encode("true}"));
+            controller.close();
+          },
+        });
+        return new Response(body, {
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Disposition": 'attachment; filename="export.json"',
+            "Set-Cookie": "secret=never-forward",
+          },
+        });
+      },
+      { configuredAppId: "runtime-app" },
+    ),
+  );
+  const response = await Promise.race([
+    responsePromise,
+    new Promise((_, reject) =>
+      setTimeout(() => {
+        releaseTail();
+        reject(new Error("proxy buffered the upstream response"));
+      }, 100),
+    ),
+  ]);
+
+  const reader = response.body.getReader();
+  const first = await Promise.race([
+    reader.read(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("first chunk buffered")), 100),
+    ),
+  ]);
+  assert.equal(new TextDecoder().decode(first.value), '{"first":');
+  assert.equal(
+    response.headers.get("Content-Disposition"),
+    'attachment; filename="export.json"',
+  );
+  assert.equal(response.headers.get("Set-Cookie"), null);
+  assert.equal(
+    calls[0].url,
+    "http://sidecar.internal/v1/exports/job-1/download?project_id=runtime+project&app_id=runtime-app",
+  );
+  releaseTail();
+  assert.equal(new TextDecoder().decode((await reader.read()).value), "true}");
+
+  const statusCalls = [];
+  const statusResponse = await proxy(
+    new Request("http://dashboard.local/api/sidecar/v1/exports/job-1"),
+    "/v1/exports/job-1",
+    proxyOptions(
+      async (url) => {
+        statusCalls.push(url.toString());
+        return Response.json({ id: "job-1" });
+      },
+      { configuredAppId: "*" },
+    ),
+  );
+  assert.equal(statusResponse.status, 200);
+  assert.equal(
+    statusCalls[0],
+    "http://sidecar.internal/v1/exports/job-1?project_id=runtime+project",
+  );
+}
+
+async function testExportIdsAreCanonicalizedBeforeUpstreamRouting(proxy) {
+  const rejected = [
+    [
+      "http://dashboard.local/api/sidecar/v1/exports/..%5Cprojects%5Cvictim%5Capps%5Ca%5Cconsolidation",
+      "/v1/exports/..\\projects\\victim\\apps\\a\\consolidation",
+    ],
+    [
+      "http://dashboard.local/api/sidecar/v1/exports/job%252Fone",
+      "/v1/exports/job%2Fone",
+    ],
+    [
+      "http://dashboard.local/api/sidecar/v1/exports/job%00one",
+      "/v1/exports/job\u0000one",
+    ],
+  ];
+  for (const [url, normalizedPath] of rejected) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request(url, { method: "GET" }),
+      normalizedPath,
+      proxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+    assert.equal(response.status, 403, normalizedPath);
+    assert.equal(fetchCalled, false, normalizedPath);
+  }
+
+  const calls = [];
+  const safeResponse = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/exports/job%2Fone?trace=yes",
+      { method: "GET" },
+    ),
+    "/v1/exports/job/one",
+    proxyOptions(async (url) => {
+      calls.push(url.toString());
+      return Response.json({ id: "job/one" });
+    }),
+  );
+
+  assert.equal(safeResponse.status, 200);
+  assert.equal(
+    calls[0],
+    "http://sidecar.internal/v1/exports/job%252Fone?trace=yes&project_id=runtime+project",
+  );
 }
 
 async function main() {
@@ -1618,8 +1776,12 @@ async function main() {
   await testUnauthenticatedMemoryRequestIsRejected(proxySidecarRequest);
   await testUpstreamFailureDoesNotLeakInternalDetails(proxySidecarRequest);
   await testUpstreamRedirectIsNotFollowedOrExposed(proxySidecarRequest);
+  await testExportIdsAreCanonicalizedBeforeUpstreamRouting(
+    proxySidecarRequest,
+  );
   await testCategoryCollectionPostForcesConfiguredProject(proxySidecarRequest);
   await testCategoryMutationRejectsStreamedOversizedBody(proxySidecarRequest);
+  await testCategoryMutationsRejectTraversalIds(proxySidecarRequest);
   await testPatchRewritesProjectEncodesCategoryAndForwardsBody(
     proxySidecarRequest,
   );
@@ -1630,7 +1792,8 @@ async function main() {
     proxySidecarRequest,
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 46 contracts passed");
+  await testExportStatusAndDownloadForceScopeAndStream(proxySidecarRequest);
+  console.log("sidecar proxy request harness: 49 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(
