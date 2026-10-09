@@ -26,7 +26,8 @@ def test_publish_workflow_applies_and_verifies_dashboard_overlay():
     overlay_scripts = "integrations/mem0-dashboard-overlay/scripts"
 
     assert "repository: SteinX/mem0" in workflow
-    assert "ref: ${{ inputs.mem0_ref || 'v2.2.1-steinx.1' }}" in workflow
+    assert "ref: ${{ env.DASHBOARD_CORE_REF }}" in workflow
+    assert "DASHBOARD_CORE_REF: v2.2.1-steinx.1" in workflow
     assert f"{overlay_scripts}/apply-dashboard-overlay" in workflow
     assert f"{overlay_scripts}/verify-dashboard-overlay" in workflow
     assert "mem0-upstream/server/dashboard" in workflow

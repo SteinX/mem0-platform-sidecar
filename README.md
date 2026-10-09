@@ -303,9 +303,11 @@ with the release tag, `latest`, and a short commit SHA tag. Manual runs tag both
 images with the requested `image_tag` and a short commit SHA tag; set
 `push_latest` only when intentionally moving the `latest` tag outside a release.
 
-The dashboard image is built from the self-hosted `SteinX/mem0` fork at `mem0_ref` after applying
-and verifying the dashboard overlay in this repository. The default manual
-`mem0_ref` is the reviewed stable baseline `v2.2.1-steinx.1`.
+The dashboard image is built from the reviewed self-hosted `SteinX/mem0` release
+`v2.2.1-steinx.1` after applying and verifying the checked-in overlay. The
+compatibility input `mem0_ref` must match this tag; other refs are rejected.
+The publisher verifies the release commit and the reviewed Core source tree
+before installing dependencies or obtaining package-publish credentials.
 
 The Dashboard baseline includes the production Node 24 Dockerfile and pnpm workspace inputs. Publish the matching Core release before this Sidecar release.
 
