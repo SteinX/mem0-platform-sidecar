@@ -1404,6 +1404,29 @@ async function testCategoryMutationRejectsStreamedOversizedBody(proxy) {
   assert.equal(fetchCalled, false);
 }
 
+async function testCategoryMutationsRejectTraversalIds(proxy) {
+  const categoryPath =
+    "/v1/projects/caller/categories/..\\projects\\victim\\categories\\secret";
+  for (const method of ["PATCH", "DELETE"]) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request("http://dashboard.local/api/sidecar/category", {
+        method,
+        headers: method === "PATCH" ? jsonHeaders() : undefined,
+        body: method === "PATCH" ? "{}" : undefined,
+      }),
+      categoryPath,
+      proxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+
+    assert.equal(response.status, 403, method);
+    assert.equal(fetchCalled, false, method);
+  }
+}
+
 async function testPatchRewritesProjectEncodesCategoryAndForwardsBody(proxy) {
   const calls = [];
   const payload = { description: "Updated", enabled: false };
@@ -1637,6 +1660,55 @@ async function testExportStatusAndDownloadForceScopeAndStream(proxy) {
   );
 }
 
+async function testExportIdsAreCanonicalizedBeforeUpstreamRouting(proxy) {
+  const rejected = [
+    [
+      "http://dashboard.local/api/sidecar/v1/exports/..%5Cprojects%5Cvictim%5Capps%5Ca%5Cconsolidation",
+      "/v1/exports/..\\projects\\victim\\apps\\a\\consolidation",
+    ],
+    [
+      "http://dashboard.local/api/sidecar/v1/exports/job%252Fone",
+      "/v1/exports/job%2Fone",
+    ],
+    [
+      "http://dashboard.local/api/sidecar/v1/exports/job%00one",
+      "/v1/exports/job\u0000one",
+    ],
+  ];
+  for (const [url, normalizedPath] of rejected) {
+    let fetchCalled = false;
+    const response = await proxy(
+      new Request(url, { method: "GET" }),
+      normalizedPath,
+      proxyOptions(async () => {
+        fetchCalled = true;
+        return Response.json({});
+      }),
+    );
+    assert.equal(response.status, 403, normalizedPath);
+    assert.equal(fetchCalled, false, normalizedPath);
+  }
+
+  const calls = [];
+  const safeResponse = await proxy(
+    new Request(
+      "http://dashboard.local/api/sidecar/v1/exports/job%2Fone?trace=yes",
+      { method: "GET" },
+    ),
+    "/v1/exports/job/one",
+    proxyOptions(async (url) => {
+      calls.push(url.toString());
+      return Response.json({ id: "job/one" });
+    }),
+  );
+
+  assert.equal(safeResponse.status, 200);
+  assert.equal(
+    calls[0],
+    "http://sidecar.internal/v1/exports/job%252Fone?trace=yes&project_id=runtime+project",
+  );
+}
+
 async function main() {
   if (process.argv.length !== 3) {
     throw new Error("usage: test-sidecar-proxy.cjs <dashboard-dir>");
@@ -1704,8 +1776,12 @@ async function main() {
   await testUnauthenticatedMemoryRequestIsRejected(proxySidecarRequest);
   await testUpstreamFailureDoesNotLeakInternalDetails(proxySidecarRequest);
   await testUpstreamRedirectIsNotFollowedOrExposed(proxySidecarRequest);
+  await testExportIdsAreCanonicalizedBeforeUpstreamRouting(
+    proxySidecarRequest,
+  );
   await testCategoryCollectionPostForcesConfiguredProject(proxySidecarRequest);
   await testCategoryMutationRejectsStreamedOversizedBody(proxySidecarRequest);
+  await testCategoryMutationsRejectTraversalIds(proxySidecarRequest);
   await testPatchRewritesProjectEncodesCategoryAndForwardsBody(
     proxySidecarRequest,
   );
@@ -1717,7 +1793,7 @@ async function main() {
   );
   await testExportListForcesConfiguredProjectInQuery(proxySidecarRequest);
   await testExportStatusAndDownloadForceScopeAndStream(proxySidecarRequest);
-  console.log("sidecar proxy request harness: 47 contracts passed");
+  console.log("sidecar proxy request harness: 49 contracts passed");
   const integrationBaseUrl = process.env.SIDECAR_PROXY_INTEGRATION_URL;
   if (integrationBaseUrl) {
     await testRealSidecarEncodedIdRoundTrip(
