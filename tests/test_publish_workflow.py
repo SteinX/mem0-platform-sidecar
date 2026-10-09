@@ -1,7 +1,11 @@
+import os
 import re
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
+from test_release_source import workflow_script
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "publish-ghcr-images.yml"
@@ -81,4 +85,47 @@ def test_prereleases_preserve_latest_for_both_images() -> None:
         "github.event_name == 'release' && !github.event.release.prerelease" in workflow
     )
     assert "github.event_name == 'workflow_dispatch' && inputs.push_latest" in workflow
-    assert workflow.count("type=raw,value=latest,enable=${{ env.PUSH_LATEST }}") == 2
+    assert (
+        workflow.count(
+            "type=raw,value=latest,enable=${{ steps.latest.outputs.push_latest }}"
+        )
+        == 2
+    )
+    assert "group: sidecar-image-publication" in workflow
+    assert "queue: max" in workflow
+
+
+@pytest.mark.parametrize(
+    ("event", "requested", "current_tag", "expected"),
+    [
+        ("release", True, "v0.3.13", True),
+        ("release", True, "v0.3.14", False),
+        ("release", False, "v0.3.14", False),
+        ("workflow_dispatch", True, "v0.3.14", True),
+    ],
+)
+def test_latest_promotion_checks_the_current_release(
+    tmp_path: Path, event: str, requested: bool, current_tag: str, expected: bool
+) -> None:
+    gh = tmp_path / "gh"
+    gh.write_text('#!/bin/bash\nprintf "%s\\n" "$CURRENT_TAG"\n')
+    gh.chmod(0o755)
+    output = tmp_path / "output"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", workflow_script("latest")],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "GITHUB_EVENT_NAME": event,
+            "GITHUB_REPOSITORY": "SteinX/mem0-platform-sidecar",
+            "PUSH_LATEST": str(requested).lower(),
+            "RELEASE_TAG": "v0.3.13",
+            "CURRENT_TAG": current_tag,
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.read_text().strip() == f"push_latest={str(expected).lower()}"
