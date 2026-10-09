@@ -5,7 +5,7 @@ import mem0_sidecar
 
 
 def test_package_has_version() -> None:
-    assert mem0_sidecar.__version__ == "0.3.11"
+    assert mem0_sidecar.__version__ == "0.3.12"
 
 
 def test_runtime_version_matches_package_metadata() -> None:
