@@ -1,6 +1,7 @@
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -51,8 +52,8 @@ def cursor_scope(request: MemoryScanRequest) -> CursorScope:
     )
 
 
-def _scope_digest(scope: CursorScope) -> str:
-    payload: JsonObject = {
+def _scope_payload(scope: CursorScope) -> JsonObject:
+    return {
         "project_id": scope.project_id,
         "app_id": scope.app_id,
         "project_wide": scope.project_wide,
@@ -64,11 +65,21 @@ def _scope_digest(scope: CursorScope) -> str:
         },
         "include_expired": scope.include_expired,
     }
+
+
+def _scope_digest(scope: CursorScope) -> str:
+    payload = _scope_payload(scope)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def encode_cursor(state: CursorState, scope: CursorScope) -> str:
+def _cursor_mac(payload: JsonObject, scope: CursorScope, secret: bytes) -> str:
+    signed: JsonObject = {"cursor": payload, "scope": _scope_payload(scope)}
+    canonical = json.dumps(signed, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(secret, canonical, hashlib.sha256).hexdigest()
+
+
+def encode_cursor(state: CursorState, scope: CursorScope, secret: bytes) -> str:
     payload: JsonObject = {
         "v": _CURSOR_VERSION,
         "snapshot_at": state.snapshot_at.isoformat(),
@@ -77,6 +88,7 @@ def encode_cursor(state: CursorState, scope: CursorScope) -> str:
         "total": state.total,
         "digest": _scope_digest(scope),
     }
+    payload["mac"] = _cursor_mac(payload, scope, secret)
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
@@ -86,11 +98,11 @@ def _parse_datetime(value: JsonValue) -> datetime:
         raise MemoryScanValidationError("invalid memory scan cursor")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
+        if parsed.tzinfo is None:
+            raise MemoryScanValidationError("invalid memory scan cursor")
+        return parsed.astimezone(UTC)
+    except (OverflowError, ValueError) as exc:
         raise MemoryScanValidationError("invalid memory scan cursor") from exc
-    if parsed.tzinfo is None:
-        raise MemoryScanValidationError("invalid memory scan cursor")
-    return parsed.astimezone(UTC)
 
 
 def _parse_keyset(value: JsonValue) -> Keyset:
@@ -104,14 +116,20 @@ def _parse_keyset(value: JsonValue) -> Keyset:
     return _parse_datetime(value[0]), value[1]
 
 
-def decode_cursor(token: str, scope: CursorScope) -> CursorState:
+def decode_cursor(token: str, scope: CursorScope, secret: bytes) -> CursorState:
     if not token or len(token) > _CURSOR_MAX_LENGTH:
         raise MemoryScanValidationError("invalid memory scan cursor")
     try:
         padded = token + "=" * (-len(token) % 4)
         decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
         value = json.loads(decoded.decode("utf-8"))
-    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
         raise MemoryScanValidationError("invalid memory scan cursor") from exc
     if not isinstance(value, dict) or set(value) != {
         "v",
@@ -120,7 +138,22 @@ def decode_cursor(token: str, scope: CursorScope) -> CursorState:
         "after",
         "total",
         "digest",
+        "mac",
     }:
+        raise MemoryScanValidationError("invalid memory scan cursor")
+    mac = value.pop("mac")
+    if (
+        not isinstance(mac, str)
+        or len(mac) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in mac)
+    ):
+        raise MemoryScanValidationError("invalid memory scan cursor")
+    expected_mac = _cursor_mac(value, scope, secret)
+    if not hmac.compare_digest(mac, expected_mac):
+        if value.get("digest") != _scope_digest(scope):
+            raise MemoryScanValidationError(
+                "memory scan cursor does not match request scope"
+            )
         raise MemoryScanValidationError("invalid memory scan cursor")
     if type(value["v"]) is not int or value["v"] != _CURSOR_VERSION:
         raise MemoryScanValidationError("invalid memory scan cursor")
@@ -136,8 +169,4 @@ def decode_cursor(token: str, scope: CursorScope) -> CursorState:
     )
     if cursor.after > cursor.upper:
         raise MemoryScanValidationError("invalid memory scan cursor")
-    if value["digest"] != _scope_digest(scope):
-        raise MemoryScanValidationError(
-            "memory scan cursor does not match request scope"
-        )
     return cursor

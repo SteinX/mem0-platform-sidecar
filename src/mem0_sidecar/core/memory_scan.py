@@ -1,15 +1,8 @@
 from datetime import UTC, datetime
 
-import anyio
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.memory_ops import (
-    MemoryUpstreamProtocolError,
-    _hydrated_record_matches_projection,
-    _is_upstream_not_found,
-    _memory_record_from_response,
-    _MemoryProjectionSnapshot,
-    _normalize_memory_record,
     _projection_matches_snapshot,
     _snapshot_memory_projection,
 )
@@ -19,8 +12,8 @@ from mem0_sidecar.core.memory_scan_cursor import (
     decode_cursor,
     encode_cursor,
 )
+from mem0_sidecar.core.memory_scan_hydration import hydrate_memory_snapshots
 from mem0_sidecar.core.memory_scan_types import (
-    JsonObject,
     Keyset,
     MemoryGetter,
     MemoryScanConflictError,
@@ -32,13 +25,16 @@ from mem0_sidecar.core.memory_scan_types import (
 from mem0_sidecar.store.models import MemoryIndex
 from mem0_sidecar.store.repositories import MemoryIndexRepository
 
-_COUNT_BATCH_SIZE, _HYDRATION_CONCURRENCY = 200, 8
+_COUNT_BATCH_SIZE = 200
 
 
 class MemoryScanService:
-    def __init__(self, *, session: Session, mem0: MemoryGetter) -> None:
+    def __init__(
+        self, *, session: Session, mem0: MemoryGetter, cursor_secret: bytes
+    ) -> None:
         self.session = session
         self.mem0 = mem0
+        self.cursor_secret = cursor_secret
 
     def _candidates(
         self,
@@ -102,7 +98,11 @@ class MemoryScanService:
 
     async def scan(self, request: MemoryScanRequest) -> MemoryScanResult:
         scope = cursor_scope(request)
-        cursor = decode_cursor(request.cursor, scope) if request.cursor else None
+        cursor = (
+            decode_cursor(request.cursor, scope, self.cursor_secret)
+            if request.cursor
+            else None
+        )
         if cursor is None:
             snapshot_at = datetime.now(UTC)
             repository = MemoryIndexRepository(self.session)
@@ -168,40 +168,7 @@ class MemoryScanService:
         )
         self.session.rollback()
 
-        hydrated: dict[str, JsonObject | None] = {}
-        limiter = anyio.CapacityLimiter(_HYDRATION_CONCURRENCY)
-
-        async def hydrate(snapshot: _MemoryProjectionSnapshot) -> None:
-            try:
-                async with limiter:
-                    response = await self.mem0.get_memory(snapshot.mem0_memory_id)
-                record = dict(response)
-                parsed = _memory_record_from_response(
-                    record, expected_id=snapshot.mem0_memory_id
-                )
-                normalized = _normalize_memory_record(parsed, projection=snapshot)
-                hydrated[snapshot.mem0_memory_id] = (
-                    normalized
-                    if _hydrated_record_matches_projection(parsed, normalized, snapshot)
-                    else None
-                )
-            except (
-                KeyError,
-                MemoryUpstreamProtocolError,
-                TypeError,
-                ValueError,
-            ):
-                hydrated[snapshot.mem0_memory_id] = None
-                return
-            except RuntimeError as exc:
-                if _is_upstream_not_found(exc):
-                    hydrated[snapshot.mem0_memory_id] = None
-                    return
-                raise
-
-        async with anyio.create_task_group() as task_group:
-            for snapshot in snapshots:
-                task_group.start_soon(hydrate, snapshot)
+        hydrated = await hydrate_memory_snapshots(self.mem0, snapshots)
 
         repository = MemoryIndexRepository(self.session)
         current = {
@@ -251,6 +218,7 @@ class MemoryScanService:
                     total=total,
                 ),
                 scope,
+                self.cursor_secret,
             )
             if has_more and raw_after is not None
             else None

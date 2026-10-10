@@ -271,4 +271,3 @@ def test_scan_cursor_rebinding_and_member_project_wide_are_rejected(tmp_path) ->
         },
     )
     assert project_wide.status_code == 403
-

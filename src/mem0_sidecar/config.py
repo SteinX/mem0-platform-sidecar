@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +38,7 @@ class SidecarSettings(BaseSettings):
     client_auth_path: str = Field(default="/auth/me")
     client_auth_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     client_auth_allow_bootstrap_admin: bool = Field(default=True)
+    memory_cursor_secret: SecretStr | None = Field(default=None, min_length=32)
     log_level: str = Field(default="INFO")
     log_format: Literal["text", "json"] = Field(default="text")
     request_id_header: str = Field(default="X-Request-ID")

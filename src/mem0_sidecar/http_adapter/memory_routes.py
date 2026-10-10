@@ -19,12 +19,9 @@ from mem0_sidecar.core.memory_ops import (
     MutationConflictError,
     validate_idempotency_key,
 )
-from mem0_sidecar.core.memory_scan import (
-    JsonObject,
-    MemoryScanConflictError,
-    MemoryScanService,
-)
+from mem0_sidecar.core.memory_scan import MemoryScanConflictError, MemoryScanService
 from mem0_sidecar.core.memory_scan_types import (
+    JsonObject,
     MemoryScanFilters,
     MemoryScanRequest,
     MemoryScanValidationError,
@@ -418,7 +415,11 @@ async def scan_memories(
         if project_wide and session.get(Project, project_id) is None:
             raise HTTPException(status_code=404, detail="Project not found")
         session.rollback()
-        result = await MemoryScanService(session=session, mem0=mem0).scan(
+        result = await MemoryScanService(
+            session=session,
+            mem0=mem0,
+            cursor_secret=request.app.state.memory_cursor_secret,
+        ).scan(
             MemoryScanRequest(
                 project_id=project_id,
                 app_id=app_id,

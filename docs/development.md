@@ -142,6 +142,7 @@ The service reads these environment variables:
 - `MEM0_SIDECAR_MEM0_VERIFY_TLS`
 - `MEM0_SIDECAR_MEM0_CA_BUNDLE`
 - `MEM0_SIDECAR_DEFAULT_PROJECT_ID`
+- `MEM0_SIDECAR_MEMORY_CURSOR_SECRET`
 - `MEM0_SIDECAR_WORKER_POLL_INTERVAL_SECONDS`
 - `MEM0_SIDECAR_LOG_LEVEL`
 - `MEM0_SIDECAR_LOG_FORMAT`
@@ -157,7 +158,14 @@ Set `MEM0_SIDECAR_MEM0_EXTRA_HEADERS` to a JSON object for gateway-specific
 headers, for example `{"X-Mem0-Org":"org-1"}`.
 
 Set `MEM0_SIDECAR_LOG_FORMAT=json` for container logs. Each request receives or
-propagates the configured request ID header and emits structured request logs;
+propagates the configured request ID header and emits structured request logs.
+
+`MEM0_SIDECAR_MEMORY_CURSOR_SECRET` is optional and must contain at least 32
+characters when set. Without it, each process generates its own key and active
+scan cursors are invalid after restart. Configure the same secret on all workers
+and replicas when a cursor may continue on another process. The key is local
+configuration and is never derived from request or upstream API credentials.
+
 Mem0 OSS upstream calls also emit structured success/failure logs.
 
 ## Automatic add recovery

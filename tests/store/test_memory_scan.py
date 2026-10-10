@@ -76,4 +76,3 @@ def test_scan_candidates_use_created_at_and_id_keyset(db_session) -> None:
         "mem-b",
         "mem-c",
     ]
-

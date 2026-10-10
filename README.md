@@ -151,6 +151,10 @@ rows can reduce the final readable count. This is not a transaction spanning all
 pages. Invalid or rebound cursors return 422; a projection changed during page
 hydration returns 409 and requires a new scan without a cursor. Existing numeric
 `/v1/memories/query` dashboard pagination and its 5000-record window are unchanged.
+Cursor state and scope are authenticated with a server-held signing key. By
+default the sidecar generates a process-local key, so outstanding cursors become
+invalid after restart. Set the same `MEM0_SIDECAR_MEMORY_CURSOR_SECRET` on every
+worker and replica when cursors must continue across restarts or instances.
 
 Dashboard, billing, analytics, hosted auth, webhooks, and full project
 management APIs are intentionally outside the current implementation.
@@ -417,6 +421,7 @@ prefix. `.env.example` is the deployment starting point.
 | `MEM0_SIDECAR_CLIENT_AUTH_PATH` | `/auth/me` | Core path used to validate incoming credentials without following redirects. |
 | `MEM0_SIDECAR_CLIENT_AUTH_TIMEOUT_SECONDS` | `5` | Timeout for Core caller validation. |
 | `MEM0_SIDECAR_CLIENT_AUTH_ALLOW_BOOTSTRAP_ADMIN` | `true` | Permit the configured private upstream operator key for dashboard, MCP, and maintenance calls. |
+| `MEM0_SIDECAR_MEMORY_CURSOR_SECRET` | generated per process | Optional cursor signing secret of at least 32 characters. Use the same value across workers and replicas for cursor continuation. |
 | `MEM0_SIDECAR_DEFAULT_PROJECT_ID` | `default` | Fallback project when neither `project_id` nor `app_id` is provided. |
 | `MEM0_SIDECAR_DIRECT_WRITE_SYNC_ENABLED` | `false` | Periodically mirror direct Mem0 OSS writes into the sidecar index. Prefer routing writers through the sidecar and enable this as a compatibility safety net. |
 | `MEM0_SIDECAR_DIRECT_WRITE_SYNC_INTERVAL_SECONDS` | `60` | Delay between bounded mirror passes. |
