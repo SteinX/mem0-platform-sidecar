@@ -1,3 +1,5 @@
+from collections.abc import Iterable, Mapping
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -31,7 +33,15 @@ def test_scan_stale_finalization_http(
         session.commit()
     if conditional_race:
 
-        def lose_race(*args: object, **kwargs: object) -> int:
+        def lose_race(
+            repository: MemoryIndexRepository,
+            *,
+            project_id: str,
+            app_id: str | None,
+            mem0_memory_ids: Iterable[str],
+            updated_at_lte: datetime,
+            expected_updated_at: Mapping[str, datetime] | None = None,
+        ) -> int:
             return 0
 
         monkeypatch.setattr(MemoryIndexRepository, "mark_stale_if_unchanged", lose_race)
