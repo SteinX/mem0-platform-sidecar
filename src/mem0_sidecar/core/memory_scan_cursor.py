@@ -167,6 +167,4 @@ def decode_cursor(token: str, scope: CursorScope, secret: bytes) -> CursorState:
         after=_parse_keyset(value["after"]),
         total=value["total"],
     )
-    if cursor.after > cursor.upper:
-        raise MemoryScanValidationError("invalid memory scan cursor")
     return cursor
