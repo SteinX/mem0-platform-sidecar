@@ -161,6 +161,7 @@ shared namespace.
 | `GET` | `/readyz` | implemented |
 | `POST` | `/v3/memories/add/` | implemented |
 | `POST` | `/v3/memories/search/` | implemented |
+| `POST` | `/v1/memories/scan` | internal authenticated cursor/count bridge |
 | `GET` | `/v1/memories/{memory_id}/` | implemented |
 | `DELETE` | `/v1/memories/{memory_id}/` | implemented |
 | `GET` | `/v1/events` | implemented |

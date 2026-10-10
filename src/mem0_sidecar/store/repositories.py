@@ -2285,6 +2285,172 @@ class MemoryIndexRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
+    @staticmethod
+    def _scan_predicates(
+        *,
+        project_id: str,
+        app_id: str | None,
+        project_wide: bool,
+        user_id: str | None,
+        agent_id: str | None,
+        run_id: str | None,
+        snapshot_at: datetime,
+        include_expired: bool,
+    ) -> tuple[ColumnElement[bool], ...]:
+        predicates: list[ColumnElement[bool]] = [
+            MemoryIndex.project_id == project_id,
+            MemoryIndex.deleted_at.is_(None),
+            MemoryIndex.consolidation_state == "ACTIVE",
+        ]
+        if not project_wide:
+            predicates.append(MemoryIndex.app_id == app_id)
+        for column, value in (
+            (MemoryIndex.user_id, user_id),
+            (MemoryIndex.agent_id, agent_id),
+            (MemoryIndex.run_id, run_id),
+        ):
+            if value is not None:
+                predicates.append(column == value)
+        if not include_expired:
+            predicates.append(
+                or_(
+                    MemoryIndex.expires_at.is_(None),
+                    MemoryIndex.expires_at > snapshot_at,
+                )
+            )
+        return tuple(predicates)
+
+    def find_scan_upper(
+        self,
+        *,
+        project_id: str,
+        app_id: str | None,
+        project_wide: bool,
+        user_id: str | None,
+        agent_id: str | None,
+        run_id: str | None,
+        snapshot_at: datetime,
+        include_expired: bool,
+    ) -> tuple[datetime, str] | None:
+        statement = (
+            select(MemoryIndex.created_at, MemoryIndex.mem0_memory_id)
+            .where(
+                *self._scan_predicates(
+                    project_id=project_id,
+                    app_id=app_id,
+                    project_wide=project_wide,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    snapshot_at=snapshot_at,
+                    include_expired=include_expired,
+                )
+            )
+            .order_by(
+                MemoryIndex.created_at.desc(), MemoryIndex.mem0_memory_id.desc()
+            )
+            .limit(1)
+        )
+        row = self.session.execute(statement).one_or_none()
+        return None if row is None else (_as_utc(row.created_at), row.mem0_memory_id)
+
+    def count_scan_rows(
+        self,
+        *,
+        project_id: str,
+        app_id: str | None,
+        project_wide: bool,
+        user_id: str | None,
+        agent_id: str | None,
+        run_id: str | None,
+        snapshot_at: datetime,
+        include_expired: bool,
+        upper: tuple[datetime, str] | None,
+    ) -> int:
+        if upper is None:
+            return 0
+        upper_created_at, upper_memory_id = upper
+        return int(
+            self.session.scalar(
+                select(func.count(MemoryIndex.id)).where(
+                    *self._scan_predicates(
+                        project_id=project_id,
+                        app_id=app_id,
+                        project_wide=project_wide,
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        run_id=run_id,
+                        snapshot_at=snapshot_at,
+                        include_expired=include_expired,
+                    ),
+                    or_(
+                        MemoryIndex.created_at < upper_created_at,
+                        and_(
+                            MemoryIndex.created_at == upper_created_at,
+                            MemoryIndex.mem0_memory_id <= upper_memory_id,
+                        ),
+                    ),
+                )
+            )
+            or 0
+        )
+
+    def list_scan_candidates(
+        self,
+        *,
+        project_id: str,
+        app_id: str | None,
+        project_wide: bool,
+        user_id: str | None,
+        agent_id: str | None,
+        run_id: str | None,
+        snapshot_at: datetime,
+        include_expired: bool,
+        upper: tuple[datetime, str] | None,
+        after: tuple[datetime, str] | None,
+        limit: int,
+    ) -> list[MemoryIndex]:
+        if limit < 1 or upper is None:
+            return []
+        upper_created_at, upper_memory_id = upper
+        statement = select(MemoryIndex).where(
+            *self._scan_predicates(
+                project_id=project_id,
+                app_id=app_id,
+                project_wide=project_wide,
+                user_id=user_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                snapshot_at=snapshot_at,
+                include_expired=include_expired,
+            ),
+            or_(
+                MemoryIndex.created_at < upper_created_at,
+                and_(
+                    MemoryIndex.created_at == upper_created_at,
+                    MemoryIndex.mem0_memory_id <= upper_memory_id,
+                ),
+            ),
+        )
+        if after is not None:
+            after_created_at, after_memory_id = after
+            statement = statement.where(
+                or_(
+                    MemoryIndex.created_at > after_created_at,
+                    and_(
+                        MemoryIndex.created_at == after_created_at,
+                        MemoryIndex.mem0_memory_id > after_memory_id,
+                    ),
+                )
+            )
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    MemoryIndex.created_at, MemoryIndex.mem0_memory_id
+                ).limit(limit)
+            )
+        )
+
     def get_memory(
         self,
         *,
