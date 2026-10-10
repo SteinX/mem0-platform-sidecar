@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.memory_ops import (
     _projection_matches_snapshot,
+    _refresh_affected_projections,
     _snapshot_memory_projection,
 )
 from mem0_sidecar.core.memory_scan_cursor import (
@@ -195,7 +196,7 @@ class MemoryScanService:
             if hydrated[snapshot.mem0_memory_id] is None
         ]
         if stale:
-            repository.mark_stale_if_unchanged(
+            stale_marked = repository.mark_stale_if_unchanged(
                 project_id=request.project_id,
                 app_id=request.app_id,
                 mem0_memory_ids=[item.mem0_memory_id for item in stale],
@@ -203,6 +204,15 @@ class MemoryScanService:
                 expected_updated_at={
                     item.mem0_memory_id: item.updated_at for item in stale
                 },
+            )
+            if stale_marked != len(stale):
+                self.session.rollback()
+                raise MemoryScanConflictError(
+                    "Memory projection changed during cursor traversal; "
+                    "restart without a cursor"
+                )
+            _refresh_affected_projections(
+                self.session, project_id=request.project_id, projections=stale
             )
         results = tuple(
             record
