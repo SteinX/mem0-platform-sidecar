@@ -24,7 +24,7 @@ from mem0_sidecar.core.memory_scan_types import (
     metadata_type,
 )
 from mem0_sidecar.store.models import MemoryIndex
-from mem0_sidecar.store.repositories import MemoryIndexRepository
+from mem0_sidecar.store.repositories import MemoryIndexRepository, ProjectRepository
 
 _COUNT_BATCH_SIZE = 200
 
@@ -171,6 +171,14 @@ class MemoryScanService:
 
         hydrated = await hydrate_memory_snapshots(self.mem0, snapshots)
 
+        stale = [
+            snapshot
+            for snapshot in snapshots
+            if hydrated[snapshot.mem0_memory_id] is None
+        ]
+        if stale:
+            ProjectRepository(self.session).lock_for_mutation(request.project_id)
+            self.session.expire_all()
         repository = MemoryIndexRepository(self.session)
         current = {
             item.mem0_memory_id: item
@@ -190,11 +198,6 @@ class MemoryScanService:
                 "Memory projection changed during cursor traversal; "
                 "restart without a cursor"
             )
-        stale = [
-            snapshot
-            for snapshot in snapshots
-            if hydrated[snapshot.mem0_memory_id] is None
-        ]
         if stale:
             stale_marked = repository.mark_stale_if_unchanged(
                 project_id=request.project_id,
