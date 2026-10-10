@@ -402,6 +402,12 @@ async def scan_memories(
             or payload.project_wide == (payload.app_id is not None)
         ):
             raise ValueError("exactly one of app_id or project_wide=true is required")
+        for field_name, value in (
+            ("project_id", payload.project_id),
+            ("app_id", payload.app_id),
+        ):
+            if value is not None:
+                validate_scope_id(value, field_name=field_name)
         project_id = validate_scope_id(
             resolve_project_id(request, raw_payload), field_name="project_id"
         )
