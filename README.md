@@ -113,6 +113,7 @@ Important modules:
 | `GET` | `/readyz` | Readiness check for the sidecar database session |
 | `POST` | `/v3/memories/add/` | Add a scoped memory through Mem0 OSS |
 | `POST` | `/v3/memories/search/` | Search scoped memories through Mem0 OSS |
+| `POST` | `/v1/memories/scan` | Authenticated internal cursor/count bridge |
 | `GET` | `/v1/memories/{memory_id}/` | Read a memory through Mem0 OSS with sidecar scope validation |
 | `DELETE` | `/v1/memories/{memory_id}/` | Delete a memory through Mem0 OSS and record a sidecar event |
 | `GET` | `/v1/events` | List sidecar events for a project |
@@ -124,6 +125,40 @@ MCP bridge 0.1.5 requires Sidecar 0.3.12 or later so add responses include the
 persisted event's credential channel, including completed idempotent replays.
 Upgrade Sidecar before MCP. Sidecar 0.3.12 preserves compatibility with bridge
 0.1.4 and does not introduce a database migration.
+Sidecar 0.3.13 adds bounded `cursor-v1` pages and a zero-Core `count` mode over
+active Sidecar projections. Its `total` and `count_basis: sidecar_projection`
+values are fixed at cursor start; they do not claim database MVCC or revalidate
+every counted row in Mem0 Core.
+Bridge 0.1.6 uses this endpoint for Pi listing; upgrade Sidecar before the bridge
+and regenerate the Pi extension afterward. No database migration is required.
+
+Admin and system scan requests select `project_id` and either `app_id` or
+`project_wide: true`; ordinary authenticated members omit those selectors and
+use the server-owned default project and app. Scans support optional exact
+`user_id`, `agent_id`, `run_id` and `type` filters:
+
+```json
+{"project_id":"repo-a","app_id":"app-a","filters":{"user_id":"alice"},"mode":"page","page_size":100}
+```
+
+Pass the returned `next_cursor` as `cursor` with the same scope, filters and
+`include_expired` setting to continue. Pages hydrate only their own bounded
+candidates, so short or empty pages can still have `has_more: true`; continue
+until `next_cursor` is null. `mode: "count"` omits `page_size` and `cursor` and
+returns the active index count without Core requests. Expired rows are excluded
+unless `include_expired: true` is supplied.
+
+The cursor fixes the initial upper key, snapshot time and total. Projections
+updated or reactivated after that time are excluded; deletion, mutation or stale
+rows can reduce the final readable count. This is not a transaction spanning all
+pages. Invalid or rebound cursors return 422; a projection changed during page
+hydration returns 409 and requires a new scan without a cursor. Existing numeric
+`/v1/memories/query` dashboard pagination and its 5000-record window are unchanged.
+Cursor state and scope are authenticated with a server-held signing key. By
+default the sidecar generates a process-local key, so outstanding cursors become
+invalid after restart. Set the same `MEM0_SIDECAR_MEMORY_CURSOR_SECRET` on every
+worker and replica when cursors must continue across restarts or instances.
+
 Dashboard, billing, analytics, hosted auth, webhooks, and full project
 management APIs are intentionally outside the current implementation.
 
@@ -389,6 +424,7 @@ prefix. `.env.example` is the deployment starting point.
 | `MEM0_SIDECAR_CLIENT_AUTH_PATH` | `/auth/me` | Core path used to validate incoming credentials without following redirects. |
 | `MEM0_SIDECAR_CLIENT_AUTH_TIMEOUT_SECONDS` | `5` | Timeout for Core caller validation. |
 | `MEM0_SIDECAR_CLIENT_AUTH_ALLOW_BOOTSTRAP_ADMIN` | `true` | Permit the configured private upstream operator key for dashboard, MCP, and maintenance calls. |
+| `MEM0_SIDECAR_MEMORY_CURSOR_SECRET` | generated per process | Optional cursor signing secret of at least 32 characters. Use the same value across workers and replicas for cursor continuation. |
 | `MEM0_SIDECAR_DEFAULT_PROJECT_ID` | `default` | Fallback project when neither `project_id` nor `app_id` is provided. |
 | `MEM0_SIDECAR_DIRECT_WRITE_SYNC_ENABLED` | `false` | Periodically mirror direct Mem0 OSS writes into the sidecar index. Prefer routing writers through the sidecar and enable this as a compatibility safety net. |
 | `MEM0_SIDECAR_DIRECT_WRITE_SYNC_INTERVAL_SECONDS` | `60` | Delay between bounded mirror passes. |

@@ -1,0 +1,24 @@
+name: Sidecar cursor checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install '.[dev]'
+      - name: Exercise cursor, count, scope and legacy-window boundaries
+        run: python -m pytest -q tests/core/test_memory_scan*.py tests/store/test_memory_scan.py tests/http_adapter/test_memory_scan*.py

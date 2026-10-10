@@ -1,9 +1,10 @@
 import re
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import unquote, unquote_to_bytes
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 from starlette.routing import Match
 from starlette.types import Scope
@@ -17,6 +18,13 @@ from mem0_sidecar.core.memory_ops import (
     MemoryService,
     MutationConflictError,
     validate_idempotency_key,
+)
+from mem0_sidecar.core.memory_scan import MemoryScanConflictError, MemoryScanService
+from mem0_sidecar.core.memory_scan_types import (
+    JsonObject,
+    MemoryScanFilters,
+    MemoryScanRequest,
+    MemoryScanValidationError,
 )
 from mem0_sidecar.core.scope import validate_scope_id
 from mem0_sidecar.http_adapter.dependencies import (
@@ -69,6 +77,50 @@ memory_router = APIRouter(
 )
 SessionDependency = Annotated[Session, Depends(get_session)]
 Mem0Dependency = Annotated[Any, Depends(get_mem0_client)]
+
+
+class MemoryScanFiltersPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    user_id: str | None = None
+    agent_id: str | None = None
+    run_id: str | None = None
+    type: str | None = None
+
+
+class MemoryScanPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: str | None = None
+    app_id: str | None = None
+    project_wide: bool = False
+    filters: MemoryScanFiltersPayload = Field(default_factory=MemoryScanFiltersPayload)
+    mode: Literal["page", "count"]
+    page_size: int | None = Field(default=None, ge=1, le=100)
+    cursor: str | None = Field(default=None, min_length=1, max_length=4096)
+    include_expired: bool = False
+
+    @model_validator(mode="after")
+    def validate_scan_shape(self) -> "MemoryScanPayload":
+        if self.project_wide and self.app_id is not None:
+            raise ValueError("app_id cannot be combined with project_wide")
+        if self.mode == "count" and self.model_fields_set.intersection(
+            {"page_size", "cursor"}
+        ):
+            raise ValueError("count mode does not accept page_size or cursor")
+        return self
+
+
+class MemoryScanResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    protocol: Literal["cursor-v1"]
+    results: list[JsonObject]
+    total: int
+    count_basis: Literal["sidecar_projection"]
+    next_cursor: str | None
+    has_more: bool
+    stale_skipped: int
 
 
 def _resolve_project_wide(
@@ -333,6 +385,93 @@ async def query_memories(
         "has_more": result["page"] * result["page_size"] < result["total"],
         "stale_skipped": result["stale_skipped"],
     }
+
+
+@memory_router.post("/v1/memories/scan", response_model=MemoryScanResponse)
+async def scan_memories(
+    payload: MemoryScanPayload,
+    request: Request,
+    session: SessionDependency,
+    mem0: Mem0Dependency,
+) -> MemoryScanResponse:
+    raw_payload = payload.model_dump(exclude_unset=True)
+    try:
+        _enforce_platform_scope_boundary(request, raw_payload)
+        if request.state.client_principal.role in {"admin", "system"} and (
+            payload.project_id is None
+            or payload.project_wide == (payload.app_id is not None)
+        ):
+            raise ValueError("exactly one of app_id or project_wide=true is required")
+        for field_name, value in (
+            ("project_id", payload.project_id),
+            ("app_id", payload.app_id),
+        ):
+            if value is not None:
+                validate_scope_id(value, field_name=field_name)
+        project_id = validate_scope_id(
+            resolve_project_id(request, raw_payload), field_name="project_id"
+        )
+        for field_name, value in (
+            ("user_id", payload.filters.user_id),
+            ("agent_id", payload.filters.agent_id),
+            ("run_id", payload.filters.run_id),
+        ):
+            validate_scope_id(value, field_name=field_name, required=False)
+        app_id, project_wide = _resolve_memory_app_scope(
+            request,
+            session,
+            project_id=project_id,
+            payload=raw_payload,
+        )
+        if app_id is None and not project_wide:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project_wide and session.get(Project, project_id) is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        session.rollback()
+        result = await MemoryScanService(
+            session=session,
+            mem0=mem0,
+            cursor_secret=request.app.state.memory_cursor_secret,
+        ).scan(
+            MemoryScanRequest(
+                project_id=project_id,
+                app_id=app_id,
+                project_wide=project_wide,
+                filters=MemoryScanFilters(
+                    user_id=payload.filters.user_id,
+                    agent_id=payload.filters.agent_id,
+                    run_id=payload.filters.run_id,
+                    type=payload.filters.type,
+                ),
+                mode=payload.mode,
+                page_size=payload.page_size,
+                cursor=payload.cursor,
+                include_expired=payload.include_expired,
+            )
+        )
+        session.commit()
+    except HTTPException:
+        session.rollback()
+        raise
+    except MemoryScanConflictError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (MemoryScanValidationError, ValueError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        session.rollback()
+        raise
+
+    return MemoryScanResponse(
+        protocol=result.protocol,
+        results=list(result.results),
+        total=result.total,
+        count_basis=result.count_basis,
+        next_cursor=result.next_cursor,
+        has_more=result.has_more,
+        stale_skipped=result.stale_skipped,
+    )
 
 
 @memory_router.get("/v1/memories/{memory_id}/")

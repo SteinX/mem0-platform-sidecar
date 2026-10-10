@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from mem0_sidecar.config import SidecarSettings, load_settings
 
 
@@ -58,6 +61,8 @@ def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
     monkeypatch.setenv(
         "MEM0_SIDECAR_CLIENT_AUTH_ALLOW_BOOTSTRAP_ADMIN", "false"
     )
+    cursor_secret = "configured-memory-cursor-secret-value"
+    monkeypatch.setenv("MEM0_SIDECAR_MEMORY_CURSOR_SECRET", cursor_secret)
 
     settings = SidecarSettings()
 
@@ -87,3 +92,12 @@ def test_settings_can_be_loaded_from_environment(monkeypatch) -> None:
     assert settings.client_auth_path == "/auth/whoami"
     assert settings.client_auth_timeout_seconds == 7.5
     assert settings.client_auth_allow_bootstrap_admin is False
+    assert settings.memory_cursor_secret is not None
+    assert settings.memory_cursor_secret.get_secret_value() == cursor_secret
+    assert cursor_secret not in repr(settings)
+    assert cursor_secret not in settings.model_dump_json()
+
+
+def test_memory_cursor_secret_requires_32_characters() -> None:
+    with pytest.raises(ValidationError):
+        SidecarSettings(memory_cursor_secret="too-short")

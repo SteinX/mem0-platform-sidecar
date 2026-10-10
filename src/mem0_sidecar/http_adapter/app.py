@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 
@@ -197,6 +198,11 @@ def create_app(
     app.state.session_factory = session_factory
     app.state.mem0_client = mem0_client
     app.state.client_auth_verifier = client_auth_verifier
+    app.state.memory_cursor_secret = (
+        settings.memory_cursor_secret.get_secret_value().encode()
+        if settings.memory_cursor_secret is not None
+        else secrets.token_bytes(32)
+    )
     app.add_middleware(
         RequestLoggingMiddleware,
         request_id_header=settings.request_id_header,
