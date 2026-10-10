@@ -91,7 +91,7 @@ class MemoryScanFiltersPayload(BaseModel):
 class MemoryScanPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    project_id: str
+    project_id: str | None = None
     app_id: str | None = None
     project_wide: bool = False
     filters: MemoryScanFiltersPayload = Field(default_factory=MemoryScanFiltersPayload)
@@ -102,8 +102,8 @@ class MemoryScanPayload(BaseModel):
 
     @model_validator(mode="after")
     def validate_scan_shape(self) -> "MemoryScanPayload":
-        if self.project_wide == (self.app_id is not None):
-            raise ValueError("exactly one of app_id or project_wide=true is required")
+        if self.project_wide and self.app_id is not None:
+            raise ValueError("app_id cannot be combined with project_wide")
         if self.mode == "count" and self.model_fields_set.intersection(
             {"page_size", "cursor"}
         ):
@@ -394,10 +394,17 @@ async def scan_memories(
     session: SessionDependency,
     mem0: Mem0Dependency,
 ) -> MemoryScanResponse:
-    raw_payload = payload.model_dump()
+    raw_payload = payload.model_dump(exclude_unset=True)
     try:
         _enforce_platform_scope_boundary(request, raw_payload)
-        project_id = validate_scope_id(payload.project_id, field_name="project_id")
+        if request.state.client_principal.role in {"admin", "system"} and (
+            payload.project_id is None
+            or payload.project_wide == (payload.app_id is not None)
+        ):
+            raise ValueError("exactly one of app_id or project_wide=true is required")
+        project_id = validate_scope_id(
+            resolve_project_id(request, raw_payload), field_name="project_id"
+        )
         for field_name, value in (
             ("user_id", payload.filters.user_id),
             ("agent_id", payload.filters.agent_id),

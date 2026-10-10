@@ -132,8 +132,10 @@ every counted row in Mem0 Core.
 Bridge 0.1.6 uses this endpoint for Pi listing; upgrade Sidecar before the bridge
 and regenerate the Pi extension afterward. No database migration is required.
 
-The scan request selects `project_id` and either `app_id` or `project_wide: true`,
-with optional exact `user_id`, `agent_id`, `run_id` and `type` filters:
+Admin and system scan requests select `project_id` and either `app_id` or
+`project_wide: true`; ordinary authenticated members omit those selectors and
+use the server-owned default project and app. Scans support optional exact
+`user_id`, `agent_id`, `run_id` and `type` filters:
 
 ```json
 {"project_id":"repo-a","app_id":"app-a","filters":{"user_id":"alice"},"mode":"page","page_size":100}
