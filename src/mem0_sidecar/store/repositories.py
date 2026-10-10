@@ -2301,6 +2301,7 @@ class MemoryIndexRepository:
             MemoryIndex.project_id == project_id,
             MemoryIndex.deleted_at.is_(None),
             MemoryIndex.consolidation_state == "ACTIVE",
+            MemoryIndex.updated_at <= snapshot_at,
         ]
         if not project_wide:
             predicates.append(MemoryIndex.app_id == app_id)

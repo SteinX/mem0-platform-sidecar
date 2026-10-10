@@ -148,7 +148,8 @@ until `next_cursor` is null. `mode: "count"` omits `page_size` and `cursor` and
 returns the active index count without Core requests. Expired rows are excluded
 unless `include_expired: true` is supplied.
 
-The cursor fixes the initial upper key and total; concurrent deletion or stale
+The cursor fixes the initial upper key, snapshot time and total. Projections
+updated or reactivated after that time are excluded; deletion, mutation or stale
 rows can reduce the final readable count. This is not a transaction spanning all
 pages. Invalid or rebound cursors return 422; a projection changed during page
 hydration returns 409 and requires a new scan without a cursor. Existing numeric
