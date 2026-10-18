@@ -292,8 +292,9 @@ class Mem0RestClient:
                 normalized.append(item)
                 continue
             record = dict(item["memory"])
-            if "score" in item:
-                record["score"] = item["score"]
+            for key in ("score", "rerank_score", "score_details"):
+                if key in item:
+                    record[key] = item[key]
             normalized.append(record)
             changed = True
         if not changed:
