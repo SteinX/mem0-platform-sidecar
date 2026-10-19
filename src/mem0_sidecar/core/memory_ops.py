@@ -18,6 +18,7 @@ from mem0_sidecar.core.explorer_filters import (
     ExplorerFilter,
     ExplorerQuery,
 )
+from mem0_sidecar.core.extraction_policy import apply_extraction_policy
 from mem0_sidecar.core.scope import Scope, normalize_scope, validate_scope_id
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
@@ -537,13 +538,19 @@ async def _hydrate_memory_records(
     mem0: Any,
     response: Any,
     memory_ids: list[str],
+    *,
+    fetch_details: bool = False,
 ) -> dict[str, dict[str, Any]]:
     embedded = _response_memory_records(response)
     semaphore = asyncio.Semaphore(_HYDRATION_CONCURRENCY)
 
     async def hydrate(memory_id: str) -> tuple[str, dict[str, Any]]:
         record = embedded.get(memory_id)
-        if record is not None and _memory_text(record) is not None:
+        if (
+            not fetch_details
+            and record is not None
+            and _memory_text(record) is not None
+        ):
             return memory_id, record
         async with semaphore:
             hydrated = await mem0.get_memory(memory_id)
@@ -1400,7 +1407,6 @@ class MemoryService:
         event = EventRepository(self.session).get(intent.event_id)
         project_id = intent.project_id
         app_id = intent.app_id
-        category = payload.get("category")
         observed_noop = payload.get("observed_noop") is True
         entity_filters = {
             key: value
@@ -1534,6 +1540,13 @@ class MemoryService:
             (_normalize_memory_record(record) for record in records),
             key=lambda item: item["id"],
         )
+        category_names = {
+            item.name
+            for item in CategoryRepository(self.session).list_project_categories(
+                project_id
+            )
+            if item.enabled
+        }
         observed_at = datetime.now(UTC)
         ProjectRepository(self.session).lock_for_mutation(project_id)
         intent_repo = MutationIntentRepository(self.session)
@@ -1564,7 +1577,7 @@ class MemoryService:
                 agent_id=item["agent_id"],
                 app_id=app_id,
                 run_id=item["run_id"],
-                category=category if isinstance(category, str) else None,
+                category=extract_category(metadata, category_names),
                 metadata=metadata,
                 **_memory_projection_fields(item, observed_at=observed_at),
             )
@@ -1828,13 +1841,14 @@ class MemoryService:
             run_id=payload.get("run_id"),
         )
         metadata = dict(payload.get("metadata") or {})
-        category_names = {
-            category.name
+        categories = [
+            category
             for category in CategoryRepository(self.session).list_project_categories(
                 project_id
             )
             if category.enabled
-        }
+        ]
+        category_names = {category.name for category in categories}
         category = extract_category(metadata, category_names)
         oss_payload = _oss_add_payload(payload, scope=scope)
         oss_payload.update(
@@ -1876,6 +1890,10 @@ class MemoryService:
                 request_fingerprint=request_fingerprint,
             )
 
+        oss_payload = apply_extraction_policy(
+            self.session, scope, oss_payload, categories
+        )
+        event_request = {**oss_payload, "metadata": dict(oss_payload["metadata"])}
         await self.recover_pending_mutations(
             project_id=project_id,
             app_id=scope.app_id,
@@ -1998,6 +2016,7 @@ class MemoryService:
                 self.mem0,
                 memory_response,
                 memory_ids,
+                fetch_details="extraction_policy" in oss_payload,
             )
             ProjectRepository(self.session).lock_for_mutation(project_id)
             intent_repo = MutationIntentRepository(self.session)
@@ -2013,6 +2032,9 @@ class MemoryService:
                 )
                 if existing is not None:
                     affected_projections.append(_snapshot_memory_projection(existing))
+                record = _projection_record_with_metadata_fallback(
+                    hydrated_records[memory_id], oss_payload["metadata"]
+                )
                 indexed = memory_repo.upsert_memory(
                     project_id=project_id,
                     mem0_memory_id=memory_id,
@@ -2020,13 +2042,10 @@ class MemoryService:
                     app_id=scope.app_id,
                     agent_id=scope.agent_id,
                     run_id=scope.run_id,
-                    category=category,
-                    metadata=metadata,
+                    category=extract_category(_record_metadata(record), category_names),
+                    metadata=_public_memory_metadata(_record_metadata(record)),
                     **_memory_projection_fields(
-                        _projection_record_with_metadata_fallback(
-                            hydrated_records[memory_id],
-                            oss_payload["metadata"],
-                        ),
+                        record,
                         observed_at=observed_at,
                     ),
                 )
