@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import httpx
@@ -349,6 +350,56 @@ def test_oss_search_uses_filter_scope_and_top_level_entity_precedence(
         assert event.app_id == "app-from-filter"
         assert event.user_id == "top-level-user"
         assert event.correlation_id == "oss-search-1"
+
+
+@pytest.mark.parametrize("path", ["/search", "/v3/memories/search"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_search_preserves_retrieval_controls_through_the_rest_client(
+    tmp_path, path, enabled
+):
+    captured = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"results": [{"id": "mem-oss-1", "memory": "Current state"}]}
+        )
+
+    mem0 = Mem0RestClient(
+        base_url="http://mem0.local", transport=httpx.MockTransport(upstream)
+    )
+    app = _app(tmp_path, mem0)
+    with app.state.session_factory() as session:
+        MemoryIndexRepository(session).upsert_memory(
+            project_id="default-project",
+            mem0_memory_id="mem-oss-1",
+            user_id="u1",
+            app_id="recall-app",
+            category=None,
+            metadata={},
+        )
+        session.commit()
+
+    response = TestClient(app).post(
+        path,
+        json={
+            "query": "current state",
+            "user_id": "u1",
+            "project_id": "default-project",
+            "app_id": "recall-app",
+            "rerank": enabled,
+            "latest_only": enabled,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(captured) == 1
+    assert captured[0]["rerank"] is enabled
+    assert captured[0]["latest_only"] is enabled
+    assert (
+        captured[0]["filters"]["_mem0_sidecar_project_id"] == "default-project"
+    )
+    assert captured[0]["filters"]["_mem0_sidecar_app_id"] == "recall-app"
 
 
 def test_oss_list_returns_scoped_core_shape_and_creates_trace(tmp_path) -> None:
