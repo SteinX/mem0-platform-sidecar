@@ -600,7 +600,12 @@ def test_platform_auth_rejection_uses_fastapi_detail_envelope(tmp_path) -> None:
     assert response.headers["WWW-Authenticate"] == "Bearer"
 
 
-def test_control_plane_routes_require_client_authentication(tmp_path) -> None:
+@pytest.mark.parametrize("path", [
+    "/v1/projects/default/categories",
+    "/v1/projects/default/extraction-policy",
+    "/v1/projects/default/ranking-policy",
+])
+def test_control_plane_routes_require_client_authentication(tmp_path, path) -> None:
     app = create_app(
         settings=SidecarSettings(
             database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
@@ -610,13 +615,24 @@ def test_control_plane_routes_require_client_authentication(tmp_path) -> None:
         client_auth_verifier=_RejectingVerifier(),
     )
 
-    response = TestClient(app).get("/v1/projects/default/categories")
+    response = TestClient(app).get(path)
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Authentication required."}
 
 
-def test_control_plane_routes_reject_member_principal(tmp_path) -> None:
+@pytest.mark.parametrize(("method", "path", "payload"), [
+    ("POST", "/v1/events/query", {"project_id": "default", "app_id": "repo"}),
+    ("PUT", "/v1/projects/default/extraction-policy", {
+        "expected_version": 0, "settings": {"enabled": True},
+    }),
+    ("PUT", "/v1/projects/default/ranking-policy", {
+        "expected_version": 0, "settings": {"enabled": True},
+    }),
+])
+def test_control_plane_routes_reject_member_principal(
+    tmp_path, method, path, payload
+) -> None:
     app = create_app(
         settings=SidecarSettings(
             database_url=f"sqlite:///{tmp_path / 'sidecar.sqlite3'}",
@@ -626,10 +642,10 @@ def test_control_plane_routes_reject_member_principal(tmp_path) -> None:
         client_auth_verifier=_RecordingVerifier(),
     )
 
-    response = TestClient(app).post(
-        "/v1/events/query",
+    response = TestClient(app).request(
+        method, path,
         headers={"Authorization": "Bearer member-jwt"},
-        json={"project_id": "default", "app_id": "repo"},
+        json=payload,
     )
 
     assert response.status_code == 403

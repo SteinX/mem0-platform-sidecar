@@ -27,6 +27,7 @@ from mem0_sidecar.core.memory_ops import (
 )
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.store.models import (
+    INACTIVE_CONSOLIDATION_STATES,
     ConsolidationProposal,
     ConsolidationRun,
     MemoryIndex,
@@ -177,7 +178,7 @@ class ConsolidationService:
             "shadowed_count": shadowed_count,
         }
         if proposal.not_before is not None:
-            result["not_before"] = proposal.not_before.isoformat()
+            result["not_before"] = self._as_utc(proposal.not_before).isoformat()
         return result
 
     @staticmethod
@@ -540,7 +541,11 @@ class ConsolidationService:
             self.session.commit()
             return result
         for source in sources:
-            source.consolidation_state = "SHADOWED"
+            source.consolidation_state = {
+                "EXACT_DUPLICATE": "MERGED",
+                "NEAR_DUPLICATE": "MERGED",
+                "CONTRADICTION": "SUPERSEDED",
+            }.get(proposal.kind, "SHADOWED")
             source.shadowed_by_proposal_id = proposal.id
         proposal.not_before = self.now() + timedelta(days=policy.shadow_grace_days)
         self._clear_shadow_attempt(proposal)
@@ -568,7 +573,7 @@ class ConsolidationService:
         for source in sources:
             if (
                 source.deleted_at is None
-                and source.consolidation_state == "SHADOWED"
+                and source.consolidation_state in INACTIVE_CONSOLIDATION_STATES
                 and source.shadowed_by_proposal_id == proposal.id
             ):
                 source.consolidation_state = "ACTIVE"
@@ -639,7 +644,7 @@ class ConsolidationService:
                 raise ConsolidationConflictError("shadowed projection is missing")
             if projection.deleted_at is None:
                 if (
-                    projection.consolidation_state != "SHADOWED"
+                    projection.consolidation_state not in INACTIVE_CONSOLIDATION_STATES
                     or projection.shadowed_by_proposal_id != proposal.id
                     or projection.content_hash != expected_hashes[memory_id]
                     or projection.pinned == 1

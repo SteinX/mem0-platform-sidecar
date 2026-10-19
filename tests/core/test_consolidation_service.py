@@ -1031,8 +1031,14 @@ async def test_incomplete_export_blocks_shadowing(db_session) -> None:
 
 
 @pytest.mark.asyncio
-async def test_shadow_exact_duplicate_excludes_canonical_and_rolls_back(db_session):
+@pytest.mark.parametrize(("kind", "state"), [
+    ("EXACT_DUPLICATE", "MERGED"), ("CONTRADICTION", "SUPERSEDED"),
+])
+async def test_shadow_excludes_canonical_and_rolls_back(db_session, kind, state):
     proposal = await seed_pending_proposal(db_session)
+    proposal.kind = kind
+    proposal.status = "PENDING" if kind == "EXACT_DUPLICATE" else "REVIEW_REQUIRED"
+    expected_status = proposal.status
     mem0 = StatefulMem0()
     service = ConsolidationService(
         session=db_session,
@@ -1042,8 +1048,9 @@ async def test_shadow_exact_duplicate_excludes_canonical_and_rolls_back(db_sessi
     )
     await service.approve_proposal(
         proposal.id,
-        expected_status="PENDING",
+        expected_status=expected_status,
         expected_source_hashes=expected_hashes(),
+        canonical_id="duplicate-a",
     )
 
     shadowed = await service.shadow_approved(proposal.id)
@@ -1057,7 +1064,8 @@ async def test_shadow_exact_duplicate_excludes_canonical_and_rolls_back(db_sessi
     )
     assert shadowed["status"] == "SHADOWED"
     assert canonical is not None and canonical.consolidation_state == "ACTIVE"
-    assert redundant is not None and redundant.consolidation_state == "SHADOWED"
+    assert redundant is not None and redundant.consolidation_state == state
+    assert await service.shadow_approved(proposal.id) == shadowed
     repository = MemoryIndexRepository(db_session)
     assert repository.list_scoped_memory_ids(
         project_id="repo-a",
@@ -1073,7 +1081,7 @@ async def test_shadow_exact_duplicate_excludes_canonical_and_rolls_back(db_sessi
         app_id="app-a",
     )
     assert rollback_source is not None
-    assert rollback_source.consolidation_state == "SHADOWED"
+    assert rollback_source.consolidation_state == state
 
     rolled_back = service.rollback_shadowed(proposal.id)
 

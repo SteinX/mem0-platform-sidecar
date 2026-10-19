@@ -427,6 +427,37 @@ def test_consolidation_downgrade_refuses_nonterminal_work(
     assert CONSOLIDATION_TABLES.issubset(sa.inspect(engine).get_table_names())
 
 
+def test_access_migration_preserves_facts_and_initializes_unknown_history(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'access.sqlite3'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "0010_add_recovery_scan_index")
+    engine = sa.create_engine(database_url)
+    now = "2026-10-19 00:00:00"
+    with engine.begin() as connection:
+        connection.execute(sa.text(
+            "INSERT INTO projects (id, name, mem0_base_url, created_at, updated_at) "
+            "VALUES ('p', 'P', 'http://core.test', :now, :now)"
+        ), {"now": now})
+        connection.execute(sa.text(
+            "INSERT INTO memories_index "
+            "(id, project_id, mem0_memory_id, created_at, updated_at) "
+            "VALUES ('row', 'p', 'fact', :now, :now)"
+        ), {"now": now})
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        row = connection.execute(sa.text(
+            "SELECT mem0_memory_id, access_count, last_accessed_at, created_at "
+            "FROM memories_index"
+        )).one()
+    assert tuple(row) == ("fact", 0, None, now)
+    command.downgrade(config, "0010_add_recovery_scan_index")
+    with engine.connect() as connection:
+        restored = connection.scalar(
+            sa.text("SELECT mem0_memory_id FROM memories_index")
+        )
+        assert restored == "fact"
+
+
 def _alembic_config(database_url: str) -> Config:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(PROJECT_ROOT / "migrations"))
