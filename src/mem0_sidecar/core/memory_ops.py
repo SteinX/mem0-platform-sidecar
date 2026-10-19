@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import TypeAdapter
+from pydantic import StrictBool, TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,6 +23,7 @@ from mem0_sidecar.core.scope import Scope, normalize_scope, validate_scope_id
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
 from mem0_sidecar.store.models import (
+    ConsolidationProposal,
     MemoryIndex,
     MutationIntent,
     Project,
@@ -49,6 +50,7 @@ _MUTATION_MARKER_LOOKUP_LIMIT = 1000
 _HYDRATION_BUFFER = 20
 _HYDRATION_CONCURRENCY = 8
 _INFER_ADAPTER = TypeAdapter(bool)
+_CURRENT_ONLY_ADAPTER = TypeAdapter(StrictBool)
 _DIRTY_TRACE_SESSION_ERROR = (
     "traced memory operation requires a clean session write-set"
 )
@@ -56,6 +58,34 @@ _DIRTY_TRACE_SESSION_ERROR = (
 
 class MemoryUpstreamProtocolError(RuntimeError):
     """The upstream response does not satisfy the memory service contract."""
+
+
+class MemoryReadValidationError(ValueError):
+    pass
+
+
+def _current_only(payload: dict[str, Any]) -> bool:
+    try:
+        return _CURRENT_ONLY_ADAPTER.validate_python(payload.get("current_only", True))
+    except ValidationError as exc:
+        raise MemoryReadValidationError("current_only must be a boolean") from exc
+
+
+def _consolidation_details(
+    session: Session, memory: MemoryIndex
+) -> dict[str, Any]:
+    proposal = session.get(ConsolidationProposal, memory.shadowed_by_proposal_id)
+    if proposal is None or (
+        proposal.project_id != memory.project_id or proposal.app_id != memory.app_id
+    ):
+        return {"state": memory.consolidation_state}
+    return {
+        "state": memory.consolidation_state,
+        "proposal_id": proposal.id,
+        "kind": proposal.kind,
+        "canonical_id": proposal.canonical_memory_id,
+        "source_ids": json.loads(proposal.source_ids_json),
+    }
 
 
 class MutationConflictError(RuntimeError):
@@ -78,6 +108,8 @@ class _MemoryProjectionSnapshot:
     category: str | None
     entity_refs_json: str
     metadata_projection_json: str
+    consolidation_state: str
+    shadowed_by_proposal_id: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -100,6 +132,8 @@ def _snapshot_memory_projection(memory: MemoryIndex) -> _MemoryProjectionSnapsho
         category=memory.category,
         entity_refs_json=memory.entity_refs_json,
         metadata_projection_json=memory.metadata_projection_json,
+        consolidation_state=memory.consolidation_state,
+        shadowed_by_proposal_id=memory.shadowed_by_proposal_id,
         created_at=_as_utc(memory.created_at),
         updated_at=_as_utc(memory.updated_at),
     )
@@ -333,6 +367,7 @@ def _oss_search_payload(payload: dict[str, Any], *, scope: Scope) -> dict[str, A
     oss_payload = dict(payload)
     oss_payload.pop("project_id", None)
     oss_payload.pop("app_id", None)
+    oss_payload.pop("current_only", None)
     filters = (
         dict(payload["filters"])
         if isinstance(payload.get("filters"), dict)
@@ -675,6 +710,7 @@ def _filter_search_results(
     *,
     memory_repo: MemoryIndexRepository,
     scope: Scope,
+    current_only: bool = True,
 ) -> dict[str, Any]:
     results = response.get("results")
     if not isinstance(results, list):
@@ -691,6 +727,7 @@ def _filter_search_results(
         app_id=scope.app_id,
         agent_id=scope.agent_id,
         run_id=scope.run_id,
+        current_only=current_only,
     )
     filtered_results = [
         item
@@ -709,6 +746,7 @@ def _filter_compatible_results(
     *,
     memory_repo: MemoryIndexRepository,
     scope: Scope,
+    current_only: bool = True,
 ) -> Any:
     if isinstance(response, list):
         results = response
@@ -731,6 +769,7 @@ def _filter_compatible_results(
         app_id=scope.app_id,
         agent_id=scope.agent_id,
         run_id=scope.run_id,
+        current_only=current_only,
     )
     filtered_results = [
         item
@@ -2098,6 +2137,7 @@ class MemoryService:
         preserve_wire_shape: bool = False,
     ) -> Any:
         _require_clean_trace_session(self.session)
+        current_only = _current_only(payload)
         scope = normalize_scope(
             project_id=project_id,
             user_id=payload.get("user_id"),
@@ -2108,7 +2148,7 @@ class MemoryService:
         upstream_params = {
             key: value
             for key, value in payload.items()
-            if key not in {"project_id", "app_id"}
+            if key not in {"project_id", "app_id", "current_only"}
         }
         event_request = {**upstream_params, "app_id": scope.app_id}
         event_repo = EventRepository(self.session)
@@ -2138,6 +2178,7 @@ class MemoryService:
                 response,
                 memory_repo=MemoryIndexRepository(self.session),
                 scope=scope,
+                current_only=current_only,
             )
             event_repo.mark_succeeded(
                 event.id,
@@ -2161,6 +2202,7 @@ class MemoryService:
         preserve_wire_shape: bool = False,
     ) -> Any:
         _require_clean_trace_session(self.session)
+        current_only = _current_only(payload)
         scope = normalize_scope(
             project_id=project_id,
             user_id=payload.get("user_id"),
@@ -2207,6 +2249,7 @@ class MemoryService:
                 response,
                 memory_repo=MemoryIndexRepository(self.session),
                 scope=scope,
+                current_only=current_only,
             )
             event_repo.mark_succeeded(
                 event.id,
@@ -2554,6 +2597,10 @@ class MemoryService:
             self.session.rollback()
             raise KeyError(memory_id)
         projection_before = _snapshot_memory_projection(memory)
+        consolidation = (
+            _consolidation_details(self.session, memory)
+            if memory.shadowed_by_proposal_id else None
+        )
         _release_read_transaction(self.session)
         event_id: str | None = None
         if trace_event:
@@ -2608,6 +2655,11 @@ class MemoryService:
                 snapshot=projection_before,
                 app_id=effective_app_id,
             )
+            if consolidation is not None:
+                validated_response = {
+                    **validated_response,
+                    "consolidation": consolidation,
+                }
         except Exception as exc:
             if event_id is not None:
                 _persist_failed_trace(

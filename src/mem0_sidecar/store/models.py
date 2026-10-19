@@ -116,6 +116,9 @@ class Category(Base):
     )
 
 
+INACTIVE_CONSOLIDATION_STATES = ("SHADOWED", "MERGED", "SUPERSEDED")
+
+
 class MemoryIndex(Base):
     __tablename__ = "memories_index"
     __table_args__ = (

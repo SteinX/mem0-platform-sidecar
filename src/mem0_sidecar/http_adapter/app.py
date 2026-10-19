@@ -10,7 +10,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from mem0_sidecar.config import SidecarSettings, load_settings
-from mem0_sidecar.core.memory_ops import MutationConflictError
+from mem0_sidecar.core.memory_ops import (
+    MemoryReadValidationError,
+    MutationConflictError,
+)
 from mem0_sidecar.http_adapter.capability_routes import capability_router
 from mem0_sidecar.http_adapter.category_routes import category_router
 from mem0_sidecar.http_adapter.client_auth import ClientAuthVerifier
@@ -218,6 +221,12 @@ def create_app(
     app.include_router(consolidation_router, dependencies=protected)
     app.include_router(export_router, dependencies=protected)
     app.include_router(extraction_policy_router, dependencies=protected)
+
+    @app.exception_handler(MemoryReadValidationError)
+    async def read_validation_handler(
+        _request: Request, exc: MemoryReadValidationError
+    ) -> JSONResponse:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
 
     @app.exception_handler(MutationConflictError)
     async def mutation_conflict_handler(

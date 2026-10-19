@@ -2506,6 +2506,7 @@ class MemoryIndexRepository:
         app_id: str | None,
         agent_id: str | None,
         run_id: str | None,
+        current_only: bool = True,
     ) -> set[str]:
         if not mem0_memory_ids:
             return set()
@@ -2513,9 +2514,10 @@ class MemoryIndexRepository:
         statement = select(MemoryIndex.mem0_memory_id).where(
             MemoryIndex.project_id == project_id,
             MemoryIndex.deleted_at.is_(None),
-            MemoryIndex.consolidation_state == "ACTIVE",
             MemoryIndex.mem0_memory_id.in_(mem0_memory_ids),
         )
+        if current_only:
+            statement = statement.where(MemoryIndex.consolidation_state == "ACTIVE")
         if user_id is not None:
             statement = statement.where(MemoryIndex.user_id == user_id)
         if app_id is not None:

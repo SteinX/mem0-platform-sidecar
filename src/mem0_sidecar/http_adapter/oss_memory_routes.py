@@ -185,6 +185,11 @@ def _list_service_payload(
         if lowered not in {"true", "false"}:
             raise ValueError("show_expired must be a boolean")
         normalized["show_expired"] = lowered == "true"
+    raw_current_only = request.query_params.get("current_only")
+    if raw_current_only is not None:
+        if raw_current_only.lower() not in {"true", "false"}:
+            raise ValueError("current_only must be a boolean")
+        normalized["current_only"] = raw_current_only.lower() == "true"
     return normalized
 
 
