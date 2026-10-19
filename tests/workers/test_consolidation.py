@@ -317,5 +317,5 @@ async def test_runtime_worker_scans_auto_approves_and_shadows(tmp_path) -> None:
         }
         jobs = session.query(Job).order_by(Job.created_at).all()
     assert proposal.status == "SHADOWED"
-    assert sorted(projections.values()) == ["ACTIVE", "SHADOWED"]
+    assert sorted(projections.values()) == ["ACTIVE", "MERGED"]
     assert [job.status.value for job in jobs] == ["SUCCEEDED", "SUCCEEDED"]

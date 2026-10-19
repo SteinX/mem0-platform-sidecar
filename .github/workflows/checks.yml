@@ -31,4 +31,8 @@ jobs:
           tests/http_adapter/test_current_facts.py
           tests/http_adapter/test_ranking.py
           tests/http_adapter/test_client_auth.py
+          tests/workers/test_consolidation.py
+          tests/http_adapter/test_memory_routes.py::test_route_scoped_requests_bootstrap_non_default_project_and_normalize_app_id
+          tests/http_adapter/test_memory_routes.py::test_route_scoped_search_preserves_explicit_app_id_without_bootstrapping_project
+          tests/http_adapter/test_memory_routes.py::test_route_scoped_search_preserves_query_app_id_without_bootstrapping_project
           tests/store/test_migrations.py::test_access_migration_preserves_facts_and_initializes_unknown_history

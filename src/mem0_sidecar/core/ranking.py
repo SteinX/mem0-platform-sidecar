@@ -87,7 +87,7 @@ class RankingPolicyConflict(ValueError):
 def get_ranking_policy(session: Session, project_id: str) -> RankingPolicy:
     project = session.get(Project, project_id)
     if project is None:
-        raise KeyError(project_id)
+        return RankingPolicy()
     return RankingPolicy.model_validate(
         json.loads(project.settings_json).get("ranking_policy", {})
     )
