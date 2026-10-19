@@ -6,6 +6,8 @@ an explicit boolean `current_only: false` to include retained historical sources
 from the same project/app/entity scope in the upstream candidate set. This does
 not expand the upstream candidate limit or include expired/deleted records.
 Explorer query/scan and exports keep their existing ACTIVE-only behavior.
+Core's `latest_only` separately filters explicit `metadata.superseded_by`
+markers; combine it with `current_only` when both forms of history are present.
 
 Newly applied exact/near duplicate proposals mark redundant sources MERGED.
 Contradiction proposals mark replaced sources SUPERSEDED. The canonical fact
