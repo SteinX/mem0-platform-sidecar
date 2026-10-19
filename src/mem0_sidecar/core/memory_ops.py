@@ -19,6 +19,14 @@ from mem0_sidecar.core.explorer_filters import (
     ExplorerQuery,
 )
 from mem0_sidecar.core.extraction_policy import apply_extraction_policy
+from mem0_sidecar.core.ranking import (
+    MemoryReadValidationError,
+    event_date,
+    get_ranking_policy,
+    rank_results,
+    ranking_limit,
+    search_controls,
+)
 from mem0_sidecar.core.scope import Scope, normalize_scope, validate_scope_id
 from mem0_sidecar.mem0_client.client import Mem0UpstreamError
 from mem0_sidecar.observability import get_request_id
@@ -58,10 +66,6 @@ _DIRTY_TRACE_SESSION_ERROR = (
 
 class MemoryUpstreamProtocolError(RuntimeError):
     """The upstream response does not satisfy the memory service contract."""
-
-
-class MemoryReadValidationError(ValueError):
-    pass
 
 
 def _current_only(payload: dict[str, Any]) -> bool:
@@ -368,6 +372,8 @@ def _oss_search_payload(payload: dict[str, Any], *, scope: Scope) -> dict[str, A
     oss_payload.pop("project_id", None)
     oss_payload.pop("app_id", None)
     oss_payload.pop("current_only", None)
+    oss_payload.pop("event_from", None)
+    oss_payload.pop("event_to", None)
     filters = (
         dict(payload["filters"])
         if isinstance(payload.get("filters"), dict)
@@ -389,6 +395,12 @@ def _result_memory_id(record: Any) -> str | None:
     if isinstance(memory_id, str) and memory_id:
         return memory_id
     return None
+
+
+def _search_result_id(record: Any) -> str | None:
+    if isinstance(record, dict) and isinstance(record.get("memory"), dict):
+        return _result_memory_id(record["memory"])
+    return _result_memory_id(record)
 
 
 def _memory_record_from_response(
@@ -655,6 +667,10 @@ def _validate_memory_patch(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"metadata must contain at most {_MAX_UPDATE_METADATA_FIELDS} fields"
         )
+    if isinstance(payload.get("metadata"), dict) and (
+        "event_date" in payload["metadata"]
+    ):
+        event_date(payload["metadata"]["event_date"])
     return {key: payload[key] for key in _MEMORY_PATCH_FIELDS if key in payload}
 
 
@@ -718,7 +734,7 @@ def _filter_search_results(
 
     candidate_ids: list[str] = []
     for item in results:
-        _append_memory_id(candidate_ids, _result_memory_id(item))
+        _append_memory_id(candidate_ids, _search_result_id(item))
 
     allowed_ids = memory_repo.list_scoped_memory_ids(
         project_id=scope.project_id,
@@ -732,7 +748,7 @@ def _filter_search_results(
     filtered_results = [
         item
         for item in results
-        if (memory_id := _result_memory_id(item)) is not None
+        if (memory_id := _search_result_id(item)) is not None
         and memory_id in allowed_ids
     ]
     filtered_response = dict(response)
@@ -761,7 +777,7 @@ def _filter_compatible_results(
 
     candidate_ids: list[str] = []
     for item in results:
-        _append_memory_id(candidate_ids, _result_memory_id(item))
+        _append_memory_id(candidate_ids, _search_result_id(item))
     allowed_ids = memory_repo.list_scoped_memory_ids(
         project_id=scope.project_id,
         mem0_memory_ids=candidate_ids,
@@ -774,7 +790,7 @@ def _filter_compatible_results(
     filtered_results = [
         item
         for item in results
-        if (memory_id := _result_memory_id(item)) is not None
+        if (memory_id := _search_result_id(item)) is not None
         and memory_id in allowed_ids
     ]
     if response_kind == "list":
@@ -1880,6 +1896,8 @@ class MemoryService:
             run_id=payload.get("run_id"),
         )
         metadata = dict(payload.get("metadata") or {})
+        if "event_date" in metadata:
+            event_date(metadata["event_date"])
         categories = [
             category
             for category in CategoryRepository(self.session).list_project_categories(
@@ -2202,7 +2220,8 @@ class MemoryService:
         preserve_wire_shape: bool = False,
     ) -> Any:
         _require_clean_trace_session(self.session)
-        current_only = _current_only(payload)
+        controls = search_controls(payload)
+        current_only = controls.current_only
         scope = normalize_scope(
             project_id=project_id,
             user_id=payload.get("user_id"),
@@ -2211,6 +2230,13 @@ class MemoryService:
             run_id=payload.get("run_id"),
         )
         oss_payload = _oss_search_payload(payload, scope=scope)
+        policy = get_ranking_policy(self.session, project_id)
+        use_ranking = policy.settings.enabled or bool(
+            controls.event_from or controls.event_to
+        )
+        limit = ranking_limit(payload) if use_ranking else 0
+        if use_ranking:
+            oss_payload["top_k"] = max(limit, policy.settings.candidate_limit)
         oss_payload.update(
             {
                 key: value
@@ -2251,6 +2277,12 @@ class MemoryService:
                 scope=scope,
                 current_only=current_only,
             )
+            if use_ranking:
+                filtered_response = rank_results(
+                    filtered_response, session=self.session, scope=scope,
+                    controls=controls, policy=policy, limit=limit,
+                    now=datetime.now(UTC),
+                )
             event_repo.mark_succeeded(
                 event.id,
                 response=_trace_response(filtered_response),

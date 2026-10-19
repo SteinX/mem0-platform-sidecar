@@ -25,6 +25,7 @@ from mem0_sidecar.http_adapter.export_routes import export_router
 from mem0_sidecar.http_adapter.extraction_policy_routes import extraction_policy_router
 from mem0_sidecar.http_adapter.memory_routes import memory_router
 from mem0_sidecar.http_adapter.oss_memory_routes import oss_memory_router
+from mem0_sidecar.http_adapter.ranking_routes import ranking_router
 from mem0_sidecar.mem0_client.client import Mem0RestClient, Mem0UpstreamError
 from mem0_sidecar.observability import RequestLoggingMiddleware, configure_logging
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
@@ -221,6 +222,7 @@ def create_app(
     app.include_router(consolidation_router, dependencies=protected)
     app.include_router(export_router, dependencies=protected)
     app.include_router(extraction_policy_router, dependencies=protected)
+    app.include_router(ranking_router, dependencies=protected)
 
     @app.exception_handler(MemoryReadValidationError)
     async def read_validation_handler(

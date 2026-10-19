@@ -67,6 +67,19 @@ configurable upstream auth, and operational logs.
 - Make failures diagnosable through request IDs, structured request logs, and
   upstream call logs.
 
+## Memory policies
+
+Optional [project/app extraction policies](docs/extraction-policy.md) classify
+new user facts and agent experience using category descriptions and assign TTLs
+to temporary types. They require the companion Core extraction-policy API.
+[Current facts](docs/current-facts.md) distinguish MERGED and SUPERSEDED sources
+and retain proposal/canonical relationships and rollback.
+[Ranking and event dates](docs/ranking-and-event-time.md) add bounded recency and
+access signals with explicit event windows. Extraction and ranking default off;
+installing these features does not change consolidation OBSERVE policies.
+Non-Docker upgrades must run `python -m alembic upgrade head` before starting
+the updated service; the Docker entrypoint already applies migrations.
+
 ## Architecture
 
 ```mermaid

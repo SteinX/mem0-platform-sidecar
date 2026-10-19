@@ -603,6 +603,7 @@ def test_platform_auth_rejection_uses_fastapi_detail_envelope(tmp_path) -> None:
 @pytest.mark.parametrize("path", [
     "/v1/projects/default/categories",
     "/v1/projects/default/extraction-policy",
+    "/v1/projects/default/ranking-policy",
 ])
 def test_control_plane_routes_require_client_authentication(tmp_path, path) -> None:
     app = create_app(
@@ -623,6 +624,9 @@ def test_control_plane_routes_require_client_authentication(tmp_path, path) -> N
 @pytest.mark.parametrize(("method", "path", "payload"), [
     ("POST", "/v1/events/query", {"project_id": "default", "app_id": "repo"}),
     ("PUT", "/v1/projects/default/extraction-policy", {
+        "expected_version": 0, "settings": {"enabled": True},
+    }),
+    ("PUT", "/v1/projects/default/ranking-policy", {
         "expected_version": 0, "settings": {"enabled": True},
     }),
 ])

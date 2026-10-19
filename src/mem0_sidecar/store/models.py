@@ -204,6 +204,10 @@ class MemoryIndex(Base):
     last_observed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    access_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_consolidation_scan_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
