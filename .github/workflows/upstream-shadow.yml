@@ -1,0 +1,148 @@
+name: Upstream compatibility shadow
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: Candidate Core full commit SHA
+        required: true
+        type: string
+      core_base_sha:
+        description: Currently released Core full commit SHA
+        required: true
+        type: string
+      sidecar_sha:
+        description: Candidate sidecar full commit SHA
+        required: true
+        type: string
+      sidecar_base_sha:
+        description: Currently released sidecar full commit SHA
+        required: true
+        type: string
+      mcp_sha:
+        description: Fixed MCP full commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-compatibility-shadow
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'SteinX/mem0-platform-sidecar' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require full immutable revisions
+        env:
+          CORE: ${{ inputs.core_sha }}
+          CORE_BASE: ${{ inputs.core_base_sha }}
+          SIDECAR: ${{ inputs.sidecar_sha }}
+          SIDECAR_BASE: ${{ inputs.sidecar_base_sha }}
+          MCP: ${{ inputs.mcp_sha }}
+        run: |
+          for sha in "$CORE" "$CORE_BASE" "$SIDECAR" "$SIDECAR_BASE" "$MCP"; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          done
+
+  compatibility:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        pair: [old-core-new-sidecar, new-core-old-sidecar, new-core-new-sidecar]
+    env:
+      CORE_SHA: ${{ matrix.pair == 'old-core-new-sidecar' && inputs.core_base_sha || inputs.core_sha }}
+      SIDECAR_SHA: ${{ matrix.pair == 'new-core-old-sidecar' && inputs.sidecar_base_sha || inputs.sidecar_sha }}
+      MCP_SHA: ${{ inputs.mcp_sha }}
+      NEXT_TELEMETRY_DISABLED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+      - name: Checkout Core
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: SteinX/mem0
+          ref: ${{ env.CORE_SHA }}
+          path: core
+          persist-credentials: false
+      - name: Checkout sidecar
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SIDECAR_SHA }}
+          path: sidecar
+          persist-credentials: false
+      - name: Checkout MCP
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: SteinX/mem0-oss-mcp
+          ref: ${{ env.MCP_SHA }}
+          path: mcp
+          persist-credentials: false
+      - name: Verify checked out revisions
+        run: |
+          test "$(git -C core rev-parse HEAD)" = "$CORE_SHA"
+          test "$(git -C sidecar rev-parse HEAD)" = "$SIDECAR_SHA"
+          test "$(git -C mcp rev-parse HEAD)" = "$MCP_SHA"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.34.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Sidecar lint and offline tests
+        working-directory: sidecar
+        run: |
+          python -m pip install '.[dev]'
+          python -m ruff check .
+          python -m pytest -q -m 'not e2e' -p no:cacheprovider
+      - name: Verify native and overlaid dashboard without dirtying Core source
+        run: |
+          cp -a core/server/dashboard "$RUNNER_TEMP/dashboard"
+          cd "$RUNNER_TEMP/dashboard"
+          pnpm install --frozen-lockfile
+          pnpm exec tsc --noEmit
+          pnpm build
+          python "$GITHUB_WORKSPACE/sidecar/integrations/mem0-dashboard-overlay/scripts/apply-dashboard-overlay" "$PWD"
+          python "$GITHUB_WORKSPACE/sidecar/integrations/mem0-dashboard-overlay/scripts/verify-dashboard-overlay" "$PWD"
+          pnpm build
+      - name: Run isolated live compatibility harness
+        working-directory: sidecar
+        env:
+          MEM0_E2E_UPSTREAM_CONTEXT: ${{ github.workspace }}/core
+          MEM0_E2E_MCP_CONTEXT: ${{ github.workspace }}/mcp
+          MEM0_E2E_EXPECTED_CORE_SHA: ${{ env.CORE_SHA }}
+          MEM0_E2E_EXPECTED_SIDECAR_SHA: ${{ env.SIDECAR_SHA }}
+          MEM0_E2E_EXPECTED_MCP_SHA: ${{ env.MCP_SHA }}
+          MEM0_E2E_EVIDENCE_DIR: ${{ runner.temp }}/evidence
+        run: python scripts/run_live_e2e_compose.py
+      - name: Reject stale, missing or skipped evidence
+        run: |
+          python controller/scripts/verify_shadow_evidence.py "$RUNNER_TEMP/evidence" \
+            --core "$CORE_SHA" --sidecar "$SIDECAR_SHA" --mcp "$MCP_SHA" \
+            > "$RUNNER_TEMP/shadow-verdict.json"
+      - name: Upload diagnostic evidence (never a release authorization)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compatibility-${{ matrix.pair }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/evidence
+            ${{ runner.temp }}/shadow-verdict.json
+          if-no-files-found: warn
+          retention-days: 30
