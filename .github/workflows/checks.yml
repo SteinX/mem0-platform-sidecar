@@ -20,6 +20,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install '.[dev]'
+      - name: Check fail-closed shadow evidence validation
+        run: |
+          python -m ruff check scripts/verify_shadow_evidence.py tests/test_shadow_evidence.py
+          python -m pytest -q tests/test_shadow_evidence.py
       - name: Exercise cursor, count, scope and legacy-window boundaries
         run: python -m pytest -q tests/core/test_memory_scan*.py tests/store/test_memory_scan.py tests/http_adapter/test_memory_scan*.py
       - name: Exercise memory policies, current facts and ranking
