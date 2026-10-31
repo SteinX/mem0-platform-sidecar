@@ -64,7 +64,9 @@ def verify(directory: Path, sources: dict[str, str]) -> dict[str, object]:
                 raise ValueError(f"No test cases: {name}")
             if any(list(root.iter(tag)) for tag in ("skipped", "failure", "error")):
                 raise ValueError(f"Non-passing test case: {name}")
-            for suite in root.iter("testsuite"):
+            for suite in root.iter():
+                if suite.tag not in {"testsuite", "testsuites"}:
+                    continue
                 if any(
                     int(suite.get(key, "0"))
                     for key in ("skipped", "failures", "errors")

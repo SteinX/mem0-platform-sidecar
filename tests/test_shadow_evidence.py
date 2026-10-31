@@ -32,8 +32,16 @@ def evidence(
     return manifest
 
 
-def test_local_evidence_never_grants_mutation_authority(tmp_path):
-    evidence(tmp_path)
+@pytest.mark.parametrize(
+    "xml",
+    [
+        b'<testsuite><testcase name="live"/></testsuite>',
+        b'<testsuites failures="0" errors="0" skipped="0">'
+        b'<testsuite><testcase name="live"/></testsuite></testsuites>',
+    ],
+)
+def test_local_evidence_never_grants_mutation_authority(tmp_path, xml):
+    evidence(tmp_path, xml)
     result = verify(tmp_path, SOURCES)
     assert result["local_evidence_valid"]
     assert not result["merge_allowed"]
@@ -52,6 +60,17 @@ def test_local_evidence_never_grants_mutation_authority(tmp_path):
 def test_empty_skipped_or_failed_suites_are_rejected(tmp_path, xml):
     evidence(tmp_path, xml)
     with pytest.raises(ValueError):
+        verify(tmp_path, SOURCES)
+
+
+@pytest.mark.parametrize("counter", ["failures", "errors", "skipped"])
+def test_nonpassing_aggregate_with_passing_cases_is_rejected(tmp_path, counter):
+    xml = (
+        f'<testsuites {counter}="1"><testsuite>'
+        '<testcase name="live"/></testsuite></testsuites>'
+    ).encode()
+    evidence(tmp_path, xml)
+    with pytest.raises(ValueError, match="Non-passing suite"):
         verify(tmp_path, SOURCES)
 
 
