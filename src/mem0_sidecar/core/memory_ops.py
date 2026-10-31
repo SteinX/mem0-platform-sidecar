@@ -437,6 +437,7 @@ def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
 
 def _public_memory_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     public_metadata = dict(metadata)
+    public_metadata.pop("_mem0_dual_request_fingerprint", None)
     public_metadata.pop(SIDECAR_PROJECT_ID_METADATA_KEY, None)
     public_metadata.pop(SIDECAR_APP_ID_METADATA_KEY, None)
     public_metadata.pop(SIDECAR_MUTATION_ID_METADATA_KEY, None)
@@ -1602,6 +1603,10 @@ class MemoryService:
             )
             if item.enabled
         }
+        frozen_policy = payload.get("upstream_payload", {}).get("extraction_policy", {})
+        category_names.update(
+            item["name"] for item in frozen_policy.get("categories", [])
+        )
         observed_at = datetime.now(UTC)
         ProjectRepository(self.session).lock_for_mutation(project_id)
         intent_repo = MutationIntentRepository(self.session)
@@ -1949,6 +1954,10 @@ class MemoryService:
 
         oss_payload = apply_extraction_policy(
             self.session, scope, oss_payload, categories
+        )
+        category_names.update(
+            item["name"]
+            for item in oss_payload.get("extraction_policy", {}).get("categories", [])
         )
         event_request = {**oss_payload, "metadata": dict(oss_payload["metadata"])}
         await self.recover_pending_mutations(

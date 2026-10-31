@@ -1,19 +1,21 @@
 import json
 from collections.abc import Sequence
-from typing import Annotated
+from typing import Annotated, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool
 from sqlalchemy.orm import Session
 
 from mem0_sidecar.core.scope import Scope
 from mem0_sidecar.store.models import Category, Project
-from mem0_sidecar.store.repositories import ProjectRepository
+from mem0_sidecar.store.repositories import CategoryRepository, ProjectRepository
 
 
 class ExtractionSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     enabled: StrictBool = False
+    allow_request_profiles: StrictBool = False
+    dual_extraction_enabled: StrictBool = False
     user_instructions: str = Field(default="", max_length=8192)
     agent_instructions: str = Field(default="", max_length=8192)
     temporary_types: dict[
@@ -77,28 +79,101 @@ def apply_extraction_policy(
     payload: dict[str, JsonValue],
     categories: Sequence[Category],
 ) -> dict[str, JsonValue]:
+    plugin_fields = {
+        "custom_instructions", "agent_custom_instructions", "custom_categories",
+        "extraction_track",
+    }
+    has_profile = bool(plugin_fields.intersection(payload))
+    request_categories = _request_categories(payload.get("custom_categories"))
+    for key in ("custom_instructions", "agent_custom_instructions"):
+        value = payload.get(key)
+        if value is not None and (type(value) is not str or len(value) > 8192):
+            raise ValueError(f"{key} must be a string of at most 8192 characters")
+    track = payload.get("extraction_track")
+    if track is not None:
+        if track not in ("personal", "project"):
+            raise ValueError("extraction_track must be personal or project")
+        if track == "personal" and (not scope.user_id or scope.agent_id):
+            raise ValueError("personal extraction requires only a user scope")
+        if track == "project" and (not scope.agent_id or scope.user_id):
+            raise ValueError("project extraction requires only an agent scope")
     policy = get_extraction_policy(session, scope.project_id, scope.app_id)
+    if track is not None and (
+        not policy.settings.enabled or not policy.settings.dual_extraction_enabled
+        or payload.get("infer") is False
+    ):
+        raise ValueError(
+            "Dual extraction requires an enabled operator dual policy and infer=true"
+        )
+    cleaned = {key: value for key, value in payload.items() if key not in plugin_fields}
     if not policy.settings.enabled or payload.get("infer") is False:
-        return payload
+        return cleaned if has_profile else payload
     agent_scoped = bool(scope.agent_id) and not scope.user_id
     instructions = (
         policy.settings.agent_instructions
         if agent_scoped
         else policy.settings.user_instructions
     )
-    result = dict(payload)
-    if "prompt" not in payload and instructions:
+    result = cleaned
+    if has_profile or policy.settings.allow_request_profiles:
+        if not instructions and policy.settings.allow_request_profiles:
+            key = "agent_custom_instructions" if agent_scoped else "custom_instructions"
+            instructions = payload.get(key)
+        if instructions:
+            result["prompt"] = instructions
+        elif track is not None:
+            result.pop("prompt", None)
+    elif "prompt" not in payload and instructions:
         result["prompt"] = instructions
-    result["extraction_policy"] = {
-        "version": policy.version,
-        "fact_kind": "agent_experience" if agent_scoped else "user_fact",
-        "categories": [
-            {
-                "name": category.name,
-                "description": category.description or category.name,
-                "ttl_days": policy.settings.temporary_types.get(category.name),
-            }
-            for category in categories
-        ],
-    }
+    effective_categories: list[dict[str, JsonValue]] = [
+        {
+            "name": category.name,
+            "description": category.description or category.name,
+            "ttl_days": policy.settings.temporary_types.get(category.name),
+        }
+        for category in categories
+    ]
+    if (
+        policy.settings.allow_request_profiles
+        and not CategoryRepository(session).list_project_categories(scope.project_id)
+    ):
+        effective_categories = request_categories
+    result["extraction_policy"] = cast(
+        JsonValue,
+        {
+            "version": policy.version,
+            "fact_kind": "agent_experience" if agent_scoped else "user_fact",
+            "categories": effective_categories,
+        },
+    )
+    return result
+
+
+def _request_categories(value: JsonValue) -> list[dict[str, JsonValue]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 64:
+        raise ValueError("custom_categories must be a list of at most 64 categories")
+    result = []
+    names = set()
+    for item in value:
+        if isinstance(item, str):
+            name, description = item, item
+        elif isinstance(item, dict) and len(item) == 1:
+            name, description = next(iter(item.items()))
+        else:
+            raise ValueError(
+                "Each custom category must be a name or single name/description pair"
+            )
+        if (
+            not isinstance(name, str) or not name.strip() or len(name) > 128
+            or not isinstance(description, str) or not description.strip()
+            or len(description) > 4096
+            or name in names
+        ):
+            raise ValueError(
+                "Custom categories require unique bounded names and descriptions"
+            )
+        names.add(name)
+        result.append({"name": name, "description": description, "ttl_days": None})
     return result

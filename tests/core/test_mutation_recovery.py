@@ -7,6 +7,10 @@ import pytest
 from sqlalchemy import select, text
 
 from mem0_sidecar.core.entities import EntityService
+from mem0_sidecar.core.extraction_policy import (
+    ExtractionSettings,
+    set_extraction_policy,
+)
 from mem0_sidecar.core.memory_ops import MemoryService, MutationConflictError
 from mem0_sidecar.mem0_client.client import Mem0RestClient, Mem0UpstreamError
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
@@ -595,6 +599,64 @@ async def test_cancelled_add_after_apply_is_unknown_then_observed_complete(
     assert _intent_state(factory)["status"] == "COMPLETED"
     assert client.add_calls == 1
     assert client.deleted_ids == []
+
+
+@pytest.mark.asyncio
+async def test_recovered_add_keeps_request_profile_category_after_policy_change(
+    tmp_path,
+) -> None:
+    factory = _session_factory(tmp_path)
+
+    class ProfileClient(_StatefulRecoveryClient):
+        async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+            self.cancel_operation = None
+            response = await super().add_memory(payload)
+            categories = payload.get("extraction_policy", {}).get("categories", [])
+            category_names = [category["name"] for category in categories]
+            response["metadata"]["categories"] = category_names
+            self.records[response["id"]]["metadata"]["categories"] = category_names
+            self.cancel_operation = "add"
+            self._cancel_once("add")
+            return response
+
+    client = ProfileClient(cancel_operation="add")
+    with factory() as session:
+        set_extraction_policy(
+            session,
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            expected_version=0,
+            settings=ExtractionSettings(enabled=True, allow_request_profiles=True),
+        )
+        session.commit()
+
+    with pytest.raises(asyncio.CancelledError):
+        with factory() as session:
+            await MemoryService(session=session, mem0=client).add_memory(
+                project_id=PROJECT_ID,
+                payload={
+                    "text": "a verified decision",
+                    "app_id": APP_ID,
+                    "custom_categories": [{"decision": "A verified decision"}],
+                },
+            )
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+
+    with factory() as session:
+        set_extraction_policy(
+            session,
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            expected_version=1,
+            settings=ExtractionSettings(enabled=True, allow_request_profiles=False),
+        )
+        session.commit()
+
+    assert await _recover(factory, client) == {"recovered": 1, "failed": 0}
+    with factory() as session:
+        indexed = session.scalar(select(MemoryIndex))
+        assert indexed is not None and indexed.category == "decision"
+    assert client.add_calls == 1
 
 
 @pytest.mark.asyncio

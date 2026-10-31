@@ -157,3 +157,104 @@ def test_policy_uses_descriptions_and_keeps_caller_values(
 def test_temporary_type_ttl_is_strict(value):
     with pytest.raises(ValidationError):
         ExtractionSettings(temporary_types={"beta": value})
+
+
+@pytest.mark.parametrize(("track", "user", "agent", "kind", "instruction"), [
+    ("personal", "alice", None, "user_fact", "Personal rule"),
+    ("project", None, "repository", "agent_experience", "Project rule"),
+])
+def test_opt_in_track_uses_local_profile_without_mutating_categories(
+    db_session, project, track, user, agent, kind, instruction,
+):
+    set_extraction_policy(
+        db_session, project_id=project.id, app_id=None, expected_version=0,
+        settings=ExtractionSettings(
+            enabled=True, allow_request_profiles=True, dual_extraction_enabled=True,
+        ),
+    )
+    scope = normalize_scope(
+        project_id=project.id, app_id="app-a", user_id=user,
+        agent_id=agent, run_id="session",
+    )
+    result = apply_extraction_policy(db_session, scope, {
+        "infer": True, "extraction_track": track,
+        "custom_instructions": "Personal rule",
+        "agent_custom_instructions": "Project rule",
+        "custom_categories": [{"decision": "Verified decision"}],
+    }, [])
+    assert result["prompt"] == instruction
+    assert result["extraction_policy"] == {
+        "version": 1, "fact_kind": kind,
+        "categories": [{
+            "name": "decision",
+            "description": "Verified decision",
+            "ttl_days": None,
+        }],
+    }
+    assert not set(result).intersection({
+        "extraction_track",
+        "custom_instructions",
+        "agent_custom_instructions",
+        "custom_categories",
+    })
+    assert db_session.query(Category).count() == 0
+
+
+def test_operator_profile_wins_and_disabled_category_cannot_be_reintroduced(
+    db_session,
+    project,
+):
+    set_extraction_policy(
+        db_session,
+        project_id=project.id,
+        app_id=None,
+        expected_version=0,
+        settings=ExtractionSettings(
+            enabled=True,
+            allow_request_profiles=True,
+            user_instructions="Operator rule",
+        ),
+    )
+    db_session.add(Category(project_id=project.id, name="blocked", enabled=False))
+    db_session.flush()
+    scope = normalize_scope(
+        project_id=project.id,
+        app_id="app-a",
+        user_id="alice",
+        agent_id=None,
+        run_id=None,
+    )
+    result = apply_extraction_policy(db_session, scope, {
+        "prompt": "Caller prompt", "custom_instructions": "Caller rule",
+        "custom_categories": ["blocked"],
+    }, [])
+    assert result["prompt"] == "Operator rule"
+    policy = result.get("extraction_policy")
+    assert isinstance(policy, dict)
+    assert policy.get("categories") == []
+
+
+def test_dual_is_disabled_by_default_and_compatibility_fields_do_not_reach_core(
+    db_session,
+    project,
+):
+    scope = normalize_scope(
+        project_id=project.id,
+        app_id="app-a",
+        user_id="alice",
+        agent_id=None,
+        run_id=None,
+    )
+    payload = {
+        "messages": [],
+        "custom_instructions": "rule",
+        "custom_categories": ["topic"],
+    }
+    assert apply_extraction_policy(db_session, scope, payload, []) == {"messages": []}
+    with pytest.raises(ValueError, match="operator dual policy"):
+        apply_extraction_policy(
+            db_session,
+            scope,
+            {**payload, "extraction_track": "personal"},
+            [],
+        )
