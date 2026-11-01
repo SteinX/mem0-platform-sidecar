@@ -115,7 +115,7 @@ def apply_extraction_policy(
         else policy.settings.user_instructions
     )
     result = cleaned
-    if has_profile or policy.settings.allow_request_profiles:
+    if has_profile:
         if not instructions and policy.settings.allow_request_profiles:
             key = "agent_custom_instructions" if agent_scoped else "custom_instructions"
             instructions = payload.get(key)

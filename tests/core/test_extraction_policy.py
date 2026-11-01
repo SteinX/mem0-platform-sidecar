@@ -153,6 +153,42 @@ def test_policy_uses_descriptions_and_keeps_caller_values(
     }
 
 
+@pytest.mark.parametrize(
+    ("user_id", "agent_id"),
+    [
+        ("user-a", None),
+        (None, "agent-a"),
+    ],
+)
+def test_request_profiles_preserve_legacy_caller_prompt(
+    db_session, project, user_id, agent_id
+):
+    set_extraction_policy(
+        db_session,
+        project_id=project.id,
+        app_id="app-a",
+        expected_version=0,
+        settings=ExtractionSettings(
+            enabled=True,
+            allow_request_profiles=True,
+            user_instructions="Operator user rule",
+            agent_instructions="Operator agent rule",
+        ),
+    )
+    scope = normalize_scope(
+        project_id=project.id,
+        app_id="app-a",
+        user_id=user_id,
+        agent_id=agent_id,
+        run_id=None,
+    )
+    payload = {"prompt": "Caller legacy prompt", "messages": []}
+
+    result = apply_extraction_policy(db_session, scope, payload, [])
+
+    assert result["prompt"] == payload["prompt"]
+
+
 @pytest.mark.parametrize("value", [True, "2", 0, -1, 3651])
 def test_temporary_type_ttl_is_strict(value):
     with pytest.raises(ValidationError):
