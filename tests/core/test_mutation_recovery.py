@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from typing import Any
 
@@ -11,7 +12,11 @@ from mem0_sidecar.core.extraction_policy import (
     ExtractionSettings,
     set_extraction_policy,
 )
-from mem0_sidecar.core.memory_ops import MemoryService, MutationConflictError
+from mem0_sidecar.core.memory_ops import (
+    MemoryService,
+    MutationConflictError,
+    _projection_category_hashes,
+)
 from mem0_sidecar.mem0_client.client import Mem0RestClient, Mem0UpstreamError
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base, Entity, Event, MemoryIndex, MutationIntent
@@ -602,11 +607,18 @@ async def test_cancelled_add_after_apply_is_unknown_then_observed_complete(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_category",
+    ["decision-63", "sk-abcdefghij", "http://127.0.0.1/private"],
+)
 async def test_recovered_add_keeps_request_profile_category_after_policy_change(
-    tmp_path,
+    tmp_path, final_category: str
 ) -> None:
     factory = _session_factory(tmp_path)
-    category_names = [f"decision-{index:02d}" for index in range(64)]
+    category_names = [
+        *(f"decision-{index:02d}" for index in range(63)),
+        final_category,
+    ]
 
     class ProfileClient(_StatefulRecoveryClient):
         async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -646,12 +658,18 @@ async def test_recovered_add_keeps_request_profile_category_after_policy_change(
             )
     assert _intent_state(factory)["status"] == "UNKNOWN"
     initial_payload = _intent_state(factory)["payload"]
-    snapshot = initial_payload["projection_category_name_snapshot"]
-    assert snapshot["count"] == len(category_names)
+    snapshot = initial_payload["projection_category_hash_snapshot"]
+    category_hashes = sorted(
+        hashlib.sha256(name.encode("utf-8")).hexdigest()
+        for name in category_names
+    )
+    assert snapshot["count"] == len(category_hashes)
     assert snapshot["chunks"] == [
-        category_names[:32],
-        category_names[32:],
+        category_hashes[:32],
+        category_hashes[32:],
     ]
+    serialized_snapshot = json.dumps(snapshot)
+    assert all(name not in serialized_snapshot for name in category_names)
 
     with factory() as session:
         intent = session.scalar(select(MutationIntent))
@@ -665,11 +683,11 @@ async def test_recovered_add_keeps_request_profile_category_after_policy_change(
                 "request_fingerprint": payload["request_fingerprint"],
                 "observed_noop": False,
             },
-            preserve_keys=("projection_category_name_snapshot",),
+            preserve_keys=("projection_category_hash_snapshot",),
         )
         session.commit()
     assert (
-        _intent_state(factory)["payload"]["projection_category_name_snapshot"]
+        _intent_state(factory)["payload"]["projection_category_hash_snapshot"]
         == snapshot
     )
 
@@ -686,8 +704,19 @@ async def test_recovered_add_keeps_request_profile_category_after_policy_change(
     assert await _recover(factory, client) == {"recovered": 1, "failed": 0}
     with factory() as session:
         indexed = session.scalar(select(MemoryIndex))
-        assert indexed is not None and indexed.category == category_names[-1]
+        assert indexed is not None and indexed.category == final_category
     assert client.add_calls == 1
+
+
+def test_projection_category_hash_snapshot_rejects_malformed_digest() -> None:
+    with pytest.raises(RuntimeError, match="malformed"):
+        _projection_category_hashes(
+            {
+                "chunks": [["not-a-sha256-digest"]],
+                "count": 1,
+                "fingerprint": "0" * 64,
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -747,6 +776,7 @@ async def test_cancelled_empty_add_finalization_recovers_from_durable_observatio
         assert set(state["payload"]) == {
             "mutation_id",
             "observed_noop",
+            "projection_category_hash_snapshot",
             "request_fingerprint",
         }
         with factory() as session:
@@ -793,12 +823,13 @@ async def test_empty_add_checkpoint_flush_failure_completes_known_noop(
         self,
         intent_id: str,
         payload: dict[str, Any],
+        **kwargs,
     ) -> MutationIntent:
         nonlocal update_failed
         if not update_failed:
             update_failed = True
             raise RuntimeError("injected checkpoint flush failure")
-        return real_update_payload(self, intent_id, payload)
+        return real_update_payload(self, intent_id, payload, **kwargs)
 
     monkeypatch.setattr(
         MutationIntentRepository,

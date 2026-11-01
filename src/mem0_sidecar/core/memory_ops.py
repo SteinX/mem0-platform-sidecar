@@ -12,7 +12,7 @@ from pydantic import StrictBool, TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from mem0_sidecar.core.categories import extract_category
+from mem0_sidecar.core.categories import category_name_hash, extract_category
 from mem0_sidecar.core.explorer_filters import (
     EXPLORER_RECORD_HORIZON,
     ExplorerFilter,
@@ -49,8 +49,8 @@ from mem0_sidecar.store.repositories import (
 SIDECAR_PROJECT_ID_METADATA_KEY = "_mem0_sidecar_project_id"
 SIDECAR_APP_ID_METADATA_KEY = "_mem0_sidecar_app_id"
 SIDECAR_MUTATION_ID_METADATA_KEY = "_mem0_sidecar_mutation_id"
-_PROJECTION_CATEGORY_NAME_SNAPSHOT = "projection_category_name_snapshot"
-_PROJECTION_CATEGORY_NAME_CHUNK_SIZE = 32
+_PROJECTION_CATEGORY_HASH_SNAPSHOT_KEY = "projection_category_hash_snapshot"
+_PROJECTION_CATEGORY_HASH_CHUNK_SIZE = 32
 _MEMORY_PATCH_FIELDS = frozenset({"text", "metadata", "expiration_date"})
 # Leave room for the project/app scope fields added before the recovery intent is
 # sanitized. Mutation-intent trace objects retain at most 50 fields.
@@ -274,21 +274,21 @@ def _canonical_fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _projection_category_name_snapshot(
+def _projection_category_hash_snapshot(
     category_names: set[str],
 ) -> dict[str, Any]:
-    names = sorted(category_names)
+    hashes = sorted({category_name_hash(name) for name in category_names})
     return {
         "chunks": [
-            names[index : index + _PROJECTION_CATEGORY_NAME_CHUNK_SIZE]
-            for index in range(0, len(names), _PROJECTION_CATEGORY_NAME_CHUNK_SIZE)
+            hashes[index : index + _PROJECTION_CATEGORY_HASH_CHUNK_SIZE]
+            for index in range(0, len(hashes), _PROJECTION_CATEGORY_HASH_CHUNK_SIZE)
         ],
-        "count": len(names),
-        "fingerprint": _canonical_fingerprint({"names": names}),
+        "count": len(hashes),
+        "fingerprint": _canonical_fingerprint({"hashes": hashes}),
     }
 
 
-def _projection_category_names(snapshot: object) -> list[str]:
+def _projection_category_hashes(snapshot: object) -> list[str]:
     if type(snapshot) is not dict or set(snapshot) != {
         "chunks",
         "count",
@@ -302,28 +302,31 @@ def _projection_category_names(snapshot: object) -> list[str]:
         raise RuntimeError("Add recovery category snapshot is malformed")
     if type(fingerprint) is not str:
         raise RuntimeError("Add recovery category snapshot is malformed")
-    names: list[str] = []
+    hashes: list[str] = []
     for index, chunk in enumerate(chunks):
         if (
             type(chunk) is not list
-            or not 1 <= len(chunk) <= _PROJECTION_CATEGORY_NAME_CHUNK_SIZE
+            or not 1 <= len(chunk) <= _PROJECTION_CATEGORY_HASH_CHUNK_SIZE
         ):
             raise RuntimeError("Add recovery category snapshot is malformed")
         if (
             index < len(chunks) - 1
-            and len(chunk) != _PROJECTION_CATEGORY_NAME_CHUNK_SIZE
+            and len(chunk) != _PROJECTION_CATEGORY_HASH_CHUNK_SIZE
         ):
             raise RuntimeError("Add recovery category snapshot is incomplete")
-        if any(type(name) is not str or not name.strip() for name in chunk):
+        if any(
+            type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in chunk
+        ):
             raise RuntimeError("Add recovery category snapshot is malformed")
-        names.extend(chunk)
+        hashes.extend(chunk)
     if (
-        count != len(names)
-        or names != sorted(set(names))
-        or fingerprint != _canonical_fingerprint({"names": names})
+        count != len(hashes)
+        or hashes != sorted(set(hashes))
+        or fingerprint != _canonical_fingerprint({"hashes": hashes})
     ):
         raise RuntimeError("Add recovery category snapshot is incomplete")
-    return names
+    return hashes
 
 
 def validate_idempotency_key(value: str | None) -> str | None:
@@ -1650,10 +1653,12 @@ class MemoryService:
             (_normalize_memory_record(record) for record in records),
             key=lambda item: item["id"],
         )
-        if _PROJECTION_CATEGORY_NAME_SNAPSHOT in payload:
-            category_names = set(
-                _projection_category_names(
-                    payload[_PROJECTION_CATEGORY_NAME_SNAPSHOT]
+        category_name_hashes: set[str] | None = None
+        if _PROJECTION_CATEGORY_HASH_SNAPSHOT_KEY in payload:
+            category_names: set[str] = set()
+            category_name_hashes = set(
+                _projection_category_hashes(
+                    payload[_PROJECTION_CATEGORY_HASH_SNAPSHOT_KEY]
                 )
             )
         else:
@@ -1711,7 +1716,11 @@ class MemoryService:
                 agent_id=item["agent_id"],
                 app_id=app_id,
                 run_id=item["run_id"],
-                category=extract_category(metadata, category_names),
+                category=extract_category(
+                    metadata,
+                    category_names,
+                    configured_name_hashes=category_name_hashes,
+                ),
                 metadata=metadata,
                 **_memory_projection_fields(item, observed_at=observed_at),
             )
@@ -2033,7 +2042,7 @@ class MemoryService:
             item["name"]
             for item in oss_payload.get("extraction_policy", {}).get("categories", [])
         )
-        category_snapshot = _projection_category_name_snapshot(category_names)
+        category_snapshot = _projection_category_hash_snapshot(category_names)
         event_request = {**oss_payload, "metadata": dict(oss_payload["metadata"])}
         await self.recover_pending_mutations(
             project_id=project_id,
@@ -2054,7 +2063,7 @@ class MemoryService:
             correlation_id=get_request_id(),
         )
         intent_payload = {
-            _PROJECTION_CATEGORY_NAME_SNAPSHOT: category_snapshot,
+            _PROJECTION_CATEGORY_HASH_SNAPSHOT_KEY: category_snapshot,
             "mutation_id": mutation_id,
             "request_fingerprint": request_fingerprint,
             "upstream_payload": oss_payload,
@@ -2065,7 +2074,7 @@ class MemoryService:
             intent_payload,
         )
         if (
-            sanitized_payload.get(_PROJECTION_CATEGORY_NAME_SNAPSHOT)
+            sanitized_payload.get(_PROJECTION_CATEGORY_HASH_SNAPSHOT_KEY)
             != category_snapshot
         ):
             self.session.rollback()
@@ -2136,7 +2145,7 @@ class MemoryService:
                             "request_fingerprint": request_fingerprint,
                             "observed_noop": True,
                         },
-                        preserve_keys=(_PROJECTION_CATEGORY_NAME_SNAPSHOT,),
+                        preserve_keys=(_PROJECTION_CATEGORY_HASH_SNAPSHOT_KEY,),
                     )
                     self.session.commit()
                 except BaseException:
