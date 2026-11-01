@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from typing import Any
 
@@ -7,7 +8,15 @@ import pytest
 from sqlalchemy import select, text
 
 from mem0_sidecar.core.entities import EntityService
-from mem0_sidecar.core.memory_ops import MemoryService, MutationConflictError
+from mem0_sidecar.core.extraction_policy import (
+    ExtractionSettings,
+    set_extraction_policy,
+)
+from mem0_sidecar.core.memory_ops import (
+    MemoryService,
+    MutationConflictError,
+    _projection_category_hashes,
+)
 from mem0_sidecar.mem0_client.client import Mem0RestClient, Mem0UpstreamError
 from mem0_sidecar.store.database import create_engine_from_url, create_session_factory
 from mem0_sidecar.store.models import Base, Entity, Event, MemoryIndex, MutationIntent
@@ -599,6 +608,119 @@ async def test_cancelled_add_after_apply_is_unknown_then_observed_complete(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "final_category",
+    ["decision-63", "sk-abcdefghij", "http://127.0.0.1/private"],
+)
+async def test_recovered_add_keeps_request_profile_category_after_policy_change(
+    tmp_path, final_category: str
+) -> None:
+    factory = _session_factory(tmp_path)
+    category_names = [
+        *(f"decision-{index:02d}" for index in range(63)),
+        final_category,
+    ]
+
+    class ProfileClient(_StatefulRecoveryClient):
+        async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+            self.cancel_operation = None
+            response = await super().add_memory(payload)
+            categories = payload.get("extraction_policy", {}).get("categories", [])
+            final_category = categories[-1]["name"]
+            response["metadata"]["categories"] = [final_category]
+            self.records[response["id"]]["metadata"]["categories"] = [final_category]
+            self.cancel_operation = "add"
+            self._cancel_once("add")
+            return response
+
+    client = ProfileClient(cancel_operation="add")
+    with factory() as session:
+        set_extraction_policy(
+            session,
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            expected_version=0,
+            settings=ExtractionSettings(enabled=True, allow_request_profiles=True),
+        )
+        session.commit()
+
+    with pytest.raises(asyncio.CancelledError):
+        with factory() as session:
+            await MemoryService(session=session, mem0=client).add_memory(
+                project_id=PROJECT_ID,
+                payload={
+                    "text": "a verified decision",
+                    "app_id": APP_ID,
+                    "custom_categories": [
+                        {name: f"{name} {'description ' * 64}"}
+                        for name in category_names
+                    ],
+                },
+            )
+    assert _intent_state(factory)["status"] == "UNKNOWN"
+    initial_payload = _intent_state(factory)["payload"]
+    snapshot = initial_payload["projection_category_hash_snapshot"]
+    category_hashes = sorted(
+        hashlib.sha256(name.encode("utf-8")).hexdigest()
+        for name in category_names
+    )
+    assert snapshot["count"] == len(category_hashes)
+    assert snapshot["chunks"] == [
+        category_hashes[:32],
+        category_hashes[32:],
+    ]
+    serialized_snapshot = json.dumps(snapshot)
+    assert all(name not in serialized_snapshot for name in category_names)
+
+    with factory() as session:
+        intent = session.scalar(select(MutationIntent))
+        assert intent is not None
+        intent_repo = MutationIntentRepository(session)
+        payload = intent_repo.payload(intent)
+        intent_repo.update_payload(
+            intent.id,
+            {
+                "mutation_id": payload["mutation_id"],
+                "request_fingerprint": payload["request_fingerprint"],
+                "observed_noop": False,
+            },
+            preserve_keys=("projection_category_hash_snapshot",),
+        )
+        session.commit()
+    assert (
+        _intent_state(factory)["payload"]["projection_category_hash_snapshot"]
+        == snapshot
+    )
+
+    with factory() as session:
+        set_extraction_policy(
+            session,
+            project_id=PROJECT_ID,
+            app_id=APP_ID,
+            expected_version=1,
+            settings=ExtractionSettings(enabled=True, allow_request_profiles=False),
+        )
+        session.commit()
+
+    assert await _recover(factory, client) == {"recovered": 1, "failed": 0}
+    with factory() as session:
+        indexed = session.scalar(select(MemoryIndex))
+        assert indexed is not None and indexed.category == final_category
+    assert client.add_calls == 1
+
+
+def test_projection_category_hash_snapshot_rejects_malformed_digest() -> None:
+    with pytest.raises(RuntimeError, match="malformed"):
+        _projection_category_hashes(
+            {
+                "chunks": [["not-a-sha256-digest"]],
+                "count": 1,
+                "fingerprint": "0" * 64,
+            }
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("failed_commit", "initial_status", "expected_recovery"),
     [
         (2, "COMPLETED", {"recovered": 0, "failed": 0}),
@@ -654,6 +776,7 @@ async def test_cancelled_empty_add_finalization_recovers_from_durable_observatio
         assert set(state["payload"]) == {
             "mutation_id",
             "observed_noop",
+            "projection_category_hash_snapshot",
             "request_fingerprint",
         }
         with factory() as session:
@@ -700,12 +823,13 @@ async def test_empty_add_checkpoint_flush_failure_completes_known_noop(
         self,
         intent_id: str,
         payload: dict[str, Any],
+        **kwargs,
     ) -> MutationIntent:
         nonlocal update_failed
         if not update_failed:
             update_failed = True
             raise RuntimeError("injected checkpoint flush failure")
-        return real_update_payload(self, intent_id, payload)
+        return real_update_payload(self, intent_id, payload, **kwargs)
 
     monkeypatch.setattr(
         MutationIntentRepository,

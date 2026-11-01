@@ -1,3 +1,5 @@
+import hashlib
+
 from mem0_sidecar.core.categories import extract_category
 
 
@@ -17,3 +19,14 @@ def test_extract_category_ignores_unknown_values() -> None:
     )
 
     assert category is None
+
+
+def test_extract_category_matches_configured_name_hash() -> None:
+    name = "sk-abcdefghij"
+    category = extract_category(
+        metadata={"categories": [name]},
+        configured_names=set(),
+        configured_name_hashes={hashlib.sha256(name.encode("utf-8")).hexdigest()},
+    )
+
+    assert category == name

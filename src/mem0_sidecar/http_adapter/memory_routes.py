@@ -13,6 +13,7 @@ from mem0_sidecar.core.explorer_filters import (
     MEMORY_FILTER_FIELDS,
     parse_explorer_query,
 )
+from mem0_sidecar.core.extraction_policy import get_extraction_policy
 from mem0_sidecar.core.memory_ops import (
     MemoryProjectionConflictError,
     MemoryService,
@@ -121,6 +122,41 @@ class MemoryScanResponse(BaseModel):
     next_cursor: str | None
     has_more: bool
     stale_skipped: int
+
+
+@memory_router.get("/v1/extraction-capabilities")
+def extraction_capabilities(
+    request: Request, session: SessionDependency,
+) -> dict[str, Any]:
+    payload = dict(request.query_params)
+    _enforce_platform_scope_boundary(request, payload)
+    try:
+        project_id = validate_scope_id(
+            resolve_project_id(request, payload), field_name="project_id",
+        )
+        if project_id is None:
+            raise ValueError("project_id is required")
+        request_app_id = validate_scope_id(
+            resolve_app_id(request, payload), field_name="app_id", required=False,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    app_id = resolve_project_app_id(
+        session, project_id=project_id, request_app_id=request_app_id,
+    ) or project_id
+    try:
+        policy = get_extraction_policy(session, project_id, app_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Project not found") from exc
+    return {
+        "protocol": "request-profiles-v1",
+        "dual_extraction_enabled": (
+            policy.settings.enabled and policy.settings.dual_extraction_enabled
+        ),
+        "request_profiles_enabled": (
+            policy.settings.enabled and policy.settings.allow_request_profiles
+        ),
+    }
 
 
 def _resolve_project_wide(
