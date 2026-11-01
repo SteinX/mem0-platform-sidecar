@@ -606,15 +606,16 @@ async def test_recovered_add_keeps_request_profile_category_after_policy_change(
     tmp_path,
 ) -> None:
     factory = _session_factory(tmp_path)
+    category_names = [f"decision-{index:02d}" for index in range(64)]
 
     class ProfileClient(_StatefulRecoveryClient):
         async def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
             self.cancel_operation = None
             response = await super().add_memory(payload)
             categories = payload.get("extraction_policy", {}).get("categories", [])
-            category_names = [category["name"] for category in categories]
-            response["metadata"]["categories"] = category_names
-            self.records[response["id"]]["metadata"]["categories"] = category_names
+            final_category = categories[-1]["name"]
+            response["metadata"]["categories"] = [final_category]
+            self.records[response["id"]]["metadata"]["categories"] = [final_category]
             self.cancel_operation = "add"
             self._cancel_once("add")
             return response
@@ -637,10 +638,40 @@ async def test_recovered_add_keeps_request_profile_category_after_policy_change(
                 payload={
                     "text": "a verified decision",
                     "app_id": APP_ID,
-                    "custom_categories": [{"decision": "A verified decision"}],
+                    "custom_categories": [
+                        {name: f"{name} {'description ' * 64}"}
+                        for name in category_names
+                    ],
                 },
             )
     assert _intent_state(factory)["status"] == "UNKNOWN"
+    initial_payload = _intent_state(factory)["payload"]
+    snapshot = initial_payload["projection_category_name_snapshot"]
+    assert snapshot["count"] == len(category_names)
+    assert snapshot["chunks"] == [
+        category_names[:32],
+        category_names[32:],
+    ]
+
+    with factory() as session:
+        intent = session.scalar(select(MutationIntent))
+        assert intent is not None
+        intent_repo = MutationIntentRepository(session)
+        payload = intent_repo.payload(intent)
+        intent_repo.update_payload(
+            intent.id,
+            {
+                "mutation_id": payload["mutation_id"],
+                "request_fingerprint": payload["request_fingerprint"],
+                "observed_noop": False,
+            },
+            preserve_keys=("projection_category_name_snapshot",),
+        )
+        session.commit()
+    assert (
+        _intent_state(factory)["payload"]["projection_category_name_snapshot"]
+        == snapshot
+    )
 
     with factory() as session:
         set_extraction_policy(
@@ -655,7 +686,7 @@ async def test_recovered_add_keeps_request_profile_category_after_policy_change(
     assert await _recover(factory, client) == {"recovered": 1, "failed": 0}
     with factory() as session:
         indexed = session.scalar(select(MemoryIndex))
-        assert indexed is not None and indexed.category == "decision"
+        assert indexed is not None and indexed.category == category_names[-1]
     assert client.add_calls == 1
 
 

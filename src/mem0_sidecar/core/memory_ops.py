@@ -49,6 +49,8 @@ from mem0_sidecar.store.repositories import (
 SIDECAR_PROJECT_ID_METADATA_KEY = "_mem0_sidecar_project_id"
 SIDECAR_APP_ID_METADATA_KEY = "_mem0_sidecar_app_id"
 SIDECAR_MUTATION_ID_METADATA_KEY = "_mem0_sidecar_mutation_id"
+_PROJECTION_CATEGORY_NAME_SNAPSHOT = "projection_category_name_snapshot"
+_PROJECTION_CATEGORY_NAME_CHUNK_SIZE = 32
 _MEMORY_PATCH_FIELDS = frozenset({"text", "metadata", "expiration_date"})
 # Leave room for the project/app scope fields added before the recovery intent is
 # sanitized. Mutation-intent trace objects retain at most 50 fields.
@@ -270,6 +272,58 @@ def _canonical_fingerprint(payload: dict[str, Any]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _projection_category_name_snapshot(
+    category_names: set[str],
+) -> dict[str, Any]:
+    names = sorted(category_names)
+    return {
+        "chunks": [
+            names[index : index + _PROJECTION_CATEGORY_NAME_CHUNK_SIZE]
+            for index in range(0, len(names), _PROJECTION_CATEGORY_NAME_CHUNK_SIZE)
+        ],
+        "count": len(names),
+        "fingerprint": _canonical_fingerprint({"names": names}),
+    }
+
+
+def _projection_category_names(snapshot: object) -> list[str]:
+    if type(snapshot) is not dict or set(snapshot) != {
+        "chunks",
+        "count",
+        "fingerprint",
+    }:
+        raise RuntimeError("Add recovery category snapshot is malformed")
+    chunks = snapshot["chunks"]
+    count = snapshot["count"]
+    fingerprint = snapshot["fingerprint"]
+    if type(chunks) is not list or type(count) is not int or count < 0:
+        raise RuntimeError("Add recovery category snapshot is malformed")
+    if type(fingerprint) is not str:
+        raise RuntimeError("Add recovery category snapshot is malformed")
+    names: list[str] = []
+    for index, chunk in enumerate(chunks):
+        if (
+            type(chunk) is not list
+            or not 1 <= len(chunk) <= _PROJECTION_CATEGORY_NAME_CHUNK_SIZE
+        ):
+            raise RuntimeError("Add recovery category snapshot is malformed")
+        if (
+            index < len(chunks) - 1
+            and len(chunk) != _PROJECTION_CATEGORY_NAME_CHUNK_SIZE
+        ):
+            raise RuntimeError("Add recovery category snapshot is incomplete")
+        if any(type(name) is not str or not name.strip() for name in chunk):
+            raise RuntimeError("Add recovery category snapshot is malformed")
+        names.extend(chunk)
+    if (
+        count != len(names)
+        or names != sorted(set(names))
+        or fingerprint != _canonical_fingerprint({"names": names})
+    ):
+        raise RuntimeError("Add recovery category snapshot is incomplete")
+    return names
 
 
 def validate_idempotency_key(value: str | None) -> str | None:
@@ -1596,17 +1650,37 @@ class MemoryService:
             (_normalize_memory_record(record) for record in records),
             key=lambda item: item["id"],
         )
-        category_names = {
-            item.name
-            for item in CategoryRepository(self.session).list_project_categories(
-                project_id
+        if _PROJECTION_CATEGORY_NAME_SNAPSHOT in payload:
+            category_names = set(
+                _projection_category_names(
+                    payload[_PROJECTION_CATEGORY_NAME_SNAPSHOT]
+                )
             )
-            if item.enabled
-        }
-        frozen_policy = payload.get("upstream_payload", {}).get("extraction_policy", {})
-        category_names.update(
-            item["name"] for item in frozen_policy.get("categories", [])
-        )
+        else:
+            category_names = {
+                item.name
+                for item in CategoryRepository(self.session).list_project_categories(
+                    project_id
+                )
+                if item.enabled
+            }
+            frozen_payload = payload.get("upstream_payload")
+            frozen_policy = (
+                frozen_payload.get("extraction_policy")
+                if isinstance(frozen_payload, dict)
+                else None
+            )
+            frozen_categories = (
+                frozen_policy.get("categories")
+                if isinstance(frozen_policy, dict)
+                else None
+            )
+            if isinstance(frozen_categories, list):
+                category_names.update(
+                    item["name"]
+                    for item in frozen_categories
+                    if isinstance(item, dict) and type(item.get("name")) is str
+                )
         observed_at = datetime.now(UTC)
         ProjectRepository(self.session).lock_for_mutation(project_id)
         intent_repo = MutationIntentRepository(self.session)
@@ -1959,6 +2033,7 @@ class MemoryService:
             item["name"]
             for item in oss_payload.get("extraction_policy", {}).get("categories", [])
         )
+        category_snapshot = _projection_category_name_snapshot(category_names)
         event_request = {**oss_payload, "metadata": dict(oss_payload["metadata"])}
         await self.recover_pending_mutations(
             project_id=project_id,
@@ -1979,6 +2054,7 @@ class MemoryService:
             correlation_id=get_request_id(),
         )
         intent_payload = {
+            _PROJECTION_CATEGORY_NAME_SNAPSHOT: category_snapshot,
             "mutation_id": mutation_id,
             "request_fingerprint": request_fingerprint,
             "upstream_payload": oss_payload,
@@ -1988,6 +2064,15 @@ class MemoryService:
             project_id,
             intent_payload,
         )
+        if (
+            sanitized_payload.get(_PROJECTION_CATEGORY_NAME_SNAPSHOT)
+            != category_snapshot
+        ):
+            self.session.rollback()
+            raise RuntimeError(
+                "Mutation intent category snapshot was not preserved; "
+                "refusing upstream add"
+            )
         intent_payload["replay_safe"] = (
             sanitized_payload.get("upstream_payload") == oss_payload
             and sanitized_payload.get("category") == category
@@ -2051,6 +2136,7 @@ class MemoryService:
                             "request_fingerprint": request_fingerprint,
                             "observed_noop": True,
                         },
+                        preserve_keys=(_PROJECTION_CATEGORY_NAME_SNAPSHOT,),
                     )
                     self.session.commit()
                 except BaseException:

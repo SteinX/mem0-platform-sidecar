@@ -1951,8 +1951,20 @@ class MutationIntentRepository:
         self,
         intent_id: str,
         payload: dict[str, Any],
+        *,
+        preserve_keys: Iterable[str] = (),
     ) -> MutationIntent:
         intent = self.get(intent_id)
+        existing = self.payload(intent)
+        preserved = {
+            key: existing[key]
+            for key in preserve_keys
+            if key in existing
+        }
+        payload = {
+            **preserved,
+            **{key: value for key, value in payload.items() if key not in preserved},
+        }
         intent.payload_json = _trace_json(
             self.sanitize_payload(intent.project_id, payload)
         )
